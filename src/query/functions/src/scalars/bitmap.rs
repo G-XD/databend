@@ -17,43 +17,47 @@ use std::ops::BitOr;
 use std::ops::BitXor;
 use std::ops::Sub;
 
-use common_expression::types::bitmap::BitmapType;
-use common_expression::types::string::StringColumnBuilder;
-use common_expression::types::ArrayType;
-use common_expression::types::BooleanType;
-use common_expression::types::StringType;
-use common_expression::types::UInt64Type;
-use common_expression::vectorize_with_builder_1_arg;
-use common_expression::vectorize_with_builder_2_arg;
-use common_expression::vectorize_with_builder_3_arg;
-use common_expression::EvalContext;
-use common_expression::FunctionDomain;
-use common_expression::FunctionRegistry;
-use croaring::treemap::NativeSerializer;
-use croaring::Treemap;
+use databend_common_expression::types::binary::BinaryColumnBuilder;
+use databend_common_expression::types::bitmap::BitmapType;
+use databend_common_expression::types::ArrayType;
+use databend_common_expression::types::BooleanType;
+use databend_common_expression::types::NullableType;
+use databend_common_expression::types::NumberDataType;
+use databend_common_expression::types::NumberType;
+use databend_common_expression::types::StringType;
+use databend_common_expression::types::UInt64Type;
+use databend_common_expression::types::ALL_SIGNED_INTEGER_TYPES;
+use databend_common_expression::types::ALL_UNSIGNED_INTEGER_TYPES;
+use databend_common_expression::vectorize_with_builder_1_arg;
+use databend_common_expression::vectorize_with_builder_2_arg;
+use databend_common_expression::vectorize_with_builder_3_arg;
+use databend_common_expression::with_signed_integer_mapped_type;
+use databend_common_expression::with_unsigned_integer_mapped_type;
+use databend_common_expression::EvalContext;
+use databend_common_expression::FunctionDomain;
+use databend_common_expression::FunctionRegistry;
+use databend_common_io::deserialize_bitmap;
+use databend_common_io::parse_bitmap;
 use itertools::join;
+use roaring::RoaringTreemap;
 
 pub fn register(registry: &mut FunctionRegistry) {
     registry.register_passthrough_nullable_1_arg::<StringType, BitmapType, _, _>(
         "to_bitmap",
         |_, _| FunctionDomain::MayThrow,
         vectorize_with_builder_1_arg::<StringType, BitmapType>(|s, builder, ctx| {
-            match std::str::from_utf8(s)
-                .map_err(|e| e.to_string())
-                .and_then(|s| {
-                    let s: String = s.chars().filter(|c| !c.is_whitespace()).collect();
-                    let result: Result<Vec<u64>, String> = s
-                        .split(',')
-                        .map(|v| v.parse::<u64>().map_err(|e| e.to_string()))
-                        .collect();
-                    result
-                }) {
-                Ok(v) => {
-                    let rb = Treemap::from_iter(v);
-                    builder.put(&rb.serialize().unwrap());
+            if let Some(validity) = &ctx.validity {
+                if !validity.get_bit(builder.len()) {
+                    builder.commit_row();
+                    return;
+                }
+            }
+            match parse_bitmap(s.as_bytes()) {
+                Ok(rb) => {
+                    rb.serialize_into(&mut builder.data).unwrap();
                 }
                 Err(e) => {
-                    ctx.set_error(builder.len(), e);
+                    ctx.set_error(builder.len(), e.to_string());
                 }
             }
             builder.commit_row();
@@ -70,39 +74,93 @@ pub fn register(registry: &mut FunctionRegistry) {
                     return;
                 }
             }
-            let mut rb = Treemap::create();
-            rb.add(arg);
+            let mut rb = RoaringTreemap::new();
+            rb.insert(arg);
 
-            builder.put(&rb.serialize().unwrap());
+            rb.serialize_into(&mut builder.data).unwrap();
             builder.commit_row();
         }),
     );
 
-    registry.register_passthrough_nullable_1_arg::<ArrayType<UInt64Type>, BitmapType, _, _>(
-        "build_bitmap",
-        |_, _| FunctionDomain::Full,
-        vectorize_with_builder_1_arg::<ArrayType<UInt64Type>, BitmapType>(|arg, builder, _ctx| {
-            let mut rb = Treemap::create();
-            for a in arg.iter() {
-                rb.add(*a);
+    for num_type in ALL_UNSIGNED_INTEGER_TYPES {
+        with_unsigned_integer_mapped_type!(|NUM_TYPE| match num_type {
+            NumberDataType::NUM_TYPE => {
+                registry.register_passthrough_nullable_1_arg::<ArrayType<NullableType<NumberType<NUM_TYPE>>>, BitmapType, _, _>(
+                    "build_bitmap",
+                    |_, _| FunctionDomain::Full,
+                    vectorize_with_builder_1_arg::<ArrayType<NullableType<NumberType<NUM_TYPE>>>, BitmapType>(|arg, builder, ctx| {
+                        if let Some(validity) = &ctx.validity {
+                            if !validity.get_bit(builder.len()) {
+                                builder.commit_row();
+                                return;
+                            }
+                        }
+                        let mut rb = RoaringTreemap::new();
+                        for a in arg.iter() {
+                            if let Some(a) = a {
+                                rb.insert(a.try_into().unwrap());
+                            }
+                        }
+
+                        rb.serialize_into(&mut builder.data).unwrap();
+                        builder.commit_row();
+                    }),
+                );
             }
+            _ => unreachable!(),
+        })
+    }
 
-            builder.put(&rb.serialize().unwrap());
-            builder.commit_row();
-        }),
-    );
+    for num_type in ALL_SIGNED_INTEGER_TYPES {
+        with_signed_integer_mapped_type!(|NUM_TYPE| match num_type {
+            NumberDataType::NUM_TYPE => {
+                registry.register_passthrough_nullable_1_arg::<ArrayType<NullableType<NumberType<NUM_TYPE>>>, BitmapType, _, _>(
+                    "build_bitmap",
+                    |_, _| FunctionDomain::MayThrow,
+                    vectorize_with_builder_1_arg::<ArrayType<NullableType<NumberType<NUM_TYPE>>>, BitmapType>(|arg, builder, ctx| {
+                        if let Some(validity) = &ctx.validity {
+                            if !validity.get_bit(builder.len()) {
+                                builder.commit_row();
+                                return;
+                            }
+                        }
+                        let mut rb = RoaringTreemap::new();
+                        for a in arg.iter() {
+                            if let Some(a) = a {
+                                if a >= 0 {
+                                    rb.insert(a.try_into().unwrap());
+                                } else {
+                                    ctx.set_error(builder.len(), "build_bitmap just support positive integer");
+                                }
+                            }
+                        }
+
+                        rb.serialize_into(&mut builder.data).unwrap();
+                        builder.commit_row();
+                    }),
+                );
+            }
+            _ => unreachable!(),
+        })
+    }
 
     registry.register_passthrough_nullable_1_arg::<BitmapType, UInt64Type, _, _>(
         "bitmap_count",
         |_, _| FunctionDomain::Full,
         vectorize_with_builder_1_arg::<BitmapType, UInt64Type>(|arg, builder, ctx| {
-            match Treemap::deserialize(arg) {
+            if let Some(validity) = &ctx.validity {
+                if !validity.get_bit(builder.len()) {
+                    builder.push(0_u64);
+                    return;
+                }
+            }
+            match deserialize_bitmap(arg) {
                 Ok(rb) => {
-                    builder.push(rb.cardinality());
+                    builder.push(rb.len());
                 }
                 Err(e) => {
-                    builder.push(0_u64);
                     ctx.set_error(builder.len(), e.to_string());
+                    builder.push(0_u64);
                 }
             }
         }),
@@ -114,18 +172,23 @@ pub fn register(registry: &mut FunctionRegistry) {
         "to_string",
         |_, _| FunctionDomain::MayThrow,
         vectorize_with_builder_1_arg::<BitmapType, StringType>(|b, builder, ctx| {
-            match Treemap::deserialize(b) {
+            if let Some(validity) = &ctx.validity {
+                if !validity.get_bit(builder.len()) {
+                    builder.commit_row();
+                    return;
+                }
+            }
+            match deserialize_bitmap(b) {
                 Ok(rb) => {
-                    let raw = rb.to_vec();
+                    let raw = rb.into_iter().collect::<Vec<_>>();
                     let s = join(raw.iter(), ",");
-                    builder.put_str(&s);
+                    builder.put_and_commit(s);
                 }
                 Err(e) => {
                     ctx.set_error(builder.len(), e.to_string());
+                    builder.commit_row();
                 }
             }
-
-            builder.commit_row();
         }),
     );
 
@@ -133,13 +196,21 @@ pub fn register(registry: &mut FunctionRegistry) {
         "bitmap_contains",
         |_, _, _| FunctionDomain::Full,
         vectorize_with_builder_2_arg::<BitmapType, UInt64Type, BooleanType>(
-            |b, item, builder, ctx| match Treemap::deserialize(b) {
-                Ok(rb) => {
-                    builder.push(rb.contains(item));
+            |b, item, builder, ctx| {
+                if let Some(validity) = &ctx.validity {
+                    if !validity.get_bit(builder.len()) {
+                        builder.push(false);
+                        return;
+                    }
                 }
-                Err(e) => {
-                    builder.push(false);
-                    ctx.set_error(builder.len(), e.to_string());
+                match deserialize_bitmap(b) {
+                    Ok(rb) => {
+                        builder.push(rb.contains(item));
+                    }
+                    Err(e) => {
+                        ctx.set_error(builder.len(), e.to_string());
+                        builder.push(false);
+                    }
                 }
             },
         ),
@@ -149,17 +220,25 @@ pub fn register(registry: &mut FunctionRegistry) {
         "bitmap_subset_limit",
         |_, _, _, _| FunctionDomain::MayThrow,
         vectorize_with_builder_3_arg::<BitmapType, UInt64Type, UInt64Type, BitmapType>(
-            |b, range_start, limit, builder, ctx| match Treemap::deserialize(b) {
-                Ok(rb) => {
-                    let collection = rb.iter().filter(|x| x >= &range_start).take(limit as usize);
-                    let subset_bitmap = Treemap::from_iter(collection);
-                    builder.put(&subset_bitmap.serialize().unwrap());
-                    builder.commit_row();
+            |b, range_start, limit, builder, ctx| {
+                if let Some(validity) = &ctx.validity {
+                    if !validity.get_bit(builder.len()) {
+                        builder.commit_row();
+                        return;
+                    }
                 }
-                Err(e) => {
-                    ctx.set_error(builder.len(), e.to_string());
+                match deserialize_bitmap(b) {
+                    Ok(rb) => {
+                        let collection = rb.iter().filter(|x| x >= &range_start).take(limit as usize);
+                        let subset_bitmap = RoaringTreemap::from_iter(collection);
+                        subset_bitmap.serialize_into(&mut builder.data).unwrap();
+                    }
+                    Err(e) => {
+                        ctx.set_error(builder.len(), e.to_string());
+                    }
                 }
-            },
+                builder.commit_row();
+            }
         ),
     );
 
@@ -167,17 +246,25 @@ pub fn register(registry: &mut FunctionRegistry) {
         "bitmap_subset_in_range",
         |_, _, _, _| FunctionDomain::MayThrow,
         vectorize_with_builder_3_arg::<BitmapType, UInt64Type, UInt64Type, BitmapType>(
-            |b, start, end, builder, ctx| match Treemap::deserialize(b) {
-                Ok(rb) => {
-                    let collection = rb.iter().filter(|x| x >= &start && x < &end);
-                    let subset_bitmap = Treemap::from_iter(collection);
-                    builder.put(&subset_bitmap.serialize().unwrap());
-                    builder.commit_row();
+            |b, start, end, builder, ctx| {
+                if let Some(validity) = &ctx.validity {
+                    if !validity.get_bit(builder.len()) {
+                        builder.commit_row();
+                        return;
+                    }
                 }
-                Err(e) => {
-                    ctx.set_error(builder.len(), e.to_string());
+                match deserialize_bitmap(b) {
+                    Ok(rb) => {
+                        let collection = rb.iter().filter(|x| x >= &start && x < &end);
+                        let subset_bitmap = RoaringTreemap::from_iter(collection);
+                        subset_bitmap.serialize_into(&mut builder.data).unwrap();
+                    }
+                    Err(e) => {
+                        ctx.set_error(builder.len(), e.to_string());
+                    }
                 }
-            },
+                builder.commit_row();
+            }
         ),
     );
 
@@ -186,26 +273,31 @@ pub fn register(registry: &mut FunctionRegistry) {
         |_, _, _, _| FunctionDomain::MayThrow,
         vectorize_with_builder_3_arg::<BitmapType, UInt64Type, UInt64Type, BitmapType>(
             |b, offset, length, builder, ctx| {
-                match Treemap::deserialize(b) {
+                if let Some(validity) = &ctx.validity {
+                    if !validity.get_bit(builder.len()) {
+                        builder.commit_row();
+                        return;
+                    }
+                }
+                match deserialize_bitmap(b) {
                     Ok(rb) => {
                         let subset_start = offset;
                         let subset_length = length;
                         if subset_start >= b.len() as u64 {
-                            let rb = Treemap::create();
-                            builder.put(&rb.serialize().unwrap());
-                            builder.commit_row();
+                            let rb = RoaringTreemap::new();
+                            rb.serialize_into(&mut builder.data).unwrap();
                         } else {
                             let adjusted_length = (subset_start + subset_length).min(b.len() as u64) - subset_start;
-                            let subset_bitmap = &rb.to_vec()[subset_start as usize..(subset_start + adjusted_length) as usize];
-                            let rb = Treemap::from_iter(subset_bitmap.to_vec());
-                            builder.put(&rb.serialize().unwrap());
-                            builder.commit_row();
+                            let subset_bitmap = &rb.into_iter().collect::<Vec<_>>()[subset_start as usize..(subset_start + adjusted_length) as usize];
+                            let rb = RoaringTreemap::from_iter(subset_bitmap.iter());
+                            rb.serialize_into(&mut builder.data).unwrap();
                         }
                     }
                     Err(e) => {
                         ctx.set_error(builder.len(), e.to_string());
                     }
                 }
+                builder.commit_row();
             },
         ),
     );
@@ -215,7 +307,13 @@ pub fn register(registry: &mut FunctionRegistry) {
         |_, _, _| FunctionDomain::Full,
         vectorize_with_builder_2_arg::<BitmapType, BitmapType, BooleanType>(
             |b, items, builder, ctx| {
-                let rb = match Treemap::deserialize(b) {
+                if let Some(validity) = &ctx.validity {
+                    if !validity.get_bit(builder.len()) {
+                        builder.push(false);
+                        return;
+                    }
+                }
+                let rb = match deserialize_bitmap(b) {
                     Ok(rb) => rb,
                     Err(e) => {
                         ctx.set_error(builder.len(), e.to_string());
@@ -223,7 +321,7 @@ pub fn register(registry: &mut FunctionRegistry) {
                         return;
                     }
                 };
-                let rb2 = match Treemap::deserialize(items) {
+                let rb2 = match deserialize_bitmap(items) {
                     Ok(rb) => rb,
                     Err(e) => {
                         ctx.set_error(builder.len(), e.to_string());
@@ -231,7 +329,7 @@ pub fn register(registry: &mut FunctionRegistry) {
                         return;
                     }
                 };
-                builder.push(rb2.is_subset(&rb));
+                builder.push(rb.is_superset(&rb2));
             },
         ),
     );
@@ -241,7 +339,13 @@ pub fn register(registry: &mut FunctionRegistry) {
         |_, _, _| FunctionDomain::Full,
         vectorize_with_builder_2_arg::<BitmapType, BitmapType, BooleanType>(
             |b, items, builder, ctx| {
-                let rb = match Treemap::deserialize(b) {
+                if let Some(validity) = &ctx.validity {
+                    if !validity.get_bit(builder.len()) {
+                        builder.push(false);
+                        return;
+                    }
+                }
+                let rb = match deserialize_bitmap(b) {
                     Ok(rb) => rb,
                     Err(e) => {
                         ctx.set_error(builder.len(), e.to_string());
@@ -249,7 +353,7 @@ pub fn register(registry: &mut FunctionRegistry) {
                         return;
                     }
                 };
-                let rb2 = match Treemap::deserialize(items) {
+                let rb2 = match deserialize_bitmap(items) {
                     Ok(rb) => rb,
                     Err(e) => {
                         ctx.set_error(builder.len(), e.to_string());
@@ -257,7 +361,7 @@ pub fn register(registry: &mut FunctionRegistry) {
                         return;
                     }
                 };
-                builder.push(rb.bitand(rb2).cardinality() != 0);
+                builder.push(rb.intersection_len(&rb2) != 0);
             },
         ),
     );
@@ -266,8 +370,14 @@ pub fn register(registry: &mut FunctionRegistry) {
         "bitmap_max",
         |_, _| FunctionDomain::MayThrow,
         vectorize_with_builder_1_arg::<BitmapType, UInt64Type>(|b, builder, ctx| {
-            let val = match Treemap::deserialize(b) {
-                Ok(rb) => match rb.maximum() {
+            if let Some(validity) = &ctx.validity {
+                if !validity.get_bit(builder.len()) {
+                    builder.push(0);
+                    return;
+                }
+            }
+            let val = match deserialize_bitmap(b) {
+                Ok(rb) => match rb.max() {
                     Some(val) => val,
                     None => {
                         ctx.set_error(builder.len(), "The bitmap is empty");
@@ -287,8 +397,14 @@ pub fn register(registry: &mut FunctionRegistry) {
         "bitmap_min",
         |_, _| FunctionDomain::MayThrow,
         vectorize_with_builder_1_arg::<BitmapType, UInt64Type>(|b, builder, ctx| {
-            let val = match Treemap::deserialize(b) {
-                Ok(rb) => match rb.minimum() {
+            if let Some(validity) = &ctx.validity {
+                if !validity.get_bit(builder.len()) {
+                    builder.push(0);
+                    return;
+                }
+            }
+            let val = match deserialize_bitmap(b) {
+                Ok(rb) => match rb.min() {
                     Some(val) => val,
                     None => {
                         ctx.set_error(builder.len(), "The bitmap is empty");
@@ -350,21 +466,33 @@ enum LogicOp {
 fn bitmap_logic_operate(
     arg1: &[u8],
     arg2: &[u8],
-    builder: &mut StringColumnBuilder,
+    builder: &mut BinaryColumnBuilder,
     ctx: &mut EvalContext,
     op: LogicOp,
 ) {
-    let Some(rb1) = Treemap::deserialize(arg1).map_err(|e| {
-        ctx.set_error(builder.len(), e.to_string());
-        builder.commit_row();
-    }).ok() else {
+    if let Some(validity) = &ctx.validity {
+        if !validity.get_bit(builder.len()) {
+            builder.commit_row();
+            return;
+        }
+    }
+    let Some(rb1) = deserialize_bitmap(arg1)
+        .map_err(|e| {
+            ctx.set_error(builder.len(), e.to_string());
+            builder.commit_row();
+        })
+        .ok()
+    else {
         return;
     };
 
-    let Some(rb2) = Treemap::deserialize(arg2).map_err(|e| {
-        ctx.set_error(builder.len(), e.to_string());
-        builder.commit_row();
-    }).ok() else {
+    let Some(rb2) = deserialize_bitmap(arg2)
+        .map_err(|e| {
+            ctx.set_error(builder.len(), e.to_string());
+            builder.commit_row();
+        })
+        .ok()
+    else {
         return;
     };
 
@@ -375,6 +503,6 @@ fn bitmap_logic_operate(
         LogicOp::Not => rb1.sub(rb2),
     };
 
-    builder.put(&rb.serialize().unwrap());
+    rb.serialize_into(&mut builder.data).unwrap();
     builder.commit_row();
 }

@@ -1,10 +1,6 @@
 name: "Test sqllogic management mode"
 description: "Running sqllogic tests in management mode"
 inputs:
-  target:
-    description: ""
-    required: true
-    default: "x86_64-unknown-linux-gnu"
   dirs:
     description: "logic test suites dirs"
     required: true
@@ -16,11 +12,8 @@ inputs:
 runs:
   using: "composite"
   steps:
-    - name: Download artifact
-      uses: ./.github/actions/artifact_download
+    - uses: ./.github/actions/setup_test
       with:
-        sha: ${{ github.sha }}
-        target: ${{ inputs.target }}
         artifacts: sqllogictests,meta,query
 
     - name: Run sqllogic Tests with management mode
@@ -30,7 +23,7 @@ runs:
       run: bash ./scripts/ci/ci-run-sqllogic-tests-management-mode.sh ${{ inputs.dirs }}
 
     - name: Upload failure
-      if: failure() || cancelled()
+      if: failure()
       uses: ./.github/actions/artifact_failure
       with:
         name: test-sqllogic-management-${{ inputs.handlers }}-${{ inputs.dirs }}

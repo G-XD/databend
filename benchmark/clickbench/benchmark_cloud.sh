@@ -4,10 +4,11 @@ set -e
 
 BENCHMARK_ID=${BENCHMARK_ID:-$(date +%s)}
 BENCHMARK_DATASET=${BENCHMARK_DATASET:-hits}
-BENCHMARK_SIZE=${BENCHMARK_SIZE:-Medium}
-BENCHMARK_CACHE_SIZE=${BENCHMARK_CACHE_SIZE:-50}
+BENCHMARK_SIZE=${BENCHMARK_SIZE:-Small}
+BENCHMARK_CACHE_SIZE=${BENCHMARK_CACHE_SIZE:-0}
 BENCHMARK_VERSION=${BENCHMARK_VERSION:-}
 BENCHMARK_DATABASE=${BENCHMARK_DATABASE:-default}
+BENCHMARK_TRIES=${BENCHMARK_TRIES:-3}
 
 if [[ -z "${BENCHMARK_VERSION}" ]]; then
     echo "Please set BENCHMARK_VERSION to run the benchmark."
@@ -34,13 +35,13 @@ echo '{}' >result.json
 yq -i ".date = \"$(date -u +%Y-%m-%d)\"" -o json result.json
 yq -i '.tags = ["s3"]' -o json result.json
 case ${BENCHMARK_SIZE} in
-Medium)
+Small)
     yq -i '.cluster_size = "16"' -o json result.json
-    yq -i '.machine = "Medium"' -o json result.json
+    yq -i '.machine = "Small"' -o json result.json
     ;;
-XLarge)
+Large)
     yq -i '.cluster_size = "64"' -o json result.json
-    yq -i '.machine = "XLarge"' -o json result.json
+    yq -i '.machine = "Large"' -o json result.json
     ;;
 *)
     echo "Unsupported benchmark size: ${BENCHMARK_SIZE}"
@@ -51,7 +52,7 @@ esac
 echo "#######################################################"
 echo "Running benchmark for Databend Cloud with S3 storage..."
 
-export BENDSQL_DSN="databend://${CLOUD_USER}:${CLOUD_PASSWORD}@${CLOUD_GATEWAY}:443/${BENCHMARK_DATABASE}?warehouse=${CLOUD_WAREHOUSE}"
+export BENDSQL_DSN="databend://${CLOUD_USER}:${CLOUD_PASSWORD}@${CLOUD_GATEWAY}:443?login=disable"
 
 echo "Creating warehouse..."
 echo "DROP WAREHOUSE IF EXISTS '${CLOUD_WAREHOUSE}';" | bendsql
@@ -70,14 +71,25 @@ until bendsql --query="SHOW WAREHOUSES LIKE '${CLOUD_WAREHOUSE}'" | grep -q "Run
     sleep 10
 done
 
+export BENDSQL_DSN="databend://${CLOUD_USER}:${CLOUD_PASSWORD}@${CLOUD_GATEWAY}:443?warehouse=${CLOUD_WAREHOUSE}"
+
+if [[ "${BENCHMARK_DATASET}" == "load" ]]; then
+    echo "Creating database..."
+    echo "CREATE DATABASE ${BENCHMARK_DATABASE};" | bendsql --database default
+fi
+
+export BENDSQL_DSN="databend://${CLOUD_USER}:${CLOUD_PASSWORD}@${CLOUD_GATEWAY}:443/${BENCHMARK_DATABASE}?warehouse=${CLOUD_WAREHOUSE}"
+
 echo "Checking session settings..."
 bendsql --query="select * from system.settings where value != default;" -o table
 
 echo "Running queries..."
 
 # analyze table
-echo "Analyze table..."
-bendsql <"${BENCHMARK_DATASET}/analyze.sql"
+if [[ -f "${BENCHMARK_DATASET}/analyze.sql" ]]; then
+    echo "Analyze table..."
+    bendsql <"${BENCHMARK_DATASET}/analyze.sql"
+fi
 
 function run_query() {
     local query_num=$1
@@ -85,7 +97,7 @@ function run_query() {
     local query=$3
 
     local q_time
-    q_time=$(echo "$query" | bendsql --time)
+    q_time=$(bendsql --time=server <"$query")
     if [[ -n $q_time ]]; then
         echo "Q${query_num}[$seq] succeeded in $q_time seconds"
         yq -i ".result[${query_num}] += [${q_time}]" -o json result.json
@@ -94,16 +106,23 @@ function run_query() {
     fi
 }
 
-TRIES=3
 QUERY_NUM=0
-while read -r query; do
-    echo "Running Q${QUERY_NUM}: ${query}"
+for query in "${BENCHMARK_DATASET}"/queries/*.sql; do
+    echo
+    echo "==> Running Q${QUERY_NUM}: ${query}"
+    cat "$query"
     yq -i ".result += [[]]" -o json result.json
-    for i in $(seq 1 $TRIES); do
+    for i in $(seq 1 "$BENCHMARK_TRIES"); do
         run_query "$QUERY_NUM" "$i" "$query"
     done
     QUERY_NUM=$((QUERY_NUM + 1))
-done <"${BENCHMARK_DATASET}/queries.sql"
+done
 
 echo "Cleaning up..."
+export BENDSQL_DSN="databend://${CLOUD_USER}:${CLOUD_PASSWORD}@${CLOUD_GATEWAY}:443?login=disable"
+if [[ "${BENCHMARK_DATASET}" == "load" ]]; then
+    echo "Dropping database..."
+    echo "DROP DATABASE IF EXISTS ${BENCHMARK_DATABASE};" | bendsql
+fi
+echo "Drop warehouse..."
 echo "DROP WAREHOUSE IF EXISTS '${CLOUD_WAREHOUSE}';" | bendsql

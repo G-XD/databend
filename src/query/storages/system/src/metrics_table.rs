@@ -15,23 +15,25 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use common_base::runtime::GLOBAL_MEM_STAT;
-use common_catalog::table::Table;
-use common_catalog::table_context::TableContext;
-use common_exception::ErrorCode;
-use common_exception::Result;
-use common_expression::types::StringType;
-use common_expression::utils::FromData;
-use common_expression::DataBlock;
-use common_expression::TableDataType;
-use common_expression::TableField;
-use common_expression::TableSchemaRefExt;
-use common_meta_app::schema::TableIdent;
-use common_meta_app::schema::TableInfo;
-use common_meta_app::schema::TableMeta;
-use common_metrics::reset_metrics;
-use common_metrics::MetricSample;
-use common_metrics::MetricValue;
+use databend_common_base::runtime::metrics::MetricSample;
+use databend_common_base::runtime::metrics::MetricValue;
+use databend_common_base::runtime::metrics::GLOBAL_METRICS_REGISTRY;
+use databend_common_base::runtime::GLOBAL_MEM_STAT;
+use databend_common_catalog::table::DistributionLevel;
+use databend_common_catalog::table::Table;
+use databend_common_catalog::table_context::TableContext;
+use databend_common_exception::ErrorCode;
+use databend_common_exception::Result;
+use databend_common_expression::types::StringType;
+use databend_common_expression::utils::FromData;
+use databend_common_expression::DataBlock;
+use databend_common_expression::TableDataType;
+use databend_common_expression::TableField;
+use databend_common_expression::TableSchemaRefExt;
+use databend_common_meta_app::schema::TableIdent;
+use databend_common_meta_app::schema::TableInfo;
+use databend_common_meta_app::schema::TableMeta;
+use databend_common_pipeline_core::Pipeline;
 
 use crate::SyncOneBlockSystemTable;
 use crate::SyncSystemTable;
@@ -43,7 +45,8 @@ pub struct MetricsTable {
 impl SyncSystemTable for MetricsTable {
     const NAME: &'static str = "system.metrics";
     // Allow distributed query.
-    const IS_LOCAL: bool = false;
+    const DISTRIBUTION_LEVEL: DistributionLevel = DistributionLevel::Warehouse;
+    const BROADCAST_TRUNCATE: bool = true;
 
     fn get_table_info(&self) -> &TableInfo {
         &self.table_info
@@ -52,24 +55,20 @@ impl SyncSystemTable for MetricsTable {
     fn get_full_data(&self, ctx: Arc<dyn TableContext>) -> Result<DataBlock> {
         let local_id = ctx.get_cluster().local_id.clone();
 
-        let prometheus_handle = common_metrics::try_handle().ok_or_else(|| {
-            ErrorCode::InitPrometheusFailure("Prometheus recorder is not initialized yet.")
-        })?;
-
-        let mut samples = common_metrics::dump_metric_samples(prometheus_handle)?;
+        let mut samples = GLOBAL_METRICS_REGISTRY.dump_sample()?;
         samples.extend(self.custom_metric_samples()?);
 
-        let mut nodes: Vec<Vec<u8>> = Vec::with_capacity(samples.len());
-        let mut metrics: Vec<Vec<u8>> = Vec::with_capacity(samples.len());
-        let mut labels: Vec<Vec<u8>> = Vec::with_capacity(samples.len());
-        let mut kinds: Vec<Vec<u8>> = Vec::with_capacity(samples.len());
-        let mut values: Vec<Vec<u8>> = Vec::with_capacity(samples.len());
+        let mut nodes: Vec<String> = Vec::with_capacity(samples.len());
+        let mut metrics: Vec<String> = Vec::with_capacity(samples.len());
+        let mut labels: Vec<String> = Vec::with_capacity(samples.len());
+        let mut kinds: Vec<String> = Vec::with_capacity(samples.len());
+        let mut values: Vec<String> = Vec::with_capacity(samples.len());
         for sample in samples.into_iter() {
-            nodes.push(local_id.clone().into_bytes());
-            metrics.push(sample.name.clone().into_bytes());
-            kinds.push(sample.value.kind().into_bytes());
-            labels.push(self.display_sample_labels(&sample.labels)?.into_bytes());
-            values.push(self.display_sample_value(&sample.value)?.into_bytes());
+            nodes.push(local_id.clone());
+            metrics.push(sample.name.clone());
+            kinds.push(sample.value.kind());
+            labels.push(self.display_sample_labels(&sample.labels)?);
+            values.push(self.display_sample_value(&sample.value)?);
         }
 
         Ok(DataBlock::new_from_columns(vec![
@@ -81,12 +80,8 @@ impl SyncSystemTable for MetricsTable {
         ]))
     }
 
-    fn truncate(&self, _ctx: Arc<dyn TableContext>) -> Result<()> {
-        let prometheus_handle = common_metrics::try_handle().ok_or_else(|| {
-            ErrorCode::InitPrometheusFailure("Prometheus recorder is not initialized yet.")
-        })?;
-
-        reset_metrics(prometheus_handle)?;
+    fn truncate(&self, _ctx: Arc<dyn TableContext>, _pipeline: &mut Pipeline) -> Result<()> {
+        GLOBAL_METRICS_REGISTRY.reset();
         Ok(())
     }
 }

@@ -14,16 +14,20 @@
 
 use std::env;
 
+use clap::ArgAction;
 use clap::Args;
 use clap::Parser;
-use common_meta_raft_store::config::get_default_raft_advertise_host;
-use common_meta_raft_store::config::RaftConfig as InnerRaftConfig;
-use common_meta_types::MetaStartupError;
-use common_tracing::Config as InnerLogConfig;
-use common_tracing::FileConfig as InnerFileLogConfig;
-use common_tracing::QueryLogConfig;
-use common_tracing::StderrConfig as InnerStderrLogConfig;
-use common_tracing::TracingConfig;
+use databend_common_meta_raft_store::config::get_default_raft_advertise_host;
+use databend_common_meta_raft_store::config::RaftConfig as InnerRaftConfig;
+use databend_common_meta_types::MetaStartupError;
+use databend_common_tracing::Config as InnerLogConfig;
+use databend_common_tracing::FileConfig as InnerFileLogConfig;
+use databend_common_tracing::OTLPConfig;
+use databend_common_tracing::ProfileLogConfig;
+use databend_common_tracing::QueryLogConfig;
+use databend_common_tracing::StderrConfig as InnerStderrLogConfig;
+use databend_common_tracing::StructLogConfig;
+use databend_common_tracing::TracingConfig;
 use serde::Deserialize;
 use serde::Serialize;
 use serfig::collectors::from_env;
@@ -61,7 +65,7 @@ pub struct Config {
     pub cmd: String,
 
     /// The key sent to databend-meta server and is only used when running with `--cmd kvapi::*`
-    #[clap(long, default_value = "", multiple = true)]
+    #[clap(long, default_value = "")]
     pub key: Vec<String>,
 
     /// The value sent to databend-meta server and is only used when running with `--cmd kvapi::upsert`
@@ -263,6 +267,7 @@ pub struct ConfigViaEnv {
     pub metasrv_log_file_level: String,
     pub metasrv_log_file_dir: String,
     pub metasrv_log_file_format: String,
+    pub metasrv_log_file_limit: usize,
     pub metasrv_log_stderr_on: bool,
     pub metasrv_log_stderr_level: String,
     pub metasrv_log_stderr_format: String,
@@ -274,21 +279,32 @@ pub struct ConfigViaEnv {
     pub grpc_tls_server_cert: String,
     pub grpc_tls_server_key: String,
 
-    pub config_id: String,
     pub kvsrv_listen_host: String,
     pub kvsrv_advertise_host: String,
-    pub kvsrv_api_port: u32,
+    pub kvsrv_api_port: u16,
     pub kvsrv_raft_dir: String,
     pub kvsrv_no_sync: bool,
+
+    pub kvsrv_log_cache_max_items: u64,
+    pub kvsrv_log_cache_capacity: u64,
+    pub kvsrv_log_wal_chunk_max_records: u64,
+    pub kvsrv_log_wal_chunk_max_size: u64,
+
     pub kvsrv_snapshot_logs_since_last: u64,
     pub kvsrv_heartbeat_interval: u64,
     pub kvsrv_install_snapshot_timeout: u64,
     pub kvsrv_wait_leader_timeout: u64,
     pub raft_max_applied_log_to_keep: u64,
+    pub raft_snapshot_chunk_size: u64,
+
+    pub raft_snapshot_db_debug_check: bool,
+    pub raft_snapshot_db_block_keys: u64,
+    pub raft_snapshot_db_block_cache_item: u64,
+    pub raft_snapshot_db_block_cache_size: u64,
+
     pub kvsrv_single: bool,
     pub metasrv_join: Vec<String>,
     pub kvsrv_id: u64,
-    pub sled_tree_prefix: String,
     pub cluster_name: String,
 }
 
@@ -308,6 +324,7 @@ impl From<Config> for ConfigViaEnv {
             metasrv_log_file_level: cfg.log.file.file_level,
             metasrv_log_file_dir: cfg.log.file.file_dir,
             metasrv_log_file_format: cfg.log.file.file_format,
+            metasrv_log_file_limit: cfg.log.file.file_limit,
             metasrv_log_stderr_on: cfg.log.stderr.stderr_on,
             metasrv_log_stderr_level: cfg.log.stderr.stderr_level,
             metasrv_log_stderr_format: cfg.log.stderr.stderr_format,
@@ -318,21 +335,32 @@ impl From<Config> for ConfigViaEnv {
             metasrv_grpc_api_advertise_host: cfg.grpc_api_advertise_host,
             grpc_tls_server_cert: cfg.grpc_tls_server_cert,
             grpc_tls_server_key: cfg.grpc_tls_server_key,
-            config_id: cfg.raft_config.config_id,
             kvsrv_listen_host: cfg.raft_config.raft_listen_host,
             kvsrv_advertise_host: cfg.raft_config.raft_advertise_host,
             kvsrv_api_port: cfg.raft_config.raft_api_port,
             kvsrv_raft_dir: cfg.raft_config.raft_dir,
             kvsrv_no_sync: cfg.raft_config.no_sync,
+
+            kvsrv_log_cache_max_items: 1_000_000,
+            kvsrv_log_cache_capacity: 1024 * 1024 * 1024,
+            kvsrv_log_wal_chunk_max_records: 100_000,
+            kvsrv_log_wal_chunk_max_size: 256 * 1024 * 1024,
+
             kvsrv_snapshot_logs_since_last: cfg.raft_config.snapshot_logs_since_last,
             kvsrv_heartbeat_interval: cfg.raft_config.heartbeat_interval,
             kvsrv_install_snapshot_timeout: cfg.raft_config.install_snapshot_timeout,
             kvsrv_wait_leader_timeout: cfg.raft_config.wait_leader_timeout,
             raft_max_applied_log_to_keep: cfg.raft_config.max_applied_log_to_keep,
+            raft_snapshot_chunk_size: cfg.raft_config.snapshot_chunk_size,
+
+            raft_snapshot_db_debug_check: cfg.raft_config.snapshot_db_debug_check,
+            raft_snapshot_db_block_keys: cfg.raft_config.snapshot_db_block_keys,
+            raft_snapshot_db_block_cache_item: cfg.raft_config.snapshot_db_block_cache_item,
+            raft_snapshot_db_block_cache_size: cfg.raft_config.snapshot_db_block_cache_size,
+
             kvsrv_single: cfg.raft_config.single,
             metasrv_join: cfg.raft_config.join,
             kvsrv_id: cfg.raft_config.id,
-            sled_tree_prefix: cfg.raft_config.sled_tree_prefix,
             cluster_name: cfg.raft_config.cluster_name,
         }
     }
@@ -343,17 +371,29 @@ impl From<Config> for ConfigViaEnv {
 impl Into<Config> for ConfigViaEnv {
     fn into(self) -> Config {
         let raft_config = RaftConfig {
-            config_id: self.config_id,
             raft_listen_host: self.kvsrv_listen_host,
             raft_advertise_host: self.kvsrv_advertise_host,
             raft_api_port: self.kvsrv_api_port,
             raft_dir: self.kvsrv_raft_dir,
             no_sync: self.kvsrv_no_sync,
+
+            log_cache_max_items: self.kvsrv_log_cache_max_items,
+            log_cache_capacity: self.kvsrv_log_cache_capacity,
+            log_wal_chunk_max_records: self.kvsrv_log_wal_chunk_max_records,
+            log_wal_chunk_max_size: self.kvsrv_log_wal_chunk_max_size,
+
             snapshot_logs_since_last: self.kvsrv_snapshot_logs_since_last,
             heartbeat_interval: self.kvsrv_heartbeat_interval,
             install_snapshot_timeout: self.kvsrv_install_snapshot_timeout,
             wait_leader_timeout: self.kvsrv_wait_leader_timeout,
             max_applied_log_to_keep: self.raft_max_applied_log_to_keep,
+            snapshot_chunk_size: self.raft_snapshot_chunk_size,
+
+            snapshot_db_debug_check: self.raft_snapshot_db_debug_check,
+            snapshot_db_block_keys: self.raft_snapshot_db_block_keys,
+            snapshot_db_block_cache_item: self.raft_snapshot_db_block_cache_item,
+            snapshot_db_block_cache_size: self.raft_snapshot_db_block_cache_size,
+
             single: self.kvsrv_single,
             join: self.metasrv_join,
             // Do not allow to leave via environment variable
@@ -361,7 +401,6 @@ impl Into<Config> for ConfigViaEnv {
             // Do not allow to leave via environment variable
             leave_id: None,
             id: self.kvsrv_id,
-            sled_tree_prefix: self.sled_tree_prefix,
             cluster_name: self.cluster_name,
         };
         let log_config = LogConfig {
@@ -370,6 +409,8 @@ impl Into<Config> for ConfigViaEnv {
                 file_level: self.metasrv_log_file_level,
                 file_dir: self.metasrv_log_file_dir,
                 file_format: self.metasrv_log_file_format,
+                file_limit: self.metasrv_log_file_limit,
+                file_prefix_filter: "databend_,openraft".to_string(),
             },
             stderr: StderrLogConfig {
                 stderr_on: self.metasrv_log_stderr_on,
@@ -407,11 +448,6 @@ impl Into<Config> for ConfigViaEnv {
 #[clap(about, version, author)]
 #[serde(default)]
 pub struct RaftConfig {
-    /// Identify a config.
-    /// This is only meant to make debugging easier with more than one Config involved.
-    #[clap(long, default_value = "")]
-    pub config_id: String,
-
     /// The local listening host for metadata communication.
     /// This config does not need to be stored in raft-store,
     /// only used when metasrv startup and listen to.
@@ -425,9 +461,9 @@ pub struct RaftConfig {
     #[clap(long, default_value_t = get_default_raft_advertise_host())]
     pub raft_advertise_host: String,
 
-    /// The listening port for metadata communication.
+    /// The listening port for raft communication.
     #[clap(long, default_value = "28004")]
-    pub raft_api_port: u32,
+    pub raft_api_port: u16,
 
     /// The dir to store persisted meta state, including raft logs, state machine etc.
     #[clap(long, default_value = "./.databend/meta")]
@@ -439,13 +475,33 @@ pub struct RaftConfig {
     #[clap(long)]
     pub no_sync: bool,
 
+    /// The maximum number of log entries for log entries cache. Default value is 1_000_000.
+    #[clap(long, default_value = "1000000")]
+    pub log_cache_max_items: u64,
+
+    /// The maximum memory in bytes for the log entries cache. Default value is 1G.
+    #[clap(long, default_value = "1073741824")]
+    pub log_cache_capacity: u64,
+
+    /// Maximum number of records in a chunk of raft-log WAL. Default value is 100_000.
+    #[clap(long, default_value = "100000")]
+    pub log_wal_chunk_max_records: u64,
+
+    /// Maximum size in bytes for a chunk of raft-log WAL. Default value si 256M
+    #[clap(long, default_value = "268435456")]
+    pub log_wal_chunk_max_size: u64,
+
     /// The number of logs since the last snapshot to trigger next snapshot.
     #[clap(long, default_value = "1024")]
     pub snapshot_logs_since_last: u64,
 
     /// The interval in milli seconds at which a leader send heartbeat message to followers.
     /// Different value of this setting on leader and followers may cause unexpected behavior.
-    #[clap(long, default_value = "1000")]
+    /// This value `t` also affect the election timeout:
+    /// Election timeout is a random between `[t*2, t*3)`,
+    /// i.e., a node start to elect in `[t*2, t*3)` without RequestVote from Candidate.
+    /// And a follower starts to elect after `[t*5, t*6)` without heartbeat from Leader.
+    #[clap(long, default_value = "500")]
     pub heartbeat_interval: u64,
 
     /// The max time in milli seconds that a leader wait for install-snapshot ack from a follower or non-voter.
@@ -455,6 +511,31 @@ pub struct RaftConfig {
     /// The maximum number of applied logs to keep before purging
     #[clap(long, default_value = "1000")]
     pub max_applied_log_to_keep: u64,
+
+    /// The size of chunk for transmitting snapshot. The default is 4MB
+    #[clap(long, default_value = "4194304")]
+    pub snapshot_chunk_size: u64,
+
+    /// Whether to check keys fed to snapshot are sorted.
+    #[clap(long, default_value = "true")]
+    pub snapshot_db_debug_check: bool,
+
+    /// The maximum number of keys allowed in a block within a snapshot db.
+    ///
+    /// A block serves as the caching unit in a snapshot database.
+    /// Smaller blocks enable more granular cache control but may increase the index size.
+    #[clap(long, default_value = "8000")]
+    pub snapshot_db_block_keys: u64,
+
+    /// The total block to cache.
+    #[clap(long, default_value = "1024")]
+    pub snapshot_db_block_cache_item: u64,
+
+    /// The total cache size for snapshot blocks.
+    ///
+    /// By default, it is 1GB.
+    #[clap(long, default_value = "1073741824")]
+    pub snapshot_db_block_cache_size: u64,
 
     /// Start databend-meta in single node mode.
     /// It initialize a single node cluster, if meta data is not initialized.
@@ -468,7 +549,7 @@ pub struct RaftConfig {
     /// If on-disk data is already initialized, this argument has no effect.
     ///
     /// The value is one or more addresses of a node in the cluster, to which this node sends a `join` request.
-    #[clap(long, multiple_occurrences = true, multiple_values = true)]
+    #[clap(long)]
     pub join: Vec<String>,
 
     /// Do not run databend-meta, but just remove a node from its cluster via the provided endpoints.
@@ -487,20 +568,17 @@ pub struct RaftConfig {
     #[clap(long, default_value = "0")]
     pub id: u64,
 
-    /// For test only: specifies the tree name prefix
-    #[clap(long, default_value = "")]
-    pub sled_tree_prefix: String,
-
     /// The node name. If the user specifies a name, the user-supplied name is used,
     /// if not, the default name is used
     #[clap(long, default_value = "foo_cluster")]
     pub cluster_name: String,
 
     /// Max timeout(in milli seconds) when waiting a cluster leader.
-    #[clap(long, default_value = "70000")]
+    #[clap(long, default_value = "180000")]
     pub wait_leader_timeout: u64,
 }
 
+// TODO(rotbl): should not be used.
 impl Default for RaftConfig {
     fn default() -> Self {
         InnerRaftConfig::default().into()
@@ -510,22 +588,34 @@ impl Default for RaftConfig {
 impl From<RaftConfig> for InnerRaftConfig {
     fn from(x: RaftConfig) -> InnerRaftConfig {
         InnerRaftConfig {
-            config_id: x.config_id,
+            config_id: "".to_string(),
             raft_listen_host: x.raft_listen_host,
             raft_advertise_host: x.raft_advertise_host,
             raft_api_port: x.raft_api_port,
             raft_dir: x.raft_dir,
             no_sync: x.no_sync,
+
+            log_cache_max_items: x.log_cache_max_items,
+            log_cache_capacity: x.log_cache_capacity,
+            log_wal_chunk_max_records: x.log_wal_chunk_max_records,
+            log_wal_chunk_max_size: x.log_wal_chunk_max_size,
+
             snapshot_logs_since_last: x.snapshot_logs_since_last,
             heartbeat_interval: x.heartbeat_interval,
             install_snapshot_timeout: x.install_snapshot_timeout,
             max_applied_log_to_keep: x.max_applied_log_to_keep,
+            snapshot_chunk_size: x.snapshot_chunk_size,
+
+            snapshot_db_debug_check: x.snapshot_db_debug_check,
+            snapshot_db_block_keys: x.snapshot_db_block_keys,
+            snapshot_db_block_cache_item: x.snapshot_db_block_cache_item,
+            snapshot_db_block_cache_size: x.snapshot_db_block_cache_size,
+
             single: x.single,
             join: x.join,
             leave_via: x.leave_via,
             leave_id: x.leave_id,
             id: x.id,
-            sled_tree_prefix: x.sled_tree_prefix,
             cluster_name: x.cluster_name,
             wait_leader_timeout: x.wait_leader_timeout,
         }
@@ -535,22 +625,33 @@ impl From<RaftConfig> for InnerRaftConfig {
 impl From<InnerRaftConfig> for RaftConfig {
     fn from(inner: InnerRaftConfig) -> Self {
         Self {
-            config_id: inner.config_id,
             raft_listen_host: inner.raft_listen_host,
             raft_advertise_host: inner.raft_advertise_host,
             raft_api_port: inner.raft_api_port,
             raft_dir: inner.raft_dir,
             no_sync: inner.no_sync,
+
+            log_cache_max_items: inner.log_cache_max_items,
+            log_cache_capacity: inner.log_cache_capacity,
+            log_wal_chunk_max_records: inner.log_wal_chunk_max_records,
+            log_wal_chunk_max_size: inner.log_wal_chunk_max_size,
+
             snapshot_logs_since_last: inner.snapshot_logs_since_last,
             heartbeat_interval: inner.heartbeat_interval,
             install_snapshot_timeout: inner.install_snapshot_timeout,
             max_applied_log_to_keep: inner.max_applied_log_to_keep,
+            snapshot_chunk_size: inner.snapshot_chunk_size,
+
+            snapshot_db_debug_check: inner.snapshot_db_debug_check,
+            snapshot_db_block_keys: inner.snapshot_db_block_keys,
+            snapshot_db_block_cache_item: inner.snapshot_db_block_cache_item,
+            snapshot_db_block_cache_size: inner.snapshot_db_block_cache_size,
+
             single: inner.single,
             join: inner.join,
             leave_via: inner.leave_via,
             leave_id: inner.leave_id,
             id: inner.id,
-            sled_tree_prefix: inner.sled_tree_prefix,
             cluster_name: inner.cluster_name,
             wait_leader_timeout: inner.wait_leader_timeout,
         }
@@ -579,11 +680,11 @@ impl Into<InnerLogConfig> for LogConfig {
         InnerLogConfig {
             file: self.file.into(),
             stderr: self.stderr.into(),
-            query: QueryLogConfig {
-                on: false,
-                dir: "".to_string(),
-            },
-            tracing: TracingConfig::from_env(),
+            otlp: OTLPConfig::default(),
+            query: QueryLogConfig::default(),
+            profile: ProfileLogConfig::default(),
+            structlog: StructLogConfig::default(),
+            tracing: TracingConfig::default(),
         }
     }
 }
@@ -600,11 +701,11 @@ impl From<InnerLogConfig> for LogConfig {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Args)]
 #[serde(default)]
 pub struct FileLogConfig {
-    /// Log level <DEBUG|INFO|ERROR>
-    #[clap(long = "log-file-on", default_value = "true")]
+    #[clap(long = "log-file-on", default_value = "true", action = ArgAction::Set, num_args = 0..=1, require_equals = true, default_missing_value = "true")]
     #[serde(rename = "on")]
     pub file_on: bool,
 
+    /// Log level <DEBUG|INFO|WARN|ERROR>
     #[clap(long = "log-file-level", default_value = "INFO")]
     #[serde(rename = "level")]
     pub file_level: String,
@@ -618,6 +719,18 @@ pub struct FileLogConfig {
     #[clap(long = "log-file-format", default_value = "json")]
     #[serde(rename = "format")]
     pub file_format: String,
+
+    /// Log file max
+    #[clap(long = "log-file-limit", default_value = "48")]
+    #[serde(rename = "limit")]
+    pub file_limit: usize,
+
+    /// Log prefix filter, separated by comma.
+    /// For example, `"databend_,openraft"` enables logging for `databend_*` crates and `openraft` crate.
+    /// This filter does not affect `WARNING` and `ERROR` log.
+    #[clap(long = "log-file-prefix-filter", default_value = "databend_,openraft")]
+    #[serde(rename = "prefix_filter")]
+    pub file_prefix_filter: String,
 }
 
 impl Default for FileLogConfig {
@@ -634,6 +747,8 @@ impl Into<InnerFileLogConfig> for FileLogConfig {
             level: self.file_level,
             dir: self.file_dir,
             format: self.file_format,
+            limit: self.file_limit,
+            prefix_filter: self.file_prefix_filter,
         }
     }
 }
@@ -645,6 +760,8 @@ impl From<InnerFileLogConfig> for FileLogConfig {
             file_level: inner.level,
             file_dir: inner.dir,
             file_format: inner.format,
+            file_limit: inner.limit,
+            file_prefix_filter: inner.prefix_filter,
         }
     }
 }
@@ -652,11 +769,11 @@ impl From<InnerFileLogConfig> for FileLogConfig {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Args)]
 #[serde(default)]
 pub struct StderrLogConfig {
-    /// Log level <DEBUG|INFO|ERROR>
-    #[clap(long = "log-stderr-on")]
+    #[clap(long = "log-stderr-on", default_value = "false", action = ArgAction::Set, num_args = 0..=1, require_equals = true, default_missing_value = "true")]
     #[serde(rename = "on")]
     pub stderr_on: bool,
 
+    /// Log level <DEBUG|INFO|WARN|ERROR>
     #[clap(long = "log-stderr-level", default_value = "INFO")]
     #[serde(rename = "level")]
     pub stderr_level: String,

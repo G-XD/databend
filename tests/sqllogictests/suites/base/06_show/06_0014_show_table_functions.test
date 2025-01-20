@@ -1,0 +1,34 @@
+query T
+SHOW TABLE_FUNCTIONS LIKE 'number%'
+----
+numbers
+numbers_local
+numbers_mt
+
+query T
+SHOW TABLE_FUNCTIONS LIKE 'fuse%'
+----
+fuse_amend
+fuse_block
+fuse_column
+fuse_encoding
+fuse_segment
+fuse_snapshot
+fuse_statistic
+fuse_time_travel_size
+fuse_vacuum_drop_aggregating_index
+fuse_vacuum_drop_inverted_index
+fuse_vacuum_temporary_table
+
+query T
+SHOW TABLE_FUNCTIONS LIKE 'fuse%' LIMIT 1
+----
+fuse_amend
+
+query T
+SHOW TABLE_FUNCTIONS WHERE name='fuse_snapshot' LIMIT 1
+----
+fuse_snapshot
+
+statement error
+SHOW TABLE_FUNCTIONS WHERE ee='err' LIMIT 1

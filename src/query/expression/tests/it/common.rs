@@ -14,15 +14,16 @@
 
 use std::io::Write;
 
-use common_arrow::arrow::compute::merge_sort::MergeSlice;
-use common_expression::BlockEntry;
-use common_expression::BlockRowIndex;
-use common_expression::Column;
-use common_expression::DataBlock;
-use common_expression::Value;
+use databend_common_expression::BlockEntry;
+use databend_common_expression::BlockRowIndex;
+use databend_common_expression::Column;
+use databend_common_expression::DataBlock;
+use databend_common_expression::Value;
+
+type MergeSlice = (usize, usize, usize);
 
 pub fn new_block(columns: &[Column]) -> DataBlock {
-    let len = columns.get(0).map_or(1, |c| c.len());
+    let len = columns.first().map_or(1, |c| c.len());
     let columns = columns
         .iter()
         .map(|col| BlockEntry::new(col.data_type(), Value::Column(col.clone())))
@@ -66,8 +67,7 @@ pub fn run_concat(file: &mut impl Write, blocks: &[DataBlock]) {
 }
 
 pub fn run_take_block(file: &mut impl Write, indices: &[BlockRowIndex], blocks: &[DataBlock]) {
-    let blocks = blocks.iter().collect::<Vec<_>>();
-    let result = DataBlock::take_blocks(&blocks, indices, 0);
+    let result = DataBlock::take_blocks(blocks, indices, 0);
     writeln!(file, "Take Block indices:         {indices:?}").unwrap();
     for (i, block) in blocks.iter().enumerate() {
         writeln!(file, "Block{i}:\n{block}").unwrap();

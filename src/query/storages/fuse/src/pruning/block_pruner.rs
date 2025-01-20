@@ -18,19 +18,19 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Instant;
 
-use common_base::base::tokio::sync::OwnedSemaphorePermit;
-use common_catalog::plan::block_id_in_segment;
-use common_exception::ErrorCode;
-use common_exception::Result;
-use common_expression::BLOCK_NAME_COL_NAME;
+use databend_common_base::base::tokio::sync::OwnedSemaphorePermit;
+use databend_common_catalog::plan::block_id_in_segment;
+use databend_common_exception::ErrorCode;
+use databend_common_exception::Result;
+use databend_common_expression::types::F32;
+use databend_common_expression::BLOCK_NAME_COL_NAME;
+use databend_common_metrics::storage::*;
+use databend_storages_common_pruner::BlockMetaIndex;
+use databend_storages_common_pruner::VirtualBlockMetaIndex;
+use databend_storages_common_table_meta::meta::BlockMeta;
 use futures_util::future;
-use storages_common_pruner::BlockMetaIndex;
-use storages_common_table_meta::meta::BlockMeta;
-use storages_common_table_meta::meta::CompactSegmentInfo;
 
 use super::SegmentLocation;
-use crate::metrics::*;
-use crate::pruning::BloomPruner;
 use crate::pruning::PruningContext;
 
 pub struct BlockPruner {
@@ -46,25 +46,54 @@ impl BlockPruner {
     pub async fn pruning(
         &self,
         segment_location: SegmentLocation,
-        segment_info: &CompactSegmentInfo,
+        block_metas: Arc<Vec<Arc<BlockMeta>>>,
     ) -> Result<Vec<(BlockMetaIndex, Arc<BlockMeta>)>> {
-        if let Some(bloom_pruner) = &self.pruning_ctx.bloom_pruner {
-            self.block_pruning(bloom_pruner, segment_location, segment_info)
+        // Apply internal column pruning.
+        let block_meta_indexes = self.internal_column_pruning(&block_metas);
+
+        // Apply block pruning.
+        if self.pruning_ctx.bloom_pruner.is_some()
+            || self.pruning_ctx.inverted_index_pruner.is_some()
+            || self.pruning_ctx.virtual_column_pruner.is_some()
+        {
+            // async pruning with bloom index, inverted index or virtual columns.
+            self.block_pruning(segment_location, block_metas, block_meta_indexes)
                 .await
         } else {
-            // if no available filter pruners, just prune the blocks by
-            // using zone map index, and do not spawn async tasks
-            self.block_pruning_sync(segment_location, segment_info)
+            // sync pruning without a bloom index, inverted index and virtual columns.
+            self.block_pruning_sync(segment_location, block_metas, block_meta_indexes)
         }
     }
 
-    // async pruning with bloom index.
-    #[async_backtrace::framed]
-    async fn block_pruning(
+    /// Apply internal column pruning.
+    pub fn internal_column_pruning(
         &self,
-        bloom_pruner: &Arc<dyn BloomPruner + Send + Sync>,
+        block_metas: &[Arc<BlockMeta>],
+    ) -> Vec<(usize, Arc<BlockMeta>)> {
+        match &self.pruning_ctx.internal_column_pruner {
+            Some(pruner) => block_metas
+                .iter()
+                .enumerate()
+                .filter(|(_, block_meta)| {
+                    pruner.should_keep(BLOCK_NAME_COL_NAME, &block_meta.location.0)
+                })
+                .map(|(index, block_meta)| (index, block_meta.clone()))
+                .collect(),
+            None => block_metas
+                .iter()
+                .enumerate()
+                .map(|(index, block_meta)| (index, block_meta.clone()))
+                .collect(),
+        }
+    }
+
+    // async pruning with bloom index, inverted index or virtual columns.
+    #[async_backtrace::framed]
+    pub async fn block_pruning(
+        &self,
         segment_location: SegmentLocation,
-        segment_info: &CompactSegmentInfo,
+        block_metas: Arc<Vec<Arc<BlockMeta>>>,
+        block_meta_indexes: Vec<(usize, Arc<BlockMeta>)>,
     ) -> Result<Vec<(BlockMetaIndex, Arc<BlockMeta>)>> {
         let pruning_stats = self.pruning_ctx.pruning_stats.clone();
         let pruning_runtime = &self.pruning_ctx.pruning_runtime;
@@ -72,23 +101,11 @@ impl BlockPruner {
         let limit_pruner = self.pruning_ctx.limit_pruner.clone();
         let range_pruner = self.pruning_ctx.range_pruner.clone();
         let page_pruner = self.pruning_ctx.page_pruner.clone();
+        let bloom_pruner = self.pruning_ctx.bloom_pruner.clone();
+        let inverted_index_pruner = self.pruning_ctx.inverted_index_pruner.clone();
+        let virtual_column_pruner = self.pruning_ctx.virtual_column_pruner.clone();
 
-        let segment_block_metas = segment_info.block_metas()?;
-
-        let blocks = if let Some(internal_column_pruner) = &self.pruning_ctx.internal_column_pruner
-        {
-            segment_block_metas
-                .iter()
-                .enumerate()
-                .filter(|(_, block)| {
-                    internal_column_pruner.should_keep(BLOCK_NAME_COL_NAME, &block.location.0)
-                })
-                .collect::<Vec<_>>()
-        } else {
-            segment_block_metas.iter().enumerate().collect()
-        };
-
-        let mut blocks = blocks.into_iter();
+        let mut block_meta_indexes = block_meta_indexes.into_iter();
         let pruning_tasks = std::iter::from_fn(|| {
             // check limit speculatively
             if limit_pruner.exceeded() {
@@ -96,12 +113,12 @@ impl BlockPruner {
             }
 
             type BlockPruningFutureReturn =
-                Pin<Box<dyn Future<Output = (usize, bool, Option<Range<usize>>, String)> + Send>>;
+                Pin<Box<dyn Future<Output = Result<BlockPruneResult>> + Send>>;
             type BlockPruningFuture =
                 Box<dyn FnOnce(OwnedSemaphorePermit) -> BlockPruningFutureReturn + Send + 'static>;
 
             let pruning_stats = pruning_stats.clone();
-            blocks.next().map(|(block_idx, block_meta)| {
+            block_meta_indexes.next().map(|(block_idx, block_meta)| {
                 // Perf.
                 {
                     metrics_inc_blocks_range_pruning_before(1);
@@ -110,9 +127,13 @@ impl BlockPruner {
                     pruning_stats.set_blocks_range_pruning_before(1);
                 }
 
+                let mut prune_result =
+                    BlockPruneResult::new(block_idx, block_meta.location.0.clone());
                 let block_meta = block_meta.clone();
                 let row_count = block_meta.row_count;
-                if range_pruner.should_keep(&block_meta.col_stats, Some(&block_meta.col_metas)) {
+                prune_result.keep =
+                    range_pruner.should_keep(&block_meta.col_stats, Some(&block_meta.col_metas));
+                if prune_result.keep {
                     // Perf.
                     {
                         metrics_inc_blocks_range_pruning_after(1);
@@ -125,43 +146,101 @@ impl BlockPruner {
                     let bloom_pruner = bloom_pruner.clone();
                     let limit_pruner = limit_pruner.clone();
                     let page_pruner = page_pruner.clone();
+                    let inverted_index_pruner = inverted_index_pruner.clone();
+                    let virtual_column_pruner = virtual_column_pruner.clone();
+                    let block_location = block_meta.location.clone();
                     let index_location = block_meta.bloom_filter_index_location.clone();
                     let index_size = block_meta.bloom_filter_index_size;
                     let column_ids = block_meta.col_metas.keys().cloned().collect::<Vec<_>>();
 
                     let v: BlockPruningFuture = Box::new(move |permit: OwnedSemaphorePermit| {
                         Box::pin(async move {
-                            // Perf.
-                            {
-                                metrics_inc_blocks_bloom_pruning_before(1);
-                                metrics_inc_bytes_block_bloom_pruning_before(block_meta.block_size);
-
-                                pruning_stats.set_blocks_bloom_pruning_before(1);
-                            }
-
                             let _permit = permit;
-                            let keep = bloom_pruner
-                                .should_keep(&index_location, index_size, column_ids)
-                                .await
-                                && limit_pruner.within_limit(row_count);
-
-                            if keep {
+                            if let Some(bloom_pruner) = bloom_pruner {
                                 // Perf.
                                 {
-                                    metrics_inc_blocks_bloom_pruning_after(1);
-                                    metrics_inc_bytes_block_bloom_pruning_after(
+                                    metrics_inc_blocks_bloom_pruning_before(1);
+                                    metrics_inc_bytes_block_bloom_pruning_before(
                                         block_meta.block_size,
                                     );
 
-                                    pruning_stats.set_blocks_bloom_pruning_after(1);
+                                    pruning_stats.set_blocks_bloom_pruning_before(1);
                                 }
 
+                                let keep_by_bloom = bloom_pruner
+                                    .should_keep(
+                                        &index_location,
+                                        index_size,
+                                        &block_meta.col_stats,
+                                        column_ids,
+                                        &block_meta,
+                                    )
+                                    .await;
+
+                                prune_result.keep =
+                                    keep_by_bloom && limit_pruner.within_limit(row_count);
+                                if prune_result.keep {
+                                    // Perf.
+                                    {
+                                        metrics_inc_blocks_bloom_pruning_after(1);
+                                        metrics_inc_bytes_block_bloom_pruning_after(
+                                            block_meta.block_size,
+                                        );
+
+                                        pruning_stats.set_blocks_bloom_pruning_after(1);
+                                    }
+                                }
+                            } else {
+                                prune_result.keep = limit_pruner.within_limit(row_count);
+                            }
+                            if prune_result.keep {
                                 let (keep, range) =
                                     page_pruner.should_keep(&block_meta.cluster_stats);
-                                (block_idx, keep, range, block_meta.location.0.clone())
-                            } else {
-                                (block_idx, keep, None, block_meta.location.0.clone())
+
+                                prune_result.keep = keep;
+                                prune_result.range = range;
                             }
+                            if prune_result.keep {
+                                if let Some(inverted_index_pruner) = inverted_index_pruner {
+                                    // Perf.
+                                    {
+                                        metrics_inc_blocks_inverted_index_pruning_before(1);
+                                        metrics_inc_bytes_block_inverted_index_pruning_before(
+                                            block_meta.block_size,
+                                        );
+
+                                        pruning_stats.set_blocks_inverted_index_pruning_before(1);
+                                    }
+                                    let matched_rows = inverted_index_pruner
+                                        .should_keep(&block_location.0, row_count)
+                                        .await?;
+                                    prune_result.keep = matched_rows.is_some();
+                                    prune_result.matched_rows = matched_rows;
+
+                                    if prune_result.keep {
+                                        // Perf.
+                                        {
+                                            metrics_inc_blocks_inverted_index_pruning_after(1);
+                                            metrics_inc_bytes_block_inverted_index_pruning_after(
+                                                block_meta.block_size,
+                                            );
+                                            pruning_stats
+                                                .set_blocks_inverted_index_pruning_after(1);
+                                        }
+                                    }
+                                }
+                            }
+                            if prune_result.keep {
+                                if let Some(virtual_column_pruner) = virtual_column_pruner {
+                                    // Check whether can read virtual columns,
+                                    // and ignore the source columns.
+                                    let virtual_block_meta = virtual_column_pruner
+                                        .prune_virtual_columns(&block_location.0)
+                                        .await?;
+                                    prune_result.virtual_block_meta = virtual_block_meta;
+                                }
+                            }
+                            Ok(prune_result)
                         })
                     });
                     v
@@ -169,7 +248,7 @@ impl BlockPruner {
                     let v: BlockPruningFuture = Box::new(move |permit: OwnedSemaphorePermit| {
                         Box::pin(async move {
                             let _permit = permit;
-                            (block_idx, false, None, block_meta.location.0.clone())
+                            Ok(prune_result)
                         })
                     });
                     v
@@ -188,24 +267,26 @@ impl BlockPruner {
             .map_err(|e| ErrorCode::StorageOther(format!("block pruning failure, {}", e)))?;
 
         let mut result = Vec::with_capacity(joint.len());
-        let block_num = segment_info.summary.block_count as usize;
-        for item in joint {
-            let (block_idx, keep, range, block_location) = item;
-            if keep {
-                let block = segment_block_metas[block_idx].clone();
+        let block_num = block_metas.len();
+        for prune_result in joint {
+            let prune_result = prune_result?;
+            if prune_result.keep {
+                let block = block_metas[prune_result.block_idx].clone();
 
-                debug_assert_eq!(block_location, block.location.0);
+                debug_assert_eq!(prune_result.block_location, block.location.0);
 
                 result.push((
                     BlockMetaIndex {
                         segment_idx: segment_location.segment_idx,
-                        block_idx,
-                        range,
+                        block_idx: prune_result.block_idx,
+                        range: prune_result.range,
                         page_size: block.page_size() as usize,
-                        block_id: block_id_in_segment(block_num, block_idx),
-                        block_location: block_location.clone(),
+                        block_id: block_id_in_segment(block_num, prune_result.block_idx),
+                        block_location: prune_result.block_location.clone(),
                         segment_location: segment_location.location.0.clone(),
                         snapshot_location: segment_location.snapshot_loc.clone(),
+                        matched_rows: prune_result.matched_rows.clone(),
+                        virtual_block_meta: prune_result.virtual_block_meta.clone(),
                     },
                     block,
                 ))
@@ -220,10 +301,11 @@ impl BlockPruner {
         Ok(result)
     }
 
-    fn block_pruning_sync(
+    pub fn block_pruning_sync(
         &self,
         segment_location: SegmentLocation,
-        segment_info: &CompactSegmentInfo,
+        block_metas: Arc<Vec<Arc<BlockMeta>>>,
+        block_meta_indexes: Vec<(usize, Arc<BlockMeta>)>,
     ) -> Result<Vec<(BlockMetaIndex, Arc<BlockMeta>)>> {
         let pruning_stats = self.pruning_ctx.pruning_stats.clone();
         let limit_pruner = self.pruning_ctx.limit_pruner.clone();
@@ -232,25 +314,12 @@ impl BlockPruner {
 
         let start = Instant::now();
 
-        let segment_block_metas = segment_info.block_metas()?;
-        let blocks = if let Some(internal_column_pruner) = &self.pruning_ctx.internal_column_pruner
-        {
-            segment_block_metas
-                .iter()
-                .enumerate()
-                .filter(|(_, block)| {
-                    internal_column_pruner.should_keep(BLOCK_NAME_COL_NAME, &block.location.0)
-                })
-                .collect::<Vec<_>>()
-        } else {
-            segment_block_metas.iter().enumerate().collect::<Vec<_>>()
-        };
-        let mut result = Vec::with_capacity(blocks.len());
-        let block_num = segment_info.summary.block_count as usize;
-        for (block_idx, block_meta) in blocks {
+        let mut result = Vec::with_capacity(block_meta_indexes.len());
+        let block_num = block_metas.len();
+        for (block_idx, block_meta) in block_meta_indexes {
             // Perf.
             {
-                metrics_inc_blocks_range_pruning_after(1);
+                metrics_inc_blocks_range_pruning_before(1);
                 metrics_inc_bytes_block_range_pruning_before(block_meta.block_size);
 
                 pruning_stats.set_blocks_range_pruning_before(1);
@@ -284,6 +353,8 @@ impl BlockPruner {
                             block_location: block_meta.as_ref().location.0.clone(),
                             segment_location: segment_location.location.0.clone(),
                             snapshot_location: segment_location.snapshot_loc.clone(),
+                            matched_rows: None,
+                            virtual_block_meta: None,
                         },
                         block_meta.clone(),
                     ))
@@ -297,5 +368,35 @@ impl BlockPruner {
         }
 
         Ok(result)
+    }
+}
+
+// result of block pruning
+struct BlockPruneResult {
+    // the block index in segment
+    block_idx: usize,
+    // the location of the block
+    block_location: String,
+    // whether keep the block after pruning
+    keep: bool,
+    // the page ranges should keeped in the block
+    range: Option<Range<usize>>,
+    // the matched rows and scores should keeped in the block
+    // only used by inverted index search
+    matched_rows: Option<Vec<(usize, Option<F32>)>>,
+    // the optional block meta of virtual columns
+    virtual_block_meta: Option<VirtualBlockMetaIndex>,
+}
+
+impl BlockPruneResult {
+    fn new(block_idx: usize, block_location: String) -> Self {
+        Self {
+            block_idx,
+            block_location,
+            keep: false,
+            range: None,
+            matched_rows: None,
+            virtual_block_meta: None,
+        }
     }
 }

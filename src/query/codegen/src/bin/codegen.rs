@@ -13,6 +13,7 @@
 // limitations under the License.
 
 fn main() {
-    codegen::writes::codegen_arithmetic_type();
-    codegen::writes::codegen_register();
+    databend_codegen::writes::codegen_arithmetic_type();
+    databend_codegen::writes::codegen_register();
+    databend_codegen::writes::codegen_hilbert_lut();
 }

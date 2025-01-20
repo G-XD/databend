@@ -14,8 +14,9 @@
 
 use std::collections::HashMap;
 
-use crate::optimizer::property::histogram::Histogram;
-use crate::optimizer::Datum;
+use databend_common_storage::Datum;
+use databend_common_storage::Histogram;
+
 use crate::IndexType;
 
 pub type ColumnStatSet = HashMap<IndexType, ColumnStat>;

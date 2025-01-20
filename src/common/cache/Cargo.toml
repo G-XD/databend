@@ -1,5 +1,5 @@
 [package]
-name = "common-cache"
+name = "databend-common-cache"
 version = { workspace = true }
 authors = { workspace = true }
 license = { workspace = true }
@@ -8,18 +8,13 @@ edition = { workspace = true }
 
 [lib]
 doctest = false
-test = false
-
-[features]
-heapsize = ["heapsize_"]
+test = true
 
 [dependencies]
-
-# Crates.io dependencies
-hashbrown = "0.14"
-hashlink = "0.8"
-
-[target.'cfg(not(target_os = "macos"))'.dependencies]
-heapsize_ = { package = "heapsize", version = "0.4.2", optional = true }
+hashbrown = { workspace = true }
+hashlink = { workspace = true }
 
 [dev-dependencies]
+
+[lints]
+workspace = true

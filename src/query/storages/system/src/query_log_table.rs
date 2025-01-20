@@ -12,16 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use chrono::NaiveDateTime;
-use common_exception::Result;
-use common_expression::types::number::NumberScalar;
-use common_expression::types::NumberDataType;
-use common_expression::ColumnBuilder;
-use common_expression::Scalar;
-use common_expression::TableDataType;
-use common_expression::TableField;
-use common_expression::TableSchemaRef;
-use common_expression::TableSchemaRefExt;
+use chrono::DateTime;
+use databend_common_exception::Result;
+use databend_common_expression::types::number::NumberScalar;
+use databend_common_expression::types::NumberDataType;
+use databend_common_expression::ColumnBuilder;
+use databend_common_expression::Scalar;
+use databend_common_expression::TableDataType;
+use databend_common_expression::TableField;
+use databend_common_expression::TableSchemaRef;
+use databend_common_expression::TableSchemaRefExt;
 use serde::Serialize;
 use serde::Serializer;
 use serde_repr::Serialize_repr;
@@ -36,23 +36,52 @@ pub enum LogType {
     Start = 1,
     Finish = 2,
     Error = 3,
+
+    /// canceled by another thread:
+    /// 1. `kill <query_id>` statement
+    /// 2. client_driver/ctx.cancel() -> /kill
     Aborted = 4,
+
+    /// close early because client does not need more data:
+    /// 1. explicit or implicit result_set.close() -> /final
+    Closed = 5,
 }
 
-fn date_str<S>(dt: &i32, s: S) -> Result<S::Ok, S::Error>
+impl LogType {
+    pub fn as_string(&self) -> String {
+        match self {
+            LogType::Start => "Start".to_string(),
+            LogType::Finish => "Finish".to_string(),
+            LogType::Error => "Error".to_string(),
+            LogType::Aborted => "Aborted".to_string(),
+            LogType::Closed => "Closed".to_string(),
+        }
+    }
+}
+
+impl std::fmt::Debug for LogType {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "{}", self.as_string())
+    }
+}
+
+fn date_str<S>(dt: &i32, s: S) -> std::result::Result<S::Ok, S::Error>
 where S: Serializer {
-    let t = NaiveDateTime::from_timestamp_opt(i64::from(*dt) * 24 * 3600, 0).unwrap();
+    let t = DateTime::from_timestamp(i64::from(*dt) * 24 * 3600, 0)
+        .unwrap()
+        .naive_utc();
     s.serialize_str(t.format("%Y-%m-%d").to_string().as_str())
 }
 
-fn datetime_str<S>(dt: &i64, s: S) -> Result<S::Ok, S::Error>
+fn datetime_str<S>(dt: &i64, s: S) -> std::result::Result<S::Ok, S::Error>
 where S: Serializer {
-    let t = NaiveDateTime::from_timestamp_opt(
+    let t = DateTime::from_timestamp(
         dt / 1_000_000,
         TryFrom::try_from((dt % 1_000_000) * 1000).unwrap_or(0),
         // u32::try_from((dt % 1_000_000) * 1000).unwrap_or(0),
     )
-    .unwrap();
+    .unwrap()
+    .naive_utc();
     s.serialize_str(t.format("%Y-%m-%d %H:%M:%S%.6f").to_string().as_str())
 }
 
@@ -60,6 +89,7 @@ where S: Serializer {
 pub struct QueryLogElement {
     // Type.
     pub log_type: LogType,
+    pub log_type_name: String,
     pub handler_type: String,
 
     // User.
@@ -77,6 +107,8 @@ pub struct QueryLogElement {
     pub query_id: String,
     pub query_kind: String,
     pub query_text: String,
+    pub query_hash: String,
+    pub query_parameterized_hash: String,
 
     #[serde(serialize_with = "date_str")]
     pub event_date: i32,
@@ -85,6 +117,7 @@ pub struct QueryLogElement {
     #[serde(serialize_with = "datetime_str")]
     pub query_start_time: i64,
     pub query_duration_ms: i64,
+    pub query_queued_duration_ms: i64,
 
     // Schema.
     pub current_database: String,
@@ -108,6 +141,15 @@ pub struct QueryLogElement {
     pub result_bytes: u64,
     pub cpu_usage: u32,
     pub memory_usage: u64,
+    pub join_spilled_bytes: u64,
+    pub join_spilled_rows: u64,
+    pub agg_spilled_bytes: u64,
+    pub agg_spilled_rows: u64,
+    pub group_by_spilled_bytes: u64,
+    pub group_by_spilled_rows: u64,
+    pub bytes_from_remote_disk: u64,
+    pub bytes_from_local_disk: u64,
+    pub bytes_from_memory: u64,
 
     // Client.
     pub client_info: String,
@@ -128,6 +170,12 @@ pub struct QueryLogElement {
 
     // Extra.
     pub extra: String,
+
+    pub has_profiles: bool,
+
+    // Transaction
+    pub txn_state: String,
+    pub txn_id: String,
 }
 
 impl SystemLogElement for QueryLogElement {
@@ -137,6 +185,7 @@ impl SystemLogElement for QueryLogElement {
         TableSchemaRefExt::create(vec![
             // Type.
             TableField::new("log_type", TableDataType::Number(NumberDataType::Int8)),
+            TableField::new("log_type_name", TableDataType::String),
             TableField::new("handler_type", TableDataType::String),
             // User.
             TableField::new("tenant_id", TableDataType::String),
@@ -149,11 +198,17 @@ impl SystemLogElement for QueryLogElement {
             TableField::new("query_id", TableDataType::String),
             TableField::new("query_kind", TableDataType::String),
             TableField::new("query_text", TableDataType::String),
+            TableField::new("query_hash", TableDataType::String),
+            TableField::new("query_parameterized_hash", TableDataType::String),
             TableField::new("event_date", TableDataType::Date),
             TableField::new("event_time", TableDataType::Timestamp),
             TableField::new("query_start_time", TableDataType::Timestamp),
             TableField::new(
                 "query_duration_ms",
+                TableDataType::Number(NumberDataType::Int64),
+            ),
+            TableField::new(
+                "query_queued_duration_ms",
                 TableDataType::Number(NumberDataType::Int64),
             ),
             // Schema.
@@ -169,6 +224,30 @@ impl SystemLogElement for QueryLogElement {
             ),
             TableField::new(
                 "written_bytes",
+                TableDataType::Number(NumberDataType::UInt64),
+            ),
+            TableField::new(
+                "join_spilled_rows",
+                TableDataType::Number(NumberDataType::UInt64),
+            ),
+            TableField::new(
+                "join_spilled_bytes",
+                TableDataType::Number(NumberDataType::UInt64),
+            ),
+            TableField::new(
+                "agg_spilled_rows",
+                TableDataType::Number(NumberDataType::UInt64),
+            ),
+            TableField::new(
+                "agg_spilled_bytes",
+                TableDataType::Number(NumberDataType::UInt64),
+            ),
+            TableField::new(
+                "group_by_spilled_rows",
+                TableDataType::Number(NumberDataType::UInt64),
+            ),
+            TableField::new(
+                "group_by_spilled_bytes",
                 TableDataType::Number(NumberDataType::UInt64),
             ),
             TableField::new(
@@ -207,6 +286,18 @@ impl SystemLogElement for QueryLogElement {
                 "memory_usage",
                 TableDataType::Number(NumberDataType::UInt64),
             ),
+            TableField::new(
+                "bytes_from_remote_disk",
+                TableDataType::Number(NumberDataType::UInt64),
+            ),
+            TableField::new(
+                "bytes_from_local_disk",
+                TableDataType::Number(NumberDataType::UInt64),
+            ),
+            TableField::new(
+                "bytes_from_memory",
+                TableDataType::Number(NumberDataType::UInt64),
+            ),
             // Client.
             TableField::new("client_info", TableDataType::String),
             TableField::new("client_address", TableDataType::String),
@@ -224,6 +315,7 @@ impl SystemLogElement for QueryLogElement {
             TableField::new("session_settings", TableDataType::String),
             // Extra.
             TableField::new("extra", TableDataType::String),
+            TableField::new("has_profile", TableDataType::Boolean),
         ])
     }
 
@@ -236,45 +328,57 @@ impl SystemLogElement for QueryLogElement {
         columns
             .next()
             .unwrap()
-            .push(Scalar::String(self.handler_type.as_bytes().to_vec()).as_ref());
+            .push(Scalar::String(self.log_type_name.clone()).as_ref());
+        columns
+            .next()
+            .unwrap()
+            .push(Scalar::String(self.handler_type.clone()).as_ref());
         // User.
         columns
             .next()
             .unwrap()
-            .push(Scalar::String(self.tenant_id.as_bytes().to_vec()).as_ref());
+            .push(Scalar::String(self.tenant_id.clone()).as_ref());
         columns
             .next()
             .unwrap()
-            .push(Scalar::String(self.cluster_id.as_bytes().to_vec()).as_ref());
+            .push(Scalar::String(self.cluster_id.clone()).as_ref());
         columns
             .next()
             .unwrap()
-            .push(Scalar::String(self.node_id.as_bytes().to_vec()).as_ref());
+            .push(Scalar::String(self.node_id.clone()).as_ref());
         columns
             .next()
             .unwrap()
-            .push(Scalar::String(self.sql_user.as_bytes().to_vec()).as_ref());
+            .push(Scalar::String(self.sql_user.clone()).as_ref());
         columns
             .next()
             .unwrap()
-            .push(Scalar::String(self.sql_user_quota.as_bytes().to_vec()).as_ref());
+            .push(Scalar::String(self.sql_user_quota.clone()).as_ref());
         columns
             .next()
             .unwrap()
-            .push(Scalar::String(self.sql_user_privileges.as_bytes().to_vec()).as_ref());
+            .push(Scalar::String(self.sql_user_privileges.clone()).as_ref());
         // Query.
         columns
             .next()
             .unwrap()
-            .push(Scalar::String(self.query_id.as_bytes().to_vec()).as_ref());
+            .push(Scalar::String(self.query_id.clone()).as_ref());
         columns
             .next()
             .unwrap()
-            .push(Scalar::String(self.query_kind.as_bytes().to_vec()).as_ref());
+            .push(Scalar::String(self.query_kind.clone()).as_ref());
         columns
             .next()
             .unwrap()
-            .push(Scalar::String(self.query_text.as_bytes().to_vec()).as_ref());
+            .push(Scalar::String(self.query_text.clone()).as_ref());
+        columns
+            .next()
+            .unwrap()
+            .push(Scalar::String(self.query_hash.clone()).as_ref());
+        columns
+            .next()
+            .unwrap()
+            .push(Scalar::String(self.query_parameterized_hash.clone()).as_ref());
         columns
             .next()
             .unwrap()
@@ -291,27 +395,31 @@ impl SystemLogElement for QueryLogElement {
             .next()
             .unwrap()
             .push(Scalar::Number(NumberScalar::Int64(self.query_duration_ms)).as_ref());
+        columns
+            .next()
+            .unwrap()
+            .push(Scalar::Number(NumberScalar::Int64(self.query_queued_duration_ms)).as_ref());
         // Schema.
         columns
             .next()
             .unwrap()
-            .push(Scalar::String(self.current_database.as_bytes().to_vec()).as_ref());
+            .push(Scalar::String(self.current_database.clone()).as_ref());
         columns
             .next()
             .unwrap()
-            .push(Scalar::String(self.databases.as_bytes().to_vec()).as_ref());
+            .push(Scalar::String(self.databases.clone()).as_ref());
         columns
             .next()
             .unwrap()
-            .push(Scalar::String(self.tables.as_bytes().to_vec()).as_ref());
+            .push(Scalar::String(self.tables.clone()).as_ref());
         columns
             .next()
             .unwrap()
-            .push(Scalar::String(self.columns.as_bytes().to_vec()).as_ref());
+            .push(Scalar::String(self.columns.clone()).as_ref());
         columns
             .next()
             .unwrap()
-            .push(Scalar::String(self.projections.as_bytes().to_vec()).as_ref());
+            .push(Scalar::String(self.projections.clone()).as_ref());
         // Stats.
         columns
             .next()
@@ -321,6 +429,30 @@ impl SystemLogElement for QueryLogElement {
             .next()
             .unwrap()
             .push(Scalar::Number(NumberScalar::UInt64(self.written_bytes)).as_ref());
+        columns
+            .next()
+            .unwrap()
+            .push(Scalar::Number(NumberScalar::UInt64(self.join_spilled_rows)).as_ref());
+        columns
+            .next()
+            .unwrap()
+            .push(Scalar::Number(NumberScalar::UInt64(self.join_spilled_bytes)).as_ref());
+        columns
+            .next()
+            .unwrap()
+            .push(Scalar::Number(NumberScalar::UInt64(self.agg_spilled_rows)).as_ref());
+        columns
+            .next()
+            .unwrap()
+            .push(Scalar::Number(NumberScalar::UInt64(self.agg_spilled_bytes)).as_ref());
+        columns
+            .next()
+            .unwrap()
+            .push(Scalar::Number(NumberScalar::UInt64(self.group_by_spilled_rows)).as_ref());
+        columns
+            .next()
+            .unwrap()
+            .push(Scalar::Number(NumberScalar::UInt64(self.group_by_spilled_bytes)).as_ref());
         columns
             .next()
             .unwrap()
@@ -369,19 +501,35 @@ impl SystemLogElement for QueryLogElement {
             .next()
             .unwrap()
             .push(Scalar::Number(NumberScalar::UInt64(self.memory_usage)).as_ref());
+
+        columns
+            .next()
+            .unwrap()
+            .push(Scalar::Number(NumberScalar::UInt64(self.bytes_from_remote_disk)).as_ref());
+
+        columns
+            .next()
+            .unwrap()
+            .push(Scalar::Number(NumberScalar::UInt64(self.bytes_from_local_disk)).as_ref());
+
+        columns
+            .next()
+            .unwrap()
+            .push(Scalar::Number(NumberScalar::UInt64(self.bytes_from_memory)).as_ref());
+
         // Client.
         columns
             .next()
             .unwrap()
-            .push(Scalar::String(self.client_info.as_bytes().to_vec()).as_ref());
+            .push(Scalar::String(self.client_info.clone()).as_ref());
         columns
             .next()
             .unwrap()
-            .push(Scalar::String(self.client_address.as_bytes().to_vec()).as_ref());
+            .push(Scalar::String(self.client_address.clone()).as_ref());
         columns
             .next()
             .unwrap()
-            .push(Scalar::String(self.user_agent.as_bytes().to_vec()).as_ref());
+            .push(Scalar::String(self.user_agent.clone()).as_ref());
         // Exception.
         columns
             .next()
@@ -390,26 +538,30 @@ impl SystemLogElement for QueryLogElement {
         columns
             .next()
             .unwrap()
-            .push(Scalar::String(self.exception_text.as_bytes().to_vec()).as_ref());
+            .push(Scalar::String(self.exception_text.clone()).as_ref());
         columns
             .next()
             .unwrap()
-            .push(Scalar::String(self.stack_trace.as_bytes().to_vec()).as_ref());
+            .push(Scalar::String(self.stack_trace.clone()).as_ref());
         // Server.
         columns
             .next()
             .unwrap()
-            .push(Scalar::String(self.server_version.as_bytes().to_vec()).as_ref());
+            .push(Scalar::String(self.server_version.clone()).as_ref());
         // Session settings
         columns
             .next()
             .unwrap()
-            .push(Scalar::String(self.session_settings.as_bytes().to_vec()).as_ref());
+            .push(Scalar::String(self.session_settings.clone()).as_ref());
         // Extra.
         columns
             .next()
             .unwrap()
-            .push(Scalar::String(self.extra.as_bytes().to_vec()).as_ref());
+            .push(Scalar::String(self.extra.clone()).as_ref());
+        columns
+            .next()
+            .unwrap()
+            .push(Scalar::Boolean(self.has_profiles).as_ref());
         Ok(())
     }
 }

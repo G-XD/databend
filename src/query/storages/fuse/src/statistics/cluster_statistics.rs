@@ -12,24 +12,23 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use common_exception::Result;
-use common_expression::BlockThresholds;
-use common_expression::DataBlock;
-use common_expression::DataField;
-use common_expression::FunctionContext;
-use common_expression::Scalar;
-use common_sql::evaluator::BlockOperator;
-use storages_common_table_meta::meta::ClusterStatistics;
+use std::cmp::Ordering;
 
-use crate::statistics::column_statistic::Trim;
+use databend_common_exception::Result;
+use databend_common_expression::BlockThresholds;
+use databend_common_expression::DataBlock;
+use databend_common_expression::DataField;
+use databend_common_expression::FunctionContext;
+use databend_common_expression::Scalar;
+use databend_common_sql::evaluator::BlockOperator;
+use databend_storages_common_table_meta::meta::ClusterStatistics;
 
-pub const CLUSTER_STATS_STRING_PREFIX_LEN: usize = 8;
+use crate::table_functions::cmp_with_null;
 
 #[derive(Clone, Default)]
 pub struct ClusterStatsGenerator {
     cluster_key_id: u32,
 
-    pub(crate) cluster_key_index: Vec<usize>,
     pub(crate) extra_key_num: usize,
 
     max_page_size: Option<usize>,
@@ -37,9 +36,10 @@ pub struct ClusterStatsGenerator {
     level: i32,
     block_thresholds: BlockThresholds,
 
-    pub(crate) operators: Vec<BlockOperator>,
-    pub(crate) out_fields: Vec<DataField>,
-    pub(crate) func_ctx: FunctionContext,
+    pub cluster_key_index: Vec<usize>,
+    pub operators: Vec<BlockOperator>,
+    pub out_fields: Vec<DataField>,
+    pub func_ctx: FunctionContext,
 }
 
 impl ClusterStatsGenerator {
@@ -80,11 +80,11 @@ impl ClusterStatsGenerator {
     // The input block contains the cluster key block.
     pub fn gen_stats_for_append(
         &self,
-        data_block: DataBlock,
+        mut data_block: DataBlock,
     ) -> Result<(Option<ClusterStatistics>, DataBlock)> {
         let cluster_stats = self.clusters_statistics(&data_block, self.level)?;
-        let block = data_block.pop_columns(self.extra_key_num)?;
-        Ok((cluster_stats, block))
+        data_block.pop_columns(self.extra_key_num);
+        Ok((cluster_stats, data_block))
     }
 
     // This can be used in deletion, for an existing block.
@@ -131,29 +131,19 @@ impl ClusterStatsGenerator {
 
         for key in self.cluster_key_index.iter() {
             let val = data_block.get_by_offset(*key);
-            let val_ref = val.value.as_ref();
-            let left = unsafe { val_ref.index_unchecked(0) }.to_owned();
-            min.push(
-                left.clone()
-                    .trim_min(CLUSTER_STATS_STRING_PREFIX_LEN)
-                    .unwrap_or(left),
-            );
+            let left = unsafe { val.value.index_unchecked(0) }.to_owned();
+            min.push(left);
 
             // The maximum in cluster statistics neednot larger than the non-trimmed one.
             // So we use trim_min directly.
-            let right = unsafe { val_ref.index_unchecked(val_ref.len() - 1) }.to_owned();
-            max.push(
-                right
-                    .clone()
-                    .trim_min(CLUSTER_STATS_STRING_PREFIX_LEN)
-                    .unwrap_or(right),
-            );
+            let right = unsafe { val.value.index_unchecked(val.value.len() - 1) }.to_owned();
+            max.push(right);
         }
 
         let level = if min == max
             && self
                 .block_thresholds
-                .check_perfect_block(data_block.num_rows(), data_block.memory_size())
+                .check_large_enough(data_block.num_rows(), data_block.memory_size())
         {
             -1
         } else {
@@ -166,8 +156,7 @@ impl ClusterStatsGenerator {
                 let mut tuple_values = Vec::with_capacity(self.cluster_key_index.len());
                 for key in self.cluster_key_index.iter() {
                     let val = data_block.get_by_offset(*key);
-                    let val_ref = val.value.as_ref();
-                    let left = unsafe { val_ref.index_unchecked(start) };
+                    let left = unsafe { val.value.index_unchecked(start) };
                     tuple_values.push(left.to_owned());
                 }
                 values.push(Scalar::Tuple(tuple_values));
@@ -184,5 +173,25 @@ impl ClusterStatsGenerator {
             level,
             pages,
         )))
+    }
+}
+
+pub fn sort_by_cluster_stats(
+    v1: &Option<ClusterStatistics>,
+    v2: &Option<ClusterStatistics>,
+    default_cluster_key: u32,
+) -> Ordering {
+    match (v1.as_ref(), v2.as_ref()) {
+        (Some(a), Some(b)) => {
+            if a.cluster_key_id != default_cluster_key && b.cluster_key_id != default_cluster_key {
+                return Ordering::Equal;
+            }
+
+            match a.min().iter().cmp_by(b.min().iter(), cmp_with_null) {
+                Ordering::Equal => a.max().iter().cmp_by(b.max().iter(), cmp_with_null),
+                ord => ord,
+            }
+        }
+        _ => Ordering::Equal,
     }
 }

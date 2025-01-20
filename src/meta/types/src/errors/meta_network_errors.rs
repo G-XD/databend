@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::fmt;
 use std::fmt::Display;
 
 use anyerror::AnyError;
@@ -19,6 +20,8 @@ use serde::Deserialize;
 use serde::Serialize;
 use thiserror::Error;
 use tonic::Code;
+
+use crate::errors;
 
 // represent network related errors
 #[derive(Error, Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -55,6 +58,18 @@ impl MetaNetworkError {
             Self::BadAddressFormat(e) => Self::BadAddressFormat(e.add_context(|| context)),
             Self::InvalidArgument(e) => e.add_context(context).into(),
             Self::InvalidReply(e) => e.add_context(context).into(),
+        }
+    }
+
+    pub fn name(&self) -> &'static str {
+        match self {
+            MetaNetworkError::ConnectionError(_) => "ConnectionError",
+            MetaNetworkError::GetNodeAddrError(_) => "GetNodeAddrError",
+            MetaNetworkError::DnsParseError(_) => "DnsParseError",
+            MetaNetworkError::TLSConfigError(_) => "TLSConfigError",
+            MetaNetworkError::BadAddressFormat(_) => "BadAddressFormat",
+            MetaNetworkError::InvalidArgument(_) => "InvalidArgument",
+            MetaNetworkError::InvalidReply(_) => "InvalidReply",
         }
     }
 }
@@ -105,7 +120,6 @@ impl InvalidArgument {
 }
 
 #[derive(thiserror::Error, serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
-#[error("InvalidReply: {msg} source: {source}")]
 pub struct InvalidReply {
     msg: String,
     #[source]
@@ -116,13 +130,29 @@ impl InvalidReply {
     pub fn new(msg: impl Display, source: &(impl std::error::Error + 'static)) -> Self {
         Self {
             msg: msg.to_string(),
-            source: AnyError::new(source),
+            source: AnyError::new(source).with_type(None::<String>),
         }
     }
 
     pub fn add_context(mut self, context: impl Display) -> Self {
         self.msg = format!("{}: {}", self.msg, context);
         self
+    }
+}
+
+impl Display for InvalidReply {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "InvalidReply: ")?;
+        if !self.msg.is_empty() {
+            write!(f, "{}; ", self.msg)?;
+        }
+        write!(f, "source:({})", self.source)
+    }
+}
+
+impl From<errors::IncompleteStream> for InvalidReply {
+    fn from(e: errors::IncompleteStream) -> Self {
+        Self::new("Invalid reply", &e)
     }
 }
 
@@ -162,5 +192,11 @@ impl From<tonic::Status> for MetaNetworkError {
 impl From<tonic::transport::Error> for MetaNetworkError {
     fn from(err: tonic::transport::Error) -> Self {
         MetaNetworkError::ConnectionError(ConnectionError::new(err, ""))
+    }
+}
+
+impl From<errors::IncompleteStream> for MetaNetworkError {
+    fn from(e: errors::IncompleteStream) -> Self {
+        MetaNetworkError::InvalidReply(InvalidReply::from(e))
     }
 }

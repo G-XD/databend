@@ -15,19 +15,23 @@
 mod agg_index;
 mod block;
 pub mod bloom;
+mod inverted_index;
 pub mod meta;
-mod read_settings;
 mod snapshot_history_reader;
+mod utils;
+mod virtual_column;
 
 pub use agg_index::AggIndexReader;
+pub use block::BlockReadResult;
 pub use block::BlockReader;
-pub use block::MergeIOReadResult;
 pub use block::NativeReaderExt;
 pub use block::NativeSourceData;
-pub use block::UncompressedBuffer;
 pub use bloom::BloomBlockFilterReader;
+pub use inverted_index::InvertedIndexReader;
 pub use meta::CompactSegmentInfoReader;
 pub use meta::MetaReaders;
 pub use meta::TableSnapshotReader;
-pub use read_settings::ReadSettings;
 pub use snapshot_history_reader::SnapshotHistoryReader;
+pub use utils::build_columns_meta;
+pub use virtual_column::VirtualBlockReadResult;
+pub use virtual_column::VirtualColumnReader;

@@ -13,7 +13,6 @@
 // limitations under the License.
 
 // For use of const fn: `Option::<T>::unwrap` at compile time.
-#![feature(const_option)]
 #![feature(box_into_inner)]
 #![allow(clippy::uninlined_format_args)]
 
@@ -63,22 +62,37 @@
 mod background_job_from_to_protobuf_impl;
 mod background_task_from_to_protobuf_impl;
 mod catalog_from_to_protobuf_impl;
+mod client_session_from_to_protobuf_impl;
 mod config_from_to_protobuf_impl;
+mod connection_from_to_protobuf_impl;
 mod data_mask_from_to_protobuf_impl;
 mod database_from_to_protobuf_impl;
 mod datetime_from_to_protobuf_impl;
+mod dictionary_from_to_protobuf_impl;
 mod file_format_from_to_protobuf_impl;
 mod from_to_protobuf;
+mod id_from_to_protobuf_impl;
 mod index_from_to_protobuf_impl;
+mod least_visible_time_from_to_protobuf_impl;
+mod lock_from_to_protobuf_impl;
+mod owner_from_to_protobuf_impl;
+mod ownership_from_to_protobuf_impl;
+mod procedure_from_to_protobuf_impl;
+mod role_from_to_protobuf_impl;
 mod schema_from_to_protobuf_impl;
-mod share_from_to_protobuf_impl;
+mod sequence_from_to_protobuf_impl;
 mod stage_from_to_protobuf_impl;
 mod table_from_to_protobuf_impl;
+mod tenant_quota_from_to_protobuf_impl;
+mod tident_from_to_protobuf_impl;
+mod token_from_to_protobuf_impl;
+mod udf_from_to_protobuf_impl;
 mod user_from_to_protobuf_impl;
 mod util;
 mod virtual_column_from_to_protobuf_impl;
 
 pub use from_to_protobuf::FromToProto;
+pub use from_to_protobuf::FromToProtoEnum;
 pub use from_to_protobuf::Incompatible;
 pub use util::missing;
 pub use util::reader_check_msg;

@@ -12,534 +12,416 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::fs;
 use std::io;
 use std::io::ErrorKind;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyerror::AnyError;
-use common_base::base::tokio;
-use common_base::base::tokio::io::AsyncBufReadExt;
-use common_base::base::tokio::io::BufReader;
-use common_base::base::tokio::sync::RwLock;
-use common_base::base::tokio::sync::RwLockWriteGuard;
-use common_meta_raft_store::config::RaftConfig;
-use common_meta_raft_store::key_spaces::RaftStateKV;
-use common_meta_raft_store::key_spaces::RaftStoreEntry;
-use common_meta_raft_store::log::RaftLog;
-use common_meta_raft_store::ondisk::DATA_VERSION;
-use common_meta_raft_store::ondisk::TREE_HEADER;
-use common_meta_raft_store::sm_v002::SnapshotStoreError;
-use common_meta_raft_store::sm_v002::SnapshotStoreV002;
-use common_meta_raft_store::sm_v002::SnapshotViewV002;
-use common_meta_raft_store::sm_v002::SMV002;
-use common_meta_raft_store::state::RaftState;
-use common_meta_raft_store::state::RaftStateKey;
-use common_meta_raft_store::state::RaftStateValue;
-use common_meta_raft_store::state_machine::MetaSnapshotId;
-use common_meta_raft_store::state_machine::StoredSnapshot;
-use common_meta_sled_store::get_sled_db;
-use common_meta_sled_store::openraft::ErrorSubject;
-use common_meta_sled_store::openraft::ErrorVerb;
-use common_meta_sled_store::openraft::RaftLogId;
-use common_meta_sled_store::SledTree;
-use common_meta_stoerr::MetaStorageError;
-use common_meta_types::Endpoint;
-use common_meta_types::LogId;
-use common_meta_types::Membership;
-use common_meta_types::MetaError;
-use common_meta_types::MetaNetworkError;
-use common_meta_types::MetaStartupError;
-use common_meta_types::Node;
-use common_meta_types::NodeId;
-use common_meta_types::Snapshot;
-use common_meta_types::SnapshotData;
-use common_meta_types::SnapshotMeta;
-use common_meta_types::StorageError;
-use common_meta_types::StorageIOError;
-use common_meta_types::Vote;
-use log::as_display;
+use databend_common_base::base::tokio;
+use databend_common_base::base::tokio::sync::RwLock;
+use databend_common_base::base::tokio::sync::RwLockWriteGuard;
+use databend_common_meta_raft_store::config::RaftConfig;
+use databend_common_meta_raft_store::key_spaces::RaftStoreEntry;
+use databend_common_meta_raft_store::leveled_store::db_exporter::DBExporter;
+use databend_common_meta_raft_store::ondisk::Header;
+use databend_common_meta_raft_store::ondisk::TREE_HEADER;
+use databend_common_meta_raft_store::raft_log_v004;
+use databend_common_meta_raft_store::raft_log_v004::util;
+use databend_common_meta_raft_store::raft_log_v004::Cw;
+use databend_common_meta_raft_store::raft_log_v004::RaftLogV004;
+use databend_common_meta_raft_store::sm_v003::write_entry::WriteEntry;
+use databend_common_meta_raft_store::sm_v003::SnapshotStoreV004;
+use databend_common_meta_raft_store::sm_v003::SMV003;
+use databend_common_meta_raft_store::state_machine::MetaSnapshotId;
+use databend_common_meta_stoerr::MetaStorageError;
+use databend_common_meta_types::raft_types::Entry;
+use databend_common_meta_types::raft_types::Membership;
+use databend_common_meta_types::raft_types::NodeId;
+use databend_common_meta_types::raft_types::Snapshot;
+use databend_common_meta_types::raft_types::SnapshotMeta;
+use databend_common_meta_types::raft_types::StorageError;
+use databend_common_meta_types::snapshot_db::DB;
+use databend_common_meta_types::Endpoint;
+use databend_common_meta_types::MetaNetworkError;
+use databend_common_meta_types::MetaStartupError;
+use databend_common_meta_types::Node;
+use futures::TryStreamExt;
 use log::debug;
+use log::error;
 use log::info;
-use log::warn;
+use raft_log::api::raft_log_writer::RaftLogWriter;
+use tokio::time::sleep;
 
-use crate::export::vec_kv_to_json;
-use crate::Opened;
-
-/// This is the inner store that provides support utilities for implementing the raft storage API.
-///
-/// This store is backed by a sled db, contents are stored in 3 trees:
-///   state:
-///       id
-///       vote
-///   log
-///   state_machine
-pub struct StoreInner {
+/// This is the inner store that implements the raft log storage API.
+pub struct RaftStoreInner {
     /// The ID of the Raft node for which this storage instances is configured.
-    /// ID is also stored in raft_state. Since `id` never changes, this is a cache for fast access.
+    /// ID is also stored in raft-log.
+    ///
+    /// `id` never changes, this is a cache for fast access.
     pub id: NodeId,
 
     pub(crate) config: RaftConfig,
 
     /// If the instance is opened from an existent state(e.g. load from fs) or created.
-    is_opened: bool,
+    pub is_opened: bool,
 
-    /// The sled db for log, raft_state and state machine.
-    pub(crate) db: sled::Db,
-
-    /// Raft state includes:
-    /// id: NodeId,
-    ///     current_term,
-    ///     voted_for
-    pub raft_state: RaftState,
-
-    pub log: RaftLog,
+    /// A series of raft logs.
+    pub log: Arc<RwLock<RaftLogV004>>,
 
     /// The Raft state machine.
-    pub state_machine: Arc<RwLock<SMV002>>,
-
-    /// The current snapshot.
-    pub current_snapshot: RwLock<Option<StoredSnapshot>>,
+    pub state_machine: Arc<RwLock<SMV003>>,
 }
 
-impl AsRef<StoreInner> for StoreInner {
-    fn as_ref(&self) -> &StoreInner {
+impl AsRef<RaftStoreInner> for RaftStoreInner {
+    fn as_ref(&self) -> &RaftStoreInner {
         self
     }
 }
 
-impl Opened for StoreInner {
-    /// If the instance is opened(true) from an existent state(e.g. load from fs) or created(false).
-    fn is_opened(&self) -> bool {
-        self.is_opened
-    }
-}
-
-impl StoreInner {
-    /// Open an existent `metasrv` instance or create an new one:
-    /// 1. If `open` is `Some`, try to open an existent one.
-    /// 2. If `create` is `Some`, try to create one.
-    /// Otherwise it panic
-    #[minitrace::trace]
-    pub async fn open_create(
-        config: &RaftConfig,
-        open: Option<()>,
-        create: Option<()>,
-    ) -> Result<StoreInner, MetaStartupError> {
-        info!(config_id = as_display!(&config.config_id); "open: {:?}, create: {:?}", open, create);
-
-        let db = get_sled_db();
-
-        let raft_state = RaftState::open_create(&db, config, open, create).await?;
-        let is_open = raft_state.is_open();
-        info!("RaftState opened is_open: {}", is_open);
-
-        let log = RaftLog::open(&db, config).await?;
-        info!("RaftLog opened");
-
-        // TODO(1): remove read_state_machine_id();
-        // TODO(1): StateMachine::clean()
+impl RaftStoreInner {
+    /// Open an existent raft-store or create a new one.
+    #[fastrace::trace]
+    pub async fn open(config: &RaftConfig) -> Result<RaftStoreInner, MetaStartupError> {
+        info!("open_or_create StoreInner: id={}", config.id);
 
         fn to_startup_err(e: impl std::error::Error + 'static) -> MetaStartupError {
             let ae = AnyError::new(&e);
-            let store_err = MetaStorageError::SnapshotError(ae);
+            let store_err = MetaStorageError(ae);
             MetaStartupError::StoreOpenError(store_err)
         }
 
-        let snapshot_store = SnapshotStoreV002::new(DATA_VERSION, config.clone());
-        let last = snapshot_store
-            .load_last_snapshot()
-            .await
+        let raft_log_config = Arc::new(config.to_raft_log_config());
+
+        let dir = &raft_log_config.dir;
+
+        fs::create_dir_all(dir).map_err(|e| {
+            let err = io::Error::new(
+                e.kind(),
+                format!("{}; when:(create raft log dir: {}", e, dir),
+            );
+            to_startup_err(err)
+        })?;
+
+        let mut log = RaftLogV004::open(raft_log_config.clone()).map_err(to_startup_err)?;
+        info!("RaftLog opened at: {}", raft_log_config.dir);
+
+        let state = log.log_state();
+        info!("log_state: {:?}", state);
+        let stored_node_id = state.user_data.as_ref().and_then(|x| x.node_id);
+
+        let is_open = stored_node_id.is_some();
+
+        // If id is stored, ignore the id in config.
+        let id = stored_node_id.unwrap_or(config.id);
+
+        if !is_open {
+            log.save_user_data(Some(raft_log_v004::log_store_meta::LogStoreMeta {
+                node_id: Some(config.id),
+            }))
             .map_err(to_startup_err)?;
 
-        let (sm, stored_snapshot) = if let Some((id, snapshot)) = last {
-            let (sm, meta) = Self::rebuild_state_machine(&id, snapshot)
+            util::blocking_flush(&mut log)
+                .await
+                .map_err(to_startup_err)?;
+        }
+
+        let ss_store = SnapshotStoreV004::new(config.clone());
+        let loader = ss_store.new_loader();
+        let last = loader.load_last_snapshot().await.map_err(to_startup_err)?;
+
+        let sm = if let Some((id, snapshot)) = last {
+            let sm = Self::rebuild_state_machine(&id, snapshot)
                 .await
                 .map_err(to_startup_err)?;
 
+            let db_opt = sm.get_snapshot();
+            let snapshot_meta = db_opt.map(|x| x.snapshot_meta().clone());
+
             info!(
                 "rebuilt state machine from last snapshot({:?}), meta: {:?}",
-                id, meta
+                id, snapshot_meta
             );
-            (sm, Some(StoredSnapshot { meta }))
+
+            sm
         } else {
             info!("No snapshot, skip rebuilding state machine");
-            (Default::default(), None)
+            Default::default()
         };
 
-        Ok(Self {
-            id: raft_state.id,
+        let store = Self {
+            id,
             config: config.clone(),
             is_opened: is_open,
-            db,
-            raft_state,
-            log,
-            state_machine: sm,
-            current_snapshot: RwLock::new(stored_snapshot),
-        })
+            log: Arc::new(RwLock::new(log)),
+            state_machine: Arc::new(RwLock::new(sm)),
+        };
+
+        Ok(store)
     }
 
     /// Return a snapshot store of this instance.
-    pub fn snapshot_store(&self) -> SnapshotStoreV002 {
-        SnapshotStoreV002::new(DATA_VERSION, self.config.clone())
+    pub fn snapshot_store(&self) -> SnapshotStoreV004 {
+        SnapshotStoreV004::new(self.config.clone())
     }
 
-    async fn rebuild_state_machine(
-        id: &MetaSnapshotId,
-        snapshot: SnapshotData,
-    ) -> Result<(Arc<RwLock<SMV002>>, SnapshotMeta), io::Error> {
+    async fn rebuild_state_machine(id: &MetaSnapshotId, snapshot: DB) -> Result<SMV003, io::Error> {
         info!("rebuild state machine from last snapshot({:?})", id);
 
-        let sm = Arc::new(RwLock::new(SMV002::default()));
+        let mut sm = SMV003::default();
+        sm.install_snapshot_v003(snapshot).await?;
 
-        SMV002::install_snapshot(sm.clone(), Box::new(snapshot)).await?;
-
-        let (last_applied, last_membership) = {
-            let sm = sm.read().await;
-            let last_applied = *sm.last_applied_ref();
-            let last_membership = sm.last_membership_ref().clone();
-
-            (last_applied, last_membership)
-        };
-
-        let meta = SnapshotMeta {
-            snapshot_id: id.to_string(),
-            last_log_id: last_applied,
-            last_membership,
-        };
-
-        Ok((sm, meta))
+        Ok(sm)
     }
 
     /// Get a handle to the state machine for testing purposes.
-    pub async fn get_state_machine(&self) -> RwLockWriteGuard<'_, SMV002> {
+    pub async fn get_state_machine(&self) -> RwLockWriteGuard<'_, SMV003> {
         self.state_machine.write().await
     }
 
-    #[minitrace::trace]
+    #[fastrace::trace]
     pub(crate) async fn do_build_snapshot(&self) -> Result<Snapshot, StorageError> {
         // NOTE: building snapshot is guaranteed to be serialized called by RaftCore.
 
         info!(id = self.id; "do_build_snapshot start");
 
-        let snapshot_view = self.build_compacted_snapshot().await;
+        let mut compactor = {
+            let mut w = self.state_machine.write().await;
+            w.freeze_writable();
+            w.acquire_compactor().await
+        };
 
-        let mut snapshot_meta = snapshot_view.build_snapshot_meta();
+        let (sys_data, mut strm) = compactor
+            .compact()
+            .await
+            .map_err(|e| StorageError::read_snapshot(None, &e))?;
+
+        let last_applied = *sys_data.last_applied_ref();
+        let last_membership = sys_data.last_membership_ref().clone();
+        let snapshot_id = MetaSnapshotId::new_with_epoch(last_applied);
+        let snapshot_meta = SnapshotMeta {
+            snapshot_id: snapshot_id.to_string(),
+            last_log_id: last_applied,
+            last_membership,
+        };
+        let signature = snapshot_meta.signature();
+
+        let ss_store = self.snapshot_store();
+        let writer = ss_store
+            .new_writer()
+            .map_err(|e| StorageError::write_snapshot(Some(signature.clone()), &e))?;
+
+        let context = format!("build snapshot: {:?}", last_applied);
+        let (tx, th) = writer.spawn_writer_thread(context);
 
         info!("do_build_snapshot writing snapshot start");
 
-        let mut snapshot_store = self.snapshot_store();
-
-        // Move heavy load to a blocking thread pool.
-        let (snapshot_id, snapshot_size) = tokio::task::block_in_place({
-            let sto = &mut snapshot_store;
-            let meta = snapshot_meta.clone();
-            let sleep = self.get_delay_config("write").await;
-
-            move || {
-                Self::testing_sleep("write", sleep);
-                Self::write_snapshot(sto, meta, snapshot_view.export())
-            }
-        })?;
-
-        info!(snapshot_size = as_display!(snapshot_size); "do_build_snapshot complete");
-
-        snapshot_store.clean_old_snapshots().await?;
-
-        assert_eq!(
-            snapshot_id.last_applied, snapshot_meta.last_log_id,
-            "snapshot_id.last_applied: {:?} must equal snapshot_meta.last_log_id: {:?}",
-            snapshot_id.last_applied, snapshot_meta.last_log_id
-        );
-        snapshot_meta.snapshot_id = snapshot_id.to_string();
-
+        // Pipe entries to the writer.
         {
-            let snapshot = StoredSnapshot {
-                meta: snapshot_meta.clone(),
-            };
+            while let Some(ent) = strm
+                .try_next()
+                .await
+                .map_err(|e| StorageError::read_snapshot(None, &e))?
+            {
+                tx.send(WriteEntry::Data(ent))
+                    .await
+                    .map_err(|e| StorageError::write_snapshot(Some(signature.clone()), &e))?;
+            }
 
-            let mut current_snapshot = self.current_snapshot.write().await;
-            *current_snapshot = Some(snapshot);
+            tx.send(WriteEntry::Finish(sys_data))
+                .await
+                .map_err(|e| StorageError::write_snapshot(Some(signature.clone()), &e))?;
         }
 
-        let r = snapshot_store
-            .load_snapshot(&snapshot_meta.snapshot_id)
+        // Get snapshot write result
+        let temp_snapshot_data = th
             .await
             .map_err(|e| {
-                let e = StorageIOError::new(
-                    ErrorSubject::Snapshot(Some(snapshot_meta.signature())),
-                    ErrorVerb::Read,
-                    &e,
-                );
-                StorageError::from(e)
+                error!(error :% = e; "snapshot writer thread error");
+                StorageError::write_snapshot(Some(signature.clone()), &e)
+            })?
+            .map_err(|e| {
+                error!(error :% = e; "snapshot writer thread error");
+                StorageError::write_snapshot(Some(signature.clone()), &e)
             })?;
+
+        let db = temp_snapshot_data
+            .move_to_final_path(snapshot_id.to_string())
+            .map_err(|e| {
+                error!(error :% = e; "move temp snapshot to final path error");
+                StorageError::write_snapshot(Some(signature.clone()), &e)
+            })?;
+
+        info!(
+            snapshot_id :% = snapshot_id.to_string(),
+            snapshot_file_size :% = db.file_size(),
+            snapshot_stat :% = db.stat(); "do_build_snapshot complete");
+
+        {
+            let mut sm = self.state_machine.write().await;
+            sm.levels_mut()
+                .replace_with_compacted(compactor, db.clone());
+        }
+
+        // Clean old snapshot
+        ss_store.new_loader().clean_old_snapshots().await?;
+        info!("do_build_snapshot clean_old_snapshots complete");
 
         Ok(Snapshot {
             meta: snapshot_meta,
-            snapshot: Box::new(r),
+            snapshot: Box::new(db),
         })
     }
 
-    /// Return the delay config for testing.
-    async fn get_delay_config(&self, key: &str) -> Duration {
-        if cfg!(debug_assertions) {
-            let sm = self.get_state_machine().await;
-            let c = sm.blocking_config();
-            match key {
-                "write" => c.write_snapshot,
-                "compact" => c.compact_snapshot,
-                _ => {
-                    unreachable!("unknown key: {}", key);
-                }
-            }
-        } else {
-            Duration::from_secs(0)
-        }
-    }
-
-    /// Sleep in blocking mode for testing.
-    fn testing_sleep(key: &str, sleep: Duration) {
-        #[allow(clippy::collapsible_if)]
-        if cfg!(debug_assertions) {
-            if !sleep.is_zero() {
-                warn!("start    {} sleep: {:?}", key, sleep);
-                std::thread::sleep(sleep);
-                warn!("finished {} sleep", key);
-            }
-        }
-    }
-
-    /// Build and compact a snapshot view.
+    /// Return snapshot id and meta of the last snapshot.
     ///
-    /// - Take a snapshot view of the current state machine;
-    /// - Compact multi levels in the snapshot view into one to get rid of tombstones;
-    async fn build_compacted_snapshot(&self) -> SnapshotViewV002 {
-        let mut snapshot_view = {
-            let mut s = self.state_machine.write().await;
-            s.full_snapshot_view()
-        };
-
-        // Compact multi levels into one to get rid of tombstones
-        // Move heavy load task to a blocking thread pool.
-        tokio::task::block_in_place({
-            let s = &mut snapshot_view;
-            let sleep = self.get_delay_config("compact").await;
-
-            move || {
-                Self::testing_sleep("compact", sleep);
-                s.compact();
-            }
-        });
-
-        // State machine ensures no modification to `base` during snapshotting.
-        {
-            let mut s = self.state_machine.write().await;
-            s.replace_base(&snapshot_view);
-        }
-
-        snapshot_view
-    }
-
-    fn write_snapshot(
-        snapshot_store: &mut SnapshotStoreV002,
-        snapshot_meta: SnapshotMeta,
-        data: impl IntoIterator<Item = RaftStoreEntry>,
-    ) -> Result<(MetaSnapshotId, u64), SnapshotStoreError> {
-        let mut writer = snapshot_store.new_writer()?;
-
-        writer.write_entries::<io::Error>(data).map_err(|e| {
-            SnapshotStoreError::write(e).with_meta("serialize entries", &snapshot_meta)
-        })?;
-
-        let (snapshot_id, file_size) = writer
-            .commit(None)
-            .map_err(|e| SnapshotStoreError::write(e).with_meta("writer.commit", &snapshot_meta))?;
-
-        Ok((snapshot_id, file_size))
+    /// It returns None if there is no snapshot or there is an error parsing snapshot meta or id.
+    pub(crate) async fn try_get_snapshot_key_count(&self) -> Option<u64> {
+        let sm = self.state_machine.read().await;
+        let db = sm.levels().persisted()?;
+        Some(db.stat().key_num)
     }
 
     /// Install a snapshot to build a state machine from it and replace the old state machine with the new one.
-    #[minitrace::trace]
-    pub async fn do_install_snapshot(
-        &self,
-        data: Box<SnapshotData>,
-    ) -> Result<(), MetaStorageError> {
-        //
-
-        SMV002::install_snapshot(self.state_machine.clone(), data)
-            .await
-            .map_err(|e| {
-                MetaStorageError::SnapshotError(
-                    AnyError::new(&e).add_context(|| "replacing state-machine with snapshot"),
-                )
-            })?;
-
-        // TODO(1): read_state_machine_id() and write_state_machine_id() is no longer used.
-        // TODO(xp): use checksum to check consistency?
+    #[fastrace::trace]
+    pub async fn do_install_snapshot(&self, db: DB) -> Result<(), MetaStorageError> {
+        let mut sm = self.state_machine.write().await;
+        sm.install_snapshot_v003(db).await.map_err(|e| {
+            MetaStorageError(
+                AnyError::new(&e).add_context(|| "replacing state-machine with snapshot"),
+            )
+        })?;
 
         Ok(())
     }
 
-    /// Export data that can be used to restore a meta-service node.
-    #[minitrace::trace]
-    pub async fn export(&self) -> Result<Vec<String>, io::Error> {
-        // NOTE:
-        // Hold the snapshot lock to prevent snapshot from being replaced until exporting finished.
-        // Holding this lock prevent logs from being purged.
-        let current_snapshot = self.current_snapshot.read().await;
+    /// Export all the data that can be used to restore a meta-service node.
+    ///
+    /// Returns a `BoxStream<'a, Result<String, io::Error>>` that yields a series of JSON strings.
+    #[futures_async_stream::try_stream(boxed, ok = String, error = io::Error)]
+    pub async fn export(self: Arc<RaftStoreInner>) {
+        info!("StoreInner::export start");
 
-        let mut res = vec![];
+        // Convert an error occurred during export to `io::Error(InvalidData)`.
+        fn invalid_data(e: impl std::error::Error + Send + Sync + 'static) -> io::Error {
+            io::Error::new(ErrorKind::InvalidData, e)
+        }
+
+        fn encode_entry(tree_name: &str, ent: &RaftStoreEntry) -> Result<String, io::Error> {
+            let name_entry = (tree_name, ent);
+
+            let line = serde_json::to_string(&name_entry)
+                .map_err(|e| io::Error::new(ErrorKind::InvalidData, e))?;
+            Ok(line)
+        }
+
+        // Lock all data components so that we have a consistent view.
+        //
+        // Hold the singleton compactor to prevent snapshot from being replaced until exporting finished.
+        // Holding it prevent logs from being purged.
+        //
+        // Although vote and log must be consistent,
+        // it is OK to export RaftState and logs without transaction protection(i.e. they do not share a lock),
+        // if it guarantees no logs have a greater `vote` than `RaftState.HardState`.
+        let compactor = {
+            // If there is a compactor running,
+            // and it will be installed back to SM with
+            // `self.state_machine.write().await.levels_mut().replace_with_compacted()`.
+            // This compactor can not block with self.state_machine lock held.
+            // Otherwise, there is a deadlock:
+            // - This thread holds self.state_machine lock, acquiring compactor.
+            // - The other thread holds compactor, acquiring self.state_machine lock.
+            loop {
+                let got = {
+                    let mut sm = self.state_machine.write().await;
+                    sm.try_acquire_compactor()
+                };
+                if let Some(c) = got {
+                    break c;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        };
+
+        let mut dump = {
+            let log = self.log.read().await;
+            log.dump_data()
+        };
+
+        // Log is dumped thus there won't be a gap between sm and log.
+        // It is now safe to release the compactor.
+        let db = compactor.db().cloned();
+        drop(compactor);
 
         // Export data header first
         {
-            let header_tree = SledTree::open(&self.db, TREE_HEADER, false)
-                .map_err(|e| io::Error::new(ErrorKind::InvalidData, e))?;
-
-            let header_kvs = header_tree
-                .export()
-                .map_err(|e| io::Error::new(ErrorKind::InvalidData, e))?;
-
-            for kv in header_kvs.iter() {
-                let line = vec_kv_to_json(TREE_HEADER, kv)
-                    .map_err(|e| io::Error::new(ErrorKind::InvalidData, e))?;
-                res.push(line);
-            }
+            let entry = RaftStoreEntry::new_header(Header::this_version());
+            yield encode_entry(TREE_HEADER, &entry)?;
         }
 
-        // Export RaftState
-        //
-        // Although vote and log must be consistent,
-        // it is OK to export RaftState and logs without transaction protection,
-        // if it guarantees no logs have a greater `vote` than `RaftState.HardState`.
+        let state = dump.state();
 
-        let exported_vote = {
-            let tree_name = &self.raft_state.inner.name;
+        // Export raft state
+        {
+            let tree_name = "raft_log";
 
-            let ks = self.raft_state.inner.key_space::<RaftStateKV>();
+            let node_id = state.user_data.as_ref().and_then(|ud| ud.node_id);
+            let entry = RaftStoreEntry::NodeId(node_id);
+            yield encode_entry(tree_name, &entry)?;
 
-            let id = ks
-                .get(&RaftStateKey::Id)
-                .map_err(|e| io::Error::new(ErrorKind::InvalidData, e))?
-                .map(NodeId::from);
-            if let Some(id) = id {
-                let ent_id = RaftStoreEntry::RaftStateKV {
-                    key: RaftStateKey::Id,
-                    value: RaftStateValue::NodeId(id),
-                };
+            let vote = state.vote().map(Cw::to_inner);
+            let entry = RaftStoreEntry::Vote(vote);
+            yield encode_entry(tree_name, &entry)?;
 
-                let s = serde_json::to_string(&(tree_name, ent_id))
-                    .map_err(|e| io::Error::new(ErrorKind::InvalidData, e))?;
-
-                res.push(s);
-            }
-
-            let vote = ks
-                .get(&RaftStateKey::HardState)
-                .map_err(|e| io::Error::new(ErrorKind::InvalidData, e))?
-                .map(Vote::from);
-            if let Some(vote) = vote {
-                let ent_vote = RaftStoreEntry::RaftStateKV {
-                    key: RaftStateKey::HardState,
-                    value: RaftStateValue::HardState(vote),
-                };
-
-                let s = serde_json::to_string(&(tree_name, ent_vote))
-                    .map_err(|e| io::Error::new(ErrorKind::InvalidData, e))?;
-
-                res.push(s);
-            }
-
-            let committed = ks
-                .get(&RaftStateKey::Committed)
-                .map_err(|e| io::Error::new(ErrorKind::InvalidData, e))?
-                .and_then(Option::<LogId>::from);
-
-            let ent_committed = RaftStoreEntry::RaftStateKV {
-                key: RaftStateKey::Committed,
-                value: RaftStateValue::Committed(committed),
-            };
-
-            let s = serde_json::to_string(&(tree_name, ent_committed))
-                .map_err(|e| io::Error::new(ErrorKind::InvalidData, e))?;
-
-            res.push(s);
-
-            // NOTE: `vote` is used in the following code.
-            vote.unwrap_or_default()
+            let committed = state.committed().map(Cw::to_inner);
+            let entry = RaftStoreEntry::Committed(committed);
+            yield encode_entry(tree_name, &entry)?;
         };
 
-        // Export logs that has smaller or equal leader id as `vote`
         {
-            let tree_name = &self.log.inner.name;
+            let tree_name = "raft_log";
 
-            let log_kvs = self
-                .log
-                .inner
-                .export()
-                .map_err(|e| io::Error::new(ErrorKind::InvalidData, e))?;
-            for kv in log_kvs.iter() {
-                let kv_entry = RaftStoreEntry::deserialize(&kv[0], &kv[1])
-                    .map_err(|e| io::Error::new(ErrorKind::InvalidData, e))?;
+            let purged = state.purged().map(Cw::to_inner);
+            let entry = RaftStoreEntry::Purged(purged);
+            yield encode_entry(tree_name, &entry)?;
 
-                if let RaftStoreEntry::Logs { ref value, .. } = kv_entry {
-                    if value.get_log_id().leader_id > exported_vote.leader_id {
-                        warn!(
-                            "found log({}) with greater leader id than vote({}), skip exporting logs",
-                            value.get_log_id(),
-                            exported_vote
-                        );
-                        break;
-                    }
-                }
+            for res in dump.iter() {
+                let (log_id, payload) = res?;
+                let log_id = log_id.unpack();
+                let payload = payload.unpack();
 
-                let tree_kv = (tree_name, kv_entry);
-                let line = serde_json::to_string(&tree_kv)
-                    .map_err(|e| io::Error::new(ErrorKind::InvalidData, e))?;
+                let log_entry = Entry { log_id, payload };
 
-                res.push(line);
+                let entry = RaftStoreEntry::LogEntry(log_entry);
+                yield encode_entry(tree_name, &entry)?;
             }
         }
 
-        // Export snapshot of state machine
-        {
-            // NOTE:
-            // This name had been used by the sled tree based sm.
-            // Do not change it for keeping compatibility.
-            let tree_name = "state_machine/0";
+        // Dump snapshot of state machine
 
-            let snapshot = current_snapshot.clone();
-            if let Some(s) = snapshot {
-                let meta = s.meta;
+        // NOTE:
+        // The name in form of "state_machine/[0-9]+" had been used by the sled tree based sm.
+        // Do not change it for keeping compatibility.
+        let sm_tree_name = "state_machine/0";
 
-                let snapshot_store = SnapshotStoreV002::new(DATA_VERSION, self.config.clone());
+        info!("StoreInner::export db: {:?}", db);
 
-                let f = snapshot_store
-                    .load_snapshot(&meta.snapshot_id)
-                    .await
-                    .map_err(|e| io::Error::new(ErrorKind::InvalidData, e))?;
-                let bf = BufReader::new(f);
-                let mut lines = AsyncBufReadExt::lines(bf);
+        if let Some(db) = db {
+            let db_exporter = DBExporter::new(&db);
+            let mut strm = db_exporter.export().await?;
 
-                while let Some(l) = lines.next_line().await? {
-                    let ent: RaftStoreEntry = serde_json::from_str(&l)
-                        .map_err(|e| io::Error::new(ErrorKind::InvalidData, e))?;
-
-                    let named_entry = (tree_name, ent);
-
-                    let l = serde_json::to_string(&named_entry)
-                        .map_err(|e| io::Error::new(ErrorKind::InvalidData, e))?;
-
-                    res.push(l);
-                }
+            while let Some(ent) = strm.try_next().await? {
+                let tree_kv = (sm_tree_name, ent);
+                let line = serde_json::to_string(&tree_kv).map_err(invalid_data)?;
+                yield line;
             }
         }
-
-        Ok(res)
     }
 
     pub async fn get_node(&self, node_id: &NodeId) -> Option<Node> {
         let sm = self.state_machine.read().await;
-        let n = sm.nodes_ref().get(node_id).cloned();
+        let n = sm.sys_data_ref().nodes_ref().get(node_id).cloned();
         n
     }
 
@@ -549,7 +431,7 @@ impl StoreInner {
         list_ids: impl Fn(&Membership) -> Vec<NodeId>,
     ) -> Vec<Node> {
         let sm = self.state_machine.read().await;
-        let membership = sm.last_membership_ref().membership();
+        let membership = sm.sys_data_ref().last_membership_ref().membership();
 
         debug!("in-statemachine membership: {:?}", membership);
 
@@ -558,7 +440,7 @@ impl StoreInner {
         let mut ns = vec![];
 
         for id in ids {
-            let node = sm.nodes_ref().get(&id).cloned();
+            let node = sm.sys_data_ref().nodes_ref().get(&id).cloned();
             if let Some(x) = node {
                 ns.push(x);
             }
@@ -567,7 +449,10 @@ impl StoreInner {
         ns
     }
 
-    pub async fn get_node_endpoint(&self, node_id: &NodeId) -> Result<Endpoint, MetaError> {
+    pub async fn get_node_raft_endpoint(
+        &self,
+        node_id: &NodeId,
+    ) -> Result<Endpoint, MetaNetworkError> {
         let endpoint = self
             .get_node(node_id)
             .await

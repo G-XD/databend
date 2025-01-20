@@ -1,22 +1,16 @@
 name: "Publish Binary"
 description: "Publish releases binaries"
 inputs:
-  github_token:
-    description: "GitHub token"
-    required: true
   version:
     description: "Release version"
     required: true
   target:
     description: "Release target"
     required: true
-  repo_role_arn:
-    description: "Repo Role Arn"
-    required: true
-  mode:
-    description: "Release Normal / Hive"
+  category:
+    description: "Release default/hdfs/udf/testsuite"
     required: false
-    default: normal
+    default: default
 
 runs:
   using: "composite"
@@ -25,15 +19,15 @@ runs:
       id: name
       shell: bash
       run: |
-        case ${{ inputs.mode }} in
-          normal)
+        case ${{ inputs.category }} in
+          default)
             publish_name="databend-${{ inputs.version }}-${{ inputs.target }}"
             ;;
-          hive)
-            publish_name="databend-hive-${{ inputs.version }}-${{ inputs.target }}"
+          hdfs|udf|testsuite)
+            publish_name="databend-${{ inputs.category }}-${{ inputs.version }}-${{ inputs.target }}"
             ;;
           *)
-            echo "Unknown release mode: ${{ inputs.mode }}"
+            echo "Unknown release category {{ inputs.category }}"
             exit 1
             ;;
         esac
@@ -41,33 +35,22 @@ runs:
 
     - name: Update release to github
       shell: bash
-      env:
-        GH_TOKEN: ${{ inputs.github_token }}
       # Reference: https://cli.github.com/manual/gh_release_upload
       run: |
-        gh release upload ${{ inputs.version }} ${{ steps.name.outputs.name }}.*
+        gh release upload ${{ inputs.version }} ${{ steps.name.outputs.name }}.tar.gz --clobber
+        if [ -f ${{ steps.name.outputs.name }}-dbg.tar.gz ]; then
+          gh release upload ${{ inputs.version }} ${{ steps.name.outputs.name }}-dbg.tar.gz --clobber
+        fi
 
-    - name: Configure AWS credentials
-      uses: aws-actions/configure-aws-credentials@v2
-      with:
-        role-duration-seconds: 900
-        role-to-assume: ${{ inputs.repo_role_arn }}
-        aws-region: us-east-2
-
-    - name: Sync normal release to S3
+    - name: Sync normal release to R2
       shell: bash
-      if: inputs.mode == 'normal'
+      if: inputs.category == 'default'
       run: |
-        aws s3 cp ${{ steps.name.outputs.name }}.tar.gz s3://repo.databend.rs/databend/${{ inputs.version }}/${{ steps.name.outputs.name }}.tar.gz --no-progress
-        curl --retry 3 -fsSLo tags.json \
-            --header 'content-type: application/json' \
-            --header 'authorization: Bearer ${{ inputs.github_token }}' \
-            https://api.github.com/repos/datafuselabs/databend/tags
-        cat tags.json
-        aws s3 cp ./tags.json s3://repo.databend.rs/databend/tags.json
-        curl --retry 3 -fsSLo releases.json \
-            --header 'content-type: application/json' \
-            --header 'authorization: Bearer ${{ inputs.github_token }}' \
-            https://api.github.com/repos/datafuselabs/databend/releases
-        cat releases.json
-        aws s3 cp ./releases.json s3://repo.databend.rs/databend/releases.json
+        aws s3 cp ${{ steps.name.outputs.name }}.tar.gz s3://repo/databend/${{ inputs.version }}/${{ steps.name.outputs.name }}.tar.gz --no-progress
+        if [ -f ${{ steps.name.outputs.name }}-dbg.tar.gz ]; then
+          aws s3 cp ${{ steps.name.outputs.name }}-dbg.tar.gz s3://repo/databend/${{ inputs.version }}/${{ steps.name.outputs.name }}-dbg.tar.gz --no-progress
+        fi
+        gh api /repos/databendlabs/databend/tags > tags.json
+        aws s3 cp ./tags.json s3://repo/databend/tags.json
+        gh api /repos/databendlabs/databend/releases > releases.json
+        aws s3 cp ./releases.json s3://repo/databend/releases.json

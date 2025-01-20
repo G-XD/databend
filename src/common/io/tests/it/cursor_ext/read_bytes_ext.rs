@@ -14,36 +14,36 @@
 
 use std::io::Cursor;
 
-use common_io::cursor_ext::*;
+use databend_common_io::cursor_ext::*;
 
 #[test]
 fn test_read_ext() {
     let mut cursor = Cursor::new("1 bytes   helloworld".as_bytes());
 
     cursor.ignore_byte(b'1');
-    cursor.ignore_white_spaces();
-    let bs = cursor.remaining_slice();
+    cursor.ignore_white_spaces_or_comments();
+    let bs = Cursor::split(&cursor).1;
     assert_eq!(String::from_utf8_lossy(bs), "bytes   helloworld");
 
     let mut vec = vec![];
     cursor.until(b's', &mut vec);
     assert_eq!(
-        String::from_utf8_lossy(cursor.remaining_slice()),
+        String::from_utf8_lossy(Cursor::split(&cursor).1),
         "   helloworld"
     );
     assert_eq!(String::from_utf8_lossy(&vec), "bytes".to_string());
 
-    let spaces = cursor.ignore_white_spaces();
+    let spaces = cursor.ignore_white_spaces_or_comments();
     assert!(spaces);
     assert_eq!(
-        String::from_utf8_lossy(cursor.remaining_slice()),
+        String::from_utf8_lossy(Cursor::split(&cursor).1),
         "helloworld"
     );
 
     let mut cursor = Cursor::new("1 bytes   helloworld".as_bytes());
 
     cursor.ignore_byte(b'1');
-    cursor.ignore_white_spaces();
-    let bs = cursor.remaining_slice();
+    cursor.ignore_white_spaces_or_comments();
+    let bs = Cursor::split(&cursor).1;
     assert_eq!(String::from_utf8_lossy(bs), "bytes   helloworld");
 }

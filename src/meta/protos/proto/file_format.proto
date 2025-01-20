@@ -84,12 +84,15 @@ message FileFormatParams {
     JsonFileFormatParams json = 4;
     NdJsonFileFormatParams nd_json = 5;
     XmlFileFormatParams xml = 6;
+    OrcFileFormatParams orc = 7;
   }
 }
 
 message ParquetFileFormatParams {
   uint64 ver = 100;
   uint64 min_reader_ver = 101;
+  optional string missing_field_as = 1;
+  repeated string null_if = 4;
 }
 
 message CsvFileFormatParams {
@@ -103,6 +106,14 @@ message CsvFileFormatParams {
   string nan_display = 5;
   string escape = 6;
   string quote = 7;
+  string null_display = 8;
+  // corresponding to `!error_on_column_count_mismatch`
+  // for we can not set default value in proto3
+  bool allow_column_count_mismatch = 9;
+  optional string empty_field_as = 10;
+  optional string binary_format = 11;
+  bool output_header = 12;
+  optional string geometry_format = 13;
 }
 
 message TsvFileFormatParams {
@@ -129,11 +140,19 @@ message NdJsonFileFormatParams {
   uint64 ver = 100;
   uint64 min_reader_ver = 101;
   StageFileCompression compression = 1;
+  optional string missing_field_as = 2;
+  optional string null_field_as = 3;
+  repeated string null_if = 4;
 }
 
 message JsonFileFormatParams {
   uint64 ver = 100;
   uint64 min_reader_ver = 101;
   StageFileCompression compression = 1;
+}
 
+message OrcFileFormatParams {
+  uint64 ver = 100;
+  uint64 min_reader_ver = 101;
+  optional string missing_field_as = 1;
 }

@@ -14,17 +14,18 @@
 
 use std::sync::Arc;
 
-use common_exception::ErrorCode;
-use common_exception::Result;
-use common_expression::RemoteExpr;
-use common_expression::TableDataType;
-use common_expression::TableSchemaRef;
-use storages_common_table_meta::meta::BlockMeta;
+use databend_common_exception::ErrorCode;
+use databend_common_exception::Result;
+use databend_common_expression::RemoteExpr;
+use databend_common_expression::TableDataType;
+use databend_common_expression::TableSchemaRef;
+use databend_storages_common_table_meta::meta::BlockMeta;
 
 use crate::BlockMetaIndex;
 
 /// TopN pruner.
 /// Pruning for order by x limit N.
+#[derive(Clone)]
 pub struct TopNPrunner {
     schema: TableSchemaRef,
     sort: Vec<(RemoteExpr<String>, bool, bool)>,
@@ -59,9 +60,6 @@ impl TopNPrunner {
         }
 
         let (sort, asc, nulls_first) = &self.sort[0];
-        // Currently, we only support topn on single-column sort.
-        // TODO: support monadic + multi expression + order by cluster key sort.
-
         // Currently, we only support topn on single-column sort.
         // TODO: support monadic + multi expression + order by cluster key sort.
         let column = if let RemoteExpr::ColumnRef { id, .. } = sort {

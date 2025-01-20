@@ -14,9 +14,10 @@
 
 use std::sync::Arc;
 
-use common_exception::Result;
-use common_sql::plans::DropNetworkPolicyPlan;
-use common_users::UserApiProvider;
+use databend_common_exception::ErrorCode;
+use databend_common_exception::Result;
+use databend_common_sql::plans::DropNetworkPolicyPlan;
+use databend_common_users::UserApiProvider;
 use log::debug;
 
 use crate::interpreters::Interpreter;
@@ -42,13 +43,29 @@ impl Interpreter for DropNetworkPolicyInterpreter {
         "DropNetworkPolicyInterpreter"
     }
 
-    #[minitrace::trace]
+    fn is_ddl(&self) -> bool {
+        true
+    }
+
+    #[fastrace::trace]
     #[async_backtrace::framed]
     async fn execute2(&self) -> Result<PipelineBuildResult> {
         debug!("ctx.id" = self.ctx.get_id().as_str(); "drop_network_policy_execute");
 
         let plan = self.plan.clone();
         let tenant = self.ctx.get_tenant();
+
+        let global_network_policy = self
+            .ctx
+            .get_settings()
+            .get_network_policy()
+            .unwrap_or_default();
+        if global_network_policy == plan.name {
+            return Err(ErrorCode::NetworkPolicyIsUsedByUser(format!(
+                "network policy `{}` is global network policy, can't be dropped",
+                global_network_policy,
+            )));
+        }
 
         let user_mgr = UserApiProvider::instance();
         user_mgr

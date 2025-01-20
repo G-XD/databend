@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::fmt;
 use std::future::Future;
 use std::marker::PhantomData;
 use std::pin::Pin;
@@ -19,6 +20,8 @@ use std::task::Context;
 use std::task::Poll;
 use std::time::Duration;
 
+use log::debug;
+use log::info;
 use pin_project_lite::pin_project;
 use tokio::time::Instant;
 
@@ -26,7 +29,7 @@ pin_project! {
     /// A [`Future`] that tracks the time spent on a future.
     /// When the future is ready, the callback will be called with the total time and busy time.
     #[must_use = "futures do nothing unless you `.await` or poll them"]
-    pub struct TimingFuture<'a, T, F>
+    pub struct TimedFuture<'a, T, F>
     where F: Fn(Duration, Duration) ,
     F: 'a,
     {
@@ -41,7 +44,7 @@ pin_project! {
     }
 }
 
-impl<'a, T, F> TimingFuture<'a, T, F>
+impl<'a, T, F> TimedFuture<'a, T, F>
 where
     F: Fn(Duration, Duration),
     F: 'a,
@@ -57,7 +60,7 @@ where
     }
 }
 
-impl<'a, T: Future, F> Future for TimingFuture<'a, T, F>
+impl<'a, T: Future, F> Future for TimedFuture<'a, T, F>
 where
     F: Fn(Duration, Duration),
     F: 'a,
@@ -86,41 +89,68 @@ where
     }
 }
 
-/// Enable timing for a future with `fu.timed(f)`.
-pub trait TimingFutureExt {
+/// Enable timing for a future with `fu.with_timing(f)`.
+pub trait TimedFutureExt {
     /// Wrap the future with a timing future.
-    fn timed<'a, F>(self, f: F) -> TimingFuture<'a, Self, F>
+    fn with_timing<'a, F>(self, f: F) -> TimedFuture<'a, Self, F>
     where
         F: Fn(Duration, Duration) + 'a,
         Self: Future + Sized;
 
-    /// Wrap the future with a timing future, and call the callback if the total time is greater than the threshold.
-    fn timed_ge<'a, F>(
+    /// Wrap the future with a timing future,
+    /// and call the callback if the total time exceeds the threshold.
+    fn with_timing_threshold<'a, F>(
         self,
         threshold: Duration,
         f: F,
-    ) -> TimingFuture<'a, Self, impl Fn(Duration, Duration)>
+    ) -> TimedFuture<'a, Self, impl Fn(Duration, Duration)>
     where
         F: Fn(Duration, Duration) + 'a,
         Self: Future + Sized,
     {
-        self.timed::<'a>(move |total, busy| {
+        self.with_timing::<'a>(move |total, busy| {
             if total >= threshold {
                 f(total, busy)
             }
         })
     }
+
+    /// Log elapsed time(total and busy) in DEBUG level when the future is ready.
+    fn log_elapsed_debug<'a>(
+        self,
+        ctx: impl fmt::Display + 'a,
+    ) -> TimedFuture<'a, Self, impl Fn(Duration, Duration)>
+    where
+        Self: Future + Sized,
+    {
+        self.with_timing::<'a>(move |total, busy| {
+            debug!("Elapsed: total: {:?}, busy: {:?}; {}", total, busy, ctx);
+        })
+    }
+
+    /// Log elapsed time(total and busy) in info level when the future is ready.
+    fn log_elapsed_info<'a>(
+        self,
+        ctx: impl fmt::Display + 'a,
+    ) -> TimedFuture<'a, Self, impl Fn(Duration, Duration)>
+    where
+        Self: Future + Sized,
+    {
+        self.with_timing::<'a>(move |total, busy| {
+            info!("Elapsed: total: {:?}, busy: {:?}; {}", total, busy, ctx);
+        })
+    }
 }
 
-impl<T> TimingFutureExt for T
+impl<T> TimedFutureExt for T
 where T: Future + Sized
 {
-    fn timed<'a, F>(self, f: F) -> TimingFuture<'a, Self, F>
+    fn with_timing<'a, F>(self, f: F) -> TimedFuture<'a, Self, F>
     where
         F: Fn(Duration, Duration),
         F: 'a,
     {
-        TimingFuture::new(self, f)
+        TimedFuture::new(self, f)
     }
 }
 
@@ -132,8 +162,8 @@ mod tests {
     use std::task::Poll;
     use std::time::Duration;
 
-    use crate::future::TimingFuture;
-    use crate::future::TimingFutureExt;
+    use crate::future::TimedFuture;
+    use crate::future::TimedFutureExt;
 
     struct BlockingSleep20ms {}
 
@@ -157,7 +187,7 @@ mod tests {
         // Blocking sleep
 
         let f = BlockingSleep20ms {};
-        let f = TimingFuture::new(f, |total, busy| {
+        let f = TimedFuture::new(f, |total, busy| {
             // println!("total: {:?}, busy: {:?}", total, busy);
             assert!(total >= Duration::from_millis(20));
             assert!(total <= Duration::from_millis(50));
@@ -171,7 +201,7 @@ mod tests {
         // Async sleep
 
         let f = async move { tokio::time::sleep(Duration::from_millis(20)).await };
-        let f = TimingFuture::new(f, |total, busy| {
+        let f = TimedFuture::new(f, |total, busy| {
             // println!("total: {:?}, busy: {:?}", total, busy);
             assert!(total >= Duration::from_millis(20));
             assert!(total <= Duration::from_millis(50));
@@ -194,7 +224,7 @@ mod tests {
 
         // Blocking sleep
 
-        let f = BlockingSleep20ms {}.timed(|total, busy| {
+        let f = BlockingSleep20ms {}.with_timing(|total, busy| {
             assert!(total >= Duration::from_millis(20));
             assert!(total <= Duration::from_millis(50));
 
@@ -204,15 +234,17 @@ mod tests {
 
         rt.block_on(f);
 
-        rt.block_on(
-            BlockingSleep20ms {}.timed_ge(Duration::from_millis(10), |_total, _busy| {
+        rt.block_on(BlockingSleep20ms {}.with_timing_threshold(
+            Duration::from_millis(10),
+            |_total, _busy| {
                 // OK, triggered
-            }),
-        );
+            },
+        ));
         rt.block_on(
-            BlockingSleep20ms {}.timed_ge(Duration::from_millis(100), |_total, _busy| {
-                unreachable!("should not be called")
-            }),
+            BlockingSleep20ms {}
+                .with_timing_threshold(Duration::from_millis(100), |_total, _busy| {
+                    unreachable!("should not be called")
+                }),
         );
 
         Ok(())

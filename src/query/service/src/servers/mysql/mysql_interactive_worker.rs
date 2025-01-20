@@ -13,30 +13,31 @@
 // limitations under the License.
 
 use std::sync::Arc;
+use std::time::Duration;
 use std::time::Instant;
 
-use common_base::base::convert_byte_size;
-use common_base::base::convert_number_size;
-use common_base::base::tokio::io::AsyncWrite;
-use common_base::runtime::TrySpawn;
-use common_config::DATABEND_COMMIT_VERSION;
-use common_exception::ErrorCode;
-use common_exception::Result;
-use common_exception::ToErrorCode;
-use common_expression::DataBlock;
-use common_expression::DataSchemaRef;
-use common_expression::SendableDataBlockStream;
-use common_io::prelude::FormatSettings;
-use common_meta_app::principal::UserIdentity;
-use common_sql::Planner;
-use common_tracing::func_name;
-use common_users::CertifiedInfo;
-use common_users::UserApiProvider;
+use databend_common_base::base::convert_byte_size;
+use databend_common_base::base::convert_number_size;
+use databend_common_base::base::tokio::io::AsyncWrite;
+use databend_common_base::runtime::ThreadTracker;
+use databend_common_base::runtime::TrySpawn;
+use databend_common_config::DATABEND_COMMIT_VERSION;
+use databend_common_exception::ErrorCode;
+use databend_common_exception::Result;
+use databend_common_exception::ToErrorCode;
+use databend_common_expression::DataBlock;
+use databend_common_expression::DataSchemaRef;
+use databend_common_expression::SendableDataBlockStream;
+use databend_common_io::prelude::FormatSettings;
+use databend_common_meta_app::principal::UserIdentity;
+use databend_common_metrics::mysql::*;
+use databend_common_users::CertifiedInfo;
+use databend_common_users::UserApiProvider;
+use fastrace::func_path;
+use fastrace::prelude::*;
 use futures_util::StreamExt;
 use log::error;
 use log::info;
-use metrics::histogram;
-use minitrace::prelude::*;
 use opensrv_mysql::AsyncMysqlShim;
 use opensrv_mysql::ErrorKind;
 use opensrv_mysql::InitWriter;
@@ -44,10 +45,11 @@ use opensrv_mysql::ParamParser;
 use opensrv_mysql::QueryResultWriter;
 use opensrv_mysql::StatementMetaWriter;
 use rand::RngCore;
+use uuid::Uuid;
 
+use crate::interpreters::interpreter_plan_sql;
 use crate::interpreters::Interpreter;
 use crate::interpreters::InterpreterFactory;
-use crate::interpreters::InterpreterQueryLog;
 use crate::servers::mysql::writers::DFInitResultWriter;
 use crate::servers::mysql::writers::DFQueryResultWriter;
 use crate::servers::mysql::writers::ProgressReporter;
@@ -68,6 +70,7 @@ pub struct InteractiveWorker {
     version: String,
     salt: [u8; 20],
     client_addr: String,
+    keep_alive_task_started: bool,
 }
 
 #[async_trait::async_trait]
@@ -187,43 +190,55 @@ impl<W: AsyncWrite + Send + Sync + Unpin> AsyncMysqlShim<W> for InteractiveWorke
         query: &'a str,
         writer: QueryResultWriter<'a, W>,
     ) -> Result<()> {
-        if self.base.session.is_aborting() {
-            writer
-                .error(
-                    ErrorKind::ER_ABORTING_CONNECTION,
-                    "Aborting this connection. because we are try aborting server.".as_bytes(),
-                )
-                .await?;
+        let query_id = Uuid::new_v4().to_string();
+        let root = Span::root(func_path!(), SpanContext::random())
+            .with_properties(|| self.base.session.to_fastrace_properties());
 
-            return Err(ErrorCode::AbortedSession(
-                "Aborting this connection. because we are try aborting server.",
-            ));
-        }
+        let mut tracking_payload = ThreadTracker::new_tracking_payload();
+        tracking_payload.query_id = Some(query_id.clone());
+        let _guard = ThreadTracker::tracking(tracking_payload);
 
-        let mut writer = DFQueryResultWriter::create(writer);
+        ThreadTracker::tracking_future(async {
+            if self.base.session.is_aborting() {
+                writer
+                    .error(
+                        ErrorKind::ER_ABORTING_CONNECTION,
+                        "Aborting this connection. because we are try aborting server.".as_bytes(),
+                    )
+                    .await?;
 
-        let instant = Instant::now();
-        let query_result = self
-            .base
-            .do_query(query)
-            .await
-            .map_err(|err| err.display_with_sql(query));
+                return Err(ErrorCode::AbortedSession(
+                    "Aborting this connection. because we are try aborting server.",
+                ));
+            }
 
-        let format = self.base.session.get_format_settings();
+            let mut writer = DFQueryResultWriter::create(writer, self.base.session.clone());
+            if !self.keep_alive_task_started {
+                self.start_keep_alive().await
+            }
 
-        let mut write_result = writer.write(query_result, &format).await;
+            let instant = Instant::now();
+            let query_result = self
+                .base
+                .do_query(query_id, query)
+                .await
+                .map_err(|err| err.display_with_sql(query));
 
-        if let Err(cause) = write_result {
-            let suffix = format!("(while in query {})", query);
-            write_result = Err(cause.add_message_back(suffix));
-        }
+            let format = self.base.session.get_format_settings();
 
-        histogram!(
-            super::mysql_metrics::METRIC_MYSQL_PROCESSOR_REQUEST_DURATION,
-            instant.elapsed()
-        );
+            let mut write_result = writer.write(query_result, &format).await;
 
-        write_result
+            if let Err(cause) = write_result {
+                self.base.session.txn_mgr().lock().set_fail();
+                let suffix = format!("(while in query {})", query);
+                write_result = Err(cause.add_message_back(suffix));
+            }
+            observe_mysql_process_request_duration(instant.elapsed());
+
+            write_result
+        })
+        .in_span(root)
+        .await
     }
 
     #[async_backtrace::framed]
@@ -254,16 +269,39 @@ impl<W: AsyncWrite + Send + Sync + Unpin> AsyncMysqlShim<W> for InteractiveWorke
 impl InteractiveWorkerBase {
     #[async_backtrace::framed]
     async fn authenticate(&self, salt: &[u8], info: CertifiedInfo) -> Result<bool> {
+        let user_api = UserApiProvider::instance();
         let ctx = self.session.create_query_context().await?;
+        let tenant = ctx.get_tenant();
         let identity = UserIdentity::new(&info.user_name, "%");
         let client_ip = info.user_client_address.split(':').collect::<Vec<_>>()[0];
-        let user_info = UserApiProvider::instance()
-            .get_user_with_client_ip(&ctx.get_tenant(), identity, Some(client_ip))
+        let mut user = user_api
+            .get_user_with_client_ip(&tenant, identity.clone(), Some(client_ip))
             .await?;
 
-        let authed = user_info.auth_info.auth_mysql(&info.user_password, salt)?;
+        // check global network policy if user is not account admin
+        if !user.is_account_admin() {
+            let global_network_policy = ctx.get_settings().get_network_policy().unwrap_or_default();
+            if !global_network_policy.is_empty() {
+                user_api
+                    .enforce_network_policy(&tenant, &global_network_policy, Some(client_ip))
+                    .await?;
+            }
+        }
+
+        // Check password policy for login
+        let need_change = user_api
+            .check_login_password(&tenant, identity.clone(), &user)
+            .await?;
+        if need_change {
+            user.update_auth_need_change_password();
+        }
+
+        let authed = user.auth_info.auth_mysql(&info.user_password, salt)?;
+        user_api
+            .update_user_login_result(tenant, identity, authed, &user)
+            .await?;
         if authed {
-            self.session.set_authed_user(user_info, None).await?;
+            self.session.set_authed_user(user, None).await?;
         }
         Ok(authed)
     }
@@ -319,68 +357,60 @@ impl InteractiveWorkerBase {
     }
 
     #[async_backtrace::framed]
-    async fn do_query(&mut self, query: &str) -> Result<(QueryResult, Option<FormatSettings>)> {
-        let root = Span::root(func_name!(), SpanContext::random());
-        async {
-            match self.federated_server_command_check(query) {
-                Some((schema, data_block)) => {
-                    info!("Federated query: {}", query);
-                    if data_block.num_rows() > 0 {
-                        info!("Federated response: {:?}", data_block);
-                    }
-                    let has_result = data_block.num_rows() > 0;
-                    Ok((
-                        QueryResult::create(
-                            DataBlockStream::create(None, vec![data_block]).boxed(),
-                            None,
-                            has_result,
-                            schema,
-                            query.to_string(),
-                        ),
+    #[fastrace::trace]
+    async fn do_query(
+        &mut self,
+        query_id: String,
+        query: &str,
+    ) -> Result<(QueryResult, Option<FormatSettings>)> {
+        match self.federated_server_command_check(query) {
+            Some((schema, data_block)) => {
+                info!("Federated query: {}", query);
+                if data_block.num_rows() > 0 {
+                    info!("Federated response: {:?}", data_block);
+                }
+                let has_result = data_block.num_rows() > 0;
+                Ok((
+                    QueryResult::create(
+                        DataBlockStream::create(None, vec![data_block]).boxed(),
                         None,
-                    ))
-                }
-                None => {
-                    info!("Normal query: {}", query);
-                    let context = self.session.create_query_context().await?;
+                        has_result,
+                        schema,
+                        query.to_string(),
+                    ),
+                    None,
+                ))
+            }
+            None => {
+                info!("Normal query: {}", query);
+                let context = self.session.create_query_context().await?;
+                context.update_init_query_id(query_id);
 
-                    let mut planner = Planner::new(context.clone());
-                    let (plan, extras) = planner.plan_sql(query).await?;
+                // Use interpreter_plan_sql, we can write the query log if an error occurs.
+                let (plan, _, _guard) = interpreter_plan_sql(context.clone(), query, true).await?;
 
-                    context.attach_query_str(plan.to_string(), extras.statement.to_mask_sql());
-                    let interpreter = InterpreterFactory::get(context.clone(), &plan).await;
-                    let has_result_set = plan.has_result_set();
+                let interpreter = InterpreterFactory::get(context.clone(), &plan).await?;
+                let has_result_set = plan.has_result_set();
 
-                    match interpreter {
-                        Ok(interpreter) => {
-                            let (blocks, extra_info) =
-                                Self::exec_query(interpreter.clone(), &context).await?;
-                            let schema = interpreter.schema();
-                            let format = context.get_format_settings()?;
-                            Ok((
-                                QueryResult::create(
-                                    blocks,
-                                    extra_info,
-                                    has_result_set,
-                                    schema,
-                                    query.to_string(),
-                                ),
-                                Some(format),
-                            ))
-                        }
-                        Err(e) => {
-                            InterpreterQueryLog::fail_to_start(context, e.clone());
-                            Err(e)
-                        }
-                    }
-                }
+                let (blocks, extra_info) = Self::exec_query(interpreter.clone(), &context).await?;
+                let schema = plan.schema();
+                let format = context.get_format_settings()?;
+                Ok((
+                    QueryResult::create(
+                        blocks,
+                        extra_info,
+                        has_result_set,
+                        schema,
+                        query.to_string(),
+                    ),
+                    Some(format),
+                ))
             }
         }
-        .in_span(root)
-        .await
     }
 
     #[async_backtrace::framed]
+    #[fastrace::trace]
     async fn exec_query(
         interpreter: Arc<dyn Interpreter>,
         context: &Arc<QueryContext>,
@@ -388,18 +418,14 @@ impl InteractiveWorkerBase {
         SendableDataBlockStream,
         Option<Box<dyn ProgressReporter + Send>>,
     )> {
-        let root = Span::root(func_name!(), SpanContext::random());
-        async {
-            let instant = Instant::now();
+        let instant = Instant::now();
 
-            let query_result = context.try_spawn({
+        let query_result = context.try_spawn(
+            {
                 let ctx = context.clone();
                 async move {
                     let mut data_stream = interpreter.execute(ctx.clone()).await?;
-                    histogram!(
-                        super::mysql_metrics::METRIC_INTERPRETER_USEDTIME,
-                        instant.elapsed()
-                    );
+                    observe_mysql_interpreter_used_time(instant.elapsed());
 
                     // Wrap the data stream, log finish event at the end of stream
                     let intercepted_stream = async_stream::stream! {
@@ -411,19 +437,19 @@ impl InteractiveWorkerBase {
 
                     Ok::<_, ErrorCode>(intercepted_stream.boxed())
                 }
-                .in_span(Span::enter_with_local_parent("exec_query"))
-            })?;
+                .in_span(Span::enter_with_local_parent(func_path!()))
+            },
+            None,
+        )?;
 
-            let query_result = query_result.await.map_err_to_code(
-                ErrorCode::TokioError,
-                || "Cannot join handle from context's runtime",
-            )?;
-            let reporter = Box::new(ContextProgressReporter::new(context.clone(), instant))
-                as Box<dyn ProgressReporter + Send>;
-            query_result.map(|data| (data, Some(reporter)))
-        }
-        .in_span(root)
-        .await
+        let query_result = query_result
+            .await
+            .map_err_to_code(ErrorCode::TokioError, || {
+                "Cannot join handle from context's runtime"
+            })?;
+        let reporter = Box::new(ContextProgressReporter::new(context.clone(), instant))
+            as Box<dyn ProgressReporter + Send>;
+        query_result.map(|data| (data, Some(reporter)))
     }
 
     #[async_backtrace::framed]
@@ -431,9 +457,15 @@ impl InteractiveWorkerBase {
         if database_name.is_empty() {
             return Ok(());
         }
+
+        let query_id = Uuid::new_v4().to_string();
         let init_query = format!("USE `{}`;", database_name);
 
-        let do_query = self.do_query(&init_query).await;
+        let mut tracking_payload = ThreadTracker::new_tracking_payload();
+        tracking_payload.query_id = Some(query_id.clone());
+        let _guard = ThreadTracker::tracking(tracking_payload);
+
+        let do_query = ThreadTracker::tracking_future(self.do_query(query_id, &init_query)).await;
         match do_query {
             Ok((_, _)) => Ok(()),
             Err(error_code) => Err(error_code),
@@ -460,7 +492,34 @@ impl InteractiveWorker {
             salt: scramble,
             version: format!("{}-{}", MYSQL_VERSION, *DATABEND_COMMIT_VERSION),
             client_addr,
+            keep_alive_task_started: false,
         }
+    }
+
+    async fn start_keep_alive(&mut self) {
+        let session = &self.base.session;
+        let tenant = session.get_current_tenant();
+        let session_id = session.get_id();
+        let user_name = session
+            .get_current_user()
+            .expect("mysql handler should be authed when call")
+            .name;
+        self.keep_alive_task_started = true;
+
+        databend_common_base::runtime::spawn(async move {
+            loop {
+                UserApiProvider::instance()
+                    .client_session_api(&tenant)
+                    .upsert_client_session_id(
+                        &session_id,
+                        &user_name,
+                        Duration::from_secs(3600 + 600),
+                    )
+                    .await
+                    .ok();
+                tokio::time::sleep(Duration::from_secs(3600)).await;
+            }
+        });
     }
 }
 

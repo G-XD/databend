@@ -12,49 +12,43 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::alloc::Layout;
-use std::fmt;
-use std::marker::PhantomData;
-use std::sync::Arc;
-
-use common_arrow::arrow::bitmap::Bitmap;
-use common_exception::ErrorCode;
-use common_exception::Result;
-use common_expression::types::decimal::*;
-use common_expression::types::number::Int8Type;
-use common_expression::types::number::Number;
-use common_expression::types::ArgType;
-use common_expression::types::DataType;
-use common_expression::types::DecimalDataType;
-use common_expression::types::NumberDataType;
-use common_expression::types::NumberType;
-use common_expression::types::ValueType;
-use common_expression::types::F64;
-use common_expression::utils::arithmetics_type::ResultTypeOfUnary;
-use common_expression::with_number_mapped_type;
-use common_expression::Column;
-use common_expression::ColumnBuilder;
-use common_expression::Scalar;
-use common_io::prelude::*;
-use ethnum::i256;
+use boolean::TrueIdxIter;
+use borsh::BorshDeserialize;
+use borsh::BorshSerialize;
+use databend_common_exception::ErrorCode;
+use databend_common_exception::Result;
+use databend_common_expression::types::decimal::*;
+use databend_common_expression::types::number::*;
+use databend_common_expression::types::Bitmap;
+use databend_common_expression::types::Buffer;
+use databend_common_expression::types::*;
+use databend_common_expression::utils::arithmetics_type::ResultTypeOfUnary;
+use databend_common_expression::with_number_mapped_type;
+use databend_common_expression::AggregateFunctionRef;
+use databend_common_expression::Column;
+use databend_common_expression::ColumnBuilder;
+use databend_common_expression::Scalar;
+use databend_common_expression::StateAddr;
+use databend_common_expression::SELECTIVITY_THRESHOLD;
 use num_traits::AsPrimitive;
-use serde::de::DeserializeOwned;
-use serde::Serialize;
 
-use super::aggregate_function::AggregateFunction;
-use super::aggregate_function::AggregateFunctionRef;
-use super::aggregate_function_factory::AggregateFunctionDescription;
-use super::StateAddr;
-use crate::aggregates::aggregator_common::assert_unary_arguments;
+use super::assert_unary_arguments;
+use super::FunctionData;
+use crate::aggregates::aggregate_function_factory::AggregateFunctionDescription;
+use crate::aggregates::aggregate_unary::UnaryState;
+use crate::aggregates::AggrStateLoc;
+use crate::aggregates::AggregateUnaryFunction;
 
-pub trait SumState: Send + Sync + Default + 'static {
-    fn merge(&mut self, other: &mut Self) -> Result<()>;
-    fn serialize(&self, writer: &mut Vec<u8>) -> Result<()>;
-    fn deserialize(&mut self, reader: &mut &[u8]) -> Result<()>;
+pub trait SumState: BorshSerialize + BorshDeserialize + Send + Sync + Default + 'static {
+    fn merge(&mut self, other: &Self) -> Result<()>;
+    fn mem_size() -> Option<usize> {
+        None
+    }
+
     fn accumulate(&mut self, column: &Column, validity: Option<&Bitmap>) -> Result<()>;
 
     fn accumulate_row(&mut self, column: &Column, row: usize) -> Result<()>;
-    fn accumulate_keys(places: &[StateAddr], offset: usize, columns: &Column) -> Result<()>;
+    fn accumulate_keys(places: &[StateAddr], loc: &[AggrStateLoc], columns: &Column) -> Result<()>;
 
     fn merge_result(
         &mut self,
@@ -71,307 +65,215 @@ pub trait SumState: Send + Sync + Default + 'static {
     ) -> Result<()>;
 }
 
-#[derive(Default)]
-pub struct NumberSumState<T: Number, TSum: Number> {
-    pub value: TSum,
-    _t: PhantomData<T>,
+#[derive(BorshSerialize, BorshDeserialize)]
+pub struct NumberSumState<N>
+where N: ValueType
+{
+    pub value: N::Scalar,
 }
 
-impl<T, TSum> SumState for NumberSumState<T, TSum>
+impl<N> Default for NumberSumState<N>
+where
+    N: ValueType,
+    N::Scalar: Number + AsPrimitive<f64> + BorshSerialize + BorshDeserialize + std::ops::AddAssign,
+{
+    fn default() -> Self {
+        NumberSumState::<N> {
+            value: N::Scalar::default(),
+        }
+    }
+}
+
+// #[multiversion::multiversion(targets("x86_64+avx", "x86_64+sse"))]
+#[inline]
+pub fn sum_batch<T, TSum>(inner: Buffer<T>, validity: Option<&Bitmap>) -> TSum
 where
     T: Number + AsPrimitive<TSum>,
-    TSum: Number + AsPrimitive<f64> + Serialize + DeserializeOwned + std::ops::AddAssign,
+    TSum: Number + std::ops::AddAssign,
 {
-    fn serialize(&self, writer: &mut Vec<u8>) -> Result<()> {
-        serialize_into_buf(writer, &self.value)
-    }
+    match validity {
+        Some(v) => {
+            let mut sum = TSum::default();
+            if v.true_count() as f64 / v.len() as f64 >= SELECTIVITY_THRESHOLD {
+                inner.iter().zip(v.iter()).for_each(|(t, b)| {
+                    if b {
+                        sum += t.as_();
+                    }
+                });
+            } else {
+                TrueIdxIter::new(v.len(), Some(v)).for_each(|idx| {
+                    sum += unsafe { inner.get_unchecked(idx).as_() };
+                });
+            }
+            sum
+        }
+        _ => {
+            let mut sum = TSum::default();
+            inner.iter().for_each(|t| {
+                sum += t.as_();
+            });
 
-    fn deserialize(&mut self, reader: &mut &[u8]) -> Result<()> {
-        self.value = deserialize_from_slice(reader)?;
+            sum
+        }
+    }
+}
+
+impl<T, N> UnaryState<T, N> for NumberSumState<N>
+where
+    T: ValueType + Sync + Send,
+    N: ValueType,
+    T::Scalar: Number + AsPrimitive<N::Scalar>,
+    N::Scalar: Number + AsPrimitive<f64> + BorshSerialize + BorshDeserialize + std::ops::AddAssign,
+    for<'a> T::ScalarRef<'a>: Number + AsPrimitive<N::Scalar>,
+{
+    fn add(
+        &mut self,
+        other: T::ScalarRef<'_>,
+        _function_data: Option<&dyn FunctionData>,
+    ) -> Result<()> {
+        self.value += other.as_();
         Ok(())
     }
 
-    fn accumulate_row(&mut self, column: &Column, row: usize) -> Result<()> {
-        let darray = NumberType::<T>::try_downcast_column(column).unwrap();
-        self.value += darray[row].as_();
+    fn add_batch(
+        &mut self,
+        other: T::Column,
+        validity: Option<&Bitmap>,
+        _function_data: Option<&dyn FunctionData>,
+    ) -> Result<()> {
+        let col = T::upcast_column(other);
+        let buffer = NumberType::<T::Scalar>::try_downcast_column(&col).unwrap();
+        self.value += sum_batch::<T::Scalar, N::Scalar>(buffer, validity);
         Ok(())
     }
 
-    fn accumulate(&mut self, column: &Column, validity: Option<&Bitmap>) -> Result<()> {
-        let value = sum_primitive::<T, TSum>(column, validity)?;
-        self.value += value;
-        Ok(())
-    }
-
-    fn accumulate_keys(places: &[StateAddr], offset: usize, columns: &Column) -> Result<()> {
-        let darray = NumberType::<T>::try_downcast_column(columns).unwrap();
-        darray.iter().zip(places.iter()).for_each(|(c, place)| {
-            let place = place.next(offset);
-            let state = place.get::<Self>();
-            state.value += c.as_();
-        });
-        Ok(())
-    }
-
-    #[inline(always)]
-    fn merge(&mut self, other: &mut Self) -> Result<()> {
-        self.value += other.value;
+    fn merge(&mut self, rhs: &Self) -> Result<()> {
+        self.value += rhs.value;
         Ok(())
     }
 
     fn merge_result(
         &mut self,
-        builder: &mut ColumnBuilder,
-        _window_size: &Option<usize>,
+        builder: &mut N::ColumnBuilder,
+        _function_data: Option<&dyn FunctionData>,
     ) -> Result<()> {
-        let builder = NumberType::<TSum>::try_downcast_builder(builder).unwrap();
-        builder.push(self.value);
-        Ok(())
-    }
-
-    fn merge_avg_result(
-        &mut self,
-        builder: &mut ColumnBuilder,
-        count: u64,
-        _scale_add: u8,
-        _window_size: &Option<usize>,
-    ) -> Result<()> {
-        let builder = NumberType::<F64>::try_downcast_builder(builder).unwrap();
-
-        let value = self.value.as_() / (count as f64);
-        builder.push(value.into());
+        N::push_item(builder, N::to_scalar_ref(&self.value));
         Ok(())
     }
 }
 
-#[derive(Default)]
-pub struct DecimalSumState<T: Decimal> {
-    pub value: T,
-}
-
-impl<T> DecimalSumState<T>
-where T: Decimal
-        + std::ops::AddAssign
-        + Serialize
-        + DeserializeOwned
-        + Copy
-        + Clone
-        + std::fmt::Debug
-        + std::cmp::PartialOrd
+#[derive(BorshDeserialize, BorshSerialize)]
+pub struct DecimalSumState<const OVERFLOW: bool, T>
+where
+    T: ValueType,
+    T::Scalar: Decimal,
+    <T::Scalar as Decimal>::U64Array: BorshSerialize + BorshDeserialize,
 {
-    #[inline]
-    pub fn check_over_flow(&self) -> Result<()> {
-        if self.value > T::max_of_max_precision() {
+    pub value: <T::Scalar as Decimal>::U64Array,
+}
+
+impl<const OVERFLOW: bool, T> Default for DecimalSumState<OVERFLOW, T>
+where
+    T: ValueType,
+    T::Scalar: Decimal + std::ops::AddAssign,
+    <T::Scalar as Decimal>::U64Array: BorshSerialize + BorshDeserialize,
+{
+    fn default() -> Self {
+        Self {
+            value: <T::Scalar as Decimal>::U64Array::default(),
+        }
+    }
+}
+
+impl<const OVERFLOW: bool, T> UnaryState<T, T> for DecimalSumState<OVERFLOW, T>
+where
+    T: ValueType,
+    T::Scalar: Decimal + std::ops::AddAssign,
+    <T::Scalar as Decimal>::U64Array: BorshSerialize + BorshDeserialize,
+{
+    fn add(
+        &mut self,
+        other: T::ScalarRef<'_>,
+        _function_data: Option<&dyn FunctionData>,
+    ) -> Result<()> {
+        let mut value = T::Scalar::from_u64_array(self.value);
+        value += T::to_owned_scalar(other);
+
+        if OVERFLOW && (value > T::Scalar::MAX || value < T::Scalar::MIN) {
             return Err(ErrorCode::Overflow(format!(
-                "Decimal overflow: {} > {}",
+                "Decimal overflow: {:?} not in [{}, {}]",
                 self.value,
-                T::max_of_max_precision()
+                T::Scalar::MIN,
+                T::Scalar::MAX,
             )));
         }
-        Ok(())
-    }
-}
-
-impl<T> SumState for DecimalSumState<T>
-where T: Decimal
-        + std::ops::AddAssign
-        + Serialize
-        + DeserializeOwned
-        + Copy
-        + Clone
-        + std::fmt::Debug
-        + std::cmp::PartialOrd
-{
-    fn serialize(&self, writer: &mut Vec<u8>) -> Result<()> {
-        serialize_into_buf(writer, &self.value)
-    }
-
-    fn deserialize(&mut self, reader: &mut &[u8]) -> Result<()> {
-        self.value = deserialize_from_slice(reader)?;
+        self.value = value.to_u64_array();
         Ok(())
     }
 
-    fn accumulate_row(&mut self, column: &Column, row: usize) -> Result<()> {
-        let buffer = T::try_downcast_column(column).unwrap().0;
-        self.value += buffer[row];
-        self.check_over_flow()
-    }
-
-    fn accumulate(&mut self, column: &Column, validity: Option<&Bitmap>) -> Result<()> {
-        let buffer = T::try_downcast_column(column).unwrap().0;
-        match validity {
-            Some(validity) => {
-                for (i, v) in validity.iter().enumerate() {
-                    if v {
-                        self.value += buffer[i];
+    fn add_batch(
+        &mut self,
+        other: T::Column,
+        validity: Option<&Bitmap>,
+        function_data: Option<&dyn FunctionData>,
+    ) -> Result<()> {
+        if !OVERFLOW {
+            let mut sum = T::Scalar::from_u64_array(self.value);
+            let col = T::upcast_column(other);
+            let buffer = DecimalType::<T::Scalar>::try_downcast_column(&col).unwrap();
+            match validity {
+                Some(validity) if validity.null_count() > 0 => {
+                    buffer.iter().zip(validity.iter()).for_each(|(t, b)| {
+                        if b {
+                            sum += *t;
+                        }
+                    });
+                }
+                _ => {
+                    buffer.iter().for_each(|t| {
+                        sum += *t;
+                    });
+                }
+            }
+            self.value = sum.to_u64_array();
+        } else {
+            match validity {
+                Some(validity) => {
+                    for (data, valid) in T::iter_column(&other).zip(validity.iter()) {
+                        if valid {
+                            self.add(data, function_data)?;
+                        }
+                    }
+                }
+                None => {
+                    for value in T::iter_column(&other) {
+                        self.add(value, function_data)?;
                     }
                 }
             }
-            None => {
-                for v in buffer.iter() {
-                    self.value += *v;
-                }
-            }
-        }
-        self.check_over_flow()
-    }
-
-    fn accumulate_keys(places: &[StateAddr], offset: usize, columns: &Column) -> Result<()> {
-        let buffer = T::try_downcast_column(columns).unwrap().0;
-        for (i, place) in places.iter().enumerate() {
-            let state = place.next(offset).get::<DecimalSumState<T>>();
-            state.value += buffer[i];
-            state.check_over_flow()?;
         }
         Ok(())
     }
 
-    #[inline(always)]
-    fn merge(&mut self, other: &mut Self) -> Result<()> {
-        self.value += other.value;
-        self.check_over_flow()
+    fn merge(&mut self, rhs: &Self) -> Result<()> {
+        let v = T::Scalar::from_u64_array(rhs.value);
+        self.add(T::to_scalar_ref(&v), None)
     }
 
     fn merge_result(
         &mut self,
-        builder: &mut ColumnBuilder,
-        _window_size: &Option<usize>,
+        builder: &mut T::ColumnBuilder,
+        _function_data: Option<&dyn FunctionData>,
     ) -> Result<()> {
-        let builder = T::try_downcast_builder(builder).unwrap();
-        builder.push(self.value);
+        let v = T::Scalar::from_u64_array(self.value);
+        T::push_item(builder, T::to_scalar_ref(&v));
         Ok(())
-    }
-
-    fn merge_avg_result(
-        &mut self,
-        builder: &mut ColumnBuilder,
-        count: u64,
-        scale_add: u8,
-        _window_size: &Option<usize>,
-    ) -> Result<()> {
-        let builder = T::try_downcast_builder(builder).unwrap();
-
-        match self
-            .value
-            .checked_mul(T::e(scale_add as u32))
-            .and_then(|v| v.checked_div(T::from_u64(count)))
-        {
-            Some(value) => {
-                builder.push(value);
-                Ok(())
-            }
-            None => Err(ErrorCode::Overflow(format!(
-                "Decimal overflow: {} > (precision: {})",
-                self.value,
-                T::max_of_max_precision()
-            ))),
-        }
-    }
-}
-
-#[derive(Clone)]
-pub struct AggregateSumFunction<State> {
-    display_name: String,
-    _arguments: Vec<DataType>,
-    sum_t: PhantomData<State>,
-    return_type: DataType,
-}
-
-impl<State> AggregateFunction for AggregateSumFunction<State>
-where State: SumState
-{
-    fn name(&self) -> &str {
-        "AggregateSumFunction"
-    }
-
-    fn return_type(&self) -> Result<DataType> {
-        Ok(self.return_type.clone())
-    }
-
-    fn init_state(&self, place: StateAddr) {
-        place.write(|| State::default());
-    }
-
-    fn state_layout(&self) -> Layout {
-        Layout::new::<State>()
-    }
-
-    fn accumulate(
-        &self,
-        place: StateAddr,
-        columns: &[Column],
-        validity: Option<&Bitmap>,
-        _input_rows: usize,
-    ) -> Result<()> {
-        let state = place.get::<State>();
-        state.accumulate(&columns[0], validity)
-    }
-
-    // null bits can be ignored above the level of the aggregate function
-    fn accumulate_keys(
-        &self,
-        places: &[StateAddr],
-        offset: usize,
-        columns: &[Column],
-        _input_rows: usize,
-    ) -> Result<()> {
-        State::accumulate_keys(places, offset, &columns[0])
-    }
-
-    fn accumulate_row(&self, place: StateAddr, columns: &[Column], row: usize) -> Result<()> {
-        let state = place.get::<State>();
-        state.accumulate_row(&columns[0], row)
-    }
-
-    fn serialize(&self, place: StateAddr, writer: &mut Vec<u8>) -> Result<()> {
-        let state = place.get::<State>();
-        state.serialize(writer)
-    }
-
-    fn deserialize(&self, place: StateAddr, reader: &mut &[u8]) -> Result<()> {
-        let state = place.get::<State>();
-        state.deserialize(reader)
-    }
-
-    fn merge(&self, place: StateAddr, rhs: StateAddr) -> Result<()> {
-        let rhs = rhs.get::<State>();
-        let state = place.get::<State>();
-        state.merge(rhs)
-    }
-
-    #[allow(unused_mut)]
-    fn merge_result(&self, place: StateAddr, builder: &mut ColumnBuilder) -> Result<()> {
-        let state = place.get::<State>();
-        state.merge_result(builder, &None)
-    }
-}
-
-impl<State> fmt::Display for AggregateSumFunction<State> {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "{}", self.display_name)
-    }
-}
-
-impl<State> AggregateSumFunction<State>
-where State: SumState
-{
-    pub fn try_create(
-        display_name: &str,
-        arguments: Vec<DataType>,
-        return_type: DataType,
-    ) -> Result<AggregateFunctionRef> {
-        Ok(Arc::new(Self {
-            display_name: display_name.to_owned(),
-            _arguments: arguments,
-            sum_t: PhantomData,
-            return_type,
-        }))
     }
 }
 
 pub fn try_create_aggregate_sum_function(
     display_name: &str,
-    _params: Vec<Scalar>,
+    params: Vec<Scalar>,
     arguments: Vec<DataType>,
 ) -> Result<AggregateFunctionRef> {
     assert_unary_arguments(display_name, arguments.len())?;
@@ -382,15 +284,15 @@ pub fn try_create_aggregate_sum_function(
         data_type = Int8Type::data_type();
     }
 
-    with_number_mapped_type!(|NUM_TYPE| match &data_type {
-        DataType::Number(NumberDataType::NUM_TYPE) => {
-            type TSum = <NUM_TYPE as ResultTypeOfUnary>::Sum;
-            type State = NumberSumState<NUM_TYPE, TSum>;
-            AggregateSumFunction::<State>::try_create(
-                display_name,
-                arguments,
-                NumberType::<TSum>::data_type(),
-            )
+    with_number_mapped_type!(|NUM| match &data_type {
+        DataType::Number(NumberDataType::NUM) => {
+            type TSum = <NUM as ResultTypeOfUnary>::Sum;
+            let return_type = NumberType::<TSum>::data_type();
+            AggregateUnaryFunction::<
+                NumberSumState<NumberType<TSum>>,
+                NumberType<NUM>,
+                NumberType<TSum>,
+            >::try_create_unary(display_name, return_type, params, arguments[0].clone())
         }
         DataType::Decimal(DecimalDataType::Decimal128(s)) => {
             let p = MAX_DECIMAL128_PRECISION;
@@ -399,11 +301,27 @@ pub fn try_create_aggregate_sum_function(
                 scale: s.scale,
             };
 
-            AggregateSumFunction::<DecimalSumState<i128>>::try_create(
-                display_name,
-                arguments,
-                DataType::Decimal(DecimalDataType::from_size(decimal_size)?),
-            )
+            // DecimalWidth<int64_t> = 18
+            let overflow = s.precision > 18;
+            let return_type = DataType::Decimal(DecimalDataType::from_size(decimal_size)?);
+
+            if overflow {
+                AggregateUnaryFunction::<
+                    DecimalSumState<false, Decimal128Type>,
+                    Decimal128Type,
+                    Decimal128Type,
+                >::try_create_unary(
+                    display_name, return_type, params, arguments[0].clone()
+                )
+            } else {
+                AggregateUnaryFunction::<
+                    DecimalSumState<true, Decimal128Type>,
+                    Decimal128Type,
+                    Decimal128Type,
+                >::try_create_unary(
+                    display_name, return_type, params, arguments[0].clone()
+                )
+            }
         }
         DataType::Decimal(DecimalDataType::Decimal256(s)) => {
             let p = MAX_DECIMAL256_PRECISION;
@@ -412,15 +330,30 @@ pub fn try_create_aggregate_sum_function(
                 scale: s.scale,
             };
 
-            AggregateSumFunction::<DecimalSumState<i256>>::try_create(
-                display_name,
-                arguments,
-                DataType::Decimal(DecimalDataType::from_size(decimal_size)?),
-            )
+            let overflow = s.precision > 18;
+            let return_type = DataType::Decimal(DecimalDataType::from_size(decimal_size)?);
+
+            if overflow {
+                AggregateUnaryFunction::<
+                    DecimalSumState<false, Decimal256Type>,
+                    Decimal256Type,
+                    Decimal256Type,
+                >::try_create_unary(
+                    display_name, return_type, params, arguments[0].clone()
+                )
+            } else {
+                AggregateUnaryFunction::<
+                    DecimalSumState<true, Decimal256Type>,
+                    Decimal256Type,
+                    Decimal256Type,
+                >::try_create_unary(
+                    display_name, return_type, params, arguments[0].clone()
+                )
+            }
         }
         _ => Err(ErrorCode::BadDataValueType(format!(
-            "AggregateSumFunction does not support type '{:?}'",
-            arguments[0]
+            "{} does not support type '{:?}'",
+            display_name, arguments[0]
         ))),
     })
 }
@@ -434,30 +367,4 @@ pub fn aggregate_sum_function_desc() -> AggregateFunctionDescription {
         Box::new(try_create_aggregate_sum_function),
         features,
     )
-}
-
-#[inline]
-pub fn sum_primitive<T, TSum>(column: &Column, validity: Option<&Bitmap>) -> Result<TSum>
-where
-    T: Number + AsPrimitive<TSum>,
-    TSum: Number + std::ops::AddAssign,
-{
-    let inner = NumberType::<T>::try_downcast_column(column).unwrap();
-    if let Some(validity) = validity {
-        let mut sum = TSum::default();
-        inner.iter().zip(validity.iter()).for_each(|(t, b)| {
-            if b {
-                sum += t.as_();
-            }
-        });
-
-        Ok(sum)
-    } else {
-        let mut sum = TSum::default();
-        inner.iter().for_each(|t| {
-            sum += t.as_();
-        });
-
-        Ok(sum)
-    }
 }

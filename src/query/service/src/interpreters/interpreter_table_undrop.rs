@@ -14,8 +14,8 @@
 
 use std::sync::Arc;
 
-use common_exception::Result;
-use common_sql::plans::UndropTablePlan;
+use databend_common_exception::Result;
+use databend_common_sql::plans::UndropTablePlan;
 
 use crate::interpreters::Interpreter;
 use crate::pipelines::PipelineBuildResult;
@@ -37,6 +37,10 @@ impl UndropTableInterpreter {
 impl Interpreter for UndropTableInterpreter {
     fn name(&self) -> &str {
         "UndropTableInterpreter"
+    }
+
+    fn is_ddl(&self) -> bool {
+        true
     }
 
     #[async_backtrace::framed]

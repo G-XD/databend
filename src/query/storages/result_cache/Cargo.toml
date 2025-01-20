@@ -1,33 +1,39 @@
 [package]
-name = "common-storages-result-cache"
-version = "0.1.0"
-edition = "2021"
+name = "databend-common-storages-result-cache"
+version = { workspace = true }
+authors = { workspace = true }
+license = { workspace = true }
+publish = { workspace = true }
+edition = { workspace = true }
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 [lib]
 doctest = false
-test = false
+test = true
 
 [dependencies]
-common-arrow = { path = "../../../common/arrow" }
-common-catalog = { path = "../../catalog" }
-common-exception = { path = "../../../common/exception" }
-common-expression = { path = "../../expression" }
-common-meta-app = { path = "../../../meta/app" }
-common-meta-kvapi = { path = "../../../meta/kvapi" }
-common-meta-store = { path = "../../../meta/store" }
-common-meta-types = { path = "../../../meta/types" }
-common-pipeline-core = { path = "../../pipeline/core" }
-common-pipeline-sinks = { path = "../../pipeline/sinks" }
-common-pipeline-sources = { path = "../../pipeline/sources" }
-common-storage = { path = "../../../common/storage" }
-storages-common-blocks = { path = "../common/blocks" }
-storages-common-table-meta = { path = "../common/table-meta" }
-
+arrow = { workspace = true }
 async-backtrace = { workspace = true }
-async-trait = { version = "0.1.57", package = "async-trait-fn" }
+async-trait = { workspace = true }
+databend-common-catalog = { workspace = true }
+databend-common-exception = { workspace = true }
+databend-common-expression = { workspace = true }
+databend-common-meta-app = { workspace = true }
+databend-common-meta-kvapi = { workspace = true }
+databend-common-meta-store = { workspace = true }
+databend-common-meta-types = { workspace = true }
+databend-common-pipeline-core = { workspace = true }
+databend-common-pipeline-sinks = { workspace = true }
+databend-common-storage = { workspace = true }
+databend-common-storages-parquet = { workspace = true }
+databend-storages-common-blocks = { workspace = true }
+databend-storages-common-table-meta = { workspace = true }
 opendal = { workspace = true }
+parquet = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-sha2 = "0.10.6"
-uuid = { version = "1.1.2", features = ["serde", "v4"] }
+sha2 = { workspace = true }
+tokio = { workspace = true }
+uuid = { workspace = true }
+
+[lints]
+workspace = true

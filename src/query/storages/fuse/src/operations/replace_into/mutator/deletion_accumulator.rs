@@ -19,7 +19,7 @@ use ahash::HashSet;
 
 use crate::operations::mutation::BlockIndex;
 use crate::operations::mutation::SegmentIndex;
-use crate::operations::replace_into::meta::merge_into_operation_meta::UniqueKeyDigest;
+use crate::operations::replace_into::meta::UniqueKeyDigest;
 
 pub type BlockDeletionKeys = HashMap<BlockIndex, (HashSet<UniqueKeyDigest>, Vec<Vec<u64>>)>;
 #[derive(Default)]
@@ -32,29 +32,34 @@ impl DeletionAccumulator {
         &mut self,
         segment_index: SegmentIndex,
         block_index: BlockIndex,
-        key_set: &HashSet<UniqueKeyDigest>,
-        bloom_hashes: &Vec<Vec<u64>>,
+        source_on_conflict_key_set: &HashSet<UniqueKeyDigest>,
+        source_bloom_hashes: &[Vec<u64>],
     ) {
         match self.deletions.entry(segment_index) {
             Entry::Occupied(ref mut v) => {
                 let block_deletions = v.get_mut();
                 block_deletions
                     .entry(block_index)
-                    .and_modify(|(es, bh)| {
-                        es.extend(key_set);
-                        assert_eq!(bh.len(), bloom_hashes.len());
-                        for acc in bh {
-                            for hash in bloom_hashes {
-                                acc.extend(hash);
-                            }
+                    .and_modify(|(unique_digests, bloom_hashes)| {
+                        unique_digests.extend(source_on_conflict_key_set);
+                        assert_eq!(bloom_hashes.len(), source_bloom_hashes.len());
+                        for (idx, acc) in bloom_hashes.iter_mut().enumerate() {
+                            let bloom_hashes = &source_bloom_hashes[idx];
+                            acc.extend(bloom_hashes);
                         }
                     })
-                    .or_insert((key_set.clone(), bloom_hashes.clone()));
+                    .or_insert((
+                        source_on_conflict_key_set.clone(),
+                        source_bloom_hashes.to_owned(),
+                    ));
             }
             Entry::Vacant(e) => {
                 e.insert(HashMap::from_iter([(
                     block_index,
-                    (key_set.clone(), bloom_hashes.clone()),
+                    (
+                        source_on_conflict_key_set.clone(),
+                        source_bloom_hashes.to_owned(),
+                    ),
                 )]));
             }
         }

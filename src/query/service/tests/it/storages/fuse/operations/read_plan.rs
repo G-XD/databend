@@ -16,26 +16,26 @@ use std::collections::HashMap;
 use std::iter::Iterator;
 use std::sync::Arc;
 
+use arrow_schema::DataType as ArrowType;
+use arrow_schema::Field;
 use chrono::Utc;
-use common_arrow::arrow::datatypes::DataType as ArrowType;
-use common_arrow::arrow::datatypes::Field as ArrowField;
-use common_base::base::tokio;
-use common_catalog::plan::Projection;
-use common_catalog::plan::PushDownInfo;
-use common_exception::Result;
-use common_expression::ColumnId;
-use common_expression::FieldIndex;
-use common_expression::Scalar;
-use common_storage::ColumnNode;
-use common_storage::ColumnNodes;
-use common_storages_fuse::FusePartInfo;
+use databend_common_base::base::tokio;
+use databend_common_catalog::plan::Projection;
+use databend_common_catalog::plan::PushDownInfo;
+use databend_common_exception::Result;
+use databend_common_expression::ColumnId;
+use databend_common_expression::FieldIndex;
+use databend_common_expression::Scalar;
+use databend_common_storage::ColumnNode;
+use databend_common_storage::ColumnNodes;
+use databend_common_storages_fuse::FuseBlockPartInfo;
 use databend_query::storages::fuse::FuseTable;
-use databend_query::test_kits::table_test_fixture::TestFixture;
+use databend_query::test_kits::*;
+use databend_storages_common_table_meta::meta;
+use databend_storages_common_table_meta::meta::BlockMeta;
+use databend_storages_common_table_meta::meta::ColumnMeta;
+use databend_storages_common_table_meta::meta::ColumnStatistics;
 use futures::TryStreamExt;
-use storages_common_table_meta::meta;
-use storages_common_table_meta::meta::BlockMeta;
-use storages_common_table_meta::meta::ColumnMeta;
-use storages_common_table_meta::meta::ColumnStatistics;
 
 #[test]
 fn test_to_partitions() -> Result<()> {
@@ -61,12 +61,16 @@ fn test_to_partitions() -> Result<()> {
         })
     };
 
-    let col_nodes_gen = |field_index| ColumnNode {
-        field: ArrowField::new("".to_string(), ArrowType::Int64, false),
-        is_nested: false,
-        leaf_indices: vec![field_index],
-        leaf_column_ids: vec![field_index as ColumnId],
-        children: None,
+    let col_nodes_gen = |field_index| {
+        let mut n = ColumnNode::new(
+            Field::new("".to_string(), ArrowType::Int64, false),
+            false,
+            vec![],
+            vec![field_index],
+            None,
+        );
+        n.leaf_column_ids = vec![field_index as ColumnId];
+        n
     };
 
     // generates fake data.
@@ -98,6 +102,7 @@ fn test_to_partitions() -> Result<()> {
         location,
         bloom_filter_location,
         bloom_filter_size,
+        None,
         meta::Compression::Lz4Raw,
         Some(Utc::now()),
     ));
@@ -111,7 +116,7 @@ fn test_to_partitions() -> Result<()> {
     let column_nodes = ColumnNodes { column_nodes };
 
     // CASE I:  no projection
-    let (s, parts) = FuseTable::to_partitions(None, &blocks_metas, None, &column_nodes, None, None);
+    let (s, parts) = FuseTable::to_partitions(None, &blocks_metas, &column_nodes, None, None);
     assert_eq!(parts.len(), num_of_block as usize);
     let expected_block_size: u64 = cols_metas
         .values()
@@ -140,7 +145,7 @@ fn test_to_partitions() -> Result<()> {
     });
 
     let (stats, parts) =
-        FuseTable::to_partitions(None, &blocks_metas, None, &column_nodes, None, push_down);
+        FuseTable::to_partitions(None, &blocks_metas, &column_nodes, None, push_down);
     assert_eq!(parts.len(), num_of_block as usize);
     assert_eq!(expected_block_size * num_of_block, stats.read_bytes as u64);
 
@@ -149,9 +154,10 @@ fn test_to_partitions() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_fuse_table_exact_statistic() -> Result<()> {
-    let fixture = TestFixture::new().await;
-    let ctx = fixture.ctx();
+    let fixture = TestFixture::setup().await?;
+    let ctx = fixture.new_query_ctx().await?;
 
+    fixture.create_default_database().await?;
     fixture.create_default_table().await?;
 
     let mut table = fixture.latest_default_table().await?;
@@ -183,8 +189,9 @@ async fn test_fuse_table_exact_statistic() -> Result<()> {
         assert!(!parts.is_empty());
 
         let part = parts.partitions[0].clone();
-        let fuse_part = FusePartInfo::from_part(&part)?;
+        let fuse_part = FuseBlockPartInfo::from_part(&part)?;
         assert!(fuse_part.create_on.is_some())
     }
+
     Ok(())
 }

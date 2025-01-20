@@ -13,12 +13,14 @@
 // limitations under the License.
 
 use chrono_tz::Tz;
-use common_exception::ErrorCode;
-use common_exception::Result;
-use common_expression::TableSchemaRef;
-use common_meta_app::principal::FileFormatParams;
-use common_meta_app::principal::StageFileFormatType;
-use common_settings::Settings;
+use databend_common_exception::ErrorCode;
+use databend_common_exception::Result;
+use databend_common_expression::TableSchemaRef;
+use databend_common_io::GeometryDataType;
+use databend_common_meta_app::principal::FileFormatParams;
+use databend_common_meta_app::principal::StageFileFormatType;
+use databend_common_settings::Settings;
+use jiff::tz::TimeZone;
 
 use crate::output_format::CSVOutputFormat;
 use crate::output_format::CSVWithNamesAndTypesOutputFormat;
@@ -44,7 +46,12 @@ pub struct FileFormatOptionsExt {
     pub json_strings: bool,
     pub disable_variant_check: bool,
     pub timezone: Tz,
+    pub jiff_timezone: TimeZone,
     pub is_select: bool,
+    pub is_clickhouse: bool,
+    pub is_rounding_mode: bool,
+    pub geometry_format: GeometryDataType,
+    pub enable_dst_hour_fix: bool,
 }
 
 impl FileFormatOptionsExt {
@@ -53,6 +60,14 @@ impl FileFormatOptionsExt {
         is_select: bool,
     ) -> Result<FileFormatOptionsExt> {
         let timezone = parse_timezone(settings)?;
+        let jiff_timezone = parse_jiff_timezone(settings)?;
+        let enable_dst_hour_fix = settings.get_enable_dst_hour_fix()?;
+        let geometry_format = settings.get_geometry_output_format()?;
+        let numeric_cast_option = settings
+            .get_numeric_cast_option()
+            .unwrap_or("rounding".to_string());
+        let is_rounding_mode = numeric_cast_option.as_str() == "rounding";
+
         let options = FileFormatOptionsExt {
             ident_case_sensitive: false,
             headers: 0,
@@ -60,7 +75,12 @@ impl FileFormatOptionsExt {
             json_strings: false,
             disable_variant_check: false,
             timezone,
+            jiff_timezone,
             is_select,
+            is_clickhouse: false,
+            is_rounding_mode,
+            geometry_format,
+            enable_dst_hour_fix,
         };
         Ok(options)
     }
@@ -70,6 +90,9 @@ impl FileFormatOptionsExt {
         settings: &Settings,
     ) -> Result<FileFormatOptionsExt> {
         let timezone = parse_timezone(settings)?;
+        let jiff_timezone = parse_jiff_timezone(settings)?;
+        let geometry_format = settings.get_geometry_output_format()?;
+        let enable_dst_hour_fix = settings.get_enable_dst_hour_fix()?;
         let mut options = FileFormatOptionsExt {
             ident_case_sensitive: settings.get_unquoted_ident_case_sensitive()?,
             headers: 0,
@@ -77,7 +100,12 @@ impl FileFormatOptionsExt {
             json_strings: false,
             disable_variant_check: false,
             timezone,
+            jiff_timezone,
             is_select: false,
+            is_clickhouse: true,
+            is_rounding_mode: true,
+            geometry_format,
+            enable_dst_hour_fix,
         };
         let suf = &clickhouse_type.suffixes;
         options.headers = suf.headers;
@@ -104,14 +132,22 @@ impl FileFormatOptionsExt {
         params: FileFormatParams,
     ) -> Result<Box<dyn OutputFormat>> {
         let output: Box<dyn OutputFormat> = match &params {
-            FileFormatParams::Csv(params) => match self.headers {
-                0 => Box::new(CSVOutputFormat::create(schema, params, self)),
-                1 => Box::new(CSVWithNamesOutputFormat::create(schema, params, self)),
-                2 => Box::new(CSVWithNamesAndTypesOutputFormat::create(
-                    schema, params, self,
-                )),
-                _ => unreachable!(),
-            },
+            FileFormatParams::Csv(params) => {
+                if self.is_clickhouse {
+                    match self.headers {
+                        0 => Box::new(CSVOutputFormat::create(schema, params, self)),
+                        1 => Box::new(CSVWithNamesOutputFormat::create(schema, params, self)),
+                        2 => Box::new(CSVWithNamesAndTypesOutputFormat::create(
+                            schema, params, self,
+                        )),
+                        _ => unreachable!(),
+                    }
+                } else if params.output_header {
+                    Box::new(CSVWithNamesOutputFormat::create(schema, params, self))
+                } else {
+                    Box::new(CSVOutputFormat::create(schema, params, self))
+                }
+            }
             FileFormatParams::Tsv(params) => match self.headers {
                 0 => Box::new(TSVOutputFormat::create(schema, params, self)),
                 1 => Box::new(TSVWithNamesOutputFormat::create(schema, params, self)),
@@ -186,4 +222,14 @@ pub fn parse_timezone(settings: &Settings) -> Result<Tz> {
     let tz = settings.get_timezone()?;
     tz.parse::<Tz>()
         .map_err(|_| ErrorCode::InvalidTimezone("Timezone has been checked and should be valid"))
+}
+
+pub fn parse_jiff_timezone(settings: &Settings) -> Result<TimeZone> {
+    let tz = settings.get_timezone()?;
+    TimeZone::get(&tz).map_err(|e| {
+        ErrorCode::InvalidTimezone(format!(
+            "Timezone has been checked and should be valid but got error: {}",
+            e
+        ))
+    })
 }

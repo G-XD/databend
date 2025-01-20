@@ -16,25 +16,28 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use chrono::Utc;
-use common_base::base::GlobalInstance;
-use common_config::CatalogConfig;
-use common_config::InnerConfig;
-use common_exception::ErrorCode;
-use common_exception::Result;
-use common_meta_api::SchemaApi;
-use common_meta_app::schema::CatalogId;
-use common_meta_app::schema::CatalogInfo;
-use common_meta_app::schema::CatalogMeta;
-use common_meta_app::schema::CatalogNameIdent;
-use common_meta_app::schema::CatalogOption;
-use common_meta_app::schema::CatalogType;
-use common_meta_app::schema::CreateCatalogReq;
-use common_meta_app::schema::DropCatalogReq;
-use common_meta_app::schema::GetCatalogReq;
-use common_meta_app::schema::HiveCatalogOption;
-use common_meta_app::schema::ListCatalogReq;
-use common_meta_store::MetaStore;
-use common_meta_store::MetaStoreProvider;
+use databend_common_base::base::GlobalInstance;
+use databend_common_config::CatalogConfig;
+use databend_common_config::InnerConfig;
+use databend_common_exception::ErrorCode;
+use databend_common_exception::Result;
+use databend_common_meta_api::SchemaApi;
+use databend_common_meta_app::app_error::AppError;
+use databend_common_meta_app::schema::CatalogIdIdent;
+use databend_common_meta_app::schema::CatalogInfo;
+use databend_common_meta_app::schema::CatalogMeta;
+use databend_common_meta_app::schema::CatalogNameIdent;
+use databend_common_meta_app::schema::CatalogOption;
+use databend_common_meta_app::schema::CatalogType;
+use databend_common_meta_app::schema::CreateCatalogReq;
+use databend_common_meta_app::schema::DropCatalogReq;
+use databend_common_meta_app::schema::HiveCatalogOption;
+use databend_common_meta_app::schema::ListCatalogReq;
+use databend_common_meta_app::tenant::Tenant;
+use databend_common_meta_store::MetaStore;
+use databend_common_meta_store::MetaStoreProvider;
+use databend_common_meta_types::anyerror::func_name;
+use databend_storages_common_session::SessionState;
 
 use super::Catalog;
 use super::CatalogCreator;
@@ -51,12 +54,15 @@ pub struct CatalogManager {
 
     /// catalog_creators is the catalog creators that registered.
     pub catalog_creators: HashMap<CatalogType, Arc<dyn CatalogCreator>>,
+
+    conf: InnerConfig,
 }
 
 impl CatalogManager {
     /// Fetch catalog manager from global instance.
     pub fn instance() -> Arc<CatalogManager> {
-        GlobalInstance::get()
+        let global_instance: Arc<CatalogManager> = GlobalInstance::get();
+        global_instance
     }
 
     /// Init the catalog manager in global instance.
@@ -94,19 +100,19 @@ impl CatalogManager {
             let creator = catalog_creators.get(&CatalogType::Hive).ok_or_else(|| {
                 ErrorCode::BadArguments(format!("unknown catalog type: {:?}", CatalogType::Hive))
             })?;
-            let ctl = creator.try_create(&CatalogInfo {
-                id: CatalogId { catalog_id: 0 },
-                name_ident: CatalogNameIdent {
-                    tenant: tenant.clone(),
-                    catalog_name: name.clone(),
-                },
+
+            let ctl_info = CatalogInfo {
+                id: CatalogIdIdent::new(&tenant, 0).into(),
+                name_ident: CatalogNameIdent::new(tenant.clone(), name).into(),
                 meta: CatalogMeta {
                     catalog_option: CatalogOption::Hive(HiveCatalogOption {
-                        address: hive_ctl_cfg.address.clone(),
+                        address: hive_ctl_cfg.metastore_address.clone(),
+                        storage_params: None,
                     }),
                     created_on: Utc::now(),
                 },
-            })?;
+            };
+            let ctl = creator.try_create(Arc::new(ctl_info), conf.to_owned(), &meta)?;
             external_catalogs.insert(name.clone(), ctl);
         }
 
@@ -115,6 +121,7 @@ impl CatalogManager {
             default_catalog,
             external_catalogs,
             catalog_creators,
+            conf: conf.to_owned(),
         };
 
         Ok(Arc::new(catalog_manager))
@@ -124,16 +131,20 @@ impl CatalogManager {
     ///
     /// There are some place that we don't have async context, so we provide
     /// `get_default_catalog` to allow users fetch default catalog without async.
-    pub fn get_default_catalog(&self) -> Result<Arc<dyn Catalog>> {
-        Ok(self.default_catalog.clone())
+    pub fn get_default_catalog(&self, session_state: SessionState) -> Result<Arc<dyn Catalog>> {
+        Ok(self.default_catalog.set_session_state(session_state))
     }
 
     /// build_catalog builds a catalog from catalog info.
-    pub fn build_catalog(&self, info: &CatalogInfo) -> Result<Arc<dyn Catalog>> {
+    pub fn build_catalog(
+        &self,
+        info: Arc<CatalogInfo>,
+        session_state: SessionState,
+    ) -> Result<Arc<dyn Catalog>> {
         let typ = info.meta.catalog_option.catalog_type();
 
         if typ == CatalogType::Default {
-            return Ok(self.default_catalog.clone());
+            return self.get_default_catalog(session_state);
         }
 
         let creator = self
@@ -141,7 +152,7 @@ impl CatalogManager {
             .get(&typ)
             .ok_or_else(|| ErrorCode::BadArguments(format!("unknown catalog type: {:?}", typ)))?;
 
-        creator.try_create(info)
+        creator.try_create(info, self.conf.clone(), &self.meta)
     }
 
     /// Get a catalog from manager.
@@ -151,22 +162,28 @@ impl CatalogManager {
     /// DEFAULT catalog is handled specially via `get_default_catalog`. Other catalogs
     /// will be fetched from metasrv.
     #[async_backtrace::framed]
-    pub async fn get_catalog(&self, tenant: &str, catalog_name: &str) -> Result<Arc<dyn Catalog>> {
+    pub async fn get_catalog(
+        &self,
+        // TODO: use Tenant or NonEmptyString
+        tenant: &str,
+        catalog_name: &str,
+        session_state: SessionState,
+    ) -> Result<Arc<dyn Catalog>> {
         if catalog_name == CATALOG_DEFAULT {
-            return self.get_default_catalog();
+            return self.get_default_catalog(session_state);
         }
 
         if let Some(ctl) = self.external_catalogs.get(catalog_name) {
             return Ok(ctl.clone());
         }
 
-        // Get catalog from metasrv.
-        let info = self
-            .meta
-            .get_catalog(GetCatalogReq::new(tenant, catalog_name))
-            .await?;
+        let tenant = Tenant::new_or_err(tenant, func_name!())?;
+        let ident = CatalogNameIdent::new(tenant, catalog_name);
 
-        self.build_catalog(&info)
+        // Get catalog from metasrv.
+        let info = self.meta.get_catalog(&ident).await?;
+
+        self.build_catalog(info, session_state)
     }
 
     /// Create a new catalog.
@@ -182,13 +199,20 @@ impl CatalogManager {
             ));
         }
 
-        if self.external_catalogs.get(req.catalog_name()).is_some() {
+        if self.external_catalogs.contains_key(req.catalog_name()) {
             return Err(ErrorCode::BadArguments(
                 "catalog already exists that cannot be created".to_string(),
             ));
         }
 
-        let _ = self.meta.create_catalog(req).await;
+        let create_res = self.meta.create_catalog(&req.name_ident, &req.meta).await?;
+        if create_res.is_err() {
+            if req.if_not_exists {
+                // Alright
+            } else {
+                return Err(AppError::from(req.name_ident.exist_error("create_catalog")).into());
+            }
+        }
 
         Ok(())
     }
@@ -200,7 +224,7 @@ impl CatalogManager {
     /// Trying to drop default catalog will return an error.
     #[async_backtrace::framed]
     pub async fn drop_catalog(&self, req: DropCatalogReq) -> Result<()> {
-        let catalog_name = &req.name_ident.catalog_name;
+        let catalog_name = req.name_ident.name();
 
         if catalog_name == CATALOG_DEFAULT {
             return Err(ErrorCode::BadArguments(
@@ -208,31 +232,45 @@ impl CatalogManager {
             ));
         }
 
-        if self.external_catalogs.get(catalog_name).is_some() {
+        if self.external_catalogs.contains_key(catalog_name) {
             return Err(ErrorCode::BadArguments(
                 "catalog already exists that cannot be dropped".to_string(),
             ));
         }
 
-        let _ = self.meta.drop_catalog(req).await;
+        let dropped = self.meta.drop_catalog(&req.name_ident).await?;
+        if dropped.is_none() {
+            if req.if_exists {
+                // Alright
+            } else {
+                return Err(AppError::from(req.name_ident.unknown_error("drop_catalog")).into());
+            }
+        }
 
         Ok(())
     }
 
     #[async_backtrace::framed]
-    pub async fn list_catalogs(&self, tenant: &str) -> Result<Vec<Arc<dyn Catalog>>> {
-        let mut catalogs = vec![self.get_default_catalog()?];
+    pub async fn list_catalogs(
+        &self,
+        tenant: &Tenant,
+        session_state: SessionState,
+    ) -> Result<Vec<Arc<dyn Catalog>>> {
+        let mut catalogs = vec![self.get_default_catalog(session_state.clone())?];
 
         // insert external catalogs.
         for ctl in self.external_catalogs.values() {
             catalogs.push(ctl.clone());
         }
 
-        // fecth catalogs from metasrv.
-        let infos = self.meta.list_catalogs(ListCatalogReq::new(tenant)).await?;
+        // fetch catalogs from metasrv.
+        let infos = self
+            .meta
+            .list_catalogs(ListCatalogReq::new(tenant.clone()))
+            .await?;
 
         for info in infos {
-            catalogs.push(self.build_catalog(&info)?);
+            catalogs.push(self.build_catalog(info, session_state.clone())?);
         }
 
         Ok(catalogs)

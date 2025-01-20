@@ -12,14 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use common_expression::date_helper::DateConverter;
-use common_expression::types::number::NumberScalar;
-use common_expression::DataBlock;
-use common_expression::ScalarRef;
-use common_expression::TableSchemaRef;
-use common_io::prelude::FormatSettings;
-use croaring::treemap::NativeSerializer;
-use croaring::Treemap;
+use databend_common_expression::date_helper::DateConverter;
+use databend_common_expression::types::interval::interval_to_string;
+use databend_common_expression::types::number::NumberScalar;
+use databend_common_expression::DataBlock;
+use databend_common_expression::ScalarRef;
+use databend_common_expression::TableSchemaRef;
+use databend_common_io::deserialize_bitmap;
+use databend_common_io::prelude::FormatSettings;
+use geozero::wkb::Ewkb;
+use geozero::ToJson;
+use jiff::fmt::strtime;
 use serde_json::Map as JsonMap;
 use serde_json::Value as JsonValue;
 
@@ -43,11 +46,15 @@ impl JSONOutputFormat {
             rows: 0,
             format_settings: FormatSettings {
                 timezone: options.timezone,
+                jiff_timezone: options.jiff_timezone.clone(),
+                geometry_format: options.geometry_format,
+                enable_dst_hour_fix: options.enable_dst_hour_fix,
+                format_null_as_str: true,
             },
         }
     }
 
-    fn format_schema(&self) -> common_exception::Result<Vec<u8>> {
+    fn format_schema(&self) -> databend_common_exception::Result<Vec<u8>> {
         let fields = self.schema.fields();
         if fields.is_empty() {
             return Ok(b"\"meta\":[]".to_vec());
@@ -90,16 +97,18 @@ fn scalar_to_json(s: ScalarRef<'_>, format: &FormatSettings) -> JsonValue {
         },
         ScalarRef::Decimal(x) => serde_json::to_value(x.to_string()).unwrap(),
         ScalarRef::Date(v) => {
-            let dt = DateConverter::to_date(&v, format.timezone);
-            serde_json::to_value(dt.format("%Y-%m-%d").to_string()).unwrap()
+            let dt = DateConverter::to_date(&v, format.jiff_timezone.clone());
+            serde_json::to_value(strtime::format("%Y-%m-%d", dt).unwrap()).unwrap()
         }
+        ScalarRef::Interval(v) => serde_json::to_value(interval_to_string(&v).to_string()).unwrap(),
         ScalarRef::Timestamp(v) => {
-            let dt = DateConverter::to_timestamp(&v, format.timezone);
-            serde_json::to_value(dt.format("%Y-%m-%d %H:%M:%S").to_string()).unwrap()
+            let dt = DateConverter::to_timestamp(&v, format.jiff_timezone.clone());
+            serde_json::to_value(strtime::format("%Y-%m-%d %H:%M:%S", &dt).unwrap()).unwrap()
         }
         ScalarRef::EmptyArray => JsonValue::Array(vec![]),
         ScalarRef::EmptyMap => JsonValue::Object(JsonMap::new()),
-        ScalarRef::String(x) => JsonValue::String(String::from_utf8_lossy(x).to_string()),
+        ScalarRef::Binary(x) => JsonValue::String(hex::encode_upper(x)),
+        ScalarRef::String(x) => JsonValue::String(x.to_string()),
         ScalarRef::Array(x) => {
             let vals = x
                 .iter()
@@ -122,7 +131,7 @@ fn scalar_to_json(s: ScalarRef<'_>, format: &FormatSettings) -> JsonValue {
             JsonValue::Object(vals)
         }
         ScalarRef::Bitmap(b) => {
-            let rb = Treemap::deserialize(b).expect("failed to deserialize bitmap");
+            let rb = deserialize_bitmap(b).expect("failed to deserialize bitmap");
             let data = rb
                 .iter()
                 .map(|v| JsonValue::Number(serde_json::Number::from(v)))
@@ -141,11 +150,22 @@ fn scalar_to_json(s: ScalarRef<'_>, format: &FormatSettings) -> JsonValue {
             let b = jsonb::from_slice(x).unwrap();
             b.into()
         }
+        ScalarRef::Geometry(x) => {
+            let geom = Ewkb(x).to_json().expect("failed to convert ewkb to json");
+            jsonb::from_slice(geom.as_bytes()).unwrap().into()
+        }
+        ScalarRef::Geography(x) => {
+            let geom = Ewkb(x.0).to_json().expect("failed to convert ewkb to json");
+            jsonb::from_slice(geom.as_bytes()).unwrap().into()
+        }
     }
 }
 
 impl OutputFormat for JSONOutputFormat {
-    fn serialize_block(&mut self, data_block: &DataBlock) -> common_exception::Result<Vec<u8>> {
+    fn serialize_block(
+        &mut self,
+        data_block: &DataBlock,
+    ) -> databend_common_exception::Result<Vec<u8>> {
         let mut res = if self.first_block {
             self.first_block = false;
             let mut buf = b"{".to_vec();
@@ -173,8 +193,7 @@ impl OutputFormat for JSONOutputFormat {
             }
             res.push(b'{');
             for (c, value) in data_block.columns().iter().enumerate() {
-                let value = value.value.as_ref();
-                let scalar = unsafe { value.index_unchecked(row) };
+                let scalar = unsafe { value.value.index_unchecked(row) };
                 let value = scalar_to_json(scalar, &self.format_settings);
 
                 res.push(b'\"');
@@ -194,7 +213,7 @@ impl OutputFormat for JSONOutputFormat {
         Ok(res)
     }
 
-    fn finalize(&mut self) -> common_exception::Result<Vec<u8>> {
+    fn finalize(&mut self) -> databend_common_exception::Result<Vec<u8>> {
         let mut buf = b"".to_vec();
         if self.first_row {
             buf.push(b'{');

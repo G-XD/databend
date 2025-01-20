@@ -15,16 +15,20 @@
 use std::fmt::Display;
 use std::fmt::Formatter;
 
+use derive_visitor::Drive;
+use derive_visitor::DriveMut;
+
+use crate::ast::CreateOption;
 use crate::ast::Expr;
 use crate::ast::TypeName;
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Drive, DriveMut)]
 pub struct DataMaskArg {
     pub arg_name: String,
     pub arg_type: TypeName,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Drive, DriveMut)]
 pub struct DataMaskPolicy {
     pub args: Vec<DataMaskArg>,
     pub return_type: TypeName,
@@ -32,17 +36,21 @@ pub struct DataMaskPolicy {
     pub comment: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Drive, DriveMut)]
 pub struct CreateDatamaskPolicyStmt {
-    pub if_not_exists: bool,
+    pub create_option: CreateOption,
     pub name: String,
     pub policy: DataMaskPolicy,
 }
 
 impl Display for CreateDatamaskPolicyStmt {
     fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
-        write!(f, "CREATE MASKING POLICY ")?;
-        if self.if_not_exists {
+        write!(f, "CREATE ")?;
+        if let CreateOption::CreateOrReplace = self.create_option {
+            write!(f, "OR REPLACE ")?;
+        }
+        write!(f, "MASKING POLICY ")?;
+        if let CreateOption::CreateIfNotExists = self.create_option {
             write!(f, "IF NOT EXISTS ")?;
         }
         write!(f, "{} AS (", self.name)?;
@@ -56,7 +64,7 @@ impl Display for CreateDatamaskPolicyStmt {
         }
         write!(
             f,
-            ") RETURN {} -> {}",
+            ") RETURNS {} -> {}",
             self.policy.return_type, self.policy.body
         )?;
         if let Some(comment) = &self.policy.comment {
@@ -67,7 +75,7 @@ impl Display for CreateDatamaskPolicyStmt {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq, Drive, DriveMut)]
 pub struct DropDatamaskPolicyStmt {
     pub if_exists: bool,
     pub name: String,
@@ -85,7 +93,7 @@ impl Display for DropDatamaskPolicyStmt {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq, Drive, DriveMut)]
 pub struct DescDatamaskPolicyStmt {
     pub name: String,
 }

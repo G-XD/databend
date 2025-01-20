@@ -13,7 +13,6 @@
 // limitations under the License.
 
 use std::collections::BTreeMap;
-use std::collections::BTreeSet;
 use std::fmt;
 use std::fmt::Display;
 use std::fmt::Formatter;
@@ -21,70 +20,47 @@ use std::ops::Deref;
 
 use chrono::DateTime;
 use chrono::Utc;
+use databend_common_meta_types::seq_value::SeqV;
 
-use crate::share::ShareNameIdent;
-use crate::share::ShareSpec;
+use super::CreateOption;
+use crate::schema::database_id::DatabaseId;
+use crate::schema::database_name_ident::DatabaseNameIdent;
+use crate::tenant::Tenant;
+use crate::tenant::ToTenant;
+use crate::KeyWithTenant;
 
-#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, Default, Eq, PartialEq)]
-pub struct DatabaseNameIdent {
-    pub tenant: String,
-    pub db_name: String,
-}
-
-impl Display for DatabaseNameIdent {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "'{}'/'{}'", self.tenant, self.db_name)
-    }
-}
-
-#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DatabaseInfo {
-    pub ident: DatabaseIdent,
+    pub database_id: DatabaseId,
     pub name_ident: DatabaseNameIdent,
-    pub meta: DatabaseMeta,
+    pub meta: SeqV<DatabaseMeta>,
 }
 
-#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, Default, Eq, PartialEq)]
-pub struct DatabaseIdent {
-    pub db_id: u64,
-    pub seq: u64,
-}
-
-#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, Default, Eq, PartialEq)]
-pub struct DatabaseId {
-    pub db_id: u64,
-}
-
-impl Display for DatabaseId {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.db_id)
-    }
-}
-
-#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct DatabaseIdToName {
     pub db_id: u64,
 }
 
 impl Display for DatabaseIdToName {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         write!(f, "{}", self.db_id)
     }
 }
 
-#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, Default, Eq, PartialEq)]
-pub struct DbIdListKey {
-    pub tenant: String,
-    pub db_name: String,
-}
-
-impl Display for DbIdListKey {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "'{}'/'{}'", self.tenant, self.db_name)
+impl DatabaseIdToName {
+    pub fn new(db_id: u64) -> Self {
+        DatabaseIdToName { db_id }
     }
 }
 
-#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, Eq, PartialEq)]
+// see `ShareGrantObjectPrivilege`
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ShareDbId {
+    Usage(u64),
+    Reference(u64),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DatabaseMeta {
     pub engine: String,
     pub engine_options: BTreeMap<String, String>,
@@ -93,11 +69,29 @@ pub struct DatabaseMeta {
     pub updated_on: DateTime<Utc>,
     pub comment: String,
 
-    // if used in CreateDatabaseReq, this field MUST set to None.
+    /// if used in CreateDatabaseReq, this field MUST set to None.
     pub drop_on: Option<DateTime<Utc>>,
-    // shared by share_id
-    pub shared_by: BTreeSet<u64>,
-    pub from_share: Option<ShareNameIdent>,
+
+    /// Indicates whether garbage collection is currently in progress for this dropped database.
+    ///
+    /// If it is in progress, the database should not be un-dropped, because the data may be incomplete.
+    ///
+    /// ```text
+    /// normal <----.
+    ///   |         |
+    ///   | drop()  | undrop()
+    ///   v         |
+    /// dropped ----'
+    ///   |
+    ///   | gc()
+    ///   v
+    /// gc_in_progress=True
+    ///   |
+    ///   | purge data from meta-service
+    ///   v
+    /// completed removed
+    /// ```
+    pub gc_in_progress: bool,
 }
 
 impl Default for DatabaseMeta {
@@ -110,14 +104,13 @@ impl Default for DatabaseMeta {
             updated_on: Utc::now(),
             comment: "".to_string(),
             drop_on: None,
-            shared_by: BTreeSet::new(),
-            from_share: None,
+            gc_in_progress: false,
         }
     }
 }
 
 impl Display for DatabaseMeta {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         write!(
             f,
             "Engine: {}={:?}, Options: {:?}, CreatedOn: {:?}",
@@ -129,6 +122,17 @@ impl Display for DatabaseMeta {
 impl DatabaseInfo {
     pub fn engine(&self) -> &str {
         &self.meta.engine
+    }
+
+    /// Create a new database info without id or meta seq.
+    ///
+    /// Usually such an instance is used for an external database, whose metadata is not stored in databend meta-service.
+    pub fn without_id_seq(name_ident: DatabaseNameIdent, meta: DatabaseMeta) -> Self {
+        Self {
+            database_id: DatabaseId::new(0),
+            name_ident,
+            meta: SeqV::new(0, meta),
+        }
     }
 }
 
@@ -163,40 +167,59 @@ impl DbIdList {
         self.id_list.pop()
     }
 
-    pub fn last(&mut self) -> Option<&u64> {
+    pub fn last(&self) -> Option<&u64> {
         self.id_list.last()
     }
 }
 
 impl Display for DbIdList {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         write!(f, "DB id list: {:?}", self.id_list)
     }
 }
 
-#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CreateDatabaseReq {
-    pub if_not_exists: bool,
+    pub create_option: CreateOption,
     pub name_ident: DatabaseNameIdent,
     pub meta: DatabaseMeta,
 }
 
 impl Display for CreateDatabaseReq {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "create_db(if_not_exists={}):{}/{}={:?}",
-            self.if_not_exists, self.name_ident.tenant, self.name_ident.db_name, self.meta
-        )
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+        match self.create_option {
+            CreateOption::Create => write!(
+                f,
+                "create_db:{}/{}={:?}",
+                self.name_ident.tenant_name(),
+                self.name_ident.database_name(),
+                self.meta
+            ),
+            CreateOption::CreateIfNotExists => write!(
+                f,
+                "create_db_if_not_exists:{}/{}={:?}",
+                self.name_ident.tenant_name(),
+                self.name_ident.database_name(),
+                self.meta
+            ),
+
+            CreateOption::CreateOrReplace => write!(
+                f,
+                "create_or_replace_db:{}/{}={:?}",
+                self.name_ident.tenant_name(),
+                self.name_ident.database_name(),
+                self.meta
+            ),
+        }
     }
 }
 
-#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CreateDatabaseReply {
-    pub db_id: u64,
+    pub db_id: DatabaseId,
 }
 
-#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RenameDatabaseReq {
     pub if_exists: bool,
     pub name_ident: DatabaseNameIdent,
@@ -204,11 +227,13 @@ pub struct RenameDatabaseReq {
 }
 
 impl Display for RenameDatabaseReq {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         write!(
             f,
             "rename_database:{}/{}=>{}",
-            self.name_ident.tenant, self.name_ident.db_name, self.new_db_name
+            self.name_ident.tenant_name(),
+            self.name_ident.database_name(),
+            self.new_db_name
         )
     }
 }
@@ -216,55 +241,58 @@ impl Display for RenameDatabaseReq {
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct RenameDatabaseReply {}
 
-#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DropDatabaseReq {
     pub if_exists: bool,
     pub name_ident: DatabaseNameIdent,
 }
 
 impl Display for DropDatabaseReq {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         write!(
             f,
             "drop_db(if_exists={}):{}/{}",
-            self.if_exists, self.name_ident.tenant, self.name_ident.db_name
+            self.if_exists,
+            self.name_ident.tenant_name(),
+            self.name_ident.database_name(),
         )
     }
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct DropDatabaseReply {
-    pub spec_vec: Option<Vec<ShareSpec>>,
+    pub db_id: u64,
 }
 
-#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UndropDatabaseReq {
     pub name_ident: DatabaseNameIdent,
 }
 
 impl Display for UndropDatabaseReq {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         write!(
             f,
             "undrop_db:{}/{}",
-            self.name_ident.tenant, self.name_ident.db_name
+            self.name_ident.tenant_name(),
+            self.name_ident.database_name(),
         )
     }
 }
 
 impl UndropDatabaseReq {
-    pub fn tenant(&self) -> &str {
-        &self.name_ident.tenant
+    pub fn tenant(&self) -> &Tenant {
+        self.name_ident.tenant()
     }
     pub fn db_name(&self) -> &str {
-        &self.name_ident.db_name
+        self.name_ident.database_name()
     }
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct UndropDatabaseReply {}
 
-#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GetDatabaseReq {
     pub inner: DatabaseNameIdent,
 }
@@ -278,121 +306,57 @@ impl Deref for GetDatabaseReq {
 }
 
 impl GetDatabaseReq {
-    pub fn new(tenant: impl Into<String>, db_name: impl Into<String>) -> GetDatabaseReq {
+    pub fn new(tenant: impl ToTenant, db_name: impl ToString) -> GetDatabaseReq {
         GetDatabaseReq {
-            inner: DatabaseNameIdent {
-                tenant: tenant.into(),
-                db_name: db_name.into(),
-            },
+            inner: DatabaseNameIdent::new(tenant, db_name),
         }
     }
 }
 
-#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
-pub enum DatabaseInfoFilter {
-    // include all dropped databases
-    IncludeDropped,
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ListDatabaseReq {
+    pub tenant: Tenant,
 }
 
-#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
-pub struct ListDatabaseReq {
-    pub tenant: String,
-    pub filter: Option<DatabaseInfoFilter>,
+impl ListDatabaseReq {
+    pub fn tenant(&self) -> &Tenant {
+        &self.tenant
+    }
 }
 
 mod kvapi_key_impl {
-    use common_meta_kvapi::kvapi;
+    use databend_common_meta_kvapi::kvapi;
 
+    use crate::schema::database_name_ident::DatabaseNameIdentRaw;
     use crate::schema::DatabaseId;
     use crate::schema::DatabaseIdToName;
-    use crate::schema::DatabaseNameIdent;
-    use crate::schema::DbIdListKey;
-    use crate::schema::PREFIX_DATABASE;
-    use crate::schema::PREFIX_DATABASE_BY_ID;
-    use crate::schema::PREFIX_DATABASE_ID_TO_NAME;
-    use crate::schema::PREFIX_DB_ID_LIST;
 
-    /// __fd_database/<tenant>/<db_name> -> <db_id>
-    impl kvapi::Key for DatabaseNameIdent {
-        const PREFIX: &'static str = PREFIX_DATABASE;
-
-        fn to_string_key(&self) -> String {
-            kvapi::KeyBuilder::new_prefixed(Self::PREFIX)
-                .push_str(&self.tenant)
-                .push_str(&self.db_name)
-                .done()
+    impl kvapi::KeyCodec for DatabaseIdToName {
+        fn encode_key(&self, b: kvapi::KeyBuilder) -> kvapi::KeyBuilder {
+            b.push_u64(self.db_id)
         }
 
-        fn from_str_key(s: &str) -> Result<Self, kvapi::KeyError> {
-            let mut p = kvapi::KeyParser::new_prefixed(s, Self::PREFIX)?;
-
-            let tenant = p.next_str()?;
-            let db_name = p.next_str()?;
-            p.done()?;
-
-            Ok(DatabaseNameIdent { tenant, db_name })
-        }
-    }
-
-    /// "__fd_database_by_id/<db_id>"
-    impl kvapi::Key for DatabaseId {
-        const PREFIX: &'static str = PREFIX_DATABASE_BY_ID;
-
-        fn to_string_key(&self) -> String {
-            kvapi::KeyBuilder::new_prefixed(Self::PREFIX)
-                .push_u64(self.db_id)
-                .done()
-        }
-
-        fn from_str_key(s: &str) -> Result<Self, kvapi::KeyError> {
-            let mut p = kvapi::KeyParser::new_prefixed(s, Self::PREFIX)?;
-
-            let db_id = p.next_u64()?;
-            p.done()?;
-
-            Ok(DatabaseId { db_id })
+        fn decode_key(parser: &mut kvapi::KeyParser) -> Result<Self, kvapi::KeyError> {
+            let db_id = parser.next_u64()?;
+            Ok(Self { db_id })
         }
     }
 
     /// "__fd_database_id_to_name/<db_id> -> DatabaseNameIdent"
     impl kvapi::Key for DatabaseIdToName {
-        const PREFIX: &'static str = PREFIX_DATABASE_ID_TO_NAME;
+        const PREFIX: &'static str = "__fd_database_id_to_name";
 
-        fn to_string_key(&self) -> String {
-            kvapi::KeyBuilder::new_prefixed(Self::PREFIX)
-                .push_u64(self.db_id)
-                .done()
-        }
+        type ValueType = DatabaseNameIdentRaw;
 
-        fn from_str_key(s: &str) -> Result<Self, kvapi::KeyError> {
-            let mut p = kvapi::KeyParser::new_prefixed(s, Self::PREFIX)?;
-
-            let db_id = p.next_u64()?;
-            p.done()?;
-
-            Ok(DatabaseIdToName { db_id })
+        fn parent(&self) -> Option<String> {
+            Some(DatabaseId::new(self.db_id).to_string_key())
         }
     }
 
-    /// "_fd_db_id_list/<tenant>/<db_name> -> db_id_list"
-    impl kvapi::Key for DbIdListKey {
-        const PREFIX: &'static str = PREFIX_DB_ID_LIST;
-
-        fn to_string_key(&self) -> String {
-            kvapi::KeyBuilder::new_prefixed(Self::PREFIX)
-                .push_str(&self.tenant)
-                .push_str(&self.db_name)
-                .done()
-        }
-
-        fn from_str_key(s: &str) -> Result<Self, kvapi::KeyError> {
-            let mut p = kvapi::KeyParser::new_prefixed(s, Self::PREFIX)?;
-
-            let tenant = p.next_str()?;
-            let db_name = p.next_str()?;
-            p.done()?;
-
-            Ok(DbIdListKey { tenant, db_name })
+    impl kvapi::Value for DatabaseNameIdentRaw {
+        type KeyType = DatabaseIdToName;
+        fn dependency_keys(&self, _key: &Self::KeyType) -> impl IntoIterator<Item = String> {
+            []
         }
     }
 }

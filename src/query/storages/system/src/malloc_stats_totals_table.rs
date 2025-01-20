@@ -15,23 +15,24 @@
 use std::default::Default;
 use std::sync::Arc;
 
-use common_catalog::table::Table;
-use common_catalog::table_context::TableContext;
-use common_exception::ErrorCode;
-use common_exception::Result;
-use common_expression::types::string::StringColumnBuilder;
-use common_expression::types::NumberDataType;
-use common_expression::types::NumberType;
-use common_expression::types::StringType;
-use common_expression::types::ValueType;
-use common_expression::Column;
-use common_expression::DataBlock;
-use common_expression::TableDataType;
-use common_expression::TableField;
-use common_expression::TableSchemaRefExt;
-use common_meta_app::schema::TableIdent;
-use common_meta_app::schema::TableInfo;
-use common_meta_app::schema::TableMeta;
+use databend_common_catalog::table::DistributionLevel;
+use databend_common_catalog::table::Table;
+use databend_common_catalog::table_context::TableContext;
+use databend_common_exception::ErrorCode;
+use databend_common_exception::Result;
+use databend_common_expression::types::string::StringColumnBuilder;
+use databend_common_expression::types::NumberDataType;
+use databend_common_expression::types::NumberType;
+use databend_common_expression::types::StringType;
+use databend_common_expression::types::ValueType;
+use databend_common_expression::Column;
+use databend_common_expression::DataBlock;
+use databend_common_expression::TableDataType;
+use databend_common_expression::TableField;
+use databend_common_expression::TableSchemaRefExt;
+use databend_common_meta_app::schema::TableIdent;
+use databend_common_meta_app::schema::TableInfo;
+use databend_common_meta_app::schema::TableMeta;
 use tikv_jemalloc_ctl::epoch;
 
 use crate::SyncOneBlockSystemTable;
@@ -41,7 +42,7 @@ macro_rules! set_value {
     ($stat:ident, $names:expr, $values:expr) => {
         let mib = $stat::mib()?;
         let value = mib.read()?;
-        $names.put_slice($stat::name().as_bytes());
+        $names.put_str(&String::from_utf8_lossy($stat::name().as_bytes()));
         $names.commit_row();
         $values.push(value as u64);
     };
@@ -53,13 +54,15 @@ pub struct MallocStatsTotalsTable {
 
 impl SyncSystemTable for MallocStatsTotalsTable {
     const NAME: &'static str = "system.malloc_stats_totals";
+    const DISTRIBUTION_LEVEL: DistributionLevel = DistributionLevel::Warehouse;
 
     fn get_table_info(&self) -> &TableInfo {
         &self.table_info
     }
 
-    fn get_full_data(&self, _ctx: Arc<dyn TableContext>) -> Result<DataBlock> {
-        let values = Self::build_columns().map_err(convert_je_err)?;
+    fn get_full_data(&self, ctx: Arc<dyn TableContext>) -> Result<DataBlock> {
+        let local_id = ctx.get_cluster().local_id.clone();
+        let values = Self::build_columns(&local_id).map_err(convert_je_err)?;
         Ok(DataBlock::new_from_columns(values))
     }
 }
@@ -69,6 +72,7 @@ type BuildResult = std::result::Result<Vec<Column>, Box<dyn std::error::Error>>;
 impl MallocStatsTotalsTable {
     pub fn create(table_id: u64) -> Arc<dyn Table> {
         let schema = TableSchemaRefExt::create(vec![
+            TableField::new("node", TableDataType::String),
             TableField::new("name", TableDataType::String),
             TableField::new("value", TableDataType::Number(NumberDataType::UInt64)),
         ]);
@@ -88,8 +92,8 @@ impl MallocStatsTotalsTable {
         SyncOneBlockSystemTable::create(MallocStatsTotalsTable { table_info })
     }
 
-    fn build_columns() -> BuildResult {
-        let mut names = StringColumnBuilder::with_capacity(6, 6 * 4);
+    fn build_columns(node_name: &str) -> BuildResult {
+        let mut names = StringColumnBuilder::with_capacity(6);
         let mut values: Vec<u64> = vec![];
 
         let e = epoch::mib()?;
@@ -109,10 +113,11 @@ impl MallocStatsTotalsTable {
         set_value!(resident, names, values);
         set_value!(metadata, names, values);
 
+        let node_names = Column::String(StringColumnBuilder::repeat(node_name, 6).build());
         let names = StringType::upcast_column(names.build());
         let values = NumberType::<u64>::upcast_column(values.into());
 
-        Ok(vec![names, values])
+        Ok(vec![node_names, names, values])
     }
 }
 

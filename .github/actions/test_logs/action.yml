@@ -1,0 +1,17 @@
+name: "Test collection query & profile logs for databend query"
+description: "Test collection query & profile logs for databend query"
+runs:
+  using: "composite"
+  steps:
+    - uses: ./.github/actions/setup_test
+
+    - name: Run logging Tests
+      shell: bash
+      run: |
+        bash ./tests/logging/test-logs.sh
+
+    - name: Upload failure
+      if: failure()
+      uses: ./.github/actions/artifact_failure
+      with:
+        name: test-logs

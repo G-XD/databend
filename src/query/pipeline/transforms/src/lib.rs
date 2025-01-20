@@ -12,8 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#![deny(unused_crate_dependencies)]
+#![allow(internal_features)]
+#![allow(clippy::unconditional_recursion)]
 #![feature(core_intrinsics)]
 #![feature(int_roundings)]
+#![feature(let_chains)]
+#![feature(iter_map_windows)]
 
 pub mod processors;
+pub use processors::*;

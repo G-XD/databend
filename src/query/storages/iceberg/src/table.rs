@@ -13,138 +13,205 @@
 // limitations under the License.
 
 use std::any::Any;
+use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow_schema::Schema as ArrowSchema;
 use async_trait::async_trait;
 use chrono::Utc;
-use common_arrow::arrow::datatypes::Field as Arrow2Field;
-use common_arrow::arrow::datatypes::Schema as Arrow2Schema;
-use common_catalog::plan::DataSourcePlan;
-use common_catalog::plan::ParquetReadOptions;
-use common_catalog::plan::PartInfo;
-use common_catalog::plan::PartStatistics;
-use common_catalog::plan::Partitions;
-use common_catalog::plan::PartitionsShuffleKind;
-use common_catalog::plan::PushDownInfo;
-use common_catalog::table::Table;
-use common_catalog::table_args::TableArgs;
-use common_catalog::table_context::TableContext;
-use common_exception::ErrorCode;
-use common_exception::Result;
-use common_expression::TableSchema;
-use common_expression::TableSchemaRef;
-use common_functions::BUILTIN_FUNCTIONS;
-use common_meta_app::schema::TableIdent;
-use common_meta_app::schema::TableInfo;
-use common_meta_app::schema::TableMeta;
-use common_pipeline_core::processors::port::OutputPort;
-use common_pipeline_core::Pipeline;
-use common_pipeline_core::SourcePipeBuilder;
-use common_storage::DataOperator;
-use common_storages_parquet::ParquetPart;
-use common_storages_parquet::ParquetPartitionPruner;
-use common_storages_parquet::ParquetRSReader;
-use common_storages_parquet::ParquetTable;
-use storages_common_pruner::RangePrunerCreator;
-use tokio::sync::OnceCell;
+use databend_common_catalog::catalog::Catalog;
+use databend_common_catalog::catalog::StorageDescription;
+use databend_common_catalog::plan::DataSourcePlan;
+use databend_common_catalog::plan::PartInfo;
+use databend_common_catalog::plan::PartStatistics;
+use databend_common_catalog::plan::Partitions;
+use databend_common_catalog::plan::PartitionsShuffleKind;
+use databend_common_catalog::plan::PushDownInfo;
+use databend_common_catalog::table::DistributionLevel;
+use databend_common_catalog::table::Table;
+use databend_common_catalog::table::TableStatistics;
+use databend_common_catalog::table_args::TableArgs;
+use databend_common_catalog::table_context::TableContext;
+use databend_common_exception::ErrorCode;
+use databend_common_exception::Result;
+use databend_common_expression::DataSchema;
+use databend_common_expression::TableSchema;
+use databend_common_meta_app::schema::TableIdent;
+use databend_common_meta_app::schema::TableInfo;
+use databend_common_meta_app::schema::TableMeta;
+use databend_common_pipeline_core::Pipeline;
+use databend_storages_common_table_meta::table::ChangeType;
+use futures::TryStreamExt;
+use iceberg::io::FileIOBuilder;
 
 use crate::partition::IcebergPartInfo;
-use crate::stats::get_stats_of_data_file;
+use crate::predicate::PredicateBuilder;
 use crate::table_source::IcebergTableSource;
+use crate::IcebergCatalog;
+
+pub const ICEBERG_ENGINE: &str = "ICEBERG";
 
 /// accessor wrapper as a table
-///
-/// TODO: we should use icelake Table instead.
+#[derive(Clone)]
 pub struct IcebergTable {
     info: TableInfo,
-    op: opendal::Operator,
 
-    table: OnceCell<icelake::Table>,
+    pub table: iceberg::table::Table,
 }
 
 impl IcebergTable {
     /// create a new table on the table directory
-    #[async_backtrace::framed]
-    pub fn try_new(dop: DataOperator, info: TableInfo) -> Result<IcebergTable> {
-        Ok(Self {
-            info,
-            op: dop.operator(),
-            table: OnceCell::new(),
-        })
+    pub fn try_create(info: TableInfo) -> Result<Box<dyn Table>> {
+        let table = Self::parse_engine_options(&info.meta.engine_options)?;
+        Ok(Box::new(Self { info, table }))
+    }
+
+    pub fn description() -> StorageDescription {
+        StorageDescription {
+            engine_name: ICEBERG_ENGINE.to_string(),
+            comment: "ICEBERG Storage Engine".to_string(),
+            support_cluster_key: false,
+        }
+    }
+
+    pub async fn load_iceberg_table(
+        ctl: &IcebergCatalog,
+        database: &str,
+        table_name: &str,
+    ) -> Result<iceberg::table::Table> {
+        let db_ident = iceberg::NamespaceIdent::new(database.to_string());
+        let table = ctl
+            .iceberg_catalog()
+            .load_table(&iceberg::TableIdent::new(db_ident, table_name.to_string()))
+            .await
+            .map_err(|err| {
+                ErrorCode::ReadTableDataError(format!("Iceberg catalog load failed: {err:?}"))
+            })?;
+        Ok(table)
+    }
+
+    pub fn get_schema(table: &iceberg::table::Table) -> Result<TableSchema> {
+        let meta = table.metadata();
+
+        // Build arrow schema from iceberg metadata.
+        let arrow_schema: ArrowSchema = meta.current_schema().as_ref().try_into().map_err(|e| {
+            ErrorCode::ReadTableDataError(format!("Cannot convert table metadata: {e:?}"))
+        })?;
+        TableSchema::try_from(&arrow_schema)
+    }
+
+    /// build_engine_options will generate `engine_options` from [`iceberg::table::Table`] so that
+    /// we can distribute it across nodes and rebuild this table without loading from catalog again.
+    ///
+    /// We will never persist the `engine_options` to storage, so it's safe to change the implementation.
+    /// As long as you make sure both [`build_engine_options`] and [`parse_engine_options`] been updated.
+    pub fn build_engine_options(table: &iceberg::table::Table) -> Result<BTreeMap<String, String>> {
+        let (file_io_scheme, file_io_props) = table.file_io().clone().into_props();
+        let file_io_props = serde_json::to_string(&file_io_props)?;
+        let metadata_location = table
+            .metadata_location()
+            .map(|v| v.to_string())
+            .unwrap_or_default();
+        let metadata = serde_json::to_string(table.metadata())?;
+        let identifier = serde_json::to_string(table.identifier())?;
+
+        Ok(BTreeMap::from_iter([
+            ("iceberg.file_io.scheme".to_string(), file_io_scheme),
+            ("iceberg.file_io.props".to_string(), file_io_props),
+            ("iceberg.metadata_location".to_string(), metadata_location),
+            ("iceberg.metadata".to_string(), metadata),
+            ("iceberg.identifier".to_string(), identifier),
+        ]))
+    }
+
+    /// parse_engine_options will parse `engine_options` to [`BTreeMap`] so that we can rebuild the table.
+    ///
+    /// See [`build_engine_options`] for more information.
+    pub fn parse_engine_options(
+        options: &BTreeMap<String, String>,
+    ) -> Result<iceberg::table::Table> {
+        let file_io_scheme = options.get("iceberg.file_io.scheme").ok_or_else(|| {
+            ErrorCode::ReadTableDataError(
+                "Rebuild iceberg table failed: Missing iceberg.file_io.scheme",
+            )
+        })?;
+
+        let file_io_props: HashMap<String, String> =
+            serde_json::from_str(options.get("iceberg.file_io.props").ok_or_else(|| {
+                ErrorCode::ReadTableDataError(
+                    "Rebuild iceberg table failed: Missing iceberg.file_io.props",
+                )
+            })?)?;
+
+        let metadata_location = options
+            .get("iceberg.metadata_location")
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+
+        let metadata: iceberg::spec::TableMetadata =
+            serde_json::from_str(options.get("iceberg.metadata").ok_or_else(|| {
+                ErrorCode::ReadTableDataError(
+                    "Rebuild iceberg table failed: Missing iceberg.metadata",
+                )
+            })?)?;
+
+        let identifier: iceberg::TableIdent =
+            serde_json::from_str(options.get("iceberg.identifier").ok_or_else(|| {
+                ErrorCode::ReadTableDataError(
+                    "Rebuild iceberg table failed: Missing iceberg.identifier",
+                )
+            })?)?;
+
+        let file_io = FileIOBuilder::new(file_io_scheme)
+            .with_props(file_io_props)
+            .build()
+            .map_err(|err| {
+                ErrorCode::ReadTableDataError(format!(
+                    "Rebuild iceberg table file io failed: {err:?}"
+                ))
+            })?;
+
+        iceberg::table::Table::builder()
+            .identifier(identifier)
+            .metadata(metadata)
+            .metadata_location(metadata_location)
+            .file_io(file_io)
+            .build()
+            .map_err(|err| {
+                ErrorCode::ReadTableDataError(format!("Rebuild iceberg table failed: {err:?}"))
+            })
     }
 
     /// create a new table on the table directory
     #[async_backtrace::framed]
-    pub async fn try_create(
-        catalog: &str,
-        database: &str,
+    pub async fn try_create_from_iceberg_catalog(
+        ctl: IcebergCatalog,
+        database_name: &str,
         table_name: &str,
-        dop: DataOperator,
     ) -> Result<IcebergTable> {
-        let op = dop.operator();
-        let table = icelake::Table::open_with_op(op.clone())
-            .await
-            .map_err(|e| ErrorCode::ReadTableDataError(format!("Cannot load metadata: {e:?}")))?;
+        let table = Self::load_iceberg_table(&ctl, database_name, table_name).await?;
+        let table_schema = Self::get_schema(&table)?;
 
-        let meta = table.current_table_metadata();
-
-        // Build arrow schema from iceberg metadata.
-        let arrow_schema: ArrowSchema = meta
-            .schemas
-            .last()
-            .ok_or_else(|| {
-                ErrorCode::ReadTableDataError("Iceberg table schema is empty".to_string())
-            })?
-            .clone()
-            .try_into()
-            .map_err(|e| {
-                ErrorCode::ReadTableDataError(format!("Cannot convert table metadata: {e:?}"))
-            })?;
-
-        // Build arrow2 schema from arrow schema.
-        let fields: Vec<Arrow2Field> = arrow_schema
-            .fields()
-            .into_iter()
-            .map(|f| f.into())
-            .collect();
-        let arrow2_schema = Arrow2Schema::from(fields);
-
-        let table_schema = TableSchema::from(&arrow2_schema);
+        let engine_options = Self::build_engine_options(&table)?;
 
         // construct table info
         let info = TableInfo {
             ident: TableIdent::new(0, 0),
-            desc: format!("{database}.{table_name}"),
+            desc: format!("{database_name}.{table_name}"),
             name: table_name.to_string(),
             meta: TableMeta {
                 schema: Arc::new(table_schema),
-                catalog: catalog.to_string(),
                 engine: "iceberg".to_string(),
+                engine_options,
                 created_on: Utc::now(),
-                storage_params: Some(dop.params()),
                 ..Default::default()
             },
+            catalog_info: ctl.info(),
             ..Default::default()
         };
 
-        Ok(Self {
-            info,
-            op,
-            table: OnceCell::new_with(Some(table)),
-        })
-    }
-
-    async fn table(&self) -> Result<&icelake::Table> {
-        let op = self.op.clone();
-
-        self.table
-            .get_or_try_init(|| async {
-                icelake::Table::open_with_op(op).await.map_err(|e| {
-                    ErrorCode::ReadTableDataError(format!("Cannot load metadata: {e:?}"))
-                })
-            })
-            .await
+        Ok(Self { info, table })
     }
 
     pub fn do_read_data(
@@ -157,133 +224,66 @@ impl IcebergTable {
         let max_threads = ctx.get_settings().get_max_threads()? as usize;
         let max_threads = std::cmp::min(parts_len, max_threads);
 
-        let table_schema: TableSchemaRef = self.info.schema();
-        let projection = PushDownInfo::projection_of_push_downs(&table_schema, &plan.push_downs);
-
-        let arrow_schema = table_schema.to_arrow();
-        let arrow_fields = arrow_schema
-            .fields
-            .into_iter()
-            .map(|f| f.into())
-            .collect::<Vec<arrow_schema::Field>>();
-        let arrow_schema = arrow_schema::Schema::new(arrow_fields);
-        let parquet_schema =
-            parquet::arrow::arrow_to_parquet_schema(&arrow_schema).map_err(|e| {
-                ErrorCode::TableInfoError(format!(
-                    "Convert table schema to parquet schema failed: {}",
-                    e
-                ))
-            })?;
-
-        let praquet_reader =
-            ParquetRSReader::create(self.op.clone(), &arrow_schema, &parquet_schema, projection)?;
-
-        // TODO: we need to support top_k.
-        // TODO: we need to support prewhere.
-
-        let mut source_builder = SourcePipeBuilder::create();
-        for _ in 0..std::cmp::max(1, max_threads) {
-            let output = OutputPort::create();
-            source_builder.add_source(
-                output.clone(),
-                IcebergTableSource::create(ctx.clone(), output, praquet_reader.clone())?,
-            );
-        }
-
-        pipeline.add_pipe(source_builder.finalize());
-        Ok(())
+        let output_schema = Arc::new(DataSchema::from(plan.schema()));
+        pipeline.add_source(
+            |output| {
+                IcebergTableSource::create(ctx.clone(), output, output_schema.clone(), self.clone())
+            },
+            max_threads.max(1),
+        )
     }
 
-    #[minitrace::trace]
+    #[fastrace::trace]
     #[async_backtrace::framed]
     async fn do_read_partitions(
         &self,
-        ctx: Arc<dyn TableContext>,
+        _: Arc<dyn TableContext>,
         push_downs: Option<PushDownInfo>,
     ) -> Result<(PartStatistics, Partitions)> {
-        let table = self.table().await?;
+        let mut scan = self.table.scan();
 
-        let data_files = table.current_data_files().await.map_err(|e| {
-            ErrorCode::ReadTableDataError(format!("Cannot get current data files: {e:?}"))
-        })?;
+        if let Some(push_downs) = &push_downs {
+            if let Some(projection) = &push_downs.projection {
+                scan = scan.select(
+                    projection
+                        .project_schema(&self.schema())
+                        .fields
+                        .iter()
+                        .map(|v| v.name.clone()),
+                );
+            }
+            if let Some(filter) = &push_downs.filters {
+                let predicate = PredicateBuilder::default().build(&filter.filter);
+                scan = scan.with_filter(predicate)
+            }
+        }
 
-        let filter = push_downs
-            .as_ref()
-            .and_then(|extra| extra.filter.as_ref().map(|f| f.as_expr(&BUILTIN_FUNCTIONS)));
+        let tasks: Vec<_> = scan
+            .build()
+            .map_err(|err| ErrorCode::Internal(format!("iceberg table scan build: {err:?}")))?
+            .plan_files()
+            .await
+            .map_err(|err| ErrorCode::Internal(format!("iceberg table scan plan: {err:?}")))?
+            .try_collect()
+            .await
+            .map_err(|err| ErrorCode::Internal(format!("iceberg table scan collect: {err:?}")))?;
 
-        let schema = self.schema();
-
-        let pruner =
-            RangePrunerCreator::try_create(ctx.get_function_context()?, &schema, filter.as_ref())?;
-
-        // TODO: support other file formats. We only support parquet files now.
-        let parquet_files = data_files
+        let mut read_rows = 0;
+        let mut read_bytes = 0;
+        let total_files = tasks.len();
+        let parts: Vec<_> = tasks
             .into_iter()
-            .filter(|df| {
-                if let Some(stats) = get_stats_of_data_file(&schema, df) {
-                    pruner.should_keep(&stats, None)
-                } else {
-                    true
-                }
+            .map(|v: iceberg::scan::FileScanTask| {
+                read_rows += v.record_count.unwrap_or_default() as usize;
+                read_bytes += v.length as usize;
+                Arc::new(Box::new(IcebergPartInfo::new(v)) as Box<dyn PartInfo>)
             })
-            .map(|v: icelake::types::DataFile| match v.file_format {
-                icelake::types::DataFileFormat::Parquet => {
-                    let path = table
-                        .rel_path(&v.file_path)
-                        .expect("file path must be rel to table");
-                    Ok((path, v.file_size_in_bytes as u64))
-                }
-                _ => Err(ErrorCode::Unimplemented(
-                    "Only parquet format is supported for iceberg table",
-                )),
-            })
-            .collect::<Result<Vec<_>>>()?;
-
-        let (stats, parts) = self
-            .prune_parquet_partitions(ctx.clone(), &parquet_files, &push_downs)
-            .await?;
-
-        let parts = parts
-            .into_iter()
-            .map(|p| Arc::new(Box::new(IcebergPartInfo::Parquet(p)) as Box<dyn PartInfo>))
-            .collect::<Vec<_>>();
+            .collect();
 
         Ok((
-            stats,
-            Partitions::create_nolazy(PartitionsShuffleKind::Mod, parts),
+            PartStatistics::new_estimated(None, read_rows, read_bytes, parts.len(), total_files),
+            Partitions::create(PartitionsShuffleKind::Mod, parts),
         ))
-    }
-
-    async fn prune_parquet_partitions(
-        &self,
-        ctx: Arc<dyn TableContext>,
-        files: &[(String, u64)],
-        push_downs: &Option<PushDownInfo>,
-    ) -> Result<(PartStatistics, Vec<ParquetPart>)> {
-        if files.is_empty() {
-            return Ok((PartStatistics::default_exact(), vec![]));
-        }
-        let (first_file, _) = files[0].clone();
-        let (arrow_schema, schema_descr, compression_ratio) =
-            ParquetTable::prepare_metas(&first_file, self.op.clone()).await?;
-        let pruner = ParquetPartitionPruner::try_create(
-            ctx,
-            &arrow_schema,
-            schema_descr,
-            &first_file,
-            push_downs,
-            ParquetReadOptions::new()
-                .with_prune_row_groups(true)
-                .with_do_prewhere(false)
-                .with_prune_pages(false)
-                .with_push_down_bitmap(false),
-            compression_ratio,
-            true, // Currently, don't generate small file parts.
-        )?;
-
-        pruner
-            .read_and_prune_partitions(self.op.clone(), files)
-            .await
     }
 }
 
@@ -293,8 +293,8 @@ impl Table for IcebergTable {
         self
     }
 
-    fn is_local(&self) -> bool {
-        false
+    fn distribution_level(&self) -> DistributionLevel {
+        DistributionLevel::Cluster
     }
 
     fn get_table_info(&self) -> &TableInfo {
@@ -303,6 +303,16 @@ impl Table for IcebergTable {
 
     fn name(&self) -> &str {
         &self.get_table_info().name
+    }
+
+    // TODO load summary
+    async fn table_statistics(
+        &self,
+        _ctx: Arc<dyn TableContext>,
+        _require_fresh: bool,
+        _change_type: Option<ChangeType>,
+    ) -> Result<Option<TableStatistics>> {
+        Ok(None)
     }
 
     #[async_backtrace::framed]
@@ -321,6 +331,7 @@ impl Table for IcebergTable {
         ctx: Arc<dyn TableContext>,
         plan: &DataSourcePlan,
         pipeline: &mut Pipeline,
+        _put_cache: bool,
     ) -> Result<()> {
         self.do_read_data(ctx, plan, pipeline)
     }
@@ -331,5 +342,9 @@ impl Table for IcebergTable {
 
     fn support_column_projection(&self) -> bool {
         true
+    }
+
+    fn support_prewhere(&self) -> bool {
+        false
     }
 }

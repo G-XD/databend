@@ -12,235 +12,239 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::alloc::Layout;
-use std::fmt;
-use std::marker::PhantomData;
+use std::any::Any;
 use std::sync::Arc;
 
-use common_arrow::arrow::bitmap::Bitmap;
-use common_exception::ErrorCode;
-use common_exception::Result;
-use common_expression::types::number::Number;
-use common_expression::types::number::F64;
-use common_expression::types::DataType;
-use common_expression::types::NumberDataType;
-use common_expression::types::NumberType;
-use common_expression::types::ValueType;
-use common_expression::with_number_mapped_type;
-use common_expression::Column;
-use common_expression::ColumnBuilder;
-use common_expression::Scalar;
-use common_io::prelude::*;
+use borsh::BorshDeserialize;
+use borsh::BorshSerialize;
+use databend_common_exception::ErrorCode;
+use databend_common_exception::Result;
+use databend_common_expression::types::decimal::Decimal;
+use databend_common_expression::types::decimal::Decimal128Type;
+use databend_common_expression::types::decimal::Decimal256Type;
+use databend_common_expression::types::number::Number;
+use databend_common_expression::types::number::F64;
+use databend_common_expression::types::DataType;
+use databend_common_expression::types::DecimalDataType;
+use databend_common_expression::types::Float64Type;
+use databend_common_expression::types::NumberDataType;
+use databend_common_expression::types::NumberType;
+use databend_common_expression::types::ValueType;
+use databend_common_expression::with_number_mapped_type;
+use databend_common_expression::Scalar;
 use num_traits::AsPrimitive;
-use serde::Deserialize;
-use serde::Serialize;
 
-use super::StateAddr;
+use super::AggregateUnaryFunction;
+use super::FunctionData;
+use super::UnaryState;
 use crate::aggregates::aggregate_function_factory::AggregateFunctionDescription;
 use crate::aggregates::aggregator_common::assert_unary_arguments;
 use crate::aggregates::AggregateFunction;
-use crate::aggregates::AggregateFunctionRef;
 
-const POP: u8 = 0;
-const SAMP: u8 = 1;
+const STD_POP: u8 = 0;
+const STD_SAMP: u8 = 1;
+const VAR_POP: u8 = 2;
+const VAR_SAMP: u8 = 3;
 
-#[derive(Serialize, Deserialize)]
-struct AggregateStddevState {
-    pub sum: f64,
-    pub count: u64,
-    pub variance: f64,
+// Streaming approximate standard deviation using Welford's
+// method, DOI: 10.2307/1266577
+#[derive(BorshSerialize, BorshDeserialize, Default)]
+struct StddevState<const TYPE: u8> {
+    count: u64,    // n
+    mean: f64,     // M1
+    dsquared: f64, // M2
 }
 
-impl AggregateStddevState {
-    #[inline(always)]
-    fn add(&mut self, value: f64) {
-        self.sum += value;
+impl<const TYPE: u8> StddevState<TYPE> {
+    fn state_add(&mut self, value: f64) -> Result<()> {
         self.count += 1;
-        if self.count > 1 {
-            let t = self.count as f64 * value - self.sum;
-            self.variance += (t * t) / (self.count * (self.count - 1)) as f64;
-        }
+        let mean_differential = (value - self.mean) / self.count as f64;
+        let new_mean = self.mean + mean_differential;
+        let dsquared_increment = (value - new_mean) * (value - self.mean);
+        let new_dsquared = self.dsquared + dsquared_increment;
+
+        self.mean = new_mean;
+        self.dsquared = new_dsquared;
+        Ok(())
     }
 
-    #[inline(always)]
-    fn merge(&mut self, other: &Self) {
+    fn state_merge(&mut self, other: &Self) -> Result<()> {
         if other.count == 0 {
-            return;
+            return Ok(());
         }
         if self.count == 0 {
             self.count = other.count;
-            self.sum = other.sum;
-            self.variance = other.variance;
-            return;
+            self.mean = other.mean;
+            self.dsquared = other.dsquared;
+            return Ok(());
         }
 
-        let t = (other.count as f64 / self.count as f64) * self.sum - other.sum;
-        self.variance += other.variance
-            + ((self.count as f64 / other.count as f64) / (self.count as f64 + other.count as f64))
-                * t
-                * t;
-        self.count += other.count;
-        self.sum += other.sum;
-    }
-}
+        let count = self.count + other.count;
+        let mean = (self.count as f64 * self.mean + other.count as f64 * other.mean) / count as f64;
+        let delta = other.mean - self.mean;
 
-#[derive(Clone)]
-pub struct AggregateStddevFunction<T, const TYPE: u8> {
-    display_name: String,
-    _arguments: Vec<DataType>,
-    t: PhantomData<T>,
-}
+        self.count = count;
+        self.mean = mean;
+        self.dsquared = other.dsquared
+            + self.dsquared
+            + delta * delta * other.count as f64 * self.count as f64 / count as f64;
 
-impl<T, const TYPE: u8> AggregateFunction for AggregateStddevFunction<T, TYPE>
-where T: Number + AsPrimitive<f64>
-{
-    fn name(&self) -> &str {
-        "AggregateStddevPopFunction"
+        Ok(())
     }
 
-    fn return_type(&self) -> Result<DataType> {
-        Ok(DataType::Number(NumberDataType::Float64))
-    }
-
-    fn init_state(&self, place: StateAddr) {
-        place.write(|| AggregateStddevState {
-            sum: 0.0,
-            count: 0,
-            variance: 0.0,
-        });
-    }
-
-    fn state_layout(&self) -> Layout {
-        Layout::new::<AggregateStddevState>()
-    }
-
-    fn accumulate(
-        &self,
-        place: StateAddr,
-        columns: &[Column],
-        validity: Option<&Bitmap>,
-        _input_rows: usize,
-    ) -> Result<()> {
-        let state = place.get::<AggregateStddevState>();
-        let column = NumberType::<T>::try_downcast_column(&columns[0]).unwrap();
-        match validity {
-            Some(bitmap) => {
-                for (value, is_valid) in column.iter().zip(bitmap.iter()) {
-                    if is_valid {
-                        state.add(value.as_());
-                    }
-                }
+    fn state_merge_result(&mut self, builder: &mut Vec<F64>) -> Result<()> {
+        let result = if self.count <= 1 {
+            0f64
+        } else {
+            match TYPE {
+                STD_POP => (self.dsquared / self.count as f64).sqrt(),
+                STD_SAMP => (self.dsquared / (self.count - 1) as f64).sqrt(),
+                VAR_POP => self.dsquared / self.count as f64,
+                VAR_SAMP => self.dsquared / (self.count - 1) as f64,
+                _ => unreachable!(),
             }
-            None => {
-                for value in column.iter() {
-                    state.add(value.as_());
-                }
-            }
-        }
+        };
 
-        Ok(())
-    }
+        builder.push(result.into());
 
-    fn accumulate_keys(
-        &self,
-        places: &[StateAddr],
-        offset: usize,
-        columns: &[Column],
-        _input_rows: usize,
-    ) -> Result<()> {
-        let column = NumberType::<T>::try_downcast_column(&columns[0]).unwrap();
-
-        column.iter().zip(places.iter()).for_each(|(value, place)| {
-            let place = place.next(offset);
-            let state = place.get::<AggregateStddevState>();
-            let v: f64 = value.as_();
-            state.add(v);
-        });
-        Ok(())
-    }
-
-    fn accumulate_row(&self, place: StateAddr, columns: &[Column], row: usize) -> Result<()> {
-        let column = NumberType::<T>::try_downcast_column(&columns[0]).unwrap();
-
-        let state = place.get::<AggregateStddevState>();
-        let v: f64 = column[row].as_();
-        state.add(v);
-        Ok(())
-    }
-
-    fn serialize(&self, place: StateAddr, writer: &mut Vec<u8>) -> Result<()> {
-        let state = place.get::<AggregateStddevState>();
-        serialize_into_buf(writer, state)
-    }
-
-    fn deserialize(&self, place: StateAddr, reader: &mut &[u8]) -> Result<()> {
-        let state = place.get::<AggregateStddevState>();
-        *state = deserialize_from_slice(reader)?;
-
-        Ok(())
-    }
-
-    fn merge(&self, place: StateAddr, rhs: StateAddr) -> Result<()> {
-        let state = place.get::<AggregateStddevState>();
-        let rhs = rhs.get::<AggregateStddevState>();
-        state.merge(rhs);
-        Ok(())
-    }
-
-    #[allow(unused_mut)]
-    fn merge_result(&self, place: StateAddr, builder: &mut ColumnBuilder) -> Result<()> {
-        let state = place.get::<AggregateStddevState>();
-        let builder = NumberType::<F64>::try_downcast_builder(builder).unwrap();
-        let variance = state.variance / (state.count - TYPE as u64) as f64;
-        builder.push(variance.sqrt().into());
         Ok(())
     }
 }
 
-impl<T, const TYPE: u8> fmt::Display for AggregateStddevFunction<T, TYPE> {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "{}", self.display_name)
-    }
+#[derive(BorshSerialize, BorshDeserialize, Default)]
+struct NumberAggregateStddevState<const TYPE: u8> {
+    state: StddevState<TYPE>,
 }
 
-impl<T, const TYPE: u8> AggregateStddevFunction<T, TYPE>
-where T: Number + AsPrimitive<f64>
+impl<T, const TYPE: u8> UnaryState<T, Float64Type> for NumberAggregateStddevState<TYPE>
+where
+    T: ValueType,
+    T::Scalar: Number + AsPrimitive<f64>,
 {
-    pub fn try_create(
-        display_name: &str,
-        arguments: Vec<DataType>,
-    ) -> Result<AggregateFunctionRef> {
-        Ok(Arc::new(Self {
-            display_name: display_name.to_string(),
-            _arguments: arguments,
-            t: PhantomData,
-        }))
+    fn add(
+        &mut self,
+        other: T::ScalarRef<'_>,
+        _function_data: Option<&dyn FunctionData>,
+    ) -> Result<()> {
+        let value = T::to_owned_scalar(other).as_();
+        self.state.state_add(value)
+    }
+
+    fn merge(&mut self, other: &Self) -> Result<()> {
+        self.state.state_merge(&other.state)
+    }
+
+    fn merge_result(
+        &mut self,
+        builder: &mut Vec<F64>,
+        _function_data: Option<&dyn FunctionData>,
+    ) -> Result<()> {
+        self.state.state_merge_result(builder)
+    }
+}
+
+struct DecimalFuncData {
+    pub scale: u8,
+}
+
+impl FunctionData for DecimalFuncData {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+#[derive(BorshSerialize, BorshDeserialize, Default)]
+struct DecimalNumberAggregateStddevState<const TYPE: u8> {
+    state: StddevState<TYPE>,
+}
+
+impl<T, const TYPE: u8> UnaryState<T, Float64Type> for DecimalNumberAggregateStddevState<TYPE>
+where
+    T: ValueType,
+    T::Scalar: Decimal + BorshSerialize + BorshDeserialize,
+{
+    fn add(
+        &mut self,
+        other: T::ScalarRef<'_>,
+        function_data: Option<&dyn FunctionData>,
+    ) -> Result<()> {
+        let stddev_func_data = unsafe {
+            function_data
+                .unwrap()
+                .as_any()
+                .downcast_ref_unchecked::<DecimalFuncData>()
+        };
+        let value = T::to_owned_scalar(other).to_float64(stddev_func_data.scale);
+        self.state.state_add(value)
+    }
+
+    fn merge(&mut self, other: &Self) -> Result<()> {
+        self.state.state_merge(&other.state)
+    }
+
+    fn merge_result(
+        &mut self,
+        builder: &mut Vec<F64>,
+        _function_data: Option<&dyn FunctionData>,
+    ) -> Result<()> {
+        self.state.state_merge_result(builder)
     }
 }
 
 pub fn try_create_aggregate_stddev_pop_function<const TYPE: u8>(
     display_name: &str,
-    _params: Vec<Scalar>,
+    params: Vec<Scalar>,
     arguments: Vec<DataType>,
 ) -> Result<Arc<dyn AggregateFunction>> {
     assert_unary_arguments(display_name, arguments.len())?;
     with_number_mapped_type!(|NUM_TYPE| match &arguments[0] {
         DataType::Number(NumberDataType::NUM_TYPE) => {
-            AggregateStddevFunction::<NUM_TYPE, TYPE>::try_create(display_name, arguments)
+            let return_type = DataType::Number(NumberDataType::Float64);
+            AggregateUnaryFunction::<
+                NumberAggregateStddevState<TYPE>,
+                NumberType<NUM_TYPE>,
+                Float64Type,
+            >::try_create_unary(display_name, return_type, params, arguments[0].clone())
+        }
+        DataType::Decimal(DecimalDataType::Decimal128(s)) => {
+            let return_type = DataType::Number(NumberDataType::Float64);
+            let func = AggregateUnaryFunction::<
+                DecimalNumberAggregateStddevState<TYPE>,
+                Decimal128Type,
+                Float64Type,
+            >::try_create(
+                display_name, return_type, params, arguments[0].clone()
+            )
+            .with_function_data(Box::new(DecimalFuncData { scale: s.scale }));
+            Ok(Arc::new(func))
+        }
+        DataType::Decimal(DecimalDataType::Decimal256(s)) => {
+            let return_type = DataType::Number(NumberDataType::Float64);
+            let func = AggregateUnaryFunction::<
+                DecimalNumberAggregateStddevState<TYPE>,
+                Decimal256Type,
+                Float64Type,
+            >::try_create(
+                display_name, return_type, params, arguments[0].clone()
+            )
+            .with_function_data(Box::new(DecimalFuncData { scale: s.scale }));
+            Ok(Arc::new(func))
         }
         _ => Err(ErrorCode::BadDataValueType(format!(
-            "AggregateStddevPopFunction does not support type '{:?}'",
-            arguments[0]
+            "{} does not support type '{:?}'",
+            display_name, arguments[0]
         ))),
     })
 }
 
 pub fn aggregate_stddev_pop_function_desc() -> AggregateFunctionDescription {
-    AggregateFunctionDescription::creator(Box::new(try_create_aggregate_stddev_pop_function::<POP>))
+    AggregateFunctionDescription::creator(Box::new(
+        try_create_aggregate_stddev_pop_function::<STD_POP>,
+    ))
 }
 
 pub fn aggregate_stddev_samp_function_desc() -> AggregateFunctionDescription {
     AggregateFunctionDescription::creator(Box::new(
-        try_create_aggregate_stddev_pop_function::<SAMP>,
+        try_create_aggregate_stddev_pop_function::<STD_SAMP>,
     ))
 }

@@ -16,29 +16,45 @@
 #![feature(try_blocks)]
 
 mod entry;
-mod local;
 
-use common_base::mem_allocator::GlobalAllocator;
-use common_base::runtime::Runtime;
-use common_config::InnerConfig;
-use common_exception::Result;
-use common_license::license_manager::LicenseManager;
-use common_license::license_manager::OssLicenseManager;
+use databend_common_base::mem_allocator::GlobalAllocator;
+use databend_common_base::runtime::Runtime;
+use databend_common_base::runtime::ThreadTracker;
+use databend_common_config::InnerConfig;
+use databend_common_exception::Result;
+use databend_common_exception::ResultExt;
+use databend_common_license::license_manager::LicenseManager;
+use databend_common_license::license_manager::OssLicenseManager;
+use databend_common_tracing::pipe_file;
+use databend_common_tracing::set_crash_hook;
+use databend_common_tracing::SignalListener;
+use entry::MainError;
 
 use crate::entry::init_services;
+use crate::entry::run_cmd;
 use crate::entry::start_services;
 
 #[global_allocator]
 pub static GLOBAL_ALLOCATOR: GlobalAllocator = GlobalAllocator;
 
 fn main() {
+    let binary_version = (*databend_common_config::DATABEND_COMMIT_VERSION).clone();
+
+    // Crash tracker
+    let (input, output) = pipe_file().unwrap();
+    set_crash_hook(output);
+    SignalListener::spawn(input, binary_version);
+
+    // Thread tracker
+    ThreadTracker::init();
+
     match Runtime::with_default_worker_threads() {
         Err(cause) => {
             eprintln!("Databend Query start failure, cause: {:?}", cause);
             std::process::exit(cause.code() as i32);
         }
         Ok(rt) => {
-            if let Err(cause) = rt.block_on(async_backtrace::location!().frame(main_entrypoint())) {
+            if let Err(cause) = rt.block_on(main_entrypoint()) {
                 eprintln!("Databend Query start failure, cause: {:?}", cause);
                 std::process::exit(cause.code() as i32);
             }
@@ -46,10 +62,17 @@ fn main() {
     }
 }
 
-async fn main_entrypoint() -> Result<()> {
-    let conf: InnerConfig = InnerConfig::load()?;
-    init_services(&conf).await?;
+async fn main_entrypoint() -> Result<(), MainError> {
+    let make_error = || "an fatal error occurred in query";
+
+    let conf: InnerConfig = InnerConfig::load().await.with_context(make_error)?;
+    if run_cmd(&conf).await.with_context(make_error)? {
+        return Ok(());
+    }
+
+    init_services(&conf, false).await?;
     // init oss license manager
-    OssLicenseManager::init()?;
+    OssLicenseManager::init(conf.query.tenant_id.tenant_name().to_string())
+        .with_context(make_error)?;
     start_services(&conf).await
 }

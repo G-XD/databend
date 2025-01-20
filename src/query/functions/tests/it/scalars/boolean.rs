@@ -14,10 +14,10 @@
 
 use std::io::Write;
 
-use common_expression::types::nullable::NullableColumn;
-use common_expression::types::*;
-use common_expression::Column;
-use common_expression::FromData;
+use databend_common_expression::types::nullable::NullableColumn;
+use databend_common_expression::types::*;
+use databend_common_expression::Column;
+use databend_common_expression::FromData;
 use goldenfile::Mint;
 
 use super::run_ast;
@@ -75,17 +75,17 @@ fn test_not(file: &mut impl Write) {
     )]);
     run_ast(file, "NOT a", &[(
         "a",
-        Column::Nullable(Box::new(NullableColumn {
-            column: Column::Boolean(vec![true, false, true].into()),
-            validity: vec![false, true, false].into(),
-        })),
+        NullableColumn::new_column(
+            Column::Boolean(vec![true, false, true].into()),
+            vec![false, true, false].into(),
+        ),
     )]);
     run_ast(file, "NOT a", &[(
         "a",
-        Column::Nullable(Box::new(NullableColumn {
-            column: Column::Boolean(vec![false, false, false].into()),
-            validity: vec![true, true, false].into(),
-        })),
+        NullableColumn::new_column(
+            Column::Boolean(vec![false, false, false].into()),
+            vec![true, true, false].into(),
+        ),
     )]);
 }
 

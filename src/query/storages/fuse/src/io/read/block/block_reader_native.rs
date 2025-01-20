@@ -14,36 +14,36 @@
 
 use std::collections::BTreeMap;
 use std::collections::HashSet;
-use std::collections::VecDeque;
 use std::io::BufReader;
 use std::ops::Range;
-use std::time::Instant;
+use std::sync::Arc;
 
-use common_arrow::arrow::array::Array;
-use common_arrow::native::read::reader::NativeReader;
-use common_arrow::native::read::NativeReadBuf;
-use common_catalog::plan::PartInfoPtr;
-use common_exception::Result;
-use common_expression::types::DataType;
-use common_expression::BlockEntry;
-use common_expression::Column;
-use common_expression::ColumnId;
-use common_expression::DataBlock;
-use common_expression::Value;
+use arrow::datatypes::Schema as ArrowSchema;
+use databend_common_catalog::plan::PartInfoPtr;
+use databend_common_catalog::table_context::TableContext;
+use databend_common_exception::Result;
+use databend_common_expression::types::DataType;
+use databend_common_expression::BlockEntry;
+use databend_common_expression::Column;
+use databend_common_expression::ColumnId;
+use databend_common_expression::DataBlock;
+use databend_common_expression::DataSchema;
+use databend_common_expression::Value;
+use databend_common_metrics::storage::*;
+use databend_common_native::read::reader::read_meta_async;
+use databend_common_native::read::reader::NativeReader;
+use databend_common_native::read::NativeReadBuf;
+use databend_storages_common_io::ReadSettings;
+use databend_storages_common_table_meta::meta::ColumnMeta;
 use opendal::Operator;
-use storages_common_table_meta::meta::ColumnMeta;
 
-use crate::fuse_part::FusePartInfo;
+use crate::fuse_part::FuseBlockPartInfo;
 use crate::io::BlockReader;
-use crate::io::TableMetaLocationGenerator;
-use crate::metrics::metrics_inc_remote_io_read_bytes;
-use crate::metrics::metrics_inc_remote_io_read_milliseconds;
-use crate::metrics::metrics_inc_remote_io_read_parts;
-use crate::metrics::metrics_inc_remote_io_seeks;
 
 // Native storage format
 
 pub trait NativeReaderExt: NativeReadBuf + std::io::Seek + Send + Sync {}
+
 impl<T: NativeReadBuf + std::io::Seek + Send + Sync> NativeReaderExt for T {}
 
 pub type Reader = Box<dyn NativeReaderExt>;
@@ -54,63 +54,60 @@ impl BlockReader {
     #[async_backtrace::framed]
     pub async fn async_read_native_columns_data(
         &self,
-        part: PartInfoPtr,
+        part: &PartInfoPtr,
+        ctx: &Arc<dyn TableContext>,
+        ignore_column_ids: &Option<HashSet<ColumnId>>,
     ) -> Result<NativeSourceData> {
         // Perf
         {
             metrics_inc_remote_io_read_parts(1);
         }
 
-        let part = FusePartInfo::from_part(&part)?;
-        let mut join_handlers = Vec::with_capacity(self.project_column_nodes.len());
+        let part = FuseBlockPartInfo::from_part(part)?;
+        let settings = ReadSettings::from_ctx(ctx)?;
+        let read_res = self
+            .read_columns_data_by_merge_io(
+                &settings,
+                &part.location,
+                &part.columns_meta,
+                ignore_column_ids,
+            )
+            .await?;
 
+        let column_buffers = read_res.column_buffers()?;
+        let mut results = BTreeMap::new();
         for (index, column_node) in self.project_column_nodes.iter().enumerate() {
-            let metas: Vec<ColumnMeta> = column_node
+            if let Some(ignore_column_ids) = ignore_column_ids {
+                if column_node.leaf_column_ids.len() == 1
+                    && ignore_column_ids.contains(&column_node.leaf_column_ids[0])
+                {
+                    continue;
+                }
+            }
+
+            let readers = column_node
                 .leaf_column_ids
                 .iter()
-                .filter_map(|column_id| part.columns_meta.get(column_id))
-                .cloned()
-                .collect::<Vec<_>>();
+                .map(|column_id| {
+                    let native_meta = part
+                        .columns_meta
+                        .get(column_id)
+                        .unwrap()
+                        .as_native()
+                        .unwrap();
+                    let data = column_buffers.get(column_id).unwrap();
+                    let reader: Reader = Box::new(std::io::Cursor::new(data.clone()));
+                    NativeReader::new(reader, native_meta.pages.clone(), vec![])
+                })
+                .collect();
 
-            join_handlers.push(Self::read_native_columns_data(
-                self.operator.clone(),
-                &part.location,
-                index,
-                metas,
-                part.range(),
-            ));
-
-            // Perf
-            {
-                let total_len = column_node
-                    .leaf_column_ids
-                    .iter()
-                    .map(|column_id| {
-                        if let Some(meta) = part.columns_meta.get(column_id) {
-                            let (_, len) = meta.offset_length();
-                            len
-                        } else {
-                            0
-                        }
-                    })
-                    .sum();
-                metrics_inc_remote_io_seeks(column_node.leaf_column_ids.len() as u64);
-                metrics_inc_remote_io_read_bytes(total_len);
-            }
-        }
-        let start = Instant::now();
-        let readers = futures::future::try_join_all(join_handlers).await?;
-        let results: BTreeMap<usize, Vec<NativeReader<Reader>>> = readers.into_iter().collect();
-
-        // Perf.
-        {
-            metrics_inc_remote_io_read_milliseconds(start.elapsed().as_millis() as u64);
+            results.insert(index, readers);
         }
         Ok(results)
     }
 
     #[async_backtrace::framed]
-    async fn read_native_columns_data(
+    pub async fn read_native_columns_data(
         op: Operator,
         path: &str,
         index: usize,
@@ -119,14 +116,18 @@ impl BlockReader {
     ) -> Result<(usize, Vec<NativeReader<Reader>>)> {
         let mut native_readers = Vec::with_capacity(metas.len());
         for meta in metas {
-            let (offset, length) = meta.offset_length();
             let mut native_meta = meta.as_native().unwrap().clone();
             if let Some(range) = &range {
                 native_meta = native_meta.slice(range.start, range.end);
             }
 
-            let reader = op.range_read(path, offset..offset + length).await?;
-            let reader: Reader = Box::new(std::io::Cursor::new(reader));
+            let (offset, length) = (
+                native_meta.offset,
+                native_meta.pages.iter().map(|p| p.length).sum::<u64>(),
+            );
+
+            let reader = op.read_with(path).range(offset..offset + length).await?;
+            let reader: Reader = Box::new(std::io::Cursor::new(reader.to_bytes()));
 
             let native_reader = NativeReader::new(reader, native_meta.pages.clone(), vec![]);
             native_readers.push(native_reader);
@@ -135,11 +136,23 @@ impl BlockReader {
         Ok((index, native_readers))
     }
 
-    pub fn sync_read_native_columns_data(&self, part: PartInfoPtr) -> Result<NativeSourceData> {
-        let part = FusePartInfo::from_part(&part)?;
+    pub fn sync_read_native_columns_data(
+        &self,
+        part: &PartInfoPtr,
+        ignore_column_ids: &Option<HashSet<ColumnId>>,
+    ) -> Result<NativeSourceData> {
+        let part = FuseBlockPartInfo::from_part(part)?;
 
         let mut results: BTreeMap<usize, Vec<NativeReader<Reader>>> = BTreeMap::new();
         for (index, column_node) in self.project_column_nodes.iter().enumerate() {
+            if let Some(ignore_column_ids) = ignore_column_ids {
+                if column_node.leaf_column_ids.len() == 1
+                    && ignore_column_ids.contains(&column_node.leaf_column_ids[0])
+                {
+                    continue;
+                }
+            }
+
             let op = self.operator.clone();
             let metas: Vec<ColumnMeta> = column_node
                 .leaf_column_ids
@@ -153,29 +166,10 @@ impl BlockReader {
             results.insert(index, readers);
         }
 
-        // If virtual column file exists, read the data from the virtual columns directly.
-        if let Some(ref virtual_columns_meta) = part.virtual_columns_meta {
-            let virtual_loc =
-                TableMetaLocationGenerator::gen_virtual_block_location(&part.location);
-
-            for (_, virtual_column_meta) in virtual_columns_meta.iter() {
-                let metas = vec![virtual_column_meta.meta.clone()];
-
-                let readers = Self::sync_read_native_column(
-                    self.operator.clone(),
-                    &virtual_loc,
-                    metas,
-                    part.range(),
-                )?;
-                let virtual_index = virtual_column_meta.index + self.project_column_nodes.len();
-                results.insert(virtual_index, readers);
-            }
-        }
-
         Ok(results)
     }
 
-    fn sync_read_native_column(
+    pub fn sync_read_native_column(
         op: Operator,
         path: &str,
         metas: Vec<ColumnMeta>,
@@ -191,7 +185,12 @@ impl BlockReader {
                 native_meta.offset,
                 native_meta.pages.iter().map(|p| p.length).sum::<u64>(),
             );
-            let reader = op.blocking().range_reader(path, offset..offset + length)?;
+            let reader = op
+                .blocking()
+                .reader_with(path)
+                .call()?
+                .into_std_read(offset..offset + length)?;
+
             let reader: Reader = Box::new(BufReader::new(reader));
 
             let native_reader = NativeReader::new(reader, native_meta.pages.clone(), vec![]);
@@ -201,39 +200,40 @@ impl BlockReader {
         Ok(native_readers)
     }
 
+    #[inline(always)]
     pub fn fill_missing_native_column_values(
         &self,
         data_block: DataBlock,
-        parts: &VecDeque<PartInfoPtr>,
+        data_block_column_ids: &HashSet<ColumnId>,
     ) -> Result<DataBlock> {
-        let part = FusePartInfo::from_part(&parts[0])?;
-
-        let data_block_column_ids: HashSet<ColumnId> = part.columns_meta.keys().cloned().collect();
-        let default_vals = self.default_vals.clone();
-
         DataBlock::create_with_default_value_and_block(
             &self.projected_schema,
             &data_block,
-            &data_block_column_ids,
-            &default_vals,
+            data_block_column_ids,
+            &self.default_vals,
         )
     }
 
     pub fn build_block(
         &self,
-        chunks: Vec<(usize, Box<dyn Array>)>,
+        columns: &[(usize, Column)],
         default_val_indices: Option<HashSet<usize>>,
     ) -> Result<DataBlock> {
-        let mut rows = 0;
-        let mut entries = Vec::with_capacity(chunks.len());
+        let mut nums_rows: Option<usize> = None;
+        let mut entries = Vec::with_capacity(self.project_column_nodes.len());
         for (index, _) in self.project_column_nodes.iter().enumerate() {
-            if let Some(array) = chunks.iter().find(|c| c.0 == index).map(|c| c.1.clone()) {
+            if let Some(column) = columns.iter().find(|c| c.0 == index).map(|c| c.1.clone()) {
                 let data_type: DataType = self.projected_schema.field(index).data_type().into();
                 entries.push(BlockEntry::new(
                     data_type.clone(),
-                    Value::Column(Column::from_arrow(array.as_ref(), &data_type)),
+                    Value::Column(column.clone()),
                 ));
-                rows = array.len();
+                match nums_rows {
+                    Some(rows) => {
+                        debug_assert_eq!(rows, column.len(), "Column  lengths are not equal")
+                    }
+                    None => nums_rows = Some(column.len()),
+                }
             } else if let Some(ref default_val_indices) = default_val_indices {
                 if default_val_indices.contains(&index) {
                     let data_type: DataType = self.projected_schema.field(index).data_type().into();
@@ -245,6 +245,26 @@ impl BlockReader {
                 }
             }
         }
-        Ok(DataBlock::new(entries, rows))
+        Ok(DataBlock::new(entries, nums_rows.unwrap_or(0)))
+    }
+
+    #[async_backtrace::framed]
+    pub async fn async_read_native_schema(
+        operator: &Operator,
+        loc: &str,
+    ) -> Option<(Vec<ColumnMeta>, ArrowSchema)> {
+        let stat = operator.stat(loc).await.ok()?;
+        let reader = operator.reader(loc).await.ok()?;
+
+        let (native_metas, schema) =
+            read_meta_async(reader.clone(), stat.content_length() as usize)
+                .await
+                .ok()?;
+        let metas = native_metas
+            .into_iter()
+            .map(ColumnMeta::Native)
+            .collect::<Vec<ColumnMeta>>();
+        let schema = DataSchema::from(&schema);
+        Some((metas, ArrowSchema::from(&schema)))
     }
 }

@@ -14,19 +14,29 @@ version = "0.1.0"
 name = "databend-sqllogictests"
 
 [dependencies]
-async-trait = "0.1.53"
-clap = { version = "4.1.11", features = ["derive", "env"] }
-common-exception = { path = "../../src/common/exception" }
-env_logger = "0.10.0"
-futures-util = "0.3.25"
-lazy_static = { workspace = true }
-mysql_async = { version = "0.31", default-features = false, features = ["rustls-tls"] }
-rand = "0.8.5"
-regex = "1.8.1"
-reqwest = { workspace = true }
-serde = "1.0.150"
-serde_json = "1.0.89"
-sqllogictest = "0.15.1"
-thiserror = "1.0.37"
+async-recursion = { workspace = true }
+async-trait = { workspace = true }
+bollard = { workspace = true }
+clap = { workspace = true }
+cookie = { workspace = true }
+databend-common-exception = { workspace = true }
+env_logger = { workspace = true }
+futures-util = { workspace = true }
+mysql_async = { workspace = true }
+rand = { workspace = true }
+recursive = { workspace = true }
+redis = { workspace = true }
+regex = { workspace = true }
+reqwest = { workspace = true, features = ["cookies"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sqllogictest = { workspace = true }
+testcontainers = { workspace = true }
+testcontainers-modules = { workspace = true, features = ["mysql", "redis"] }
+thiserror = { workspace = true }
 tokio = { workspace = true }
-walkdir = "2.3.2"
+url = { workspace = true }
+walkdir = { workspace = true }
+
+[lints]
+workspace = true

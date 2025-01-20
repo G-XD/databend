@@ -15,12 +15,11 @@
 use std::fmt::Display;
 use std::fmt::Formatter;
 
-use common_profile::SharedProcessorProfiles;
-use common_sql::MetadataRef;
+use databend_common_sql::MetadataRef;
 
-use crate::api::DataExchange;
 use crate::schedulers::QueryFragmentActions;
 use crate::schedulers::QueryFragmentsActions;
+use crate::servers::flight::v1::exchange::DataExchange;
 
 impl QueryFragmentsActions {
     pub fn display_indent<'a>(&'a self, metadata: &'a MetadataRef) -> impl Display + '_ {
@@ -36,8 +35,8 @@ struct QueryFragmentsActionsWrap<'a> {
     metadata: &'a MetadataRef,
 }
 
-impl<'a> Display for QueryFragmentsActionsWrap<'a> {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+impl Display for QueryFragmentsActionsWrap<'_> {
+    fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
         for (index, fragment_actions) in self.inner.fragments_actions.iter().enumerate() {
             if index != 0 {
                 writeln!(f)?;
@@ -64,8 +63,8 @@ struct QueryFragmentActionsWrap<'a> {
     metadata: &'a MetadataRef,
 }
 
-impl<'a> Display for QueryFragmentActionsWrap<'a> {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+impl Display for QueryFragmentActionsWrap<'_> {
+    fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
         writeln!(f, "Fragment {}:", self.inner.fragment_id)?;
 
         if let Some(data_exchange) = &self.inner.data_exchange {
@@ -80,8 +79,8 @@ impl<'a> Display for QueryFragmentActionsWrap<'a> {
             let fragment_action = &self.inner.fragment_actions[0];
             let plan_display_string = fragment_action
                 .physical_plan
-                .format(self.metadata.clone(), SharedProcessorProfiles::default())
-                .and_then(|node| node.format_pretty_with_prefix("    "))
+                .format(self.metadata.clone(), Default::default())
+                .and_then(|node| Ok(node.format_pretty_with_prefix("    ")?))
                 .unwrap();
             write!(f, "{}", plan_display_string)?;
         }

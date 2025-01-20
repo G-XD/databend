@@ -14,49 +14,53 @@
 
 use std::collections::HashSet;
 
-use common_base::base::tokio;
-use common_exception::Result;
-use common_expression::types::Float64Type;
-use common_expression::types::Int32Type;
-use common_expression::types::NumberDataType;
-use common_expression::types::UInt64Type;
-use common_expression::Column;
-use common_expression::ColumnId;
-use common_expression::DataBlock;
-use common_expression::FromData;
-use common_expression::Scalar;
-use common_expression::TableDataType;
-use common_expression::TableField;
-use common_sql::plans::AddColumnOption;
-use common_sql::plans::AddTableColumnPlan;
-use common_sql::plans::DropTableColumnPlan;
-use common_sql::Planner;
-use common_storages_fuse::io::MetaReaders;
-use common_storages_fuse::FuseTable;
-use common_storages_fuse::TableContext;
+use databend_common_base::base::tokio;
+use databend_common_base::base::OrderedFloat;
+use databend_common_exception::Result;
+use databend_common_expression::types::Float64Type;
+use databend_common_expression::types::Int32Type;
+use databend_common_expression::types::NumberDataType;
+use databend_common_expression::types::UInt64Type;
+use databend_common_expression::Column;
+use databend_common_expression::ColumnId;
+use databend_common_expression::DataBlock;
+use databend_common_expression::FromData;
+use databend_common_expression::Scalar;
+use databend_common_expression::TableDataType;
+use databend_common_expression::TableField;
+use databend_common_sql::plans::AddColumnOption;
+use databend_common_sql::plans::AddTableColumnPlan;
+use databend_common_sql::plans::DropTableColumnPlan;
+use databend_common_sql::Planner;
+use databend_common_storages_fuse::io::MetaReaders;
+use databend_common_storages_fuse::FuseTable;
+use databend_common_storages_fuse::TableContext;
 use databend_query::interpreters::AddTableColumnInterpreter;
 use databend_query::interpreters::DropTableColumnInterpreter;
 use databend_query::interpreters::Interpreter;
 use databend_query::interpreters::InterpreterFactory;
-use databend_query::test_kits::table_test_fixture::TestFixture;
+use databend_query::test_kits::*;
+use databend_storages_common_cache::LoadParams;
+use databend_storages_common_table_meta::meta::SegmentInfo;
+use databend_storages_common_table_meta::meta::TableSnapshot;
+use databend_storages_common_table_meta::meta::Versioned;
+use databend_storages_common_table_meta::table::OPT_KEY_SNAPSHOT_LOCATION;
 use futures_util::TryStreamExt;
-use ordered_float::OrderedFloat;
-use storages_common_cache::LoadParams;
-use storages_common_table_meta::meta::SegmentInfo;
-use storages_common_table_meta::meta::TableSnapshot;
-use storages_common_table_meta::meta::Versioned;
-use storages_common_table_meta::table::OPT_KEY_SNAPSHOT_LOCATION;
 
 async fn check_segment_column_ids(
     fixture: &TestFixture,
     expected_column_ids: Option<Vec<ColumnId>>,
     expected_column_min_max: Option<Vec<(ColumnId, (Scalar, Scalar))>>,
 ) -> Result<()> {
-    let catalog = fixture.ctx().get_catalog("default").await?;
+    let catalog = fixture
+        .new_query_ctx()
+        .await?
+        .get_catalog("default")
+        .await?;
     // get the latest tbl
     let table = catalog
         .get_table(
-            fixture.default_tenant().as_str(),
+            &fixture.default_tenant(),
             fixture.default_db_name().as_str(),
             fixture.default_table_name().as_str(),
         )
@@ -90,11 +94,11 @@ async fn check_segment_column_ids(
     if let Some(expected_column_ids) = expected_column_ids {
         let expected_column_ids =
             HashSet::<ColumnId>::from_iter(expected_column_ids.clone().iter().cloned());
+        let compact_segment_reader = MetaReaders::segment_info_reader(
+            fuse_table.get_operator(),
+            TestFixture::default_table_schema(),
+        );
         for (seg_loc, _) in &snapshot.segments {
-            let compact_segment_reader = MetaReaders::segment_info_reader(
-                fuse_table.get_operator(),
-                TestFixture::default_table_schema(),
-            );
             let params = LoadParams {
                 location: seg_loc.clone(),
                 len_hint: None,
@@ -103,7 +107,7 @@ async fn check_segment_column_ids(
             };
 
             let compact_segment_info = compact_segment_reader.read(&params).await?;
-            let segment_info = SegmentInfo::try_from(compact_segment_info.as_ref())?;
+            let segment_info = SegmentInfo::try_from(compact_segment_info)?;
 
             segment_info.blocks.iter().for_each(|block_meta| {
                 assert_eq!(
@@ -127,8 +131,9 @@ async fn check_segment_column_ids(
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_fuse_table_optimize_alter_table() -> Result<()> {
-    let fixture = TestFixture::new().await;
-    let ctx = fixture.ctx();
+    let fixture = TestFixture::setup().await?;
+    fixture.create_default_database().await?;
+
     let tbl_name = fixture.default_table_name();
     let db_name = fixture.default_db_name();
     let catalog_name = fixture.default_catalog_name();
@@ -157,8 +162,9 @@ async fn test_fuse_table_optimize_alter_table() -> Result<()> {
         table: fixture.default_table_name(),
         column: "t".to_string(),
     };
+    let ctx = fixture.new_query_ctx().await?;
     let interpreter = DropTableColumnInterpreter::try_create(ctx.clone(), drop_table_column_plan)?;
-    interpreter.execute(ctx.clone()).await?;
+    let _ = interpreter.execute(ctx.clone()).await?;
 
     // add a column of uint64 with default value `(1,15.0)`
     let field = TableField::new("b", TableDataType::Tuple {
@@ -178,9 +184,10 @@ async fn test_fuse_table_optimize_alter_table() -> Result<()> {
         field,
         comment: "".to_string(),
         option: AddColumnOption::End,
+        is_deterministic: true,
     };
     let interpreter = AddTableColumnInterpreter::try_create(ctx.clone(), add_table_column_plan)?;
-    interpreter.execute(ctx.clone()).await?;
+    let _ = interpreter.execute(ctx.clone()).await?;
 
     // insert values for new schema
     let block = {
@@ -194,11 +201,12 @@ async fn test_fuse_table_optimize_alter_table() -> Result<()> {
 
     // get the latest tbl
     let table = fixture
-        .ctx()
+        .new_query_ctx()
+        .await?
         .get_catalog(&catalog_name)
         .await?
         .get_table(
-            fixture.default_tenant().as_str(),
+            &fixture.default_tenant(),
             fixture.default_db_name().as_str(),
             fixture.default_table_name().as_str(),
         )
@@ -216,19 +224,27 @@ async fn test_fuse_table_optimize_alter_table() -> Result<()> {
             (
                 3,
                 (
-                    Scalar::Number(common_expression::types::number::NumberScalar::UInt64(1)),
-                    Scalar::Number(common_expression::types::number::NumberScalar::UInt64(4)),
+                    Scalar::Number(
+                        databend_common_expression::types::number::NumberScalar::UInt64(1),
+                    ),
+                    Scalar::Number(
+                        databend_common_expression::types::number::NumberScalar::UInt64(4),
+                    ),
                 ),
             ),
             (
                 4,
                 (
-                    Scalar::Number(common_expression::types::number::NumberScalar::Float64(
-                        OrderedFloat(13.0),
-                    )),
-                    Scalar::Number(common_expression::types::number::NumberScalar::Float64(
-                        OrderedFloat(15.0),
-                    )),
+                    Scalar::Number(
+                        databend_common_expression::types::number::NumberScalar::Float64(
+                            OrderedFloat(13.0),
+                        ),
+                    ),
+                    Scalar::Number(
+                        databend_common_expression::types::number::NumberScalar::Float64(
+                            OrderedFloat(15.0),
+                        ),
+                    ),
                 ),
             ),
         ]),
@@ -237,6 +253,7 @@ async fn test_fuse_table_optimize_alter_table() -> Result<()> {
 
     // do compact
     let query = format!("optimize table {db_name}.{tbl_name} compact");
+    let ctx = fixture.new_query_ctx().await?;
     let mut planner = Planner::new(ctx.clone());
     let (plan, _) = planner.plan_sql(&query).await?;
     let interpreter = InterpreterFactory::get(ctx.clone(), &plan).await?;
@@ -253,19 +270,27 @@ async fn test_fuse_table_optimize_alter_table() -> Result<()> {
             (
                 3,
                 (
-                    Scalar::Number(common_expression::types::number::NumberScalar::UInt64(1)),
-                    Scalar::Number(common_expression::types::number::NumberScalar::UInt64(4)),
+                    Scalar::Number(
+                        databend_common_expression::types::number::NumberScalar::UInt64(1),
+                    ),
+                    Scalar::Number(
+                        databend_common_expression::types::number::NumberScalar::UInt64(4),
+                    ),
                 ),
             ),
             (
                 4,
                 (
-                    Scalar::Number(common_expression::types::number::NumberScalar::Float64(
-                        OrderedFloat(13.0),
-                    )),
-                    Scalar::Number(common_expression::types::number::NumberScalar::Float64(
-                        OrderedFloat(15.0),
-                    )),
+                    Scalar::Number(
+                        databend_common_expression::types::number::NumberScalar::Float64(
+                            OrderedFloat(13.0),
+                        ),
+                    ),
+                    Scalar::Number(
+                        databend_common_expression::types::number::NumberScalar::Float64(
+                            OrderedFloat(15.0),
+                        ),
+                    ),
                 ),
             ),
         ]),

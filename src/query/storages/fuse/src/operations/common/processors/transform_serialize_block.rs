@@ -14,40 +14,40 @@
 
 use std::any::Any;
 use std::sync::Arc;
-use std::time::Instant;
 
-use common_base::base::ProgressValues;
-use common_catalog::table_context::TableContext;
-use common_exception::ErrorCode;
-use common_exception::Result;
-use common_expression::BlockMetaInfoDowncast;
-use common_expression::DataBlock;
-use common_pipeline_core::pipe::PipeItem;
-use common_pipeline_core::processors::port::InputPort;
-use common_pipeline_core::processors::processor::ProcessorPtr;
+use databend_common_base::base::ProgressValues;
+use databend_common_catalog::table::Table;
+use databend_common_catalog::table_context::TableContext;
+use databend_common_exception::ErrorCode;
+use databend_common_exception::Result;
+use databend_common_expression::BlockMetaInfoDowncast;
+use databend_common_expression::ComputedExpr;
+use databend_common_expression::DataBlock;
+use databend_common_expression::TableSchema;
+use databend_common_pipeline_core::processors::Event;
+use databend_common_pipeline_core::processors::InputPort;
+use databend_common_pipeline_core::processors::OutputPort;
+use databend_common_pipeline_core::processors::Processor;
+use databend_common_pipeline_core::processors::ProcessorPtr;
+use databend_common_pipeline_core::PipeItem;
+use databend_common_sql::executor::physical_plans::MutationKind;
+use databend_common_storage::MutationStatus;
+use databend_storages_common_index::BloomIndex;
 use opendal::Operator;
-use storages_common_index::BloomIndex;
 
-use crate::io::write_data;
+use crate::io::create_inverted_index_builders;
 use crate::io::BlockBuilder;
 use crate::io::BlockSerialization;
-use crate::metrics::metrics_inc_block_index_write_bytes;
-use crate::metrics::metrics_inc_block_index_write_milliseconds;
-use crate::metrics::metrics_inc_block_index_write_nums;
-use crate::metrics::metrics_inc_block_write_bytes;
-use crate::metrics::metrics_inc_block_write_milliseconds;
-use crate::metrics::metrics_inc_block_write_nums;
+use crate::io::BlockWriter;
 use crate::operations::common::BlockMetaIndex;
 use crate::operations::common::MutationLogEntry;
 use crate::operations::common::MutationLogs;
 use crate::operations::mutation::ClusterStatsGenType;
 use crate::operations::mutation::SerializeDataMeta;
-use crate::pipelines::processors::port::OutputPort;
-use crate::pipelines::processors::processor::Event;
-use crate::pipelines::processors::Processor;
 use crate::statistics::ClusterStatsGenerator;
 use crate::FuseTable;
 
+#[allow(clippy::large_enum_variant)]
 enum State {
     Consume,
     NeedSerialize {
@@ -69,6 +69,8 @@ pub struct TransformSerializeBlock {
 
     block_builder: BlockBuilder,
     dal: Operator,
+    table_id: Option<u64>, // Only used in multi table insert
+    kind: MutationKind,
 }
 
 impl TransformSerializeBlock {
@@ -78,11 +80,56 @@ impl TransformSerializeBlock {
         output: Arc<OutputPort>,
         table: &FuseTable,
         cluster_stats_gen: ClusterStatsGenerator,
+        kind: MutationKind,
     ) -> Result<Self> {
-        let source_schema = Arc::new(table.table_info.schema().remove_virtual_computed_fields());
+        Self::do_create(ctx, input, output, table, cluster_stats_gen, kind, false)
+    }
+
+    pub fn try_create_with_tid(
+        ctx: Arc<dyn TableContext>,
+        input: Arc<InputPort>,
+        output: Arc<OutputPort>,
+        table: &FuseTable,
+        cluster_stats_gen: ClusterStatsGenerator,
+        kind: MutationKind,
+    ) -> Result<Self> {
+        Self::do_create(ctx, input, output, table, cluster_stats_gen, kind, true)
+    }
+
+    fn do_create(
+        ctx: Arc<dyn TableContext>,
+        input: Arc<InputPort>,
+        output: Arc<OutputPort>,
+        table: &FuseTable,
+        cluster_stats_gen: ClusterStatsGenerator,
+        kind: MutationKind,
+        with_tid: bool,
+    ) -> Result<Self> {
+        // remove virtual computed fields.
+        let mut fields = table
+            .schema()
+            .fields()
+            .iter()
+            .filter(|f| !matches!(f.computed_expr(), Some(ComputedExpr::Virtual(_))))
+            .cloned()
+            .collect::<Vec<_>>();
+        if !matches!(kind, MutationKind::Insert | MutationKind::Replace) {
+            // add stream fields.
+            for stream_column in table.stream_columns().iter() {
+                fields.push(stream_column.table_field());
+            }
+        }
+        let source_schema = Arc::new(TableSchema {
+            fields,
+            ..table.schema().as_ref().clone()
+        });
+
         let bloom_columns_map = table
             .bloom_index_cols
             .bloom_index_fields(source_schema.clone(), BloomIndex::supported_type)?;
+
+        let inverted_index_builders = create_inverted_index_builders(&table.table_info.meta);
+
         let block_builder = BlockBuilder {
             ctx,
             meta_locations: table.meta_location_generator().clone(),
@@ -90,6 +137,7 @@ impl TransformSerializeBlock {
             write_settings: table.get_write_settings(),
             cluster_stats_gen,
             bloom_columns_map,
+            inverted_index_builders,
         };
         Ok(TransformSerializeBlock {
             state: State::Consume,
@@ -98,6 +146,8 @@ impl TransformSerializeBlock {
             output_data: None,
             block_builder,
             dal: table.get_operator(),
+            table_id: if with_tid { Some(table.get_id()) } else { None },
+            kind,
         })
     }
 
@@ -169,28 +219,42 @@ impl Processor for TransformSerializeBlock {
         let mut input_data = self.input.pull_data().unwrap()?;
         let meta = input_data.take_meta();
         if let Some(meta) = meta {
-            let meta =
-                SerializeDataMeta::downcast_from(meta).ok_or(ErrorCode::Internal("It's a bug"))?;
-            if let Some(deleted_segment) = meta.deleted_segment {
-                // delete a whole segment, segment level
-                let data_block =
-                    Self::mutation_logs(MutationLogEntry::DeletedSegment { deleted_segment });
-                self.output.push_data(Ok(data_block));
-                Ok(Event::NeedConsume)
-            } else if input_data.is_empty() {
-                // delete a whole block, block level
-                let data_block =
-                    Self::mutation_logs(MutationLogEntry::DeletedBlock { index: meta.index });
-                self.output.push_data(Ok(data_block));
-                Ok(Event::NeedConsume)
-            } else {
-                // replace the old block
-                self.state = State::NeedSerialize {
-                    block: input_data,
-                    stats_type: meta.stats_type,
-                    index: Some(meta.index),
-                };
-                Ok(Event::Sync)
+            let meta = SerializeDataMeta::downcast_from(meta)
+                .ok_or_else(|| ErrorCode::Internal("It's a bug"))?;
+            match meta {
+                SerializeDataMeta::DeletedSegment(deleted_segment) => {
+                    // delete a whole segment, segment level
+                    let data_block =
+                        Self::mutation_logs(MutationLogEntry::DeletedSegment { deleted_segment });
+                    self.output.push_data(Ok(data_block));
+                    Ok(Event::NeedConsume)
+                }
+                SerializeDataMeta::SerializeBlock(serialize_block) => {
+                    if input_data.is_empty() {
+                        // delete a whole block, block level
+                        let data_block = Self::mutation_logs(MutationLogEntry::DeletedBlock {
+                            index: serialize_block.index,
+                        });
+                        self.output.push_data(Ok(data_block));
+                        Ok(Event::NeedConsume)
+                    } else {
+                        // replace the old block
+                        self.state = State::NeedSerialize {
+                            block: input_data,
+                            stats_type: serialize_block.stats_type,
+                            index: Some(serialize_block.index),
+                        };
+                        Ok(Event::Sync)
+                    }
+                }
+                SerializeDataMeta::CompactExtras(compact_extras) => {
+                    // compact extras
+                    let data_block = Self::mutation_logs(MutationLogEntry::CompactExtras {
+                        extras: compact_extras,
+                    });
+                    self.output.push_data(Ok(data_block));
+                    Ok(Event::NeedConsume)
+                }
             }
         } else if input_data.is_empty() {
             // do nothing
@@ -215,6 +279,9 @@ impl Processor for TransformSerializeBlock {
                 stats_type,
                 index,
             } => {
+                // Check if the datablock is valid, this is needed to ensure data is correct
+                block.check_valid()?;
+
                 let serialized =
                     self.block_builder
                         .build(block, |block, generator| match &stats_type {
@@ -237,58 +304,47 @@ impl Processor for TransformSerializeBlock {
     async fn async_process(&mut self) -> Result<()> {
         match std::mem::replace(&mut self.state, State::Consume) {
             State::Serialized { serialized, index } => {
-                let start = Instant::now();
-                // write block data.
-                let raw_block_data = serialized.block_raw_data;
-                let data_size = raw_block_data.len();
-                let path = serialized.block_meta.location.0.as_str();
-                write_data(raw_block_data, &self.dal, path).await?;
+                let block_meta = BlockWriter::write_down(&self.dal, serialized).await?;
+                let progress_values = ProgressValues {
+                    rows: block_meta.row_count as usize,
+                    bytes: block_meta.block_size as usize,
+                };
+                self.block_builder
+                    .ctx
+                    .get_write_progress()
+                    .incr(&progress_values);
 
-                // Perf.
-                {
-                    metrics_inc_block_write_nums(1);
-                    metrics_inc_block_write_bytes(data_size as u64);
-                    metrics_inc_block_write_milliseconds(start.elapsed().as_millis() as u64);
-                }
-
-                // write index data.
-                let bloom_index_state = serialized.bloom_index_state;
-                if let Some(bloom_index_state) = bloom_index_state {
-                    let index_size = bloom_index_state.data.len();
-                    write_data(
-                        bloom_index_state.data,
-                        &self.dal,
-                        &bloom_index_state.location.0,
-                    )
-                    .await?;
-                    // Perf.
-                    {
-                        metrics_inc_block_index_write_nums(1);
-                        metrics_inc_block_index_write_bytes(index_size as u64);
-                        metrics_inc_block_index_write_milliseconds(
-                            start.elapsed().as_millis() as u64
-                        );
-                    }
-                }
-
-                let data_block = if let Some(index) = index {
-                    Self::mutation_logs(MutationLogEntry::Replaced {
+                let mutation_log_data_block = if let Some(index) = index {
+                    // we are replacing the block represented by the `index`
+                    Self::mutation_logs(MutationLogEntry::ReplacedBlock {
                         index,
-                        block_meta: Arc::new(serialized.block_meta),
+                        block_meta: Arc::new(block_meta),
                     })
                 } else {
-                    let progress_values = ProgressValues {
-                        rows: serialized.block_meta.row_count as usize,
-                        bytes: serialized.block_meta.block_size as usize,
-                    };
-                    self.block_builder
-                        .ctx
-                        .get_write_progress()
-                        .incr(&progress_values);
+                    // appending new data block
+                    if matches!(self.kind, MutationKind::Insert) {
+                        if let Some(tid) = self.table_id {
+                            self.block_builder
+                                .ctx
+                                .update_multi_table_insert_status(tid, block_meta.row_count);
+                        } else {
+                            self.block_builder.ctx.add_mutation_status(MutationStatus {
+                                insert_rows: block_meta.row_count,
+                                update_rows: 0,
+                                deleted_rows: 0,
+                            });
+                        }
+                    }
 
-                    DataBlock::empty_with_meta(Box::new(serialized.block_meta))
+                    if matches!(self.kind, MutationKind::Recluster) {
+                        Self::mutation_logs(MutationLogEntry::ReclusterAppendBlock {
+                            block_meta: Arc::new(block_meta),
+                        })
+                    } else {
+                        DataBlock::empty_with_meta(Box::new(block_meta))
+                    }
                 };
-                self.output_data = Some(data_block);
+                self.output_data = Some(mutation_log_data_block);
             }
             _ => return Err(ErrorCode::Internal("It's a bug.")),
         }

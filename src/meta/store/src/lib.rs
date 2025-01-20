@@ -12,29 +12,24 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#![deny(unused_crate_dependencies)]
-
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::Context;
 use std::task::Poll;
 
-use common_grpc::RpcClientConf;
-use common_meta_client::ClientHandle;
-use common_meta_client::MetaGrpcClient;
-use common_meta_embedded::MetaEmbedded;
-use common_meta_kvapi::kvapi;
-use common_meta_kvapi::kvapi::GetKVReply;
-use common_meta_kvapi::kvapi::ListKVReply;
-use common_meta_kvapi::kvapi::MGetKVReply;
-use common_meta_kvapi::kvapi::UpsertKVReply;
-use common_meta_kvapi::kvapi::UpsertKVReq;
-use common_meta_types::protobuf::WatchRequest;
-use common_meta_types::protobuf::WatchResponse;
-use common_meta_types::MetaError;
-use common_meta_types::TxnReply;
-use common_meta_types::TxnRequest;
-use log::as_debug;
+use databend_common_grpc::RpcClientConf;
+use databend_common_meta_client::ClientHandle;
+use databend_common_meta_client::MetaGrpcClient;
+use databend_common_meta_embedded::MemMeta;
+use databend_common_meta_kvapi::kvapi;
+use databend_common_meta_kvapi::kvapi::KVStream;
+use databend_common_meta_kvapi::kvapi::UpsertKVReply;
+use databend_common_meta_types::protobuf::WatchRequest;
+use databend_common_meta_types::protobuf::WatchResponse;
+use databend_common_meta_types::MetaError;
+use databend_common_meta_types::TxnReply;
+use databend_common_meta_types::TxnRequest;
+use databend_common_meta_types::UpsertKV;
 use log::info;
 use tokio_stream::Stream;
 
@@ -49,7 +44,7 @@ pub struct MetaStoreProvider {
 /// MetaStore is impl with either a local embedded meta store, or a grpc-client of metasrv
 #[derive(Clone)]
 pub enum MetaStore {
-    L(Arc<MetaEmbedded>),
+    L(Arc<MemMeta>),
     R(Arc<ClientHandle>),
 }
 
@@ -90,35 +85,28 @@ impl MetaStore {
 impl kvapi::KVApi for MetaStore {
     type Error = MetaError;
 
-    async fn upsert_kv(&self, act: UpsertKVReq) -> Result<UpsertKVReply, MetaError> {
+    async fn upsert_kv(&self, act: UpsertKV) -> Result<UpsertKVReply, Self::Error> {
         match self {
             MetaStore::L(x) => x.upsert_kv(act).await,
             MetaStore::R(x) => x.upsert_kv(act).await,
         }
     }
 
-    async fn get_kv(&self, key: &str) -> Result<GetKVReply, MetaError> {
+    async fn get_kv_stream(&self, keys: &[String]) -> Result<KVStream<Self::Error>, Self::Error> {
         match self {
-            MetaStore::L(x) => x.get_kv(key).await,
-            MetaStore::R(x) => x.get_kv(key).await,
+            MetaStore::L(x) => x.get_kv_stream(keys).await,
+            MetaStore::R(x) => x.get_kv_stream(keys).await,
         }
     }
 
-    async fn mget_kv(&self, key: &[String]) -> Result<MGetKVReply, MetaError> {
+    async fn list_kv(&self, prefix: &str) -> Result<KVStream<Self::Error>, Self::Error> {
         match self {
-            MetaStore::L(x) => x.mget_kv(key).await,
-            MetaStore::R(x) => x.mget_kv(key).await,
+            MetaStore::L(x) => x.list_kv(prefix).await,
+            MetaStore::R(x) => x.list_kv(prefix).await,
         }
     }
 
-    async fn prefix_list_kv(&self, prefix: &str) -> Result<ListKVReply, MetaError> {
-        match self {
-            MetaStore::L(x) => x.prefix_list_kv(prefix).await,
-            MetaStore::R(x) => x.prefix_list_kv(prefix).await,
-        }
-    }
-
-    async fn transaction(&self, txn: TxnRequest) -> Result<TxnReply, MetaError> {
+    async fn transaction(&self, txn: TxnRequest) -> Result<TxnReply, Self::Error> {
         match self {
             MetaStore::L(x) => x.transaction(txn).await,
             MetaStore::R(x) => x.transaction(txn).await,
@@ -134,15 +122,15 @@ impl MetaStoreProvider {
     pub async fn create_meta_store(&self) -> Result<MetaStore, MetaError> {
         if self.rpc_conf.local_mode() {
             info!(
-                conf = as_debug!(&self.rpc_conf);
+                conf :? =(&self.rpc_conf);
                 "use embedded meta, data will be removed when process exits"
             );
 
             // NOTE: This can only be used for test: data will be removed when program quit.
-            let meta_store = MetaEmbedded::get_meta().await?;
-            Ok(MetaStore::L(meta_store))
+            let meta_store = MemMeta::default();
+            Ok(MetaStore::L(Arc::new(meta_store)))
         } else {
-            info!(conf = as_debug!(&self.rpc_conf); "use remote meta");
+            info!(conf :? =(&self.rpc_conf); "use remote meta");
             let client = MetaGrpcClient::try_new(&self.rpc_conf)?;
             Ok(MetaStore::R(client))
         }

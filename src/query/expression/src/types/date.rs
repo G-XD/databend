@@ -12,15 +12,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::cmp::Ordering;
 use std::fmt::Display;
 use std::io::Cursor;
 use std::ops::Range;
 
-use chrono::NaiveDate;
-use chrono_tz::Tz;
-use common_arrow::arrow::buffer::Buffer;
-use common_io::cursor_ext::BufferReadDateTimeExt;
-use common_io::cursor_ext::ReadBytesExt;
+use databend_common_column::buffer::Buffer;
+use databend_common_exception::ErrorCode;
+use databend_common_io::cursor_ext::BufferReadDateTimeExt;
+use databend_common_io::cursor_ext::ReadBytesExt;
+use jiff::civil::Date;
+use jiff::fmt::strtime;
+use jiff::tz::TimeZone;
+use log::error;
 use num_traits::AsPrimitive;
 
 use super::number::SimpleDomain;
@@ -28,6 +32,7 @@ use crate::date_helper::DateConverter;
 use crate::property::Domain;
 use crate::types::ArgType;
 use crate::types::DataType;
+use crate::types::DecimalSize;
 use crate::types::GenericMap;
 use crate::types::ValueType;
 use crate::utils::arrow::buffer_into_mut;
@@ -43,12 +48,14 @@ pub const DATE_MIN: i32 = -354285;
 pub const DATE_MAX: i32 = 2932896;
 
 /// Check if date is within range.
+/// /// If days is invalid convert to DATE_MIN.
 #[inline]
-pub fn check_date(days: i64) -> Result<i32, String> {
+pub fn clamp_date(days: i64) -> i32 {
     if (DATE_MIN as i64..=DATE_MAX as i64).contains(&days) {
-        Ok(days as i32)
+        days as i32
     } else {
-        Err("date is out of range".to_string())
+        error!("{}", format!("date {} is out of range", days));
+        DATE_MIN
     }
 }
 
@@ -68,11 +75,11 @@ impl ValueType for DateType {
         long
     }
 
-    fn to_owned_scalar<'a>(scalar: Self::ScalarRef<'a>) -> Self::Scalar {
+    fn to_owned_scalar(scalar: Self::ScalarRef<'_>) -> Self::Scalar {
         scalar
     }
 
-    fn to_scalar_ref<'a>(scalar: &'a Self::Scalar) -> Self::ScalarRef<'a> {
+    fn to_scalar_ref(scalar: &Self::Scalar) -> Self::ScalarRef<'_> {
         *scalar
     }
 
@@ -83,7 +90,7 @@ impl ValueType for DateType {
         }
     }
 
-    fn try_downcast_column<'a>(col: &'a Column) -> Option<Self::Column> {
+    fn try_downcast_column(col: &Column) -> Option<Self::Column> {
         match col {
             Column::Date(column) => Some(column.clone()),
             _ => None,
@@ -91,16 +98,28 @@ impl ValueType for DateType {
     }
 
     fn try_downcast_domain(domain: &Domain) -> Option<SimpleDomain<i32>> {
-        domain.as_date().map(SimpleDomain::clone)
+        domain.as_date().cloned()
     }
 
-    fn try_downcast_builder<'a>(
-        builder: &'a mut ColumnBuilder,
-    ) -> Option<&'a mut Self::ColumnBuilder> {
+    fn try_downcast_builder(builder: &mut ColumnBuilder) -> Option<&mut Self::ColumnBuilder> {
         match builder {
             ColumnBuilder::Date(builder) => Some(builder),
             _ => None,
         }
+    }
+
+    fn try_downcast_owned_builder(builder: ColumnBuilder) -> Option<Self::ColumnBuilder> {
+        match builder {
+            ColumnBuilder::Date(builder) => Some(builder),
+            _ => None,
+        }
+    }
+
+    fn try_upcast_column_builder(
+        builder: Self::ColumnBuilder,
+        _decimal_size: Option<DecimalSize>,
+    ) -> Option<ColumnBuilder> {
+        Some(ColumnBuilder::Date(builder))
     }
 
     fn upcast_scalar(scalar: Self::Scalar) -> Scalar {
@@ -115,26 +134,26 @@ impl ValueType for DateType {
         Domain::Date(domain)
     }
 
-    fn column_len<'a>(col: &'a Self::Column) -> usize {
+    fn column_len(col: &Self::Column) -> usize {
         col.len()
     }
 
-    fn index_column<'a>(col: &'a Self::Column, index: usize) -> Option<Self::ScalarRef<'a>> {
+    fn index_column(col: &Self::Column, index: usize) -> Option<Self::ScalarRef<'_>> {
         col.get(index).cloned()
     }
 
-    unsafe fn index_column_unchecked<'a>(
-        col: &'a Self::Column,
-        index: usize,
-    ) -> Self::ScalarRef<'a> {
+    #[inline(always)]
+    unsafe fn index_column_unchecked(col: &Self::Column, index: usize) -> Self::ScalarRef<'_> {
+        debug_assert!(index < col.len());
+
         *col.get_unchecked(index)
     }
 
-    fn slice_column<'a>(col: &'a Self::Column, range: Range<usize>) -> Self::Column {
+    fn slice_column(col: &Self::Column, range: Range<usize>) -> Self::Column {
         col.clone().sliced(range.start, range.end - range.start)
     }
 
-    fn iter_column<'a>(col: &'a Self::Column) -> Self::ColumnIterator<'a> {
+    fn iter_column(col: &Self::Column) -> Self::ColumnIterator<'_> {
         col.iter().cloned()
     }
 
@@ -148,6 +167,10 @@ impl ValueType for DateType {
 
     fn push_item(builder: &mut Self::ColumnBuilder, item: Self::Scalar) {
         builder.push(item);
+    }
+
+    fn push_item_repeat(builder: &mut Self::ColumnBuilder, item: Self::ScalarRef<'_>, n: usize) {
+        builder.resize(builder.len() + n, item);
     }
 
     fn push_default(builder: &mut Self::ColumnBuilder) {
@@ -165,6 +188,41 @@ impl ValueType for DateType {
     fn build_scalar(builder: Self::ColumnBuilder) -> Self::Scalar {
         assert_eq!(builder.len(), 1);
         builder[0]
+    }
+
+    #[inline(always)]
+    fn compare(lhs: Self::ScalarRef<'_>, rhs: Self::ScalarRef<'_>) -> Ordering {
+        lhs.cmp(&rhs)
+    }
+
+    #[inline(always)]
+    fn equal(left: Self::ScalarRef<'_>, right: Self::ScalarRef<'_>) -> bool {
+        left == right
+    }
+
+    #[inline(always)]
+    fn not_equal(left: Self::ScalarRef<'_>, right: Self::ScalarRef<'_>) -> bool {
+        left != right
+    }
+
+    #[inline(always)]
+    fn greater_than(left: Self::ScalarRef<'_>, right: Self::ScalarRef<'_>) -> bool {
+        left > right
+    }
+
+    #[inline(always)]
+    fn greater_than_equal(left: Self::ScalarRef<'_>, right: Self::ScalarRef<'_>) -> bool {
+        left >= right
+    }
+
+    #[inline(always)]
+    fn less_than(left: Self::ScalarRef<'_>, right: Self::ScalarRef<'_>) -> bool {
+        left < right
+    }
+
+    #[inline(always)]
+    fn less_than_equal(left: Self::ScalarRef<'_>, right: Self::ScalarRef<'_>) -> bool {
+        left <= right
     }
 }
 
@@ -201,18 +259,25 @@ impl ArgType for DateType {
 }
 
 #[inline]
-pub fn string_to_date(date_str: impl AsRef<[u8]>, tz: Tz) -> Option<NaiveDate> {
+pub fn string_to_date(
+    date_str: impl AsRef<[u8]>,
+    jiff_tz: &TimeZone,
+) -> databend_common_exception::Result<Date> {
     let mut reader = Cursor::new(std::str::from_utf8(date_str.as_ref()).unwrap().as_bytes());
-    match reader.read_date_text(&tz) {
+    match reader.read_date_text(jiff_tz) {
         Ok(d) => match reader.must_eof() {
-            Ok(..) => Some(d),
-            Err(_) => None,
+            Ok(..) => Ok(d),
+            Err(_) => Err(ErrorCode::BadArguments("unexpected argument")),
         },
-        Err(_) => None,
+        Err(e) => match e.code() {
+            ErrorCode::BAD_BYTES => Err(e),
+            _ => Err(ErrorCode::BadArguments("unexpected argument")),
+        },
     }
 }
 
 #[inline]
-pub fn date_to_string(date: impl AsPrimitive<i64>, tz: Tz) -> impl Display {
-    date.as_().to_date(tz).format(DATE_FORMAT)
+pub fn date_to_string(date: impl AsPrimitive<i64>, tz: &TimeZone) -> impl Display {
+    let res = date.as_().to_date(tz.clone());
+    strtime::format(DATE_FORMAT, res).unwrap()
 }

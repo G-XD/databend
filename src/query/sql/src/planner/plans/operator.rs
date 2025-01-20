@@ -14,61 +14,88 @@
 
 use std::sync::Arc;
 
-use common_catalog::table_context::TableContext;
-use common_exception::ErrorCode;
-use common_exception::Result;
+use databend_common_catalog::table_context::TableContext;
+use databend_common_exception::ErrorCode;
+use databend_common_exception::Result;
 
-use super::aggregate::Aggregate;
-use super::dummy_table_scan::DummyTableScan;
-use super::eval_scalar::EvalScalar;
-use super::filter::Filter;
-use super::join::Join;
-use super::limit::Limit;
-use super::pattern::PatternPlan;
-use super::scan::Scan;
-use super::sort::Sort;
-use super::union_all::UnionAll;
+use super::MutationSource;
 use crate::optimizer::PhysicalProperty;
 use crate::optimizer::RelExpr;
 use crate::optimizer::RelationalProperty;
 use crate::optimizer::RequiredProperty;
 use crate::optimizer::StatInfo;
-use crate::plans::materialized_cte::MaterializedCte;
-use crate::plans::runtime_filter_source::RuntimeFilterSource;
+use crate::plans::r_cte_scan::RecursiveCteScan;
+use crate::plans::Aggregate;
+use crate::plans::AsyncFunction;
+use crate::plans::CacheScan;
 use crate::plans::ConstantTableScan;
-use crate::plans::CteScan;
+use crate::plans::DummyTableScan;
+use crate::plans::EvalScalar;
 use crate::plans::Exchange;
-use crate::plans::Lambda;
+use crate::plans::ExpressionScan;
+use crate::plans::Filter;
+use crate::plans::Join;
+use crate::plans::Limit;
+use crate::plans::Mutation;
+use crate::plans::OptimizeCompactBlock;
 use crate::plans::ProjectSet;
+use crate::plans::Recluster;
+use crate::plans::Scan;
+use crate::plans::Sort;
+use crate::plans::Udf;
+use crate::plans::UnionAll;
 use crate::plans::Window;
 
 pub trait Operator {
+    /// Get relational operator kind
     fn rel_op(&self) -> RelOp;
 
-    fn is_pattern(&self) -> bool {
-        false
+    /// Get arity of this operator
+    fn arity(&self) -> usize {
+        1
     }
 
-    fn derive_relational_prop(&self, rel_expr: &RelExpr) -> Result<Arc<RelationalProperty>>;
+    /// Derive relational property
+    fn derive_relational_prop(&self, _rel_expr: &RelExpr) -> Result<Arc<RelationalProperty>> {
+        Ok(Arc::new(RelationalProperty::default()))
+    }
 
-    fn derive_physical_prop(&self, rel_expr: &RelExpr) -> Result<PhysicalProperty>;
+    /// Derive physical property
+    fn derive_physical_prop(&self, rel_expr: &RelExpr) -> Result<PhysicalProperty> {
+        rel_expr.derive_physical_prop_child(0)
+    }
 
-    fn derive_cardinality(&self, rel_expr: &RelExpr) -> Result<Arc<StatInfo>>;
+    /// Derive statistics information
+    fn derive_stats(&self, _rel_expr: &RelExpr) -> Result<Arc<StatInfo>> {
+        Ok(Arc::new(StatInfo::default()))
+    }
 
+    /// Compute required property for child with index `child_index`
     fn compute_required_prop_child(
         &self,
-        ctx: Arc<dyn TableContext>,
-        rel_expr: &RelExpr,
-        child_index: usize,
+        _ctx: Arc<dyn TableContext>,
+        _rel_expr: &RelExpr,
+        _child_index: usize,
         required: &RequiredProperty,
-    ) -> Result<RequiredProperty>;
+    ) -> Result<RequiredProperty> {
+        Ok(required.clone())
+    }
+
+    /// Enumerate all possible combinations of required property for children
+    fn compute_required_prop_children(
+        &self,
+        _ctx: Arc<dyn TableContext>,
+        _rel_expr: &RelExpr,
+        _required: &RequiredProperty,
+    ) -> Result<Vec<Vec<RequiredProperty>>> {
+        Ok(vec![vec![RequiredProperty::default(); self.arity()]])
+    }
 }
 
 /// Relational operator
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum RelOp {
     Scan,
-    CteScan,
     Join,
     EvalScalar,
     Filter,
@@ -78,12 +105,19 @@ pub enum RelOp {
     Exchange,
     UnionAll,
     DummyTableScan,
-    RuntimeFilterSource,
     Window,
     ProjectSet,
-    MaterializedCte,
-    Lambda,
     ConstantTableScan,
+    ExpressionScan,
+    CacheScan,
+    Udf,
+    Udaf,
+    AsyncFunction,
+    RecursiveCteScan,
+    MergeInto,
+    Recluster,
+    CompactBlock,
+    MutationSource,
 
     // Pattern
     Pattern,
@@ -93,7 +127,6 @@ pub enum RelOp {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum RelOperator {
     Scan(Scan),
-    CteScan(CteScan),
     Join(Join),
     EvalScalar(EvalScalar),
     Filter(Filter),
@@ -103,14 +136,18 @@ pub enum RelOperator {
     Exchange(Exchange),
     UnionAll(UnionAll),
     DummyTableScan(DummyTableScan),
-    RuntimeFilterSource(RuntimeFilterSource),
     Window(Window),
     ProjectSet(ProjectSet),
-    MaterializedCte(MaterializedCte),
-    Lambda(Lambda),
     ConstantTableScan(ConstantTableScan),
-
-    Pattern(PatternPlan),
+    ExpressionScan(ExpressionScan),
+    CacheScan(CacheScan),
+    Udf(Udf),
+    RecursiveCteScan(RecursiveCteScan),
+    AsyncFunction(AsyncFunction),
+    Mutation(Mutation),
+    Recluster(Recluster),
+    CompactBlock(OptimizeCompactBlock),
+    MutationSource(MutationSource),
 }
 
 impl Operator for RelOperator {
@@ -123,17 +160,48 @@ impl Operator for RelOperator {
             RelOperator::Aggregate(rel_op) => rel_op.rel_op(),
             RelOperator::Sort(rel_op) => rel_op.rel_op(),
             RelOperator::Limit(rel_op) => rel_op.rel_op(),
-            RelOperator::Pattern(rel_op) => rel_op.rel_op(),
             RelOperator::Exchange(rel_op) => rel_op.rel_op(),
             RelOperator::UnionAll(rel_op) => rel_op.rel_op(),
             RelOperator::DummyTableScan(rel_op) => rel_op.rel_op(),
-            RelOperator::RuntimeFilterSource(rel_op) => rel_op.rel_op(),
             RelOperator::ProjectSet(rel_op) => rel_op.rel_op(),
             RelOperator::Window(rel_op) => rel_op.rel_op(),
-            RelOperator::CteScan(rel_op) => rel_op.rel_op(),
-            RelOperator::MaterializedCte(rel_op) => rel_op.rel_op(),
-            RelOperator::Lambda(rel_op) => rel_op.rel_op(),
             RelOperator::ConstantTableScan(rel_op) => rel_op.rel_op(),
+            RelOperator::ExpressionScan(rel_op) => rel_op.rel_op(),
+            RelOperator::CacheScan(rel_op) => rel_op.rel_op(),
+            RelOperator::Udf(rel_op) => rel_op.rel_op(),
+            RelOperator::RecursiveCteScan(rel_op) => rel_op.rel_op(),
+            RelOperator::AsyncFunction(rel_op) => rel_op.rel_op(),
+            RelOperator::Mutation(rel_op) => rel_op.rel_op(),
+            RelOperator::Recluster(rel_op) => rel_op.rel_op(),
+            RelOperator::CompactBlock(rel_op) => rel_op.rel_op(),
+            RelOperator::MutationSource(rel_op) => rel_op.rel_op(),
+        }
+    }
+
+    fn arity(&self) -> usize {
+        match self {
+            RelOperator::Scan(rel_op) => rel_op.arity(),
+            RelOperator::Join(rel_op) => rel_op.arity(),
+            RelOperator::EvalScalar(rel_op) => rel_op.arity(),
+            RelOperator::Filter(rel_op) => rel_op.arity(),
+            RelOperator::Aggregate(rel_op) => rel_op.arity(),
+            RelOperator::Sort(rel_op) => rel_op.arity(),
+            RelOperator::Limit(rel_op) => rel_op.arity(),
+            RelOperator::Exchange(rel_op) => rel_op.arity(),
+            RelOperator::UnionAll(rel_op) => rel_op.arity(),
+            RelOperator::DummyTableScan(rel_op) => rel_op.arity(),
+            RelOperator::Window(rel_op) => rel_op.arity(),
+            RelOperator::ProjectSet(rel_op) => rel_op.arity(),
+            RelOperator::ConstantTableScan(rel_op) => rel_op.arity(),
+            RelOperator::ExpressionScan(rel_op) => rel_op.arity(),
+            RelOperator::CacheScan(rel_op) => rel_op.arity(),
+            RelOperator::Udf(rel_op) => rel_op.arity(),
+            RelOperator::RecursiveCteScan(rel_op) => rel_op.arity(),
+            RelOperator::AsyncFunction(rel_op) => rel_op.arity(),
+            RelOperator::Mutation(rel_op) => rel_op.arity(),
+            RelOperator::Recluster(rel_op) => rel_op.arity(),
+            RelOperator::CompactBlock(rel_op) => rel_op.arity(),
+            RelOperator::MutationSource(rel_op) => rel_op.arity(),
         }
     }
 
@@ -146,17 +214,21 @@ impl Operator for RelOperator {
             RelOperator::Aggregate(rel_op) => rel_op.derive_relational_prop(rel_expr),
             RelOperator::Sort(rel_op) => rel_op.derive_relational_prop(rel_expr),
             RelOperator::Limit(rel_op) => rel_op.derive_relational_prop(rel_expr),
-            RelOperator::Pattern(rel_op) => rel_op.derive_relational_prop(rel_expr),
             RelOperator::Exchange(rel_op) => rel_op.derive_relational_prop(rel_expr),
             RelOperator::UnionAll(rel_op) => rel_op.derive_relational_prop(rel_expr),
             RelOperator::DummyTableScan(rel_op) => rel_op.derive_relational_prop(rel_expr),
-            RelOperator::RuntimeFilterSource(rel_op) => rel_op.derive_relational_prop(rel_expr),
             RelOperator::ProjectSet(rel_op) => rel_op.derive_relational_prop(rel_expr),
             RelOperator::Window(rel_op) => rel_op.derive_relational_prop(rel_expr),
-            RelOperator::CteScan(rel_op) => rel_op.derive_relational_prop(rel_expr),
-            RelOperator::MaterializedCte(rel_op) => rel_op.derive_relational_prop(rel_expr),
-            RelOperator::Lambda(rel_op) => rel_op.derive_relational_prop(rel_expr),
             RelOperator::ConstantTableScan(rel_op) => rel_op.derive_relational_prop(rel_expr),
+            RelOperator::ExpressionScan(rel_op) => rel_op.derive_relational_prop(rel_expr),
+            RelOperator::CacheScan(rel_op) => rel_op.derive_relational_prop(rel_expr),
+            RelOperator::Udf(rel_op) => rel_op.derive_relational_prop(rel_expr),
+            RelOperator::RecursiveCteScan(rel_op) => rel_op.derive_relational_prop(rel_expr),
+            RelOperator::AsyncFunction(rel_op) => rel_op.derive_relational_prop(rel_expr),
+            RelOperator::Mutation(rel_op) => rel_op.derive_relational_prop(rel_expr),
+            RelOperator::Recluster(rel_op) => rel_op.derive_relational_prop(rel_expr),
+            RelOperator::CompactBlock(rel_op) => rel_op.derive_relational_prop(rel_expr),
+            RelOperator::MutationSource(rel_op) => rel_op.derive_relational_prop(rel_expr),
         }
     }
 
@@ -169,40 +241,48 @@ impl Operator for RelOperator {
             RelOperator::Aggregate(rel_op) => rel_op.derive_physical_prop(rel_expr),
             RelOperator::Sort(rel_op) => rel_op.derive_physical_prop(rel_expr),
             RelOperator::Limit(rel_op) => rel_op.derive_physical_prop(rel_expr),
-            RelOperator::Pattern(rel_op) => rel_op.derive_physical_prop(rel_expr),
             RelOperator::Exchange(rel_op) => rel_op.derive_physical_prop(rel_expr),
             RelOperator::UnionAll(rel_op) => rel_op.derive_physical_prop(rel_expr),
             RelOperator::DummyTableScan(rel_op) => rel_op.derive_physical_prop(rel_expr),
-            RelOperator::RuntimeFilterSource(rel_op) => rel_op.derive_physical_prop(rel_expr),
             RelOperator::ProjectSet(rel_op) => rel_op.derive_physical_prop(rel_expr),
             RelOperator::Window(rel_op) => rel_op.derive_physical_prop(rel_expr),
-            RelOperator::CteScan(rel_op) => rel_op.derive_physical_prop(rel_expr),
-            RelOperator::MaterializedCte(rel_op) => rel_op.derive_physical_prop(rel_expr),
-            RelOperator::Lambda(rel_op) => rel_op.derive_physical_prop(rel_expr),
             RelOperator::ConstantTableScan(rel_op) => rel_op.derive_physical_prop(rel_expr),
+            RelOperator::ExpressionScan(rel_op) => rel_op.derive_physical_prop(rel_expr),
+            RelOperator::CacheScan(rel_op) => rel_op.derive_physical_prop(rel_expr),
+            RelOperator::Udf(rel_op) => rel_op.derive_physical_prop(rel_expr),
+            RelOperator::RecursiveCteScan(rel_op) => rel_op.derive_physical_prop(rel_expr),
+            RelOperator::AsyncFunction(rel_op) => rel_op.derive_physical_prop(rel_expr),
+            RelOperator::Mutation(rel_op) => rel_op.derive_physical_prop(rel_expr),
+            RelOperator::Recluster(rel_op) => rel_op.derive_physical_prop(rel_expr),
+            RelOperator::CompactBlock(rel_op) => rel_op.derive_physical_prop(rel_expr),
+            RelOperator::MutationSource(rel_op) => rel_op.derive_physical_prop(rel_expr),
         }
     }
 
-    fn derive_cardinality(&self, rel_expr: &RelExpr) -> Result<Arc<StatInfo>> {
+    fn derive_stats(&self, rel_expr: &RelExpr) -> Result<Arc<StatInfo>> {
         match self {
-            RelOperator::Scan(rel_op) => rel_op.derive_cardinality(rel_expr),
-            RelOperator::Join(rel_op) => rel_op.derive_cardinality(rel_expr),
-            RelOperator::EvalScalar(rel_op) => rel_op.derive_cardinality(rel_expr),
-            RelOperator::Filter(rel_op) => rel_op.derive_cardinality(rel_expr),
-            RelOperator::Aggregate(rel_op) => rel_op.derive_cardinality(rel_expr),
-            RelOperator::Sort(rel_op) => rel_op.derive_cardinality(rel_expr),
-            RelOperator::Limit(rel_op) => rel_op.derive_cardinality(rel_expr),
-            RelOperator::Pattern(rel_op) => rel_op.derive_cardinality(rel_expr),
-            RelOperator::Exchange(rel_op) => rel_op.derive_cardinality(rel_expr),
-            RelOperator::UnionAll(rel_op) => rel_op.derive_cardinality(rel_expr),
-            RelOperator::DummyTableScan(rel_op) => rel_op.derive_cardinality(rel_expr),
-            RelOperator::RuntimeFilterSource(rel_op) => rel_op.derive_cardinality(rel_expr),
-            RelOperator::ProjectSet(rel_op) => rel_op.derive_cardinality(rel_expr),
-            RelOperator::Window(rel_op) => rel_op.derive_cardinality(rel_expr),
-            RelOperator::CteScan(rel_op) => rel_op.derive_cardinality(rel_expr),
-            RelOperator::MaterializedCte(rel_op) => rel_op.derive_cardinality(rel_expr),
-            RelOperator::Lambda(rel_op) => rel_op.derive_cardinality(rel_expr),
-            RelOperator::ConstantTableScan(rel_op) => rel_op.derive_cardinality(rel_expr),
+            RelOperator::Scan(rel_op) => rel_op.derive_stats(rel_expr),
+            RelOperator::Join(rel_op) => rel_op.derive_stats(rel_expr),
+            RelOperator::EvalScalar(rel_op) => rel_op.derive_stats(rel_expr),
+            RelOperator::Filter(rel_op) => rel_op.derive_stats(rel_expr),
+            RelOperator::Aggregate(rel_op) => rel_op.derive_stats(rel_expr),
+            RelOperator::Sort(rel_op) => rel_op.derive_stats(rel_expr),
+            RelOperator::Limit(rel_op) => rel_op.derive_stats(rel_expr),
+            RelOperator::Exchange(rel_op) => rel_op.derive_stats(rel_expr),
+            RelOperator::UnionAll(rel_op) => rel_op.derive_stats(rel_expr),
+            RelOperator::DummyTableScan(rel_op) => rel_op.derive_stats(rel_expr),
+            RelOperator::ProjectSet(rel_op) => rel_op.derive_stats(rel_expr),
+            RelOperator::Window(rel_op) => rel_op.derive_stats(rel_expr),
+            RelOperator::ConstantTableScan(rel_op) => rel_op.derive_stats(rel_expr),
+            RelOperator::ExpressionScan(rel_op) => rel_op.derive_stats(rel_expr),
+            RelOperator::CacheScan(rel_op) => rel_op.derive_stats(rel_expr),
+            RelOperator::Udf(rel_op) => rel_op.derive_stats(rel_expr),
+            RelOperator::RecursiveCteScan(rel_op) => rel_op.derive_stats(rel_expr),
+            RelOperator::AsyncFunction(rel_op) => rel_op.derive_stats(rel_expr),
+            RelOperator::Mutation(rel_op) => rel_op.derive_stats(rel_expr),
+            RelOperator::Recluster(rel_op) => rel_op.derive_stats(rel_expr),
+            RelOperator::CompactBlock(rel_op) => rel_op.derive_stats(rel_expr),
+            RelOperator::MutationSource(rel_op) => rel_op.derive_stats(rel_expr),
         }
     }
 
@@ -235,9 +315,6 @@ impl Operator for RelOperator {
             RelOperator::Limit(rel_op) => {
                 rel_op.compute_required_prop_child(ctx, rel_expr, child_index, required)
             }
-            RelOperator::Pattern(rel_op) => {
-                rel_op.compute_required_prop_child(ctx, rel_expr, child_index, required)
-            }
             RelOperator::Exchange(rel_op) => {
                 rel_op.compute_required_prop_child(ctx, rel_expr, child_index, required)
             }
@@ -247,26 +324,117 @@ impl Operator for RelOperator {
             RelOperator::DummyTableScan(rel_op) => {
                 rel_op.compute_required_prop_child(ctx, rel_expr, child_index, required)
             }
-            RelOperator::RuntimeFilterSource(rel_op) => {
-                rel_op.compute_required_prop_child(ctx, rel_expr, child_index, required)
-            }
             RelOperator::Window(rel_op) => {
                 rel_op.compute_required_prop_child(ctx, rel_expr, child_index, required)
             }
             RelOperator::ProjectSet(rel_op) => {
                 rel_op.compute_required_prop_child(ctx, rel_expr, child_index, required)
             }
-            RelOperator::CteScan(rel_op) => {
-                rel_op.compute_required_prop_child(ctx, rel_expr, child_index, required)
-            }
-            RelOperator::MaterializedCte(rel_op) => {
-                rel_op.compute_required_prop_child(ctx, rel_expr, child_index, required)
-            }
-            RelOperator::Lambda(rel_op) => {
-                rel_op.compute_required_prop_child(ctx, rel_expr, child_index, required)
-            }
             RelOperator::ConstantTableScan(rel_op) => {
                 rel_op.compute_required_prop_child(ctx, rel_expr, child_index, required)
+            }
+            RelOperator::ExpressionScan(rel_op) => {
+                rel_op.compute_required_prop_child(ctx, rel_expr, child_index, required)
+            }
+            RelOperator::CacheScan(rel_op) => {
+                rel_op.compute_required_prop_child(ctx, rel_expr, child_index, required)
+            }
+            RelOperator::Udf(rel_op) => {
+                rel_op.compute_required_prop_child(ctx, rel_expr, child_index, required)
+            }
+            RelOperator::RecursiveCteScan(rel_op) => {
+                rel_op.compute_required_prop_child(ctx, rel_expr, child_index, required)
+            }
+            RelOperator::AsyncFunction(rel_op) => {
+                rel_op.compute_required_prop_child(ctx, rel_expr, child_index, required)
+            }
+            RelOperator::Mutation(rel_op) => {
+                rel_op.compute_required_prop_child(ctx, rel_expr, child_index, required)
+            }
+            RelOperator::Recluster(rel_op) => {
+                rel_op.compute_required_prop_child(ctx, rel_expr, child_index, required)
+            }
+            RelOperator::CompactBlock(rel_op) => {
+                rel_op.compute_required_prop_child(ctx, rel_expr, child_index, required)
+            }
+            RelOperator::MutationSource(rel_op) => {
+                rel_op.compute_required_prop_child(ctx, rel_expr, child_index, required)
+            }
+        }
+    }
+
+    fn compute_required_prop_children(
+        &self,
+        ctx: Arc<dyn TableContext>,
+        rel_expr: &RelExpr,
+        required: &RequiredProperty,
+    ) -> Result<Vec<Vec<RequiredProperty>>> {
+        match self {
+            RelOperator::Scan(rel_op) => {
+                rel_op.compute_required_prop_children(ctx, rel_expr, required)
+            }
+            RelOperator::Join(rel_op) => {
+                rel_op.compute_required_prop_children(ctx, rel_expr, required)
+            }
+            RelOperator::EvalScalar(rel_op) => {
+                rel_op.compute_required_prop_children(ctx, rel_expr, required)
+            }
+            RelOperator::Filter(rel_op) => {
+                rel_op.compute_required_prop_children(ctx, rel_expr, required)
+            }
+            RelOperator::Aggregate(rel_op) => {
+                rel_op.compute_required_prop_children(ctx, rel_expr, required)
+            }
+            RelOperator::Sort(rel_op) => {
+                rel_op.compute_required_prop_children(ctx, rel_expr, required)
+            }
+            RelOperator::Limit(rel_op) => {
+                rel_op.compute_required_prop_children(ctx, rel_expr, required)
+            }
+            RelOperator::Exchange(rel_op) => {
+                rel_op.compute_required_prop_children(ctx, rel_expr, required)
+            }
+            RelOperator::UnionAll(rel_op) => {
+                rel_op.compute_required_prop_children(ctx, rel_expr, required)
+            }
+            RelOperator::DummyTableScan(rel_op) => {
+                rel_op.compute_required_prop_children(ctx, rel_expr, required)
+            }
+            RelOperator::Window(rel_op) => {
+                rel_op.compute_required_prop_children(ctx, rel_expr, required)
+            }
+            RelOperator::ProjectSet(rel_op) => {
+                rel_op.compute_required_prop_children(ctx, rel_expr, required)
+            }
+            RelOperator::ConstantTableScan(rel_op) => {
+                rel_op.compute_required_prop_children(ctx, rel_expr, required)
+            }
+            RelOperator::ExpressionScan(rel_op) => {
+                rel_op.compute_required_prop_children(ctx, rel_expr, required)
+            }
+            RelOperator::CacheScan(rel_op) => {
+                rel_op.compute_required_prop_children(ctx, rel_expr, required)
+            }
+            RelOperator::Udf(rel_op) => {
+                rel_op.compute_required_prop_children(ctx, rel_expr, required)
+            }
+            RelOperator::RecursiveCteScan(rel_op) => {
+                rel_op.compute_required_prop_children(ctx, rel_expr, required)
+            }
+            RelOperator::AsyncFunction(rel_op) => {
+                rel_op.compute_required_prop_children(ctx, rel_expr, required)
+            }
+            RelOperator::Mutation(rel_op) => {
+                rel_op.compute_required_prop_children(ctx, rel_expr, required)
+            }
+            RelOperator::Recluster(rel_op) => {
+                rel_op.compute_required_prop_children(ctx, rel_expr, required)
+            }
+            RelOperator::CompactBlock(rel_op) => {
+                rel_op.compute_required_prop_children(ctx, rel_expr, required)
+            }
+            RelOperator::MutationSource(rel_op) => {
+                rel_op.compute_required_prop_children(ctx, rel_expr, required)
             }
         }
     }
@@ -285,49 +453,10 @@ impl TryFrom<RelOperator> for Scan {
         if let RelOperator::Scan(value) = value {
             Ok(value)
         } else {
-            Err(ErrorCode::Internal(
-                "Cannot downcast RelOperator to LogicalGet",
-            ))
-        }
-    }
-}
-
-impl From<CteScan> for RelOperator {
-    fn from(value: CteScan) -> Self {
-        Self::CteScan(value)
-    }
-}
-
-impl TryFrom<RelOperator> for CteScan {
-    type Error = ErrorCode;
-
-    fn try_from(value: RelOperator) -> Result<Self> {
-        if let RelOperator::CteScan(value) = value {
-            Ok(value)
-        } else {
-            Err(ErrorCode::Internal(
-                "Cannot downcast RelOperator to CteScan",
-            ))
-        }
-    }
-}
-
-impl From<MaterializedCte> for RelOperator {
-    fn from(value: MaterializedCte) -> Self {
-        Self::MaterializedCte(value)
-    }
-}
-
-impl TryFrom<RelOperator> for MaterializedCte {
-    type Error = ErrorCode;
-
-    fn try_from(value: RelOperator) -> Result<Self> {
-        if let RelOperator::MaterializedCte(value) = value {
-            Ok(value)
-        } else {
-            Err(ErrorCode::Internal(
-                "Cannot downcast RelOperator to MaterializedCte",
-            ))
+            Err(ErrorCode::Internal(format!(
+                "Cannot downcast {:?} to Scan",
+                value.rel_op()
+            )))
         }
     }
 }
@@ -344,9 +473,10 @@ impl TryFrom<RelOperator> for Join {
         if let RelOperator::Join(value) = value {
             Ok(value)
         } else {
-            Err(ErrorCode::Internal(
-                "Cannot downcast RelOperator to LogicalJoin",
-            ))
+            Err(ErrorCode::Internal(format!(
+                "Cannot downcast {:?} to Join",
+                value.rel_op()
+            )))
         }
     }
 }
@@ -363,9 +493,10 @@ impl TryFrom<RelOperator> for EvalScalar {
         if let RelOperator::EvalScalar(value) = value {
             Ok(value)
         } else {
-            Err(ErrorCode::Internal(
-                "Cannot downcast RelOperator to EvalScalar",
-            ))
+            Err(ErrorCode::Internal(format!(
+                "Cannot downcast {:?} to EvalScalar",
+                value.rel_op()
+            )))
         }
     }
 }
@@ -382,7 +513,10 @@ impl TryFrom<RelOperator> for Filter {
         if let RelOperator::Filter(value) = value {
             Ok(value)
         } else {
-            Err(ErrorCode::Internal("Cannot downcast RelOperator to Filter"))
+            Err(ErrorCode::Internal(format!(
+                "Cannot downcast {:?} to Filter",
+                value.rel_op()
+            )))
         }
     }
 }
@@ -399,9 +533,10 @@ impl TryFrom<RelOperator> for Aggregate {
         if let RelOperator::Aggregate(value) = value {
             Ok(value)
         } else {
-            Err(ErrorCode::Internal(
-                "Cannot downcast RelOperator to Aggregate",
-            ))
+            Err(ErrorCode::Internal(format!(
+                "Cannot downcast {:?} to Aggregate",
+                value.rel_op()
+            )))
         }
     }
 }
@@ -418,7 +553,10 @@ impl TryFrom<RelOperator> for Window {
         if let RelOperator::Window(value) = value {
             Ok(value)
         } else {
-            Err(ErrorCode::Internal("Cannot downcast RelOperator to Window"))
+            Err(ErrorCode::Internal(format!(
+                "Cannot downcast {:?} to Window",
+                value.rel_op()
+            )))
         }
     }
 }
@@ -435,7 +573,10 @@ impl TryFrom<RelOperator> for Sort {
         if let RelOperator::Sort(value) = value {
             Ok(value)
         } else {
-            Err(ErrorCode::Internal("Cannot downcast RelOperator to Sort"))
+            Err(ErrorCode::Internal(format!(
+                "Cannot downcast {:?} to Sort",
+                value.rel_op()
+            )))
         }
     }
 }
@@ -452,26 +593,10 @@ impl TryFrom<RelOperator> for Limit {
         if let RelOperator::Limit(value) = value {
             Ok(value)
         } else {
-            Err(ErrorCode::Internal("Cannot downcast RelOperator to Limit"))
-        }
-    }
-}
-
-impl From<PatternPlan> for RelOperator {
-    fn from(v: PatternPlan) -> Self {
-        Self::Pattern(v)
-    }
-}
-
-impl TryFrom<RelOperator> for PatternPlan {
-    type Error = ErrorCode;
-    fn try_from(value: RelOperator) -> Result<Self> {
-        if let RelOperator::Pattern(value) = value {
-            Ok(value)
-        } else {
-            Err(ErrorCode::Internal(
-                "Cannot downcast RelOperator to Pattern",
-            ))
+            Err(ErrorCode::Internal(format!(
+                "Cannot downcast {:?} to Limit",
+                value.rel_op()
+            )))
         }
     }
 }
@@ -488,9 +613,10 @@ impl TryFrom<RelOperator> for Exchange {
         if let RelOperator::Exchange(value) = value {
             Ok(value)
         } else {
-            Err(ErrorCode::Internal(
-                "Cannot downcast RelOperator to Exchange",
-            ))
+            Err(ErrorCode::Internal(format!(
+                "Cannot downcast {:?} to Exchange",
+                value.rel_op()
+            )))
         }
     }
 }
@@ -507,9 +633,10 @@ impl TryFrom<RelOperator> for UnionAll {
         if let RelOperator::UnionAll(value) = value {
             Ok(value)
         } else {
-            Err(ErrorCode::Internal(
-                "Cannot downcast RelOperator to UnionAll",
-            ))
+            Err(ErrorCode::Internal(format!(
+                "Cannot downcast {:?} to UnionAll",
+                value.rel_op()
+            )))
         }
     }
 }
@@ -526,29 +653,10 @@ impl TryFrom<RelOperator> for DummyTableScan {
         if let RelOperator::DummyTableScan(value) = value {
             Ok(value)
         } else {
-            Err(ErrorCode::Internal(
-                "Cannot downcast RelOperator to DummyTableScan",
-            ))
-        }
-    }
-}
-
-impl From<RuntimeFilterSource> for RelOperator {
-    fn from(value: RuntimeFilterSource) -> Self {
-        Self::RuntimeFilterSource(value)
-    }
-}
-
-impl TryFrom<RelOperator> for RuntimeFilterSource {
-    type Error = ErrorCode;
-
-    fn try_from(value: RelOperator) -> std::result::Result<Self, Self::Error> {
-        if let RelOperator::RuntimeFilterSource(value) = value {
-            Ok(value)
-        } else {
-            Err(ErrorCode::Internal(
-                "Cannot downcast RelOperator to RuntimeFilterSource",
-            ))
+            Err(ErrorCode::Internal(format!(
+                "Cannot downcast {:?} to DummyTableScan",
+                value.rel_op()
+            )))
         }
     }
 }
@@ -566,27 +674,10 @@ impl TryFrom<RelOperator> for ProjectSet {
         if let RelOperator::ProjectSet(value) = value {
             Ok(value)
         } else {
-            Err(ErrorCode::Internal(
-                "Cannot downcast RelOperator to ProjectSet",
-            ))
-        }
-    }
-}
-
-impl From<Lambda> for RelOperator {
-    fn from(value: Lambda) -> Self {
-        Self::Lambda(value)
-    }
-}
-
-impl TryFrom<RelOperator> for Lambda {
-    type Error = ErrorCode;
-
-    fn try_from(value: RelOperator) -> std::result::Result<Self, Self::Error> {
-        if let RelOperator::Lambda(value) = value {
-            Ok(value)
-        } else {
-            Err(ErrorCode::Internal("Cannot downcast RelOperator to Lambda"))
+            Err(ErrorCode::Internal(format!(
+                "Cannot downcast {:?} to ProjectSet",
+                value.rel_op()
+            )))
         }
     }
 }
@@ -597,6 +688,12 @@ impl From<ConstantTableScan> for RelOperator {
     }
 }
 
+impl From<ExpressionScan> for RelOperator {
+    fn from(value: ExpressionScan) -> Self {
+        Self::ExpressionScan(value)
+    }
+}
+
 impl TryFrom<RelOperator> for ConstantTableScan {
     type Error = ErrorCode;
 
@@ -604,9 +701,146 @@ impl TryFrom<RelOperator> for ConstantTableScan {
         if let RelOperator::ConstantTableScan(value) = value {
             Ok(value)
         } else {
-            Err(ErrorCode::Internal(
-                "Cannot downcast RelOperator to ConstantTableScan",
-            ))
+            Err(ErrorCode::Internal(format!(
+                "Cannot downcast {:?} to ConstantTableScan",
+                value.rel_op()
+            )))
+        }
+    }
+}
+
+impl From<Udf> for RelOperator {
+    fn from(value: Udf) -> Self {
+        Self::Udf(value)
+    }
+}
+
+impl TryFrom<RelOperator> for Udf {
+    type Error = ErrorCode;
+
+    fn try_from(value: RelOperator) -> std::result::Result<Self, Self::Error> {
+        if let RelOperator::Udf(value) = value {
+            Ok(value)
+        } else {
+            Err(ErrorCode::Internal(format!(
+                "Cannot downcast {:?} to Udf",
+                value.rel_op()
+            )))
+        }
+    }
+}
+
+impl TryFrom<RelOperator> for RecursiveCteScan {
+    type Error = ErrorCode;
+
+    fn try_from(value: RelOperator) -> std::result::Result<Self, Self::Error> {
+        if let RelOperator::RecursiveCteScan(value) = value {
+            Ok(value)
+        } else {
+            Err(ErrorCode::Internal(format!(
+                "Cannot downcast {:?} to RecursiveCteScan",
+                value.rel_op()
+            )))
+        }
+    }
+}
+impl From<AsyncFunction> for RelOperator {
+    fn from(value: AsyncFunction) -> Self {
+        Self::AsyncFunction(value)
+    }
+}
+
+impl TryFrom<RelOperator> for AsyncFunction {
+    type Error = ErrorCode;
+
+    fn try_from(value: RelOperator) -> std::result::Result<Self, Self::Error> {
+        if let RelOperator::AsyncFunction(value) = value {
+            Ok(value)
+        } else {
+            Err(ErrorCode::Internal(format!(
+                "Cannot downcast {:?} to AsyncFunction",
+                value.rel_op()
+            )))
+        }
+    }
+}
+
+impl From<Mutation> for RelOperator {
+    fn from(v: Mutation) -> Self {
+        Self::Mutation(v)
+    }
+}
+
+impl TryFrom<RelOperator> for Mutation {
+    type Error = ErrorCode;
+    fn try_from(value: RelOperator) -> Result<Self> {
+        if let RelOperator::Mutation(value) = value {
+            Ok(value)
+        } else {
+            Err(ErrorCode::Internal(format!(
+                "Cannot downcast {:?} to MergeInto",
+                value.rel_op()
+            )))
+        }
+    }
+}
+
+impl From<Recluster> for RelOperator {
+    fn from(v: Recluster) -> Self {
+        Self::Recluster(v)
+    }
+}
+
+impl TryFrom<RelOperator> for Recluster {
+    type Error = ErrorCode;
+    fn try_from(value: RelOperator) -> Result<Self> {
+        if let RelOperator::Recluster(value) = value {
+            Ok(value)
+        } else {
+            Err(ErrorCode::Internal(format!(
+                "Cannot downcast {:?} to Recluster",
+                value.rel_op()
+            )))
+        }
+    }
+}
+
+impl From<OptimizeCompactBlock> for RelOperator {
+    fn from(v: OptimizeCompactBlock) -> Self {
+        Self::CompactBlock(v)
+    }
+}
+
+impl TryFrom<RelOperator> for OptimizeCompactBlock {
+    type Error = ErrorCode;
+    fn try_from(value: RelOperator) -> Result<Self> {
+        if let RelOperator::CompactBlock(value) = value {
+            Ok(value)
+        } else {
+            Err(ErrorCode::Internal(format!(
+                "Cannot downcast {:?} to OptimizeCompactBlock",
+                value.rel_op()
+            )))
+        }
+    }
+}
+
+impl From<MutationSource> for RelOperator {
+    fn from(v: MutationSource) -> Self {
+        Self::MutationSource(v)
+    }
+}
+
+impl TryFrom<RelOperator> for MutationSource {
+    type Error = ErrorCode;
+    fn try_from(value: RelOperator) -> Result<Self> {
+        if let RelOperator::MutationSource(value) = value {
+            Ok(value)
+        } else {
+            Err(ErrorCode::Internal(format!(
+                "Cannot downcast {:?} to MutationSource",
+                value.rel_op()
+            )))
         }
     }
 }

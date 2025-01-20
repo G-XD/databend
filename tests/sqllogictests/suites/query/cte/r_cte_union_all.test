@@ -1,0 +1,118 @@
+control sortmode rowsort
+
+statement ok
+create or replace database db;
+
+statement ok
+use db;
+
+# simple recursive CTE
+query I
+with recursive t as (select 1 as x union all select x+1 from t where x < 3) select * from t
+----
+1
+2
+3
+
+# simple recursive CTE with an alias
+query I
+with recursive t as (select 1 as x union all select x+1 from t as m where m.x < 3) select * from t
+----
+1
+2
+3
+
+# recursive CTE with multiple references and aliases
+onlyif todo
+query I
+with recursive t as (select 1 as x union all select m.x+f.x from t as m, t as f where m.x < 3) select * from t
+----
+1
+2
+4
+
+# strings and multiple columns
+query IT
+with recursive t as (select 1 as x, 'hello' as y union all select x+1, y || '-' || 'hello' from t where x < 3) select * from t;
+----
+1	hello
+2	hello-hello
+3	hello-hello-hello
+
+onlyif todo
+# referencing same CTE multiple times
+query I
+with recursive t as (select 1 as x union all select x+1 from t where x < 3) select min(a1.x) from t a1, t a2;
+----
+1
+
+# nested uncorrelated subquery
+query I
+with recursive t as (select 1 as x union all select x+(SELECT 1) from t where x < 3) select * from t;
+----
+1
+2
+3
+
+
+# recursive CTE with table-producing function
+query I
+WITH RECURSIVE t AS (
+	SELECT 1 AS i
+	UNION ALL
+	SELECT j
+	FROM t, generate_series(0, 10, 1) series(j)
+	WHERE j=i+1
+)
+SELECT * FROM t;
+----
+1
+10
+2
+3
+4
+5
+6
+7
+8
+9
+
+# bug: https://github.com/databendlabs/databend/issues/17027
+statement ok
+CREATE or replace TABLE parent_child
+(
+  parent VARCHAR(30),
+  child VARCHAR(30)
+);
+
+statement ok
+INSERT INTO parent_child
+VALUES ('Org','Org'),('Org','Global'),('Global','North'),
+('Global','South'),('Global','East'),('Global','West'),
+('Global','Org detail'),('North','North East'),('North','North West');
+
+query I
+WITH RECURSIVE tree_values
+    (parent, child)
+AS (
+    SELECT parent, child
+    FROM parent_child
+    WHERE parent = child
+    UNION ALL
+    SELECT c.parent, c.child
+    FROM parent_child c
+    INNER JOIN tree_values p
+    ON p.child = c.parent
+    WHERE c.parent != c.child
+)
+select parent, child from tree_values
+where parent = 'Global';
+----
+Global East
+Global North
+Global Org detail
+Global South
+Global West
+
+statement ok
+drop table parent_child;

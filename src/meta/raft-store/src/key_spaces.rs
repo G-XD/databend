@@ -15,22 +15,24 @@
 //! Defines application key spaces that are defined by raft-store.
 //! All of the key spaces stores key-value pairs in the underlying sled db.
 
-use common_meta_sled_store::sled;
-use common_meta_sled_store::SledKeySpace;
-use common_meta_sled_store::SledOrderedSerde;
-use common_meta_sled_store::SledSerde;
-use common_meta_stoerr::MetaStorageError;
-use common_meta_types::compat07;
-use common_meta_types::Entry;
-use common_meta_types::LogIndex;
-use common_meta_types::Node;
-use common_meta_types::NodeId;
-use common_meta_types::SeqNum;
-use common_meta_types::SeqV;
+use databend_common_meta_sled_store::sled;
+use databend_common_meta_sled_store::SledKeySpace;
+use databend_common_meta_sled_store::SledOrderedSerde;
+use databend_common_meta_sled_store::SledSerde;
+use databend_common_meta_stoerr::MetaStorageError;
+use databend_common_meta_types::raft_types::Entry;
+use databend_common_meta_types::raft_types::LogId;
+use databend_common_meta_types::raft_types::LogIndex;
+use databend_common_meta_types::raft_types::NodeId;
+use databend_common_meta_types::raft_types::Vote;
+use databend_common_meta_types::seq_value::SeqV;
+use databend_common_meta_types::Node;
+use databend_common_meta_types::SeqNum;
 use serde::Deserialize;
 use serde::Serialize;
 
 use crate::ondisk::Header;
+use crate::ondisk::OnDisk;
 use crate::state::RaftStateKey;
 use crate::state::RaftStateValue;
 use crate::state_machine::ClientLastRespValue;
@@ -78,7 +80,7 @@ impl SledKeySpace for StateMachineMeta {
 }
 
 /// Key-Value Types for storing meta data of a raft in sled::Tree:
-/// node_id, vote, state_machine_id pairs:(a,b)
+/// node_id, vote
 pub struct RaftStateKV {}
 impl SledKeySpace for RaftStateKV {
     const PREFIX: u8 = 4;
@@ -132,6 +134,100 @@ impl SledKeySpace for DataHeader {
     type V = Header;
 }
 
+/// Serialize SledKeySpace key value pair
+macro_rules! serialize_for_sled {
+    ($ks:tt, $key:expr, $value:expr) => {
+        Ok(($ks::serialize_key($key)?, $ks::serialize_value($value)?))
+    };
+}
+
+/// Convert (sub_tree_prefix, key, value, key_space1, key_space2...) into a [`RaftStoreEntry`].
+///
+/// It compares the sub_tree_prefix with prefix defined by every key space to determine which key space it belongs to.
+macro_rules! deserialize_by_prefix {
+    ($prefix: expr, $vec_key: expr, $vec_value: expr, $($key_space: tt),+ ) => {
+        $(
+
+        if <$key_space as SledKeySpace>::PREFIX == $prefix {
+
+            let key = SledOrderedSerde::de($vec_key)?;
+            let value = SledSerde::de($vec_value)?;
+
+            // Self reference the enum that use this macro
+            return Ok(Self::$key_space { key, value, });
+        }
+        )+
+    };
+}
+
+/// Enum of key-value pairs that are used in the raft state machine.
+///
+/// It is a sub set of [`RaftStoreEntry`] and contains only the types used by state-machine.
+#[rustfmt::skip]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum SMEntry {
+    DataHeader       { key: <DataHeader       as SledKeySpace>::K, value: <DataHeader       as SledKeySpace>::V, },
+    Nodes            { key: <Nodes            as SledKeySpace>::K, value: <Nodes            as SledKeySpace>::V, },
+    StateMachineMeta { key: <StateMachineMeta as SledKeySpace>::K, value: <StateMachineMeta as SledKeySpace>::V, },
+    Expire           { key: <Expire           as SledKeySpace>::K, value: <Expire           as SledKeySpace>::V, },
+    GenericKV        { key: <GenericKV        as SledKeySpace>::K, value: <GenericKV        as SledKeySpace>::V, },
+    Sequences        { key: <Sequences        as SledKeySpace>::K, value: <Sequences        as SledKeySpace>::V, },
+}
+
+impl SMEntry {
+    /// Serialize a key-value entry into a two elt vec of vec<u8>: `[key, value]`.
+    #[rustfmt::skip]
+    pub fn serialize(kv: &SMEntry) -> Result<(sled::IVec, sled::IVec), MetaStorageError> {
+
+        match kv {
+            Self::DataHeader       { key, value } => serialize_for_sled!(DataHeader,       key, value),
+            Self::Nodes            { key, value } => serialize_for_sled!(Nodes,            key, value),
+            Self::StateMachineMeta { key, value } => serialize_for_sled!(StateMachineMeta, key, value),
+            Self::Expire           { key, value } => serialize_for_sled!(Expire,           key, value),
+            Self::GenericKV        { key, value } => serialize_for_sled!(GenericKV,        key, value),
+            Self::Sequences        { key, value } => serialize_for_sled!(Sequences,        key, value),
+        }
+    }
+
+    /// Deserialize a serialized key-value entry `[key, value]`.
+    ///
+    /// It is able to deserialize openraft-v7 or openraft-v8 key-value pairs.
+    /// The compatibility is provided by [`SledSerde`] implementation for value types.
+    pub fn deserialize(prefix_key: &[u8], vec_value: &[u8]) -> Result<Self, MetaStorageError> {
+        let prefix = prefix_key[0];
+        let vec_key = &prefix_key[1..];
+
+        deserialize_by_prefix!(
+            prefix,
+            vec_key,
+            vec_value,
+            // Available key spaces:
+            DataHeader,
+            Nodes,
+            StateMachineMeta,
+            Expire,
+            GenericKV,
+            Sequences
+        );
+
+        unreachable!("unknown prefix: {}", prefix);
+    }
+
+    pub fn last_applied(&self) -> Option<LogId> {
+        match self {
+            Self::StateMachineMeta { key, value } => {
+                if *key == StateMachineMetaKey::LastApplied {
+                    let last: LogId = value.clone().try_into().unwrap();
+                    Some(last)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+}
+
 /// Enum of key-value pairs that are used in the raft storage impl for meta-service.
 #[rustfmt::skip]
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -146,29 +242,66 @@ pub enum RaftStoreEntry {
     Sequences        { key: <Sequences        as SledKeySpace>::K, value: <Sequences        as SledKeySpace>::V, },
     ClientLastResps  { key: <ClientLastResps  as SledKeySpace>::K, value: <ClientLastResps  as SledKeySpace>::V, },
     LogMeta          { key: <LogMeta          as SledKeySpace>::K, value: <LogMeta          as SledKeySpace>::V, },
+
+    // V004 log:
+    LogEntry(Entry),
+    NodeId(Option<NodeId>),
+    Vote(Option<Vote>),
+    Committed(Option<LogId>),
+    Purged(Option<LogId>),
 }
 
 impl RaftStoreEntry {
+    /// Upgrade V003 to V004
+    pub fn upgrade(self) -> Self {
+        match self.clone() {
+            Self::Logs { key: _, value } => Self::LogEntry(value),
+            Self::RaftStateKV { key: _, value } => match value {
+                RaftStateValue::NodeId(node_id) => Self::NodeId(Some(node_id)),
+                RaftStateValue::HardState(vote) => Self::Vote(Some(vote)),
+                RaftStateValue::Committed(committed) => Self::Committed(committed),
+                RaftStateValue::StateMachineId(_) => self,
+            },
+            Self::LogMeta { key: _, value } => Self::Purged(Some(value.log_id())),
+
+            RaftStoreEntry::DataHeader { .. }
+            | RaftStoreEntry::Nodes { .. }
+            | RaftStoreEntry::StateMachineMeta { .. }
+            | RaftStoreEntry::Expire { .. }
+            | RaftStoreEntry::GenericKV { .. }
+            | RaftStoreEntry::Sequences { .. }
+            | RaftStoreEntry::ClientLastResps { .. }
+            | RaftStoreEntry::LogEntry(_)
+            | RaftStoreEntry::NodeId(_)
+            | RaftStoreEntry::Vote(_)
+            | RaftStoreEntry::Committed(_)
+            | RaftStoreEntry::Purged(_) => self,
+        }
+    }
+
     /// Serialize a key-value entry into a two elt vec of vec<u8>: `[key, value]`.
     #[rustfmt::skip]
     pub fn serialize(kv: &RaftStoreEntry) -> Result<(sled::IVec, sled::IVec), MetaStorageError> {
-        macro_rules! ser {
-            ($ks:tt, $key:expr, $value:expr) => {
-                Ok(($ks::serialize_key($key)?, $ks::serialize_value($value)?))
-            };
-        }
 
         match kv {
-            Self::DataHeader       { key, value } => ser!(DataHeader,       key, value),
-            Self::Logs             { key, value } => ser!(Logs,             key, value),
-            Self::Nodes            { key, value } => ser!(Nodes,            key, value),
-            Self::StateMachineMeta { key, value } => ser!(StateMachineMeta, key, value),
-            Self::RaftStateKV      { key, value } => ser!(RaftStateKV,      key, value),
-            Self::Expire           { key, value } => ser!(Expire,           key, value),
-            Self::GenericKV        { key, value } => ser!(GenericKV,        key, value),
-            Self::Sequences        { key, value } => ser!(Sequences,        key, value),
-            Self::ClientLastResps  { key, value } => ser!(ClientLastResps,  key, value),
-            Self::LogMeta          { key, value } => ser!(LogMeta,          key, value),
+            Self::DataHeader       { key, value } => serialize_for_sled!(DataHeader,       key, value),
+            Self::Logs             { key, value } => serialize_for_sled!(Logs,             key, value),
+            Self::Nodes            { key, value } => serialize_for_sled!(Nodes,            key, value),
+            Self::StateMachineMeta { key, value } => serialize_for_sled!(StateMachineMeta, key, value),
+            Self::RaftStateKV      { key, value } => serialize_for_sled!(RaftStateKV,      key, value),
+            Self::Expire           { key, value } => serialize_for_sled!(Expire,           key, value),
+            Self::GenericKV        { key, value } => serialize_for_sled!(GenericKV,        key, value),
+            Self::Sequences        { key, value } => serialize_for_sled!(Sequences,        key, value),
+            Self::ClientLastResps  { key, value } => serialize_for_sled!(ClientLastResps,  key, value),
+            Self::LogMeta          { key, value } => serialize_for_sled!(LogMeta,          key, value),
+
+            RaftStoreEntry::LogEntry(_) |
+            RaftStoreEntry::NodeId(_)|
+            RaftStoreEntry::Vote(_) |
+            RaftStoreEntry::Committed(_)|
+            RaftStoreEntry::Purged(_) => {
+                unreachable!("V004 entries should not be serialized for sled")
+            }
         }
     }
 
@@ -180,24 +313,6 @@ impl RaftStoreEntry {
         let prefix = prefix_key[0];
         let vec_key = &prefix_key[1..];
 
-        // Convert (sub_tree_prefix, key, value, key_space1, key_space2...) into a [`RaftStoreEntry`].
-        //
-        // It compares the sub_tree_prefix with prefix defined by every key space to determine which key space it belongs to.
-        macro_rules! deserialize_by_prefix {
-            ($prefix: expr, $vec_key: expr, $vec_value: expr, $($key_space: tt),+ ) => {
-                $(
-
-                if <$key_space as SledKeySpace>::PREFIX == $prefix {
-
-                    let key = SledOrderedSerde::de($vec_key)?;
-                    let value = SledSerde::de($vec_value)?;
-
-                    return Ok(RaftStoreEntry::$key_space { key, value, });
-                }
-                )+
-            };
-        }
-
         deserialize_by_prefix!(
             prefix,
             vec_key,
@@ -217,91 +332,40 @@ impl RaftStoreEntry {
 
         unreachable!("unknown prefix: {}", prefix);
     }
+
+    pub fn new_header(header: Header) -> Self {
+        RaftStoreEntry::DataHeader {
+            key: OnDisk::KEY_HEADER.to_string(),
+            value: header,
+        }
+    }
 }
 
-// TODO: Compatible layer for is only used by upgrade process. Move these types to a separate mod
-/// Compatible layer for RaftStoreEntry
-#[rustfmt::skip]
-#[derive(Serialize, Deserialize)]
-pub enum RaftStoreEntryCompat {
-    DataHeader       { key: <DataHeader       as SledKeySpace>::K, value: <DataHeader as SledKeySpace>::V,        },
-    Logs             { key: <Logs             as SledKeySpace>::K, value: compat07::Entry,                        },
-    Nodes            { key: <Nodes            as SledKeySpace>::K, value: <Nodes as SledKeySpace>::V,             },
-    StateMachineMeta { key: <StateMachineMeta as SledKeySpace>::K, value: crate::compat07::StateMachineMetaValue, },
-    RaftStateKV      { key: <RaftStateKV      as SledKeySpace>::K, value: crate::compat07::RaftStateValue,        },
-    Expire           { key: <Expire           as SledKeySpace>::K, value: <Expire as SledKeySpace>::V,            },
-    GenericKV        { key: <GenericKV        as SledKeySpace>::K, value: <GenericKV as SledKeySpace>::V,         },
-    Sequences        { key: <Sequences        as SledKeySpace>::K, value: <Sequences as SledKeySpace>::V,         },
-    ClientLastResps  { key: <ClientLastResps  as SledKeySpace>::K, value: <ClientLastResps as SledKeySpace>::V,   },
-    LogMeta          { key: <LogMeta          as SledKeySpace>::K, value: crate::compat07::LogMetaValue,          },
-}
+impl TryInto<SMEntry> for RaftStoreEntry {
+    type Error = String;
 
-impl openraft::compat::Upgrade<RaftStoreEntry> for RaftStoreEntryCompat {
     #[rustfmt::skip]
-    fn upgrade(self) -> RaftStoreEntry {
+    fn try_into(self) -> Result<SMEntry, Self::Error> {
         match self {
-            RaftStoreEntryCompat::DataHeader       { key, value } => RaftStoreEntry::DataHeader       { key, value, },
-            RaftStoreEntryCompat::Logs             { key, value } => RaftStoreEntry::Logs             { key, value: value.upgrade(), },
-            RaftStoreEntryCompat::Nodes            { key, value } => RaftStoreEntry::Nodes            { key, value, },
-            RaftStoreEntryCompat::StateMachineMeta { key, value } => RaftStoreEntry::StateMachineMeta { key, value: value.upgrade(), },
-            RaftStoreEntryCompat::RaftStateKV      { key, value } => RaftStoreEntry::RaftStateKV      { key, value: value.upgrade(), },
-            RaftStoreEntryCompat::Expire           { key, value } => RaftStoreEntry::Expire           { key, value, },
-            RaftStoreEntryCompat::GenericKV        { key, value } => RaftStoreEntry::GenericKV        { key, value, },
-            RaftStoreEntryCompat::Sequences        { key, value } => RaftStoreEntry::Sequences        { key, value, },
-            RaftStoreEntryCompat::ClientLastResps  { key, value } => RaftStoreEntry::ClientLastResps  { key, value, },
-            RaftStoreEntryCompat::LogMeta          { key, value } => RaftStoreEntry::LogMeta          { key, value: value.upgrade(), },
+            Self::DataHeader       { key, value } => Ok(SMEntry::DataHeader       { key, value }),
+            Self::Nodes            { key, value } => Ok(SMEntry::Nodes            { key, value }),
+            Self::StateMachineMeta { key, value } => Ok(SMEntry::StateMachineMeta { key, value }),
+            Self::Expire           { key, value } => Ok(SMEntry::Expire           { key, value }),
+            Self::GenericKV        { key, value } => Ok(SMEntry::GenericKV        { key, value }),
+            Self::Sequences        { key, value } => Ok(SMEntry::Sequences        { key, value }),
+
+            Self::Logs             { .. } => {Err("SMEntry does not contain Logs".to_string())},
+            Self::RaftStateKV      { .. } => {Err("SMEntry does not contain RaftStateKV".to_string())}
+            Self::ClientLastResps  { .. } => {Err("SMEntry does not contain ClientLastResps".to_string())}
+            Self::LogMeta          { .. } => {Err("SMEntry does not contain LogMeta".to_string())}
+
+
+            Self::LogEntry        (_) => {Err("SMEntry does not contain LogEntry".to_string())}
+            Self::Vote            (_) => {Err("SMEntry does not contain Vote".to_string())}
+            Self::NodeId          (_) => {Err("SMEntry does not contain NodeId".to_string())}
+            Self::Committed       (_) => {Err("SMEntry does not contain Committed".to_string())}
+            Self::Purged          (_) => {Err("SMEntry does not contain Purged".to_string())}
+
         }
-    }
-}
-impl RaftStoreEntryCompat {
-    /// Deserialize a serialized key-value entry `[key, value]`.
-    ///
-    /// It is able to deserialize openraft-v7 or openraft-v8 key-value pairs and output oepnraft-v8 type: RaftStoreEntry
-    pub fn deserialize(
-        prefix_key: &[u8],
-        vec_value: &[u8],
-    ) -> Result<RaftStoreEntry, MetaStorageError> {
-        use openraft::compat::Upgrade;
-
-        let prefix = prefix_key[0];
-        let vec_key = &prefix_key[1..];
-
-        // Convert (sub_tree_prefix, key, value, key_space1, key_space2...) into a [`RaftStoreEntry`].
-        //
-        // It compares the sub_tree_prefix with prefix defined by every key space to determine which key space it belongs to.
-        macro_rules! deserialize_by_prefix {
-            ($prefix: expr, $vec_key: expr, $vec_value: expr, $($key_space: tt),+ ) => {
-                $(
-
-                if <$key_space as SledKeySpace>::PREFIX == $prefix {
-
-                    let key = SledOrderedSerde::de($vec_key)?;
-                    let value = SledSerde::de($vec_value)?;
-
-                    let entry = RaftStoreEntryCompat::$key_space { key, value, };
-                    return Ok(entry.upgrade());
-                }
-                )+
-            };
-        }
-
-        deserialize_by_prefix!(
-            prefix,
-            vec_key,
-            vec_value,
-            // Available key spaces:
-            DataHeader,
-            Logs,
-            Nodes,
-            StateMachineMeta,
-            RaftStateKV,
-            Expire,
-            GenericKV,
-            Sequences,
-            ClientLastResps,
-            LogMeta
-        );
-
-        unreachable!("unknown prefix: {}", prefix);
     }
 }

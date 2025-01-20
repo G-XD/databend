@@ -12,18 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::sync::Arc;
 
-use common_exception::ErrorCode;
-use common_exception::Result;
-use common_meta_app::schema::CreateTableReq;
-use common_meta_app::schema::DropTableByIdReq;
-use common_meta_app::schema::TableMeta;
-use common_meta_app::schema::TableNameIdent;
-use common_sql::plans::AlterViewPlan;
-use common_sql::Planner;
-use common_storages_view::view_table::VIEW_ENGINE;
+use databend_common_exception::ErrorCode;
+use databend_common_exception::Result;
+use databend_common_meta_app::schema::UpsertTableOptionReq;
+use databend_common_meta_types::MatchSeq;
+use databend_common_sql::plans::AlterViewPlan;
+use databend_common_sql::Planner;
 
 use crate::interpreters::Interpreter;
 use crate::pipelines::PipelineBuildResult;
@@ -47,23 +44,18 @@ impl Interpreter for AlterViewInterpreter {
         "AlterViewInterpreter"
     }
 
+    fn is_ddl(&self) -> bool {
+        true
+    }
+
     #[async_backtrace::framed]
     async fn execute2(&self) -> Result<PipelineBuildResult> {
-        // drop view
         let catalog = self.ctx.get_catalog(&self.plan.catalog).await?;
         if let Ok(tbl) = catalog
             .get_table(&self.plan.tenant, &self.plan.database, &self.plan.view_name)
             .await
         {
-            catalog
-                .drop_table_by_id(DropTableByIdReq {
-                    if_exists: true,
-                    tb_id: tbl.get_id(),
-                })
-                .await?;
-
-            // create new view
-            let mut options = BTreeMap::new();
+            let mut options = HashMap::new();
             let subquery = if self.plan.column_names.is_empty() {
                 self.plan.subquery.clone()
             } else {
@@ -83,27 +75,22 @@ impl Interpreter for AlterViewInterpreter {
                     self.plan.column_names.join(", ")
                 )
             };
-            options.insert("query".to_string(), subquery);
+            options.insert("query".to_string(), Some(subquery));
 
-            let plan = CreateTableReq {
-                if_not_exists: true,
-                name_ident: TableNameIdent {
-                    tenant: self.plan.tenant.clone(),
-                    db_name: self.plan.database.clone(),
-                    table_name: self.plan.view_name.clone(),
-                },
-                table_meta: TableMeta {
-                    engine: VIEW_ENGINE.to_string(),
-                    options,
-                    ..Default::default()
-                },
+            let req = UpsertTableOptionReq {
+                table_id: tbl.get_id(),
+                seq: MatchSeq::Exact(tbl.get_table_info().ident.seq),
+                options,
             };
-            catalog.create_table(plan).await?;
+
+            catalog
+                .upsert_table_option(&self.plan.tenant, &self.plan.database, req)
+                .await?;
 
             Ok(PipelineBuildResult::create())
         } else {
             return Err(ErrorCode::UnknownView(format!(
-                "{}.{} as view Already Exists",
+                "Unknown view '{}'.'{}'",
                 self.plan.database, self.plan.view_name
             )));
         }

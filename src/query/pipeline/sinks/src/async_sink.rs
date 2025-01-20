@@ -16,14 +16,14 @@ use std::any::Any;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use async_trait::unboxed_simple;
-use common_base::runtime::GlobalIORuntime;
-use common_base::runtime::TrySpawn;
-use common_exception::Result;
-use common_expression::DataBlock;
-use common_pipeline_core::processors::port::InputPort;
-use common_pipeline_core::processors::processor::Event;
-use common_pipeline_core::processors::Processor;
+use databend_common_base::runtime::drop_guard;
+use databend_common_base::runtime::GlobalIORuntime;
+use databend_common_base::runtime::TrySpawn;
+use databend_common_exception::Result;
+use databend_common_expression::DataBlock;
+use databend_common_pipeline_core::processors::Event;
+use databend_common_pipeline_core::processors::InputPort;
+use databend_common_pipeline_core::processors::Processor;
 
 #[async_trait]
 pub trait AsyncSink: Send {
@@ -39,8 +39,11 @@ pub trait AsyncSink: Send {
         Ok(())
     }
 
-    #[unboxed_simple]
     async fn consume(&mut self, data_block: DataBlock) -> Result<bool>;
+
+    fn details_status(&self) -> Option<String> {
+        None
+    }
 }
 
 pub struct AsyncSinker<T: AsyncSink + 'static> {
@@ -67,23 +70,25 @@ impl<T: AsyncSink + 'static> AsyncSinker<T> {
 
 impl<T: AsyncSink + 'static> Drop for AsyncSinker<T> {
     fn drop(&mut self) {
-        if !self.called_on_start || !self.called_on_finish {
-            if let Some(mut inner) = self.inner.take() {
-                GlobalIORuntime::instance().spawn({
-                    let called_on_start = self.called_on_start;
-                    let called_on_finish = self.called_on_finish;
-                    async move {
-                        if !called_on_start {
-                            let _ = inner.on_start().await;
-                        }
+        drop_guard(move || {
+            if !self.called_on_start || !self.called_on_finish {
+                if let Some(mut inner) = self.inner.take() {
+                    GlobalIORuntime::instance().spawn({
+                        let called_on_start = self.called_on_start;
+                        let called_on_finish = self.called_on_finish;
+                        async move {
+                            if !called_on_start {
+                                let _ = inner.on_start().await;
+                            }
 
-                        if !called_on_finish {
-                            let _ = inner.on_finish().await;
+                            if !called_on_finish {
+                                let _ = inner.on_finish().await;
+                            }
                         }
-                    }
-                });
+                    });
+                }
             }
-        }
+        })
     }
 }
 
@@ -154,5 +159,9 @@ impl<T: AsyncSink + 'static> Processor for AsyncSinker<T> {
         }
 
         Ok(())
+    }
+
+    fn details_status(&self) -> Option<String> {
+        self.inner.as_ref().and_then(|x| x.details_status())
     }
 }

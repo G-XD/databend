@@ -16,16 +16,14 @@ use std::error::Error;
 use std::fmt::Debug;
 use std::fmt::Display;
 use std::fmt::Formatter;
-use std::sync::Arc;
 
-use common_meta_stoerr::MetaStorageError;
-use common_meta_types::MetaAPIError;
-use common_meta_types::MetaError;
+use databend_common_ast::Span;
+use geozero::error::GeozeroError;
 
-use crate::exception::ErrorCodeBacktrace;
 use crate::exception_backtrace::capture;
 use crate::ErrorCode;
-use crate::Span;
+use crate::ErrorFrame;
+use crate::StackTrace;
 
 #[derive(thiserror::Error)]
 enum OtherErrors {
@@ -33,7 +31,7 @@ enum OtherErrors {
 }
 
 impl Display for OtherErrors {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
         match self {
             OtherErrors::AnyHow { error } => write!(f, "{}", error),
         }
@@ -41,7 +39,7 @@ impl Display for OtherErrors {
 }
 
 impl Debug for OtherErrors {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
         match self {
             OtherErrors::AnyHow { error } => write!(f, "{:?}", error),
         }
@@ -51,6 +49,12 @@ impl Debug for OtherErrors {
 impl From<std::net::AddrParseError> for ErrorCode {
     fn from(error: std::net::AddrParseError) -> Self {
         ErrorCode::BadAddressFormat(format!("Bad address format, cause: {}", error))
+    }
+}
+
+impl From<cidr::errors::NetworkParseError> for ErrorCode {
+    fn from(error: cidr::errors::NetworkParseError) -> Self {
+        ErrorCode::BadAddressFormat(format!("Bad network format, cause: {}", error))
     }
 }
 
@@ -66,6 +70,7 @@ impl From<anyhow::Error> for ErrorCode {
             1002,
             "anyhow",
             format!("{}, source: {:?}", error, error.source()),
+            String::new(),
             Some(Box::new(OtherErrors::AnyHow { error })),
             capture(),
         )
@@ -80,6 +85,12 @@ impl From<&str> for ErrorCode {
 
 impl From<std::num::ParseIntError> for ErrorCode {
     fn from(error: std::num::ParseIntError) -> Self {
+        ErrorCode::from_std_error(error)
+    }
+}
+
+impl From<std::str::ParseBoolError> for ErrorCode {
+    fn from(error: std::str::ParseBoolError) -> Self {
         ErrorCode::from_std_error(error)
     }
 }
@@ -102,18 +113,19 @@ impl From<std::num::TryFromIntError> for ErrorCode {
     }
 }
 
-impl From<common_arrow::arrow::error::Error> for ErrorCode {
-    fn from(error: common_arrow::arrow::error::Error) -> Self {
-        use common_arrow::arrow::error::Error;
+impl From<arrow_schema::ArrowError> for ErrorCode {
+    fn from(error: arrow_schema::ArrowError) -> Self {
         match error {
-            Error::NotYetImplemented(v) => ErrorCode::Unimplemented(format!("arrow: {v}")),
+            arrow_schema::ArrowError::NotYetImplemented(v) => {
+                ErrorCode::Unimplemented(format!("arrow: {v}"))
+            }
             v => ErrorCode::from_std_error(v),
         }
     }
 }
 
-impl From<common_arrow::parquet::error::Error> for ErrorCode {
-    fn from(error: common_arrow::parquet::error::Error) -> Self {
+impl From<parquet::errors::ParquetError> for ErrorCode {
+    fn from(error: parquet::errors::ParquetError) -> Self {
         ErrorCode::from_std_error(error)
     }
 }
@@ -132,13 +144,27 @@ impl From<bincode::error::DecodeError> for ErrorCode {
 
 impl From<bincode::serde::EncodeError> for ErrorCode {
     fn from(error: bincode::serde::EncodeError) -> Self {
-        ErrorCode::create(1002, "EncodeError", format!("{error:?}"), None, capture())
+        ErrorCode::create(
+            1002,
+            "EncodeError",
+            format!("{error:?}"),
+            String::new(),
+            None,
+            capture(),
+        )
     }
 }
 
 impl From<bincode::serde::DecodeError> for ErrorCode {
     fn from(error: bincode::serde::DecodeError) -> Self {
-        ErrorCode::create(1002, "DecodeError", format!("{error:?}"), None, capture())
+        ErrorCode::create(
+            1002,
+            "DecodeError",
+            format!("{error:?}"),
+            String::new(),
+            None,
+            capture(),
+        )
     }
 }
 
@@ -195,6 +221,36 @@ impl From<std::string::FromUtf8Error> for ErrorCode {
     }
 }
 
+impl From<databend_common_ast::ParseError> for ErrorCode {
+    fn from(error: databend_common_ast::ParseError) -> Self {
+        ErrorCode::SyntaxException(error.1).set_span(error.0)
+    }
+}
+
+impl From<GeozeroError> for ErrorCode {
+    fn from(value: GeozeroError) -> Self {
+        ErrorCode::GeometryError(value.to_string())
+    }
+}
+
+impl From<tantivy::TantivyError> for ErrorCode {
+    fn from(error: tantivy::TantivyError) -> Self {
+        ErrorCode::TantivyError(error.to_string())
+    }
+}
+
+impl From<tantivy::directory::error::OpenReadError> for ErrorCode {
+    fn from(error: tantivy::directory::error::OpenReadError) -> Self {
+        ErrorCode::TantivyOpenReadError(error.to_string())
+    }
+}
+
+impl From<tantivy::query::QueryParserError> for ErrorCode {
+    fn from(error: tantivy::query::QueryParserError) -> Self {
+        ErrorCode::TantivyQueryParserError(error.to_string())
+    }
+}
+
 // ===  prost error ===
 impl From<prost::EncodeError> for ErrorCode {
     fn from(error: prost::EncodeError) -> Self {
@@ -212,37 +268,88 @@ pub struct SerializedError {
     pub name: String,
     pub message: String,
     pub span: Span,
-    pub backtrace: String,
+    pub backtrace: StackTrace,
+    pub stacks: Vec<SerializedErrorFrame>,
 }
 
 impl Display for SerializedError {
-    fn fmt(&self, f: &mut Formatter<'_>) -> core::fmt::Result {
-        write!(f, "Code: {}, Text = {}.", self.code, self.message,)
+    fn fmt(&self, f: &mut Formatter) -> core::fmt::Result {
+        write!(f, "Code: {}, Text = {}.", self.code, self.message)
     }
 }
 
-impl From<ErrorCode> for SerializedError {
-    fn from(e: ErrorCode) -> Self {
+impl From<&ErrorCode> for SerializedError {
+    fn from(e: &ErrorCode) -> Self {
+        // let binary_version = (*databend_common_config::DATABEND_COMMIT_VERSION).clone();
         SerializedError {
             code: e.code(),
             name: e.name(),
             message: e.message(),
             span: e.span(),
-            backtrace: e.backtrace_str(),
+            backtrace: e.backtrace.to_physical(),
+            stacks: e.stacks().iter().map(|f| f.into()).collect(),
         }
     }
 }
 
-impl From<SerializedError> for ErrorCode {
-    fn from(se: SerializedError) -> Self {
+impl From<&SerializedError> for ErrorCode {
+    fn from(se: &SerializedError) -> Self {
         ErrorCode::create(
             se.code,
-            se.name,
-            se.message,
+            se.name.clone(),
+            se.message.clone(),
+            String::new(),
             None,
-            Some(ErrorCodeBacktrace::Serialized(Arc::new(se.backtrace))),
+            se.backtrace.clone(),
         )
         .set_span(se.span)
+        .set_stacks(se.stacks.iter().map(|f| f.into()).collect())
+    }
+}
+
+#[derive(thiserror::Error, serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct SerializedErrorFrame {
+    pub file: String,
+    pub line: u32,
+    pub col: u32,
+    pub message: String,
+}
+
+impl Display for SerializedErrorFrame {
+    fn fmt(&self, f: &mut Formatter) -> core::fmt::Result {
+        write!(
+            f,
+            "{}:{}:{}: {}",
+            self.file, self.line, self.col, self.message
+        )
+    }
+}
+
+impl From<&ErrorFrame> for SerializedErrorFrame {
+    fn from(frame: &ErrorFrame) -> Self {
+        SerializedErrorFrame {
+            file: frame.file.clone(),
+            line: frame.line,
+            col: frame.col,
+            message: frame.message.clone(),
+        }
+    }
+}
+
+impl From<&SerializedErrorFrame> for ErrorFrame {
+    fn from(frame: &SerializedErrorFrame) -> Self {
+        ErrorFrame {
+            file: frame.file.clone(),
+            line: frame.line,
+            col: frame.col,
+            message: frame.message.clone(),
+        }
+    }
+}
+
+impl From<reqwest::Error> for ErrorCode {
+    fn from(error: reqwest::Error) -> Self {
+        ErrorCode::ReqwestError(format!("Reqwest Error, cause: {}", error))
     }
 }
 
@@ -252,6 +359,13 @@ impl From<tonic::Status> for ErrorCode {
             tonic::Code::Unknown => {
                 let details = status.details();
                 if details.is_empty() {
+                    if status.source().is_some_and(|e| e.is::<hyper::Error>()) {
+                        return ErrorCode::CannotConnectNode(format!(
+                            "{}, source: {:?}",
+                            status.message(),
+                            status.source()
+                        ));
+                    }
                     return ErrorCode::UnknownException(format!(
                         "{}, source: {:?}",
                         status.message(),
@@ -260,26 +374,15 @@ impl From<tonic::Status> for ErrorCode {
                 }
                 match serde_json::from_slice::<SerializedError>(details) {
                     Err(error) => ErrorCode::from(error),
-                    Ok(serialized_error) => match serialized_error.backtrace.len() {
-                        0 => ErrorCode::create(
-                            serialized_error.code,
-                            serialized_error.name,
-                            serialized_error.message,
-                            None,
-                            None,
-                        )
-                        .set_span(serialized_error.span),
-                        _ => ErrorCode::create(
-                            serialized_error.code,
-                            serialized_error.name,
-                            serialized_error.message,
-                            None,
-                            Some(ErrorCodeBacktrace::Serialized(Arc::new(
-                                serialized_error.backtrace,
-                            ))),
-                        )
-                        .set_span(serialized_error.span),
-                    },
+                    Ok(serialized_error) => ErrorCode::create(
+                        serialized_error.code,
+                        serialized_error.name,
+                        serialized_error.message,
+                        String::new(),
+                        None,
+                        serialized_error.backtrace,
+                    )
+                    .set_span(serialized_error.span),
                 }
             }
             _ => ErrorCode::Unimplemented(status.to_string()),
@@ -287,37 +390,18 @@ impl From<tonic::Status> for ErrorCode {
     }
 }
 
-impl From<MetaError> for ErrorCode {
-    fn from(e: MetaError) -> Self {
-        ErrorCode::MetaServiceError(e.to_string())
-    }
-}
-
-impl From<MetaAPIError> for ErrorCode {
-    fn from(e: MetaAPIError) -> Self {
-        ErrorCode::MetaServiceError(e.to_string())
-    }
-}
-
-impl From<MetaStorageError> for ErrorCode {
-    fn from(e: MetaStorageError) -> Self {
-        ErrorCode::MetaServiceError(e.to_string())
-    }
-}
-
 impl From<ErrorCode> for tonic::Status {
     fn from(err: ErrorCode) -> Self {
-        let error_json = serde_json::to_vec::<SerializedError>(&SerializedError {
+        let serialized_error = SerializedError {
             code: err.code(),
             name: err.name(),
             message: err.message(),
             span: err.span(),
-            backtrace: {
-                let mut str = err.backtrace_str();
-                str.truncate(2 * 1024);
-                str
-            },
-        });
+            stacks: err.stacks().iter().map(|f| f.into()).collect(),
+            backtrace: err.backtrace,
+        };
+
+        let error_json = serde_json::to_vec::<SerializedError>(&serialized_error);
 
         match error_json {
             Ok(serialized_error_json) => {
@@ -325,11 +409,23 @@ impl From<ErrorCode> for tonic::Status {
                 // To distinguish from that, we use Code::Unknown here
                 tonic::Status::with_details(
                     tonic::Code::Unknown,
-                    err.message(),
+                    serialized_error.message.clone(),
                     serialized_error_json.into(),
                 )
             }
             Err(error) => tonic::Status::unknown(error.to_string()),
         }
+    }
+}
+
+impl From<sqlx::Error> for ErrorCode {
+    fn from(error: sqlx::Error) -> Self {
+        ErrorCode::DictionarySourceError(format!("Dictionary Sqlx Error, cause: {}", error))
+    }
+}
+
+impl From<redis::RedisError> for ErrorCode {
+    fn from(error: redis::RedisError) -> Self {
+        ErrorCode::DictionarySourceError(format!("Dictionary Redis Error, cause: {}", error))
     }
 }

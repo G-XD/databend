@@ -19,10 +19,12 @@ use std::time::Instant;
 
 use base64::engine::general_purpose;
 use base64::prelude::*;
-use common_exception::ErrorCode;
-use common_exception::Result;
+use databend_common_exception::ErrorCode;
+use databend_common_exception::Result;
 use jwt_simple::prelude::ES256PublicKey;
 use jwt_simple::prelude::RS256PublicKey;
+use log::info;
+use log::warn;
 use p256::EncodedPoint;
 use p256::FieldBytes;
 use parking_lot::RwLock;
@@ -31,7 +33,8 @@ use serde::Serialize;
 
 use super::PubKey;
 
-const JWK_REFRESH_INTERVAL: u64 = 15;
+const JWKS_REFRESH_TIMEOUT: u64 = 10;
+const JWKS_REFRESH_INTERVAL: u64 = 600;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct JwkKey {
@@ -66,7 +69,7 @@ impl JwkKey {
             // Todo(youngsofun): the "alg" field is optional, maybe we need a config for it
             "RSA" => {
                 let k = RS256PublicKey::from_components(&decode(&self.n)?, &decode(&self.e)?)?;
-                Ok(PubKey::RSA256(k))
+                Ok(PubKey::RSA256(Box::new(k)))
             }
             "EC" => {
                 // borrowed from https://github.com/RustCrypto/traits/blob/master/elliptic-curve/src/jwk.rs#L68
@@ -94,22 +97,44 @@ pub struct JwkKeys {
 
 pub struct JwkKeyStore {
     pub(crate) url: String,
-    keys: Arc<RwLock<HashMap<String, PubKey>>>,
+    cached_keys: Arc<RwLock<HashMap<String, PubKey>>>,
     pub(crate) last_refreshed_at: RwLock<Option<Instant>>,
     pub(crate) refresh_interval: Duration,
+    pub(crate) refresh_timeout: Duration,
+    pub(crate) load_keys_func: Option<Arc<dyn Fn() -> HashMap<String, PubKey> + Send + Sync>>,
 }
 
 impl JwkKeyStore {
     pub fn new(url: String) -> Self {
-        let refresh_interval = Duration::from_secs(JWK_REFRESH_INTERVAL * 60);
-        let keys = Arc::new(RwLock::new(HashMap::new()));
         Self {
             url,
-            keys,
-            refresh_interval,
+            cached_keys: Arc::new(RwLock::new(HashMap::new())),
+            refresh_interval: Duration::from_secs(JWKS_REFRESH_INTERVAL),
+            refresh_timeout: Duration::from_secs(JWKS_REFRESH_TIMEOUT),
             last_refreshed_at: RwLock::new(None),
+            load_keys_func: None,
         }
     }
+
+    // only for test to mock the keys
+    pub fn with_load_keys_func(
+        mut self,
+        func: Arc<dyn Fn() -> HashMap<String, PubKey> + Send + Sync>,
+    ) -> Self {
+        self.load_keys_func = Some(func);
+        self
+    }
+
+    pub fn with_refresh_interval(mut self, interval: u64) -> Self {
+        self.refresh_interval = Duration::from_secs(interval);
+        self
+    }
+
+    pub fn with_refresh_timeout(mut self, timeout: u64) -> Self {
+        self.refresh_timeout = Duration::from_secs(timeout);
+        self
+    }
+
     pub fn url(&self) -> String {
         self.url.clone()
     }
@@ -117,57 +142,89 @@ impl JwkKeyStore {
 
 impl JwkKeyStore {
     #[async_backtrace::framed]
-    async fn load_keys(&self) -> Result<()> {
-        let response = reqwest::get(&self.url).await.map_err(|e| {
+    async fn load_keys(&self) -> Result<HashMap<String, PubKey>> {
+        if let Some(load_keys_func) = &self.load_keys_func {
+            return Ok(load_keys_func());
+        }
+
+        let client = reqwest::Client::builder()
+            .timeout(self.refresh_timeout)
+            .build()
+            .map_err(|e| {
+                ErrorCode::InvalidConfig(format!("Failed to create jwks client: {}", e))
+            })?;
+        let response = client.get(&self.url).send().await.map_err(|e| {
             ErrorCode::AuthenticateFailure(format!("Could not download JWKS: {}", e))
         })?;
-        let body = response.text().await.unwrap();
-        let jwk_keys = serde_json::from_str::<JwkKeys>(&body)
-            .map_err(|e| ErrorCode::InvalidConfig(format!("Failed to parse keys: {}", e)))?;
+        let jwk_keys: JwkKeys = response
+            .json()
+            .await
+            .map_err(|e| ErrorCode::InvalidConfig(format!("Failed to parse JWKS: {}", e)))?;
         let mut new_keys: HashMap<String, PubKey> = HashMap::new();
         for k in &jwk_keys.keys {
             new_keys.insert(k.kid.to_string(), k.get_public_key()?);
         }
-        let mut keys = self.keys.write();
-        *keys = new_keys;
-        Ok(())
+        Ok(new_keys)
     }
 
     #[async_backtrace::framed]
-    async fn maybe_reload_keys(&self) -> Result<()> {
-        let need_reload = {
-            let last_refreshed_at = *self.last_refreshed_at.read();
-            last_refreshed_at.is_none()
-                || last_refreshed_at.unwrap().elapsed() > self.refresh_interval
-        };
-        if need_reload {
-            self.load_keys().await?;
-            self.last_refreshed_at.write().replace(Instant::now());
+    async fn load_keys_with_cache(&self, force: bool) -> Result<HashMap<String, PubKey>> {
+        let need_reload = force
+            || match *self.last_refreshed_at.read() {
+                None => true,
+                Some(last_refreshed_at) => last_refreshed_at.elapsed() > self.refresh_interval,
+            };
+
+        let old_keys = self.cached_keys.read().clone();
+        if !need_reload {
+            return Ok(old_keys);
         }
-        Ok(())
+
+        // if got network issues on loading JWKS, fallback to the cached keys if available
+        let new_keys = match self.load_keys().await {
+            Ok(new_keys) => new_keys,
+            Err(err) => {
+                warn!("Failed to load JWKS: {}", err);
+                if !old_keys.is_empty() {
+                    return Ok(old_keys);
+                }
+                return Err(err.add_message("failed to load JWKS keys, and no available fallback"));
+            }
+        };
+
+        // the JWKS keys are not always changes, but when it changed, we can have a log about this.
+        if !new_keys.keys().eq(old_keys.keys()) {
+            info!("JWKS keys changed.");
+        }
+        *self.cached_keys.write() = new_keys.clone();
+        self.last_refreshed_at.write().replace(Instant::now());
+        Ok(new_keys)
     }
 
     #[async_backtrace::framed]
-    pub(super) async fn get_key(&self, key_id: Option<String>) -> Result<PubKey> {
-        self.maybe_reload_keys().await?;
-        let keys = self.keys.read();
-        match key_id {
-            Some(kid) => keys
-                .get(&kid)
-                .cloned()
-                .ok_or(ErrorCode::AuthenticateFailure(format!(
-                    "key id {} not found",
-                    &kid
-                ))),
+    pub async fn get_key(&self, key_id: Option<String>) -> Result<PubKey> {
+        let keys = self.load_keys_with_cache(false).await?;
+
+        // if the key_id is not set, and there is only one key in the store, return it
+        let key_id = match key_id {
+            Some(key_id) => key_id,
             None => {
                 if keys.len() != 1 {
-                    Err(ErrorCode::AuthenticateFailure(
+                    return Err(ErrorCode::AuthenticateFailure(
                         "must specify key_id for jwt when multi keys exists ",
-                    ))
+                    ));
                 } else {
-                    Ok((*keys.iter().next().unwrap().1).clone())
+                    return Ok((keys.iter().next().unwrap().1).clone());
                 }
             }
+        };
+
+        match keys.get(&key_id) {
+            None => Err(ErrorCode::AuthenticateFailure(format!(
+                "key id {} not found in jwk store",
+                key_id
+            ))),
+            Some(key) => Ok(key.clone()),
         }
     }
 }

@@ -7,10 +7,12 @@ CURDIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 options="$1"
 
 # Create Database
-echo "CREATE DATABASE IF NOT EXISTS ${MYSQL_DATABASE}" | $MYSQL_CLIENT_CONNECT_DEFAULT
+echo "CREATE DATABASE IF NOT EXISTS ${MYSQL_DATABASE}" | $BENDSQL_CLIENT_CONNECT_DEFAULT
+
+echo "use ${MYSQL_DATABASE}" | $BENDSQL_CLIENT_CONNECT_DEFAULT
 
 for t in customer lineitem nation orders partsupp part region supplier; do
-    echo "DROP TABLE IF EXISTS $t" | $MYSQL_CLIENT_CONNECT
+    echo "DROP TABLE IF EXISTS $t" | $BENDSQL_CLIENT_CONNECT
 done
 
 
@@ -21,14 +23,14 @@ echo "CREATE TABLE IF NOT EXISTS nation
     n_name       STRING not null,
     n_regionkey  INTEGER not null,
     n_comment    STRING
-) CLUSTER BY (n_nationkey) ${options}" | $MYSQL_CLIENT_CONNECT
+) CLUSTER BY (n_nationkey) ${options}" | $BENDSQL_CLIENT_CONNECT
 
 echo "CREATE TABLE IF NOT EXISTS region
 (
     r_regionkey  INTEGER not null,
     r_name       STRING not null,
     r_comment    STRING
-) CLUSTER BY (r_regionkey) ${options}" | $MYSQL_CLIENT_CONNECT
+) CLUSTER BY (r_regionkey) ${options}" | $BENDSQL_CLIENT_CONNECT
 
 echo "CREATE TABLE IF NOT EXISTS part
 (
@@ -41,7 +43,7 @@ echo "CREATE TABLE IF NOT EXISTS part
     p_container   STRING not null,
     p_retailprice DECIMAL(15, 2) not null,
     p_comment     STRING not null
-) CLUSTER BY (p_partkey) ${options}" | $MYSQL_CLIENT_CONNECT
+) CLUSTER BY (p_partkey) ${options}" | $BENDSQL_CLIENT_CONNECT
 
 echo "CREATE TABLE IF NOT EXISTS supplier
 (
@@ -52,7 +54,7 @@ echo "CREATE TABLE IF NOT EXISTS supplier
     s_phone       STRING not null,
     s_acctbal     DECIMAL(15, 2) not null,
     s_comment     STRING not null
-) CLUSTER BY (s_suppkey) ${options}" | $MYSQL_CLIENT_CONNECT
+) CLUSTER BY (s_suppkey) ${options}" | $BENDSQL_CLIENT_CONNECT
 
 echo "CREATE TABLE IF NOT EXISTS partsupp
 (
@@ -61,7 +63,7 @@ echo "CREATE TABLE IF NOT EXISTS partsupp
     ps_availqty    BIGINT not null,
     ps_supplycost  DECIMAL(15, 2)  not null,
     ps_comment     STRING not null
-) CLUSTER BY (ps_partkey) ${options}" | $MYSQL_CLIENT_CONNECT
+) CLUSTER BY (ps_partkey) ${options}" | $BENDSQL_CLIENT_CONNECT
 
 echo "CREATE TABLE IF NOT EXISTS customer
 (
@@ -73,7 +75,7 @@ echo "CREATE TABLE IF NOT EXISTS customer
     c_acctbal     DECIMAL(15, 2)   not null,
     c_mktsegment  STRING not null,
     c_comment     STRING not null
-) CLUSTER BY (c_custkey) ${options}" | $MYSQL_CLIENT_CONNECT
+) CLUSTER BY (c_custkey) ${options}" | $BENDSQL_CLIENT_CONNECT
 
 echo "CREATE TABLE IF NOT EXISTS orders
 (
@@ -86,7 +88,7 @@ echo "CREATE TABLE IF NOT EXISTS orders
     o_clerk          STRING not null,
     o_shippriority   INTEGER not null,
     o_comment        STRING not null
-) CLUSTER BY (o_orderkey, o_orderdate) ${options}" | $MYSQL_CLIENT_CONNECT
+) CLUSTER BY (o_orderkey, o_orderdate) ${options}" | $BENDSQL_CLIENT_CONNECT
 
 echo "CREATE TABLE IF NOT EXISTS lineitem
 (
@@ -106,12 +108,12 @@ echo "CREATE TABLE IF NOT EXISTS lineitem
     l_shipinstruct STRING not null,
     l_shipmode     STRING not null,
     l_comment      STRING not null
-) CLUSTER BY(l_shipdate, l_orderkey) ${options}" | $MYSQL_CLIENT_CONNECT
+) CLUSTER BY(l_shipdate, l_orderkey) ${options}" | $BENDSQL_CLIENT_CONNECT
 
 # insert data to tables
 for t in customer lineitem nation orders partsupp part region supplier
 do
     echo "$t"
-    insert_sql="insert into $t file_format = (type = CSV skip_header = 0 field_delimiter = '|' record_delimiter = '\n')"
-    curl -s -u root: -XPUT "http://localhost:${QUERY_HTTP_HANDLER_PORT}/v1/streaming_load" -H "database: tpch" -H "insert_sql: ${insert_sql}" -F 'upload=@"./data/'$t'.tbl"' > /dev/null 2>&1
+    insert_sql="insert into ${MYSQL_DATABASE}.$t file_format = (type = CSV skip_header = 0 field_delimiter = '|' record_delimiter = '\n')"
+    curl -s -u root: -XPUT "http://localhost:${QUERY_HTTP_HANDLER_PORT}/v1/streaming_load" -H "database: tpch" -H "insert_sql: ${insert_sql}" -F 'upload=@"./data/'$t'.tbl"'
 done

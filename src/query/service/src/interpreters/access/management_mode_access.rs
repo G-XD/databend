@@ -14,22 +14,21 @@
 
 use std::sync::Arc;
 
-use common_config::GlobalConfig;
-use common_exception::ErrorCode;
-use common_exception::Result;
+use databend_common_catalog::table_context::TableContext;
+use databend_common_config::GlobalConfig;
+use databend_common_exception::ErrorCode;
+use databend_common_exception::Result;
+use databend_common_storages_stream::stream_table::STREAM_ENGINE;
+use databend_common_storages_view::view_table::VIEW_ENGINE;
 
 use crate::interpreters::access::AccessChecker;
-use crate::sessions::query_ctx::Origin::BuiltInProcedure;
 use crate::sessions::QueryContext;
 use crate::sql::plans::Plan;
 
-pub struct ManagementModeAccess {
-    ctx: Arc<QueryContext>,
-}
-
+pub struct ManagementModeAccess {}
 impl ManagementModeAccess {
-    pub fn create(ctx: Arc<QueryContext>) -> Box<dyn AccessChecker> {
-        Box::new(ManagementModeAccess { ctx })
+    pub fn create() -> Box<dyn AccessChecker> {
+        Box::new(ManagementModeAccess {})
     }
 }
 
@@ -37,54 +36,64 @@ impl ManagementModeAccess {
 impl AccessChecker for ManagementModeAccess {
     // Check what we can do if in management mode.
     #[async_backtrace::framed]
-    async fn check(&self, plan: &Plan) -> Result<()> {
+    async fn check(&self, ctx: &Arc<QueryContext>, plan: &Plan) -> Result<()> {
         // Allows for management-mode.
         if GlobalConfig::instance().query.management_mode {
             let ok = match plan {
                 Plan::Query {rewrite_kind, .. } => {
-                    use common_sql::plans::RewriteKind;
-                    if self.ctx.get_origin() == BuiltInProcedure {
-                        true
-                    } else {
+                    use databend_common_sql::plans::RewriteKind;
                         match rewrite_kind  {
                             Some(ref v) => matches!(v,
                             RewriteKind::ShowDatabases
-                            | RewriteKind::ShowTables(_)
-                            | RewriteKind::ShowColumns(_, _)
+                            | RewriteKind::ShowDropDatabases
+                            | RewriteKind::ShowTables(_, _)
+                            | RewriteKind::ShowColumns(_, _, _)
                             | RewriteKind::ShowEngines
                             | RewriteKind::ShowSettings
+                            | RewriteKind::ShowVariables
                             | RewriteKind::ShowFunctions
+                            | RewriteKind::ShowUserFunctions
                             | RewriteKind::ShowTableFunctions
                             | RewriteKind::ShowUsers
+                            // show grants will access meta, can not true in mm.
+                            // | RewriteKind::ShowGrants
                             | RewriteKind::ShowStages
                             | RewriteKind::DescribeStage
                             | RewriteKind::ListStage
-                            | RewriteKind::ShowRoles),
+                            | RewriteKind::Call
+                            | RewriteKind::ShowRoles
+                            | RewriteKind::ShowLocks
+                            | RewriteKind::ShowStreams(_)),
                             _ => false
                         }
-                    }
                 },
                 // Show.
                 Plan::ShowCreateDatabase(_)
                 | Plan::ShowCreateTable(_)
-                | Plan::ShowGrants(_)
 
                 // Set
-                | Plan::SetVariable(_)
+                | Plan::Set(_)
 
                 // Database.
                 | Plan::CreateDatabase(_)
                 | Plan::DropDatabase(_)
 
                 // Table.
-                | Plan::DescribeTable(_)
                 | Plan::CreateTable(_)
                 | Plan::DropTable(_)
+                | Plan::DropView(_)
+                | Plan::CreateView(_)
+                | Plan::CreateStream(_)
+                | Plan::DropStream(_)
+
+                // Dynamic table.
+                | Plan::CreateDynamicTable(_)
 
                 // User.
                 | Plan::AlterUser(_)
                 | Plan::CreateUser(_)
                 | Plan::DropUser(_)
+                | Plan::DescUser(_)
 
                 // Roles.
                 | Plan::ShowRoles(_)
@@ -103,20 +112,30 @@ impl AccessChecker for ManagementModeAccess {
                 | Plan::CreateNetworkPolicy(_)
                 | Plan::AlterNetworkPolicy(_)
                 | Plan::DropNetworkPolicy(_)
+                // Password policy.
+                | Plan::CreatePasswordPolicy(_)
+                | Plan::AlterPasswordPolicy(_)
+                | Plan::DropPasswordPolicy(_)
 
                 // UDF
                 | Plan::CreateUDF(_)
                 | Plan::AlterUDF(_)
                 | Plan::DropUDF(_)
-                | Plan::UseDatabase(_)
-                | Plan::Call(_) => true,
-                _ => false
+                | Plan::UseDatabase(_) => true,
+                Plan::DescribeTable(plan) => {
+                    let catalog = &plan.catalog;
+                    let database = &plan.database;
+                    let table = &plan.table;
+                    let table = ctx.get_table(catalog, database, table).await?;
+                    !matches!(table.get_table_info().engine(), VIEW_ENGINE|STREAM_ENGINE)
+                },
+                _ => false,
             };
 
             if !ok {
                 return Err(ErrorCode::ManagementModePermissionDenied(format!(
-                    "Access denied for operation:{:?} in management-mode",
-                    plan.format_indent()
+                    "Management Mode Error: Access denied for operation:{:?} in management-mode",
+                    plan.format_indent(false)?
                 )));
             }
         };

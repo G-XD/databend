@@ -12,31 +12,28 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::ops::Deref;
 use std::sync::Arc;
 
-use common_base::base::GlobalInstance;
-use common_exception::ErrorCode;
-use common_exception::Result;
-use common_settings::Settings;
+use databend_common_base::base::GlobalInstance;
+use databend_common_exception::ErrorCode;
+use databend_common_exception::Result;
 use jwt_simple::claims::JWTClaims;
 
 use crate::license::Feature;
 use crate::license::LicenseInfo;
+use crate::license::StorageQuota;
 
 pub trait LicenseManager: Sync + Send {
-    fn init() -> Result<()>
+    fn init(tenant: String) -> Result<()>
     where Self: Sized;
+
     fn instance() -> Arc<Box<dyn LicenseManager>>
     where Self: Sized;
 
     /// Check whether enterprise feature is available given context
     /// This function returns `LicenseKeyInvalid` error if enterprise license key is not valid or expired.
-    fn check_enterprise_enabled(
-        &self,
-        settings: &Arc<Settings>,
-        tenant: String,
-        feature: Feature,
-    ) -> Result<()>;
+    fn check_enterprise_enabled(&self, license_key: String, feature: Feature) -> Result<()>;
 
     /// Encodes a raw license string as a JWT using the constant public key.
     ///
@@ -57,23 +54,39 @@ pub trait LicenseManager: Sync + Send {
     /// This function may return `LicenseKeyParseError` error if the encoding or decoding of the JWT fails.
     /// ```
     fn parse_license(&self, raw: &str) -> Result<JWTClaims<LicenseInfo>>;
+
+    /// Get the storage quota from license key.
+    fn get_storage_quota(&self, license_key: String) -> Result<StorageQuota>;
 }
 
-pub struct LicenseManagerWrapper {
-    pub manager: Box<dyn LicenseManager>,
+pub struct LicenseManagerSwitch {
+    manager: Box<dyn LicenseManager>,
 }
-unsafe impl Send for LicenseManagerWrapper {}
-unsafe impl Sync for LicenseManagerWrapper {}
+
+impl LicenseManagerSwitch {
+    pub fn create(manager: Box<dyn LicenseManager>) -> LicenseManagerSwitch {
+        LicenseManagerSwitch { manager }
+    }
+
+    pub fn instance() -> Arc<LicenseManagerSwitch> {
+        GlobalInstance::get()
+    }
+}
+
+impl Deref for LicenseManagerSwitch {
+    type Target = dyn LicenseManager;
+
+    fn deref(&self) -> &Self::Target {
+        self.manager.as_ref()
+    }
+}
 
 pub struct OssLicenseManager {}
 
 impl LicenseManager for OssLicenseManager {
-    fn init() -> Result<()> {
+    fn init(_tenant: String) -> Result<()> {
         let rm = OssLicenseManager {};
-        let wrapper = LicenseManagerWrapper {
-            manager: Box::new(rm),
-        };
-        GlobalInstance::set(Arc::new(wrapper));
+        GlobalInstance::set(Arc::new(LicenseManagerSwitch::create(Box::new(rm))));
         Ok(())
     }
 
@@ -81,15 +94,9 @@ impl LicenseManager for OssLicenseManager {
         GlobalInstance::get()
     }
 
-    fn check_enterprise_enabled(
-        &self,
-        _settings: &Arc<Settings>,
-        _tenant: String,
-        _feature: Feature,
-    ) -> Result<()> {
-        Err(ErrorCode::LicenseKeyInvalid(
-            "Need Commercial License".to_string(),
-        ))
+    fn check_enterprise_enabled(&self, _license_key: String, feature: Feature) -> Result<()> {
+        // oss ignore license key.
+        feature.verify_default("Need Commercial License".to_string())
     }
 
     fn parse_license(&self, _raw: &str) -> Result<JWTClaims<LicenseInfo>> {
@@ -97,8 +104,9 @@ impl LicenseManager for OssLicenseManager {
             "Need Commercial License".to_string(),
         ))
     }
-}
 
-pub fn get_license_manager() -> Arc<LicenseManagerWrapper> {
-    GlobalInstance::get()
+    /// Always return default storage quota.
+    fn get_storage_quota(&self, _: String) -> Result<StorageQuota> {
+        Ok(StorageQuota::default())
+    }
 }

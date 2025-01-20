@@ -22,24 +22,24 @@
 //! - raft_network: for metrics about communication between nodes in raft protocol.
 //! - raft_storage: for metrics about the local storage of a raft node.
 //! - meta_network: for metrics about meta-service grpc api.
+//!
 //! The `field` is arbitrary string.
 
 use std::time::Instant;
 
-use common_metrics::counter;
-use log::error;
-
-fn f64_of(b: bool) -> f64 {
-    if b { 1_f64 } else { 0_f64 }
-}
+use databend_common_metrics::count;
+use prometheus_client::encoding::text::encode as prometheus_encode;
 
 pub mod server_metrics {
-    use common_meta_types::NodeId;
-    use metrics::counter;
-    use metrics::gauge;
-    use metrics::increment_gauge;
+    use std::sync::LazyLock;
 
-    use crate::metrics::meta_metrics::f64_of;
+    use databend_common_meta_raft_store::raft_log_v004::RaftLogStat;
+    use databend_common_meta_types::raft_types::NodeId;
+    use prometheus_client::metrics::counter::Counter;
+    use prometheus_client::metrics::family::Family;
+    use prometheus_client::metrics::gauge::Gauge;
+
+    use crate::metrics::registry::load_global_registry;
 
     macro_rules! key {
         ($key: literal) => {
@@ -47,66 +47,278 @@ pub mod server_metrics {
         };
     }
 
+    struct ServerMetrics {
+        current_leader_id: Gauge,
+        is_leader: Gauge,
+        node_is_health: Gauge,
+        leader_changes: Counter,
+        applying_snapshot: Gauge,
+        snapshot_key_count: Gauge,
+
+        raft_log_cache_items: Gauge,
+        raft_log_cache_used_size: Gauge,
+        raft_log_wal_open_chunk_size: Gauge,
+        raft_log_wal_offset: Gauge,
+        raft_log_wal_closed_chunk_count: Gauge,
+        raft_log_wal_closed_chunk_total_size: Gauge,
+
+        raft_log_size: Gauge,
+        last_log_index: Gauge,
+        last_seq: Gauge,
+        current_term: Gauge,
+        proposals_applied: Gauge,
+        proposals_pending: Gauge,
+        proposals_failed: Counter,
+        read_failed: Counter,
+        watchers: Gauge,
+        version: Family<Vec<(String, String)>, Gauge>,
+    }
+
+    impl ServerMetrics {
+        fn init() -> Self {
+            let metrics = Self {
+                current_leader_id: Gauge::default(),
+                is_leader: Gauge::default(),
+                node_is_health: Gauge::default(),
+                leader_changes: Counter::default(),
+                applying_snapshot: Gauge::default(),
+                snapshot_key_count: Gauge::default(),
+                raft_log_cache_items: Gauge::default(),
+                raft_log_cache_used_size: Gauge::default(),
+                raft_log_wal_open_chunk_size: Gauge::default(),
+                raft_log_wal_offset: Gauge::default(),
+                raft_log_wal_closed_chunk_count: Gauge::default(),
+                raft_log_wal_closed_chunk_total_size: Gauge::default(),
+                raft_log_size: Gauge::default(),
+                last_log_index: Gauge::default(),
+                last_seq: Gauge::default(),
+                current_term: Gauge::default(),
+                proposals_applied: Gauge::default(),
+                proposals_pending: Gauge::default(),
+                proposals_failed: Counter::default(),
+                read_failed: Counter::default(),
+                watchers: Gauge::default(),
+                version: Family::default(),
+            };
+
+            let mut registry = load_global_registry();
+            registry.register(
+                key!("current_leader_id"),
+                "current leader",
+                metrics.current_leader_id.clone(),
+            );
+            registry.register(key!("is_leader"), "is leader", metrics.is_leader.clone());
+            registry.register(
+                key!("node_is_health"),
+                "node is health",
+                metrics.node_is_health.clone(),
+            );
+            registry.register(
+                key!("leader_changes"),
+                "leader changes",
+                metrics.leader_changes.clone(),
+            );
+            registry.register(
+                key!("applying_snapshot"),
+                "if this node is applying snapshot",
+                metrics.applying_snapshot.clone(),
+            );
+            registry.register(
+                key!("snapshot_key_count"),
+                "number of keys in the last snapshot",
+                metrics.snapshot_key_count.clone(),
+            );
+
+            registry.register(
+                key!("raft_log_cache_items"),
+                "number of items in raft log cache",
+                metrics.raft_log_cache_items.clone(),
+            );
+            registry.register(
+                key!("raft_log_cache_used_size"),
+                "size of used space in raft log cache",
+                metrics.raft_log_cache_used_size.clone(),
+            );
+            registry.register(
+                key!("raft_log_wal_open_chunk_size"),
+                "size of open chunk in raft log wal",
+                metrics.raft_log_wal_open_chunk_size.clone(),
+            );
+            registry.register(
+                key!("raft_log_wal_offset"),
+                "global offset of raft log WAL",
+                metrics.raft_log_wal_offset.clone(),
+            );
+            registry.register(
+                key!("raft_log_wal_closed_chunk_count"),
+                "number of closed chunks in raft log WAL",
+                metrics.raft_log_wal_closed_chunk_count.clone(),
+            );
+            registry.register(
+                key!("raft_log_wal_closed_chunk_total_size"),
+                "total size of closed chunks in raft log WAL",
+                metrics.raft_log_wal_closed_chunk_total_size.clone(),
+            );
+
+            registry.register(
+                key!("raft_log_size"),
+                "the size in bytes of the on disk data of raft log",
+                metrics.raft_log_size.clone(),
+            );
+            registry.register(
+                key!("proposals_applied"),
+                "proposals applied",
+                metrics.proposals_applied.clone(),
+            );
+            registry.register(
+                key!("last_log_index"),
+                "last log index",
+                metrics.last_log_index.clone(),
+            );
+            registry.register(key!("last_seq"), "last seq", metrics.last_seq.clone());
+            registry.register(
+                key!("current_term"),
+                "current term",
+                metrics.current_term.clone(),
+            );
+            registry.register(
+                key!("proposals_pending"),
+                "proposals pending, raft-log is proposed, not yet applied",
+                metrics.proposals_pending.clone(),
+            );
+            registry.register(
+                key!("proposals_failed"),
+                "number of failed proposals(raft-log), due to leader change or storage error",
+                metrics.proposals_failed.clone(),
+            );
+            registry.register(
+                key!("read_failed"),
+                "read failed",
+                metrics.read_failed.clone(),
+            );
+            registry.register(key!("watchers"), "watchers", metrics.watchers.clone());
+            registry.register(key!("version"), "version", metrics.version.clone());
+            metrics
+        }
+    }
+
+    static SERVER_METRICS: LazyLock<ServerMetrics> = LazyLock::new(ServerMetrics::init);
+
     pub fn set_current_leader(current_leader: NodeId) {
-        gauge!(key!("current_leader_id"), current_leader as f64);
+        SERVER_METRICS.current_leader_id.set(current_leader as i64);
     }
 
     pub fn set_is_leader(is_leader: bool) {
-        gauge!(key!("is_leader"), f64_of(is_leader));
+        SERVER_METRICS.is_leader.set(is_leader as i64);
     }
 
     pub fn set_node_is_health(is_health: bool) {
-        gauge!(key!("node_is_health"), f64_of(is_health));
+        SERVER_METRICS.node_is_health.set(is_health as i64);
     }
 
     pub fn incr_leader_change() {
-        counter!(key!("leader_changes"), 1);
+        SERVER_METRICS.leader_changes.inc();
     }
 
     /// Whether or not state-machine is applying snapshot.
     pub fn incr_applying_snapshot(cnt: i64) {
-        increment_gauge!(key!("applying_snapshot"), cnt as f64);
+        SERVER_METRICS.applying_snapshot.inc_by(cnt);
+    }
+
+    pub fn set_snapshot_key_count(n: u64) {
+        SERVER_METRICS.snapshot_key_count.set(n as i64);
+    }
+
+    pub fn set_raft_log_stat(st: RaftLogStat) {
+        SERVER_METRICS
+            .raft_log_cache_items
+            .set(st.payload_cache_item_count as i64);
+        SERVER_METRICS
+            .raft_log_cache_used_size
+            .set(st.payload_cache_size as i64);
+        SERVER_METRICS
+            .raft_log_wal_open_chunk_size
+            .set(st.open_chunk.size as i64);
+        SERVER_METRICS
+            .raft_log_wal_offset
+            .set(st.open_chunk.global_end as i64);
+        SERVER_METRICS
+            .raft_log_wal_closed_chunk_count
+            .set(st.closed_chunks.len() as i64);
+        SERVER_METRICS
+            .raft_log_wal_closed_chunk_total_size
+            .set(st.closed_chunks.iter().map(|v| v.size).sum::<u64>() as i64);
+    }
+
+    pub fn set_raft_log_size(raft_log_size: u64) {
+        SERVER_METRICS.raft_log_size.set(raft_log_size as i64);
     }
 
     pub fn set_proposals_applied(proposals_applied: u64) {
-        gauge!(key!("proposals_applied"), proposals_applied as f64);
+        SERVER_METRICS
+            .proposals_applied
+            .set(proposals_applied as i64);
     }
 
     pub fn set_last_log_index(last_log_index: u64) {
-        gauge!(key!("last_log_index"), last_log_index as f64);
+        SERVER_METRICS.last_log_index.set(last_log_index as i64);
     }
 
     pub fn set_last_seq(last_seq: u64) {
-        gauge!(key!("last_seq"), last_seq as f64);
+        SERVER_METRICS.last_seq.set(last_seq as i64);
     }
 
     pub fn set_current_term(current_term: u64) {
-        gauge!(key!("current_term"), current_term as f64);
+        SERVER_METRICS.current_term.set(current_term as i64);
     }
 
     pub fn incr_proposals_pending(cnt: i64) {
-        increment_gauge!(key!("proposals_pending"), cnt as f64);
+        SERVER_METRICS.proposals_pending.inc_by(cnt);
     }
 
     pub fn incr_proposals_failed() {
-        counter!(key!("proposals_failed"), 1);
+        SERVER_METRICS.proposals_failed.inc();
+    }
+
+    /// Accumulate the number of succeeded and failed read requests.
+    pub fn incr_read_result<T, E>(r: &Result<T, E>) {
+        if r.is_ok() {
+            // TODO: success is not collected.
+        } else {
+            incr_read_failed();
+        }
     }
 
     pub fn incr_read_failed() {
-        counter!(key!("read_failed"), 1);
+        SERVER_METRICS.read_failed.inc();
     }
 
     pub fn incr_watchers(cnt: i64) {
-        increment_gauge!(key!("watchers"), cnt as f64);
+        SERVER_METRICS.watchers.inc_by(cnt);
+    }
+
+    pub fn set_version(semver: String, sha: String) {
+        let labels = &vec![
+            ("component".to_string(), "metasrv".to_string()),
+            ("semver".to_string(), semver),
+            ("sha".to_string(), sha),
+        ];
+        SERVER_METRICS.version.get_or_create(labels).set(1);
     }
 }
 
 pub mod raft_metrics {
     pub mod network {
-        use common_meta_types::NodeId;
-        use metrics::counter;
-        use metrics::histogram;
-        use metrics::increment_gauge;
+        use std::sync::LazyLock;
+
+        use databend_common_meta_types::raft_types::NodeId;
+        use prometheus_client;
+        use prometheus_client::encoding::EncodeLabelSet;
+        use prometheus_client::metrics::counter::Counter;
+        use prometheus_client::metrics::family::Family;
+        use prometheus_client::metrics::gauge::Gauge;
+        use prometheus_client::metrics::histogram::exponential_buckets;
+        use prometheus_client::metrics::histogram::Histogram;
 
         macro_rules! key {
             ($key: literal) => {
@@ -114,97 +326,345 @@ pub mod raft_metrics {
             };
         }
 
+        #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+        pub struct ToLabels {
+            pub to: String,
+        }
+
+        #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+        pub struct FromLabels {
+            pub from: String,
+        }
+
+        #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+        pub struct PeerLabels {
+            pub id: String,
+            pub addr: String,
+        }
+
+        struct RaftMetrics {
+            active_peers: Family<PeerLabels, Gauge>,
+            fail_connect_to_peer: Family<PeerLabels, Gauge>,
+            sent_bytes: Family<ToLabels, Counter>,
+            recv_bytes: Family<FromLabels, Counter>,
+            sent_failures: Family<ToLabels, Counter>,
+            append_sent_seconds: Family<ToLabels, Histogram>,
+            snapshot_send_success: Family<ToLabels, Counter>,
+            snapshot_send_failure: Family<ToLabels, Counter>,
+            snapshot_send_inflights: Family<ToLabels, Gauge>,
+            snapshot_recv_inflights: Family<FromLabels, Gauge>,
+            snapshot_sent_seconds: Family<ToLabels, Histogram>,
+            snapshot_recv_seconds: Family<FromLabels, Histogram>,
+            snapshot_recv_success: Family<FromLabels, Counter>,
+            snapshot_recv_failures: Family<FromLabels, Counter>,
+        }
+
+        impl RaftMetrics {
+            fn init() -> Self {
+                let metrics = Self {
+                    active_peers: Family::default(),
+                    fail_connect_to_peer: Family::default(),
+                    sent_bytes: Family::default(),
+                    recv_bytes: Family::default(),
+                    sent_failures: Family::default(),
+                    append_sent_seconds: Family::new_with_constructor(|| {
+                        Histogram::new(exponential_buckets(0.001f64, 2f64, 20))
+                    }), // 0.001s ~ 1024s
+                    snapshot_send_success: Family::default(),
+                    snapshot_send_failure: Family::default(),
+                    snapshot_send_inflights: Family::default(),
+                    snapshot_recv_inflights: Family::default(),
+                    snapshot_sent_seconds: Family::new_with_constructor(|| {
+                        Histogram::new(exponential_buckets(1f64, 2f64, 10))
+                    }), // 1s ~ 1024s
+                    snapshot_recv_seconds: Family::new_with_constructor(|| {
+                        Histogram::new(exponential_buckets(1f64, 2f64, 10))
+                    }), // 1s ~ 1024s
+                    snapshot_recv_success: Family::default(),
+                    snapshot_recv_failures: Family::default(),
+                };
+
+                let mut registry = crate::metrics::registry::load_global_registry();
+                registry.register(
+                    key!("active_peers"),
+                    "active peers",
+                    metrics.active_peers.clone(),
+                );
+                registry.register(
+                    key!("fail_connect_to_peer"),
+                    "fail connect to peer",
+                    metrics.fail_connect_to_peer.clone(),
+                );
+                registry.register(key!("sent_bytes"), "sent bytes", metrics.sent_bytes.clone());
+                registry.register(key!("recv_bytes"), "recv bytes", metrics.recv_bytes.clone());
+                registry.register(
+                    key!("sent_failures"),
+                    "sent failures",
+                    metrics.sent_failures.clone(),
+                );
+                registry.register(
+                    key!("append_sent_seconds"),
+                    "append entries sent seconds",
+                    metrics.append_sent_seconds.clone(),
+                );
+                registry.register(
+                    key!("snapshot_send_success"),
+                    "snapshot send success",
+                    metrics.snapshot_send_success.clone(),
+                );
+                registry.register(
+                    key!("snapshot_send_failure"),
+                    "snapshot send failure",
+                    metrics.snapshot_send_failure.clone(),
+                );
+                registry.register(
+                    key!("snapshot_send_inflights"),
+                    "snapshot send inflights",
+                    metrics.snapshot_send_inflights.clone(),
+                );
+                registry.register(
+                    key!("snapshot_recv_inflights"),
+                    "snapshot recv inflights",
+                    metrics.snapshot_recv_inflights.clone(),
+                );
+                registry.register(
+                    key!("snapshot_sent_seconds"),
+                    "snapshot sent seconds",
+                    metrics.snapshot_sent_seconds.clone(),
+                );
+                registry.register(
+                    key!("snapshot_recv_seconds"),
+                    "snapshot recv seconds",
+                    metrics.snapshot_recv_seconds.clone(),
+                );
+                registry.register(
+                    key!("snapshot_recv_success"),
+                    "snapshot recv success",
+                    metrics.snapshot_recv_success.clone(),
+                );
+                registry.register(
+                    key!("snapshot_recv_failures"),
+                    "snapshot recv failures",
+                    metrics.snapshot_recv_failures.clone(),
+                );
+                metrics
+            }
+        }
+
+        static RAFT_METRICS: LazyLock<RaftMetrics> = LazyLock::new(RaftMetrics::init);
+
         pub fn incr_active_peers(id: &NodeId, addr: &str, cnt: i64) {
-            let labels = [("id", id.to_string()), ("address", addr.to_owned())];
-            increment_gauge!(key!("active_peers"), cnt as f64, &labels);
+            let id = id.to_string();
+            RAFT_METRICS
+                .active_peers
+                .get_or_create(&PeerLabels {
+                    id,
+                    addr: addr.to_string(),
+                })
+                .inc_by(cnt);
         }
 
-        pub fn incr_fail_connections_to_peer(id: &NodeId, addr: &str) {
-            let labels = [("id", id.to_string()), ("address", addr.to_owned())];
-            counter!(key!("fail_connect_to_peer"), 1, &labels);
+        pub fn incr_connect_failure(id: &NodeId, addr: &str) {
+            let id = id.to_string();
+            RAFT_METRICS
+                .fail_connect_to_peer
+                .get_or_create(&PeerLabels {
+                    id,
+                    addr: addr.to_string(),
+                })
+                .inc();
         }
 
-        pub fn incr_sent_bytes_to_peer(id: &NodeId, bytes: u64) {
-            let labels = [("to", id.to_string())];
-            counter!(key!("sent_bytes"), bytes, &labels);
+        pub fn incr_sendto_bytes(id: &NodeId, bytes: u64) {
+            let to = id.to_string();
+            RAFT_METRICS
+                .sent_bytes
+                .get_or_create(&ToLabels { to })
+                .inc_by(bytes);
         }
 
-        pub fn incr_recv_bytes_from_peer(addr: String, bytes: u64) {
-            let labels = [("from", addr)];
-            counter!(key!("recv_bytes"), bytes, &labels);
+        pub fn incr_recvfrom_bytes(addr: String, bytes: u64) {
+            RAFT_METRICS
+                .recv_bytes
+                .get_or_create(&FromLabels { from: addr })
+                .inc_by(bytes);
         }
 
-        pub fn incr_sent_failure_to_peer(id: &NodeId) {
-            let labels = [("to", id.to_string())];
-            counter!(key!("sent_failures"), 1, &labels);
+        pub fn incr_sendto_result(id: &NodeId, success: bool) {
+            if success {
+                // success is not collected.
+            } else {
+                incr_sendto_failure(id);
+            }
         }
 
-        pub fn incr_snapshot_send_success_to_peer(id: &NodeId) {
-            let labels = [("to", id.to_string())];
-            counter!(key!("snapshot_send_success"), 1, &labels);
+        pub fn incr_sendto_failure(id: &NodeId) {
+            let to = id.to_string();
+            RAFT_METRICS
+                .sent_failures
+                .get_or_create(&ToLabels { to })
+                .inc();
         }
 
-        pub fn incr_snapshot_send_failures_to_peer(id: &NodeId) {
-            let labels = [("to", id.to_string())];
-            counter!(key!("snapshot_send_failures"), 1, &labels);
+        pub fn observe_append_sendto_spent(id: &NodeId, v: f64) {
+            let to = id.to_string();
+            RAFT_METRICS
+                .append_sent_seconds
+                .get_or_create(&ToLabels { to })
+                .observe(v);
         }
 
-        pub fn incr_snapshot_send_inflights_to_peer(id: &NodeId, cnt: i64) {
-            let labels = [("to", id.to_string())];
-            increment_gauge!(key!("snapshot_send_inflights"), cnt as f64, &labels);
+        pub fn incr_snapshot_sendto_result(id: &NodeId, success: bool) {
+            let to = id.to_string();
+            if success {
+                &RAFT_METRICS.snapshot_send_success
+            } else {
+                &RAFT_METRICS.snapshot_send_failure
+            }
+            .get_or_create(&ToLabels { to })
+            .inc();
         }
 
-        pub fn incr_snapshot_recv_inflights_from_peer(addr: String, cnt: i64) {
-            let labels = [("to", addr)];
-            increment_gauge!(key!("snapshot_recv_inflights"), cnt as f64, &labels);
+        pub fn incr_snapshot_sendto_inflight(id: &NodeId, cnt: i64) {
+            let to = id.to_string();
+            RAFT_METRICS
+                .snapshot_send_inflights
+                .get_or_create(&ToLabels { to })
+                .inc_by(cnt);
         }
 
-        pub fn sample_snapshot_sent(id: &NodeId, v: f64) {
-            let labels = [("to", id.to_string())];
-            histogram!(key!("snapshot_sent_seconds"), v, &labels);
+        pub fn incr_snapshot_recvfrom_inflight(addr: String, cnt: i64) {
+            RAFT_METRICS
+                .snapshot_recv_inflights
+                .get_or_create(&FromLabels { from: addr })
+                .inc_by(cnt);
         }
 
-        pub fn sample_snapshot_recv(addr: String, v: f64) {
-            let labels = [("from", addr)];
-            histogram!(key!("snapshot_recv_seconds"), v, &labels);
+        pub fn observe_snapshot_sendto_spent(id: &NodeId, v: f64) {
+            let to = id.to_string();
+            RAFT_METRICS
+                .snapshot_sent_seconds
+                .get_or_create(&ToLabels { to })
+                .observe(v);
         }
 
-        pub fn incr_snapshot_recv_failure_from_peer(addr: String) {
-            let labels = [("from", addr)];
-            counter!(key!("snapshot_recv_failures"), 1, &labels);
+        pub fn observe_snapshot_recvfrom_spent(addr: String, v: f64) {
+            RAFT_METRICS
+                .snapshot_recv_seconds
+                .get_or_create(&FromLabels { from: addr })
+                .observe(v);
         }
 
-        pub fn incr_snapshot_recv_success_from_peer(addr: String) {
-            let labels = [("from", addr)];
-            counter!(key!("snapshot_recv_success"), 1, &labels);
+        pub fn incr_snapshot_recvfrom_result(addr: String, success: bool) {
+            if success {
+                &RAFT_METRICS.snapshot_recv_success
+            } else {
+                &RAFT_METRICS.snapshot_recv_failures
+            }
+            .get_or_create(&FromLabels { from: addr })
+            .inc();
         }
     }
 
     pub mod storage {
-        use metrics::counter;
+        use std::sync::LazyLock;
+
+        use prometheus_client::encoding::EncodeLabelSet;
+        use prometheus_client::metrics::counter::Counter;
+        use prometheus_client::metrics::family::Family;
+
+        use crate::metrics::registry::load_global_registry;
 
         macro_rules! key {
             ($key: literal) => {
                 concat!("metasrv_raft_storage_", $key)
             };
         }
+
+        #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+        pub struct FuncLabels {
+            pub func: String,
+        }
+
+        struct StorageMetrics {
+            raft_store_write_failed: Family<FuncLabels, Counter>,
+            raft_store_read_failed: Family<FuncLabels, Counter>,
+        }
+
+        impl StorageMetrics {
+            fn init() -> Self {
+                let metrics = Self {
+                    raft_store_write_failed: Family::default(),
+                    raft_store_read_failed: Family::default(),
+                };
+
+                let mut registry = load_global_registry();
+                registry.register(
+                    key!("raft_store_write_failed"),
+                    "raft store write failed",
+                    metrics.raft_store_write_failed.clone(),
+                );
+                registry.register(
+                    key!("raft_store_read_failed"),
+                    "raft store read failed",
+                    metrics.raft_store_read_failed.clone(),
+                );
+                metrics
+            }
+        }
+
+        static STORAGE_METRICS: LazyLock<StorageMetrics> = LazyLock::new(StorageMetrics::init);
+
+        pub fn incr_raft_storage_write_result<T, E>(func: &str, result: &Result<T, E>) {
+            match result {
+                Ok(_) => {
+                    // Do not update metrics for success.
+                }
+                Err(_) => {
+                    incr_raft_storage_fail(func, true);
+                }
+            }
+        }
+
+        pub fn incr_raft_storage_read_result<T, E>(func: &str, result: &Result<T, E>) {
+            match result {
+                Ok(_) => {
+                    // Do not update metrics for success.
+                }
+                Err(_) => {
+                    incr_raft_storage_fail(func, false);
+                }
+            }
+        }
+
         pub fn incr_raft_storage_fail(func: &str, write: bool) {
-            let labels = [("func", func.to_string())];
+            let labels = FuncLabels {
+                func: func.to_string(),
+            };
             if write {
-                counter!(key!("raft_store_write_failed"), 1, &labels);
+                STORAGE_METRICS
+                    .raft_store_write_failed
+                    .get_or_create(&labels)
+                    .inc();
             } else {
-                counter!(key!("raft_store_read_failed"), 1, &labels);
+                STORAGE_METRICS
+                    .raft_store_read_failed
+                    .get_or_create(&labels)
+                    .inc();
             }
         }
     }
 }
 
 pub mod network_metrics {
+    use std::sync::LazyLock;
     use std::time::Duration;
 
-    use metrics::counter;
-    use metrics::histogram;
-    use metrics::increment_gauge;
+    use prometheus_client::metrics::counter::Counter;
+    use prometheus_client::metrics::gauge::Gauge;
+    use prometheus_client::metrics::histogram::Histogram;
+
+    use crate::metrics::registry::load_global_registry;
 
     macro_rules! key {
         ($key: literal) => {
@@ -212,27 +672,93 @@ pub mod network_metrics {
         };
     }
 
-    pub fn sample_rpc_delay_seconds(d: Duration) {
-        histogram!(key!("rpc_delay_seconds"), d);
+    #[derive(Debug)]
+    struct NetworkMetrics {
+        rpc_delay_seconds: Histogram,
+        rpc_delay_ms: Histogram,
+        sent_bytes: Counter,
+        recv_bytes: Counter,
+        req_inflights: Gauge,
+        req_success: Counter,
+        req_failed: Counter,
+    }
+
+    impl NetworkMetrics {
+        pub fn init() -> Self {
+            let metrics = Self {
+                rpc_delay_seconds: Histogram::new(
+                    vec![
+                        1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 20.0, 30.0, 60.0,
+                    ]
+                    .into_iter(),
+                ),
+                rpc_delay_ms: Histogram::new(
+                    vec![
+                        1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0, 200.0, 500.0, 1000.0, 2000.0,
+                        5000.0, 10000.0, 30000.0, 60000.0,
+                    ]
+                    .into_iter(),
+                ),
+                sent_bytes: Counter::default(),
+                recv_bytes: Counter::default(),
+                req_inflights: Gauge::default(),
+                req_success: Counter::default(),
+                req_failed: Counter::default(),
+            };
+
+            let mut registry = load_global_registry();
+            registry.register(
+                key!("rpc_delay_seconds"),
+                "rpc delay seconds",
+                metrics.rpc_delay_seconds.clone(),
+            );
+            registry.register(
+                key!("rpc_delay_ms"),
+                "rpc delay milliseconds",
+                metrics.rpc_delay_ms.clone(),
+            );
+            registry.register(key!("sent_bytes"), "sent bytes", metrics.sent_bytes.clone());
+            registry.register(key!("recv_bytes"), "recv bytes", metrics.recv_bytes.clone());
+            registry.register(
+                key!("req_inflights"),
+                "req inflights",
+                metrics.req_inflights.clone(),
+            );
+            registry.register(
+                key!("req_success"),
+                "req success",
+                metrics.req_success.clone(),
+            );
+            registry.register(key!("req_failed"), "req failed", metrics.req_failed.clone());
+
+            metrics
+        }
+    }
+
+    static NETWORK_METRICS: LazyLock<NetworkMetrics> = LazyLock::new(NetworkMetrics::init);
+
+    pub fn sample_rpc_delay(d: Duration) {
+        NETWORK_METRICS.rpc_delay_seconds.observe(d.as_secs_f64());
+        NETWORK_METRICS.rpc_delay_ms.observe(d.as_millis() as f64);
     }
 
     pub fn incr_sent_bytes(bytes: u64) {
-        counter!(key!("sent_bytes"), bytes);
+        NETWORK_METRICS.sent_bytes.inc_by(bytes);
     }
 
     pub fn incr_recv_bytes(bytes: u64) {
-        counter!(key!("recv_bytes"), bytes);
+        NETWORK_METRICS.recv_bytes.inc_by(bytes);
     }
 
     pub fn incr_request_inflights(cnt: i64) {
-        increment_gauge!(key!("req_inflights"), cnt as f64);
+        NETWORK_METRICS.req_inflights.inc_by(cnt);
     }
 
     pub fn incr_request_result(success: bool) {
         if success {
-            counter!(key!("req_success"), 1);
+            NETWORK_METRICS.req_success.inc();
         } else {
-            counter!(key!("req_failed"), 1);
+            NETWORK_METRICS.req_failed.inc();
         }
     }
 }
@@ -243,7 +769,7 @@ pub(crate) struct RequestInFlight {
     start: Option<Instant>,
 }
 
-impl counter::Count for RequestInFlight {
+impl count::Count for RequestInFlight {
     fn incr_count(&mut self, n: i64) {
         network_metrics::incr_request_inflights(n);
 
@@ -252,7 +778,7 @@ impl counter::Count for RequestInFlight {
             self.start = Some(Instant::now());
         } else if n < 0 {
             if let Some(s) = self.start {
-                network_metrics::sample_rpc_delay_seconds(s.elapsed())
+                network_metrics::sample_rpc_delay(s.elapsed())
             }
         }
     }
@@ -262,7 +788,7 @@ impl counter::Count for RequestInFlight {
 #[derive(Default)]
 pub(crate) struct ProposalPending;
 
-impl counter::Count for ProposalPending {
+impl count::Count for ProposalPending {
     fn incr_count(&mut self, n: i64) {
         server_metrics::incr_proposals_pending(n);
     }
@@ -270,11 +796,9 @@ impl counter::Count for ProposalPending {
 
 /// Encode metrics as prometheus format string
 pub fn meta_metrics_to_prometheus_string() -> String {
-    let prometheus_handle = common_metrics::try_handle()
-        .ok_or_else(|| {
-            error!("could not get prometheus_handle");
-        })
-        .unwrap();
+    let registry = crate::metrics::registry::load_global_registry();
 
-    prometheus_handle.render()
+    let mut text = String::new();
+    prometheus_encode(&mut text, &registry).unwrap();
+    text
 }

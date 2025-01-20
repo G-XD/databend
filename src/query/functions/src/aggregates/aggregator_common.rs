@@ -14,17 +14,23 @@
 
 use std::fmt::Display;
 
+use borsh::BorshDeserialize;
+use borsh::BorshSerialize;
 use bumpalo::Bump;
-use common_exception::ErrorCode;
-use common_exception::Result;
-use common_expression::types::DataType;
-use common_expression::Column;
-use common_expression::ColumnBuilder;
-use common_expression::Scalar;
+use databend_common_base::runtime::drop_guard;
+use databend_common_exception::ErrorCode;
+use databend_common_exception::Result;
+use databend_common_expression::types::DataType;
+use databend_common_expression::Column;
+use databend_common_expression::ColumnBuilder;
+use databend_common_expression::Scalar;
+use databend_common_expression::StateAddr;
 
+use super::get_states_layout;
+use super::AggrState;
 use super::AggregateFunctionFactory;
 use super::AggregateFunctionRef;
-use super::StateAddr;
+use crate::aggregates::StatesLayout;
 
 pub fn assert_unary_params<D: Display>(name: D, actual: usize) -> Result<()> {
     if actual != 1 {
@@ -106,28 +112,42 @@ pub fn assert_variadic_arguments<D: Display>(
 
 struct EvalAggr {
     addr: StateAddr,
+    state_layout: StatesLayout,
     _arena: Bump,
     func: AggregateFunctionRef,
 }
 
 impl EvalAggr {
     fn new(func: AggregateFunctionRef) -> Self {
-        let _arena = Bump::new();
-        let place = _arena.alloc_layout(func.state_layout());
-        let addr = place.into();
-        func.init_state(addr);
+        let funcs = [func];
+        let state_layout = get_states_layout(&funcs).unwrap();
+        let [func] = funcs;
 
-        Self { _arena, func, addr }
+        let _arena = Bump::new();
+        let addr = _arena.alloc_layout(state_layout.layout).into();
+
+        let state = AggrState::new(addr, &state_layout.states_loc[0]);
+        func.init_state(state);
+
+        Self {
+            addr,
+            state_layout,
+            _arena,
+            func,
+        }
     }
 }
 
 impl Drop for EvalAggr {
     fn drop(&mut self) {
-        if self.func.need_manual_drop_state() {
-            unsafe {
-                self.func.drop_state(self.addr);
+        drop_guard(move || {
+            if self.func.need_manual_drop_state() {
+                unsafe {
+                    self.func
+                        .drop_state(AggrState::new(self.addr, &self.state_layout.states_loc[0]));
+                }
             }
-        }
+        })
     }
 }
 
@@ -137,16 +157,46 @@ pub fn eval_aggr(
     columns: &[Column],
     rows: usize,
 ) -> Result<(Column, DataType)> {
+    eval_aggr_for_test(name, params, columns, rows, false)
+}
+
+pub fn eval_aggr_for_test(
+    name: &str,
+    params: Vec<Scalar>,
+    columns: &[Column],
+    rows: usize,
+    with_serialize: bool,
+) -> Result<(Column, DataType)> {
     let factory = AggregateFunctionFactory::instance();
-    let cols: Vec<Column> = columns.to_owned();
     let arguments = columns.iter().map(|x| x.data_type()).collect();
 
     let func = factory.get(name, params, arguments)?;
     let data_type = func.return_type()?;
 
     let eval = EvalAggr::new(func.clone());
-    func.accumulate(eval.addr, &cols, None, rows)?;
+    let state = AggrState::new(eval.addr, &eval.state_layout.states_loc[0]);
+    func.accumulate(state, columns.into(), None, rows)?;
+    if with_serialize {
+        let mut buf = vec![];
+        func.serialize(state, &mut buf)?;
+        func.init_state(state);
+        func.merge(state, &mut buf.as_slice())?;
+    }
     let mut builder = ColumnBuilder::with_capacity(&data_type, 1024);
-    func.merge_result(eval.addr, &mut builder)?;
+    func.merge_result(state, &mut builder)?;
     Ok((builder.build(), data_type))
+}
+
+#[inline]
+pub fn borsh_serialize_state<W: std::io::Write, T: BorshSerialize>(
+    writer: &mut W,
+    value: &T,
+) -> Result<()> {
+    borsh::to_writer(writer, value)?;
+    Ok(())
+}
+
+#[inline]
+pub fn borsh_deserialize_state<T: BorshDeserialize>(slice: &mut &[u8]) -> Result<T> {
+    Ok(T::deserialize(slice)?)
 }

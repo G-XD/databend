@@ -14,17 +14,17 @@
 
 use std::sync::Arc;
 
-use common_exception::ErrorCode;
-use common_exception::Result;
-use common_expression::types::DataType;
-use common_expression::BlockEntry;
-use common_expression::DataBlock;
-use common_expression::DataSchemaRef;
-use common_expression::Scalar;
-use common_expression::Value;
-use common_storages_stage::StageTable;
+use databend_common_exception::ErrorCode;
+use databend_common_exception::Result;
+use databend_common_expression::types::DataType;
+use databend_common_expression::BlockEntry;
+use databend_common_expression::DataBlock;
+use databend_common_expression::Scalar;
+use databend_common_expression::Value;
+use databend_common_storages_stage::StageTable;
 use jsonb::Value as JsonbValue;
 use log::debug;
+use log::info;
 
 use crate::interpreters::Interpreter;
 use crate::pipelines::PipelineBuildResult;
@@ -51,22 +51,23 @@ impl Interpreter for PresignInterpreter {
         "PresignInterpreter"
     }
 
-    fn schema(&self) -> DataSchemaRef {
-        self.plan.schema()
+    fn is_ddl(&self) -> bool {
+        true
     }
 
-    #[minitrace::trace(name = "presign_interpreter_execute")]
+    #[fastrace::trace]
     #[async_backtrace::framed]
     async fn execute2(&self) -> Result<PipelineBuildResult> {
         debug!("ctx.id" = self.ctx.get_id().as_str(); "presign_interpreter_execute");
 
         let op = StageTable::get_op(&self.plan.stage)?;
-        if !op.info().can_presign() {
+        if !op.info().full_capability().presign {
             return Err(ErrorCode::StorageUnsupported(
                 "storage doesn't support presign operation",
             ));
         }
 
+        let start_time = std::time::Instant::now();
         let presigned_req = match self.plan.action {
             PresignAction::Download => op.presign_read(&self.plan.path, self.plan.expire).await?,
             PresignAction::Upload => {
@@ -77,6 +78,10 @@ impl Interpreter for PresignInterpreter {
                 fut.await?
             }
         };
+        info!(
+            "query_id" = self.ctx.get_id();
+            "presign {:?} {} success in {}ms", self.plan.action, self.plan.path, start_time.elapsed().as_millis()
+        );
 
         let header = JsonbValue::Object(
             presigned_req
@@ -100,9 +105,7 @@ impl Interpreter for PresignInterpreter {
             vec![
                 BlockEntry::new(
                     DataType::String,
-                    Value::Scalar(Scalar::String(
-                        presigned_req.method().as_str().as_bytes().to_vec(),
-                    )),
+                    Value::Scalar(Scalar::String(presigned_req.method().as_str().to_string())),
                 ),
                 BlockEntry::new(
                     DataType::Variant,
@@ -110,9 +113,7 @@ impl Interpreter for PresignInterpreter {
                 ),
                 BlockEntry::new(
                     DataType::String,
-                    Value::Scalar(Scalar::String(
-                        presigned_req.uri().to_string().as_bytes().to_vec(),
-                    )),
+                    Value::Scalar(Scalar::String(presigned_req.uri().to_string())),
                 ),
             ],
             1,

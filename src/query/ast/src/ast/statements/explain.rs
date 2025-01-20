@@ -12,7 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+use derive_visitor::Drive;
+use derive_visitor::DriveMut;
+
+#[derive(Debug, Clone, PartialEq, Eq, Drive, DriveMut)]
 pub enum ExplainKind {
     Ast(String),
     Syntax(String),
@@ -22,11 +25,27 @@ pub enum ExplainKind {
     Graph,
     Pipeline,
     Fragments,
+
+    // `EXPLAIN RAW` and `EXPLAIN OPTIMIZED` will be deprecated in the future,
+    // use explain options instead
     Raw,
+    // `EXPLAIN DECORRELATED` will show the plan after subquery decorrelation
+    Decorrelated,
+    Optimized,
+
     Plan,
 
-    JOIN,
+    Join,
 
     // Explain analyze plan
     AnalyzePlan,
+
+    Graphical,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Drive, DriveMut)]
+pub enum ExplainOption {
+    Verbose,
+    Logical,
+    Optimized,
 }

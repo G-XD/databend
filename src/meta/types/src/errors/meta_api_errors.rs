@@ -15,14 +15,18 @@
 use std::fmt::Display;
 
 use anyerror::AnyError;
+use databend_common_exception::ErrorCode;
+use tonic::Status;
 
+use crate::errors;
 use crate::raft_types::ChangeMembershipError;
+use crate::raft_types::ClientWriteError;
 use crate::raft_types::Fatal;
 use crate::raft_types::ForwardToLeader;
-use crate::ClientWriteError;
+use crate::raft_types::RaftError;
+use crate::InvalidArgument;
 use crate::InvalidReply;
 use crate::MetaNetworkError;
-use crate::RaftError;
 
 /// Errors raised when meta-service handling a request.
 #[derive(thiserror::Error, serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -82,6 +86,16 @@ impl MetaAPIError {
                 MetaDataError::ChangeMembershipError(_) => true,
                 MetaDataError::ReadError(_) => false,
             },
+        }
+    }
+
+    pub fn name(&self) -> &'static str {
+        match self {
+            MetaAPIError::ForwardToLeader(_) => "ForwardToLeader",
+            MetaAPIError::CanNotForward(_) => "CanNotForward",
+            MetaAPIError::NetworkError(_) => "NetworkError",
+            MetaAPIError::DataError(_) => "DataError",
+            MetaAPIError::RemoteError(_) => "RemoteError",
         }
     }
 }
@@ -153,8 +167,29 @@ impl From<MetaDataReadError> for MetaOperationError {
     }
 }
 
+impl From<Status> for MetaAPIError {
+    fn from(status: Status) -> Self {
+        let net_err = MetaNetworkError::from(status);
+        Self::NetworkError(net_err)
+    }
+}
+
+impl From<InvalidArgument> for MetaAPIError {
+    fn from(e: InvalidArgument) -> Self {
+        let net_err = MetaNetworkError::from(e);
+        Self::NetworkError(net_err)
+    }
+}
+
 impl From<InvalidReply> for MetaAPIError {
     fn from(e: InvalidReply) -> Self {
+        let net_err = MetaNetworkError::from(e);
+        Self::NetworkError(net_err)
+    }
+}
+
+impl From<errors::IncompleteStream> for MetaAPIError {
+    fn from(e: errors::IncompleteStream) -> Self {
         let net_err = MetaNetworkError::from(e);
         Self::NetworkError(net_err)
     }
@@ -174,5 +209,11 @@ impl From<RaftError<ClientWriteError>> for MetaAPIError {
             }
             RaftError::Fatal(f) => MetaAPIError::DataError(MetaDataError::WriteError(f)),
         }
+    }
+}
+
+impl From<MetaAPIError> for ErrorCode {
+    fn from(e: MetaAPIError) -> Self {
+        ErrorCode::MetaServiceError(e.to_string())
     }
 }

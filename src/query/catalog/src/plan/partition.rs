@@ -13,19 +13,38 @@
 // limitations under the License.
 
 use std::any::Any;
+use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::fmt::Debug;
 use std::fmt::Formatter;
+use std::hash::Hash;
+use std::hash::Hasher;
 use std::sync::Arc;
 
-use common_exception::Result;
+use databend_common_config::GlobalConfig;
+use databend_common_exception::Result;
+use databend_storages_common_table_meta::meta::BlockMeta;
+use databend_storages_common_table_meta::meta::Statistics;
 use parking_lot::RwLock;
 use rand::prelude::SliceRandom;
 use rand::thread_rng;
 use sha2::Digest;
 
+use crate::plan::PartStatistics;
 use crate::table_context::TableContext;
+
+/// Partition information.
+#[derive(PartialEq)]
+pub enum PartInfoType {
+    // Block level partition information.
+    // Read the data from the block level.
+    BlockLevel,
+    // In lazy level, we need:
+    // 1. read the block location information from the segment.
+    // 2. read the block data from the block level.
+    LazyLevel,
+}
 
 #[typetag::serde(tag = "type")]
 pub trait PartInfo: Send + Sync {
@@ -36,10 +55,17 @@ pub trait PartInfo: Send + Sync {
 
     /// Used for partition distributed.
     fn hash(&self) -> u64;
+
+    /// Get the partition type.
+    /// Default is block level.
+    /// If the partition is lazy level, it should be override.
+    fn part_type(&self) -> PartInfoType {
+        PartInfoType::BlockLevel
+    }
 }
 
 impl Debug for Box<dyn PartInfo> {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
         match serde_json::to_string(self) {
             Ok(str) => write!(f, "{}", str),
             Err(_cause) => Err(std::fmt::Error {}),
@@ -71,37 +97,25 @@ pub enum PartitionsShuffleKind {
     Seq,
     // Bind the Partition to executor by partition.hash()%executor_nums order.
     Mod,
+    // Bind the Partition to executor by ConsistentHash(partition.hash()) order.
+    ConsistentHash,
     // Bind the Partition to executor by partition.rand() order.
     Rand,
     // Bind the Partition to executor by broadcast
-    Broadcast,
+    BroadcastCluster,
+    // Bind the Partition to warehouse executor by broadcast
+    BroadcastWarehouse,
 }
+
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq)]
 pub struct Partitions {
     pub kind: PartitionsShuffleKind,
     pub partitions: Vec<PartInfoPtr>,
-    pub is_lazy: bool,
 }
 
 impl Partitions {
-    pub fn create(
-        kind: PartitionsShuffleKind,
-        partitions: Vec<PartInfoPtr>,
-        is_lazy: bool,
-    ) -> Self {
-        Partitions {
-            kind,
-            partitions,
-            is_lazy,
-        }
-    }
-
-    pub fn create_nolazy(kind: PartitionsShuffleKind, partitions: Vec<PartInfoPtr>) -> Self {
-        Partitions {
-            kind,
-            partitions,
-            is_lazy: false,
-        }
+    pub fn create(kind: PartitionsShuffleKind, partitions: Vec<PartInfoPtr>) -> Self {
+        Partitions { kind, partitions }
     }
 
     pub fn len(&self) -> usize {
@@ -129,52 +143,112 @@ impl Partitions {
                 parts.sort_by(|a, b| a.0.cmp(&b.0));
                 parts.into_iter().map(|x| x.1).collect()
             }
+            PartitionsShuffleKind::ConsistentHash => {
+                let mut scale = 0;
+                let num_executors = executors_sorted.len();
+                const EXPECT_NODES: usize = 100;
+                while num_executors << scale < EXPECT_NODES {
+                    scale += 1;
+                }
+
+                let mut executor_part = executors_sorted
+                    .iter()
+                    .map(|e| (e.clone(), Partitions::default()))
+                    .collect::<HashMap<_, _>>();
+
+                let mut ring = executors_sorted
+                    .iter()
+                    .flat_map(|e| {
+                        let mut s = DefaultHasher::new();
+                        e.hash(&mut s);
+                        (0..1 << scale).map(move |i| {
+                            i.hash(&mut s);
+                            (e, s.finish())
+                        })
+                    })
+                    .collect::<Vec<_>>();
+
+                ring.sort_by(|&(_, a), &(_, b)| a.cmp(&b));
+
+                for p in self.partitions.iter() {
+                    let k = p.hash();
+                    let idx = match ring.binary_search_by(|&(_, h)| h.cmp(&k)) {
+                        Err(i) => i,
+                        Ok(i) => i,
+                    };
+                    let executor = if idx == ring.len() {
+                        ring[0].0
+                    } else {
+                        ring[idx].0
+                    };
+                    let part = executor_part.get_mut(executor).unwrap();
+                    part.partitions.push(p.clone());
+                }
+                return Ok(executor_part);
+            }
             PartitionsShuffleKind::Rand => {
                 let mut rng = thread_rng();
                 let mut parts = self.partitions.clone();
                 parts.shuffle(&mut rng);
                 parts
             }
-            PartitionsShuffleKind::Broadcast => {
-                let mut executor_part = HashMap::default();
-                for executor in executors_sorted.iter() {
-                    executor_part.insert(
-                        executor.clone(),
-                        Partitions::create(
-                            PartitionsShuffleKind::Seq,
-                            self.partitions.clone(),
-                            self.is_lazy,
-                        ),
-                    );
-                }
-
-                return Ok(executor_part);
+            // the executors will be all nodes in the warehouse if a query is BroadcastWarehouse.
+            PartitionsShuffleKind::BroadcastCluster | PartitionsShuffleKind::BroadcastWarehouse => {
+                return Ok(executors_sorted
+                    .into_iter()
+                    .map(|executor| {
+                        (
+                            executor,
+                            Partitions::create(PartitionsShuffleKind::Seq, self.partitions.clone()),
+                        )
+                    })
+                    .collect());
             }
         };
 
+        // If there is only one partition, we prioritize executing the query on the local node.
+        if partitions.len() == 1 {
+            let mut executor_part = HashMap::default();
+
+            let local_id = &GlobalConfig::instance().query.node_id;
+            for executor in executors_sorted.into_iter() {
+                let parts = match &executor == local_id {
+                    true => partitions.clone(),
+                    false => vec![],
+                };
+
+                executor_part.insert(
+                    executor,
+                    Partitions::create(PartitionsShuffleKind::Seq, parts),
+                );
+            }
+
+            return Ok(executor_part);
+        }
+
+        // parts_per_executor = num_parts / num_executors
+        // remain = num_parts % num_executors
+        // part distribution:
+        //   executor number      | Part number of each executor
+        // ------------------------------------------------------
+        // num_executors - remain |   parts_per_executor
+        //     remain             |   parts_per_executor + 1
         let num_parts = partitions.len();
         let mut executor_part = HashMap::default();
-        // the first num_parts % num_executors get parts_per_node parts
-        // the remaining get parts_per_node - 1 parts
-        let parts_per_node = (num_parts + num_executors - 1) / num_executors;
-        for (idx, executor) in executors_sorted.iter().enumerate() {
-            let begin = parts_per_node * idx;
-            let end = num_parts.min(parts_per_node * (idx + 1));
-            let parts = partitions[begin..end].to_vec();
-            executor_part.insert(
-                executor.clone(),
-                Partitions::create(PartitionsShuffleKind::Seq, parts.to_vec(), self.is_lazy),
-            );
-            if end == num_parts && idx < num_executors - 1 {
+        for (idx, executor) in executors_sorted.into_iter().enumerate() {
+            let begin = num_parts * idx / num_executors;
+            let end = num_parts * (idx + 1) / num_executors;
+            let parts = if begin == end {
                 // reach here only when num_executors > num_parts
-                executors_sorted[(idx + 1)..].iter().for_each(|executor| {
-                    executor_part.insert(
-                        executor.clone(),
-                        Partitions::create(PartitionsShuffleKind::Seq, vec![], self.is_lazy),
-                    );
-                });
-                break;
-            }
+                vec![]
+            } else {
+                partitions[begin..end].to_vec()
+            };
+
+            executor_part.insert(
+                executor,
+                Partitions::create(PartitionsShuffleKind::Seq, parts),
+            );
         }
 
         Ok(executor_part)
@@ -185,6 +259,16 @@ impl Partitions {
         let sha = sha2::Sha256::digest(buf);
         Ok(format!("{:x}", sha))
     }
+
+    /// Get the partition type.
+    pub fn partitions_type(&self) -> PartInfoType {
+        // If the self.partitions is empty, it means that the partition is block level.
+        if self.partitions.is_empty() {
+            return PartInfoType::BlockLevel;
+        }
+
+        self.partitions[0].part_type()
+    }
 }
 
 impl Default for Partitions {
@@ -192,7 +276,6 @@ impl Default for Partitions {
         Self {
             kind: PartitionsShuffleKind::Seq,
             partitions: vec![],
-            is_lazy: false,
         }
     }
 }
@@ -221,37 +304,10 @@ impl StealablePartitions {
         self.disable_steal = true;
     }
 
-    pub fn steal_one(&self, idx: usize) -> Option<PartInfoPtr> {
+    pub fn steal(&self, idx: usize, max_size: usize) -> Option<Vec<PartInfoPtr>> {
         let mut partitions = self.partitions.write();
         if partitions.is_empty() {
-            return self.ctx.get_partition();
-        }
-
-        let idx = if idx >= partitions.len() {
-            idx % partitions.len()
-        } else {
-            idx
-        };
-
-        for step in 0..partitions.len() {
-            let index = (idx + step) % partitions.len();
-            if !partitions[index].is_empty() {
-                return partitions[index].pop_front();
-            }
-
-            if self.disable_steal {
-                break;
-            }
-        }
-
-        drop(partitions);
-        self.ctx.get_partition()
-    }
-
-    pub fn steal(&self, idx: usize, max_size: usize) -> Vec<PartInfoPtr> {
-        let mut partitions = self.partitions.write();
-        if partitions.is_empty() {
-            return self.ctx.get_partitions(max_size);
+            return None;
         }
 
         let idx = if idx >= partitions.len() {
@@ -266,7 +322,7 @@ impl StealablePartitions {
             if !partitions[index].is_empty() {
                 let ps = &mut partitions[index];
                 let size = ps.len().min(max_size);
-                return ps.drain(..size).collect();
+                return Some(ps.drain(..size).collect());
             }
 
             if self.disable_steal {
@@ -275,6 +331,73 @@ impl StealablePartitions {
         }
 
         drop(partitions);
-        self.ctx.get_partitions(max_size)
+
+        None
     }
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct ReclusterTask {
+    pub parts: Partitions,
+    pub stats: PartStatistics,
+    pub total_rows: usize,
+    pub total_bytes: usize,
+    pub level: i32,
+}
+
+#[derive(Clone)]
+pub enum ReclusterParts {
+    Recluster {
+        tasks: Vec<ReclusterTask>,
+        remained_blocks: Vec<Arc<BlockMeta>>,
+        removed_segment_indexes: Vec<usize>,
+        removed_segment_summary: Statistics,
+    },
+    Compact(Partitions),
+}
+
+impl ReclusterParts {
+    pub fn is_empty(&self) -> bool {
+        match self {
+            ReclusterParts::Recluster {
+                tasks,
+                remained_blocks,
+                ..
+            } => tasks.is_empty() && remained_blocks.is_empty(),
+            ReclusterParts::Compact(parts) => parts.is_empty(),
+        }
+    }
+
+    pub fn new_recluster_parts() -> Self {
+        Self::Recluster {
+            tasks: vec![],
+            remained_blocks: vec![],
+            removed_segment_indexes: vec![],
+            removed_segment_summary: Statistics::default(),
+        }
+    }
+
+    pub fn new_compact_parts() -> Self {
+        Self::Compact(Partitions::default())
+    }
+
+    pub fn is_distributed(&self, ctx: Arc<dyn TableContext>) -> bool {
+        match self {
+            ReclusterParts::Recluster { tasks, .. } => tasks.len() > 1,
+            ReclusterParts::Compact(_) => {
+                (!ctx.get_cluster().is_empty())
+                    && ctx
+                        .get_settings()
+                        .get_enable_distributed_compact()
+                        .unwrap_or(false)
+            }
+        }
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, Default)]
+pub struct ReclusterInfoSideCar {
+    pub merged_blocks: Vec<Arc<BlockMeta>>,
+    pub removed_segment_indexes: Vec<usize>,
+    pub removed_statistics: Statistics,
 }

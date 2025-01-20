@@ -16,12 +16,10 @@ use std::sync::Arc;
 
 use async_channel::Sender;
 use async_trait::async_trait;
-use async_trait::unboxed_simple;
-use common_exception::ErrorCode;
-use common_exception::Result;
-use common_expression::DataBlock;
-use common_pipeline_core::processors::port::InputPort;
-use common_pipeline_core::processors::Processor;
+use databend_common_exception::Result;
+use databend_common_expression::DataBlock;
+use databend_common_pipeline_core::processors::InputPort;
+use databend_common_pipeline_core::processors::Processor;
 
 use crate::AsyncSink;
 use crate::AsyncSinker;
@@ -31,8 +29,8 @@ pub struct UnionReceiveSink {
 }
 
 impl UnionReceiveSink {
-    pub fn create(sender: Option<Sender<DataBlock>>, input: Arc<InputPort>) -> Box<dyn Processor> {
-        AsyncSinker::create(input, UnionReceiveSink { sender })
+    pub fn create(tx: Option<Sender<DataBlock>>, input: Arc<InputPort>) -> Box<dyn Processor> {
+        AsyncSinker::create(input, UnionReceiveSink { sender: tx })
     }
 }
 
@@ -46,13 +44,10 @@ impl AsyncSink for UnionReceiveSink {
         Ok(())
     }
 
-    #[unboxed_simple]
     #[async_backtrace::framed]
     async fn consume(&mut self, data_block: DataBlock) -> Result<bool> {
         if let Some(sender) = self.sender.as_ref() {
-            if sender.send(data_block).await.is_err() {
-                return Err(ErrorCode::Internal("UnionReceiveSink sender failed"));
-            };
+            return Ok(sender.send(data_block).await.is_err());
         }
 
         Ok(false)

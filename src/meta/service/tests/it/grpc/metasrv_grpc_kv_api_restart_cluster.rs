@@ -1,4 +1,4 @@
-// Copyright 2021 Datafuse Labs.
+// Copyright 2021 Datafuse Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,13 +17,14 @@
 
 use std::time::Duration;
 
-use common_base::base::Stoppable;
-use common_meta_client::ClientHandle;
-use common_meta_client::MetaGrpcClient;
-use common_meta_kvapi::kvapi::KVApi;
-use common_meta_kvapi::kvapi::UpsertKVReq;
+use databend_common_base::base::Stoppable;
+use databend_common_meta_client::ClientHandle;
+use databend_common_meta_client::MetaGrpcClient;
+use databend_common_meta_kvapi::kvapi::KVApi;
+use databend_common_meta_types::UpsertKV;
 use log::info;
 use test_harness::test;
+use tokio::time::sleep;
 
 use crate::testing::meta_service_test_harness;
 use crate::tests::service::start_metasrv_cluster;
@@ -35,7 +36,7 @@ use crate::tests::start_metasrv_with_context;
 /// - Stop and restart the cluster.
 /// - Test upsert kv and read on different nodes.
 #[test(harness = meta_service_test_harness)]
-#[minitrace::trace]
+#[fastrace::trace]
 async fn test_kv_api_restart_cluster_write_read() -> anyhow::Result<()> {
     fn make_key(tc: &MetaSrvTestContext, k: impl std::fmt::Display) -> String {
         let x = &tc.config.raft_config;
@@ -52,7 +53,7 @@ async fn test_kv_api_restart_cluster_write_read() -> anyhow::Result<()> {
             let client = tc.grpc_client().await?;
 
             let k = make_key(tc, key_suffix);
-            let res = client.upsert_kv(UpsertKVReq::update(&k, &b(&k))).await?;
+            let res = client.upsert_kv(UpsertKV::update(&k, &b(&k))).await?;
 
             info!("--- upsert res: {:?}", res);
 
@@ -85,6 +86,9 @@ async fn test_kv_api_restart_cluster_write_read() -> anyhow::Result<()> {
         }
         stopped_tcs
     };
+
+    // Sleep to make sure the previous nodes are completely stopped.
+    sleep(Duration::from_secs(1)).await;
 
     info!("--- restart the cluster");
     let tcs = {
@@ -121,7 +125,7 @@ async fn test_kv_api_restart_cluster_write_read() -> anyhow::Result<()> {
 /// - Stop and restart the cluster.
 /// - Test read kv using same grpc client.
 #[test(harness = meta_service_test_harness)]
-#[minitrace::trace]
+#[fastrace::trace]
 async fn test_kv_api_restart_cluster_token_expired() -> anyhow::Result<()> {
     fn make_key(tc: &MetaSrvTestContext, k: impl std::fmt::Display) -> String {
         let x = &tc.config.raft_config;
@@ -138,11 +142,11 @@ async fn test_kv_api_restart_cluster_token_expired() -> anyhow::Result<()> {
         for (i, tc) in tcs.iter().enumerate() {
             let k = make_key(tc, key_suffix);
             if i == 0 {
-                let res = client.upsert_kv(UpsertKVReq::update(&k, &b(&k))).await?;
+                let res = client.upsert_kv(UpsertKV::update(&k, &b(&k))).await?;
                 info!("--- upsert res: {:?}", res);
             } else {
                 let client = tc.grpc_client().await.unwrap();
-                let res = client.upsert_kv(UpsertKVReq::update(&k, &b(&k))).await?;
+                let res = client.upsert_kv(UpsertKV::update(&k, &b(&k))).await?;
                 info!("--- upsert res: {:?}", res);
             }
 
@@ -160,9 +164,10 @@ async fn test_kv_api_restart_cluster_token_expired() -> anyhow::Result<()> {
         vec![tcs[0].config.grpc_api_address.clone()],
         "root",
         "xxx",
-        None,
+        // Without timeout, the client will not be able to reconnect.
+        // This is an issue of the http client.
+        Some(Duration::from_secs(1)),
         Some(Duration::from_secs(10)),
-        Duration::from_secs(10),
         None,
     )?;
 
@@ -188,7 +193,18 @@ async fn test_kv_api_restart_cluster_token_expired() -> anyhow::Result<()> {
     let tcs = {
         let mut tcs = vec![];
         for mut tc in stopped_tcs {
+            info!(
+                "--- starting metasrv: {:?}",
+                tc.config.raft_config.raft_api_addr().await?
+            );
             start_metasrv_with_context(&mut tc).await?;
+
+            info!(
+                "--- started metasrv: {:?}",
+                tc.config.raft_config.raft_api_addr().await?
+            );
+
+            // sleep(Duration::from_secs(3)).await;
             tcs.push(tc);
         }
 

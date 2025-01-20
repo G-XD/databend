@@ -12,22 +12,32 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+mod common;
+mod copy;
 mod data_mask;
+pub mod dynamic_table;
+mod error;
 pub mod expr;
+mod input;
 #[allow(clippy::module_inception)]
 mod parser;
 pub mod query;
-pub mod quote;
-mod share;
+pub mod script;
+mod sequence;
 mod stage;
 pub mod statement;
+pub mod stream;
 pub mod token;
-pub mod unescape;
 
-pub use parser::parse_comma_separated_exprs;
-pub use parser::parse_comma_separated_idents;
-pub use parser::parse_expr;
-pub use parser::parse_sql;
-pub use parser::parser_values_with_placeholder;
-pub use parser::tokenize_sql;
+pub use common::match_text;
+pub use common::match_token;
+pub use common::IResult;
+pub use error::display_parser_error;
+pub use error::Backtrace;
+pub use error::Error;
+pub use error::ErrorKind;
+pub use input::Dialect;
+pub use input::Input;
+pub use input::ParseMode;
+pub use parser::*;
 pub use token::all_reserved_keywords;

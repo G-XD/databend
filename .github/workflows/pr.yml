@@ -17,65 +17,28 @@ permissions:
 jobs:
   title:
     runs-on: ubuntu-latest
-    if: '!github.event.pull_request.draft'
     steps:
+      - uses: actions/checkout@v4
       - name: Check PR title if not sematic
-        uses: actions/github-script@v6
+        uses: actions/github-script@v7
+        id: check
         with:
           script: |
-            const title = context.payload.pull_request.title;
-            const regex = /^(rfc|feat|fix|refactor|ci|docs|chore)(\([a-z0-9-]+\))?:/;
-            const m = title.match(regex);
-            if (!m) {
-              core.setFailed('PR title is not semantic');
-              return;
-            }
-            const prType = m[1];
-            const prScope = m[2];
-            const prSummary = title.substring(m[0].length);
-            let label = '';
-            switch (prType) {
-              case 'rfc':
-                label = 'pr-rfc';
-                break;
-              case 'feat':
-                label = 'pr-feature';
-                break;
-              case 'fix':
-                label = 'pr-bugfix';
-                break;
-              case 'refactor':
-                label = 'pr-refactor';
-                break;
-              case 'ci':
-                label = 'pr-build';
-                break;
-              case 'docs':
-                label = 'pr-doc';
-                break;
-              case 'chore':
-                label = 'pr-chore';
-                break;
-            }
-            const labels = await github.rest.issues.addLabels({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: context.issue.number,
-              labels: [label],
-            });
+            const script = require('./.github/scripts/check_pr_title.js')
+            await script({ github, context, core })
       - name: Delete Comment
-        if: success()
+        if: always() && steps.check.outputs.title == 'semantic'
         uses: everpcpc/comment-on-pr-action@v1
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          identifier: 'pr-assistant-title'
+          token: ${{ github.token }}
+          identifier: "pr-assistant-title"
           delete: true
       - name: Comment on PR
-        if: failure()
+        if: always() && steps.check.outputs.title == 'not-semantic'
         uses: everpcpc/comment-on-pr-action@v1
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          identifier: 'pr-assistant-title'
+          token: ${{ github.token }}
+          identifier: "pr-assistant-title"
           body: |
             This pull request's title is not fulfill the requirements. @${{ github.event.pull_request.user.login }} please update it 🙏.
 
@@ -102,35 +65,39 @@ jobs:
 
   cla:
     runs-on: ubuntu-latest
-    if: '!github.event.pull_request.draft'
     steps:
+      - uses: actions/checkout@v4
       - name: Check CLA if not signed
-        uses: actions/github-script@v6
+        uses: actions/github-script@v7
+        id: check
         with:
           script: |
             const body = context.payload.pull_request.body;
-            const regex = /I hereby agree to the terms of the CLA available at: https:\/\/databend\.rs\/dev\/policies\/cla\//;
+            const regex = /I hereby agree to the terms of the CLA available at: https:\/\/docs.databend.com\/dev\/policies\/cla\//;
             if (!regex.test(body)) {
               core.setFailed('CLA is not signed');
+              core.setOutput('cla', 'not-signed');
+            } else {
+              core.setOutput('cla', 'signed');
             }
       - name: Delete Comment
-        if: success()
+        if: always() && steps.check.outputs.cla == 'signed'
         uses: everpcpc/comment-on-pr-action@v1
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          identifier: 'pr-assistant-cla'
+          token: ${{ github.token }}
+          identifier: "pr-assistant-cla"
           delete: true
       - name: Comment on PR
-        if: failure()
+        if: always() && steps.check.outputs.cla == 'not-signed'
         uses: everpcpc/comment-on-pr-action@v1
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          identifier: 'pr-assistant-cla'
+          token: ${{ github.token }}
+          identifier: "pr-assistant-cla"
           body: |
-            Pull request description must contain [CLA](https://databend.rs/doc/contributing/good-pr) like the following:
+            Pull request description must contain [CLA](https://docs.databend.com/dev/policies/cla/) like the following:
 
             ```
-            I hereby agree to the terms of the CLA available at: https://databend.rs/dev/policies/cla/
+            I hereby agree to the terms of the CLA available at: https://docs.databend.com/dev/policies/cla/
 
             ## Summary
 
@@ -138,3 +105,47 @@ jobs:
 
             - Close #issue
             ```
+
+  description:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check PR description checkbox
+        uses: actions/github-script@v7
+        id: check
+        with:
+          script: |
+            const script = require('./.github/scripts/check_pr_description.js')
+            await script({ context, core })
+      - name: Delete Comment for Tests
+        if: always() && steps.check.outputs.tests == 'checked'
+        uses: everpcpc/comment-on-pr-action@v1
+        with:
+          token: ${{ github.token }}
+          identifier: "pr-assistant-description-tests"
+          delete: true
+      - name: Delete Comment for Changes
+        if: always() && steps.check.outputs.changes == 'checked'
+        uses: everpcpc/comment-on-pr-action@v1
+        with:
+          token: ${{ github.token }}
+          identifier: "pr-assistant-description-changes"
+          delete: true
+      - name: Comment on PR for Tests
+        if: always() && steps.check.outputs.tests != 'checked'
+        uses: everpcpc/comment-on-pr-action@v1
+        with:
+          token: ${{ github.token }}
+          identifier: "pr-assistant-description-tests"
+          body: |
+            At least one test kind must be checked in the PR description.
+            @${{ github.event.pull_request.user.login }} please update it 🙏.
+      - name: Comment on PR for Changes
+        if: always() && steps.check.outputs.changes != 'checked'
+        uses: everpcpc/comment-on-pr-action@v1
+        with:
+          token: ${{ github.token }}
+          identifier: "pr-assistant-description-changes"
+          body: |
+            At least one type of change must be checked in the PR description.
+            @${{ github.event.pull_request.user.login }} please update it 🙏.

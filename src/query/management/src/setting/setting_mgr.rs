@@ -14,97 +14,94 @@
 
 use std::sync::Arc;
 
-use common_exception::ErrorCode;
-use common_exception::Result;
-use common_meta_app::principal::UserSetting;
-use common_meta_kvapi::kvapi;
-use common_meta_kvapi::kvapi::UpsertKVReq;
-use common_meta_types::IntoSeqV;
-use common_meta_types::MatchSeq;
-use common_meta_types::MatchSeqExt;
-use common_meta_types::MetaError;
-use common_meta_types::Operation;
-use common_meta_types::SeqV;
-
-use crate::setting::SettingApi;
-
-static USER_SETTING_API_KEY_PREFIX: &str = "__fd_settings";
+use databend_common_exception::Result;
+use databend_common_meta_app::principal::SettingIdent;
+use databend_common_meta_app::principal::UserSetting;
+use databend_common_meta_app::tenant::Tenant;
+use databend_common_meta_kvapi::kvapi;
+use databend_common_meta_kvapi::kvapi::Key;
+use databend_common_meta_types::seq_value::SeqV;
+use databend_common_meta_types::seq_value::SeqValue;
+use databend_common_meta_types::MetaError;
+use databend_common_meta_types::UpsertKV;
+use futures::TryStreamExt;
 
 pub struct SettingMgr {
     kv_api: Arc<dyn kvapi::KVApi<Error = MetaError>>,
-    setting_prefix: String,
+    tenant: Tenant,
 }
 
 impl SettingMgr {
-    #[allow(dead_code)]
-    pub fn create(kv_api: Arc<dyn kvapi::KVApi<Error = MetaError>>, tenant: &str) -> Result<Self> {
-        Ok(SettingMgr {
+    pub fn create(kv_api: Arc<dyn kvapi::KVApi<Error = MetaError>>, tenant: &Tenant) -> Self {
+        SettingMgr {
             kv_api,
-            setting_prefix: format!("{}/{}", USER_SETTING_API_KEY_PREFIX, tenant),
-        })
+            tenant: tenant.clone(),
+        }
+    }
+
+    fn setting_ident(&self, name: &str) -> SettingIdent {
+        SettingIdent::new(self.tenant.clone(), name)
+    }
+
+    fn setting_key(&self, name: &str) -> String {
+        self.setting_ident(name).to_string_key()
+    }
+
+    fn setting_prefix(&self) -> String {
+        self.setting_ident("").to_string_key()
     }
 }
 
-#[async_trait::async_trait]
-impl SettingApi for SettingMgr {
+// TODO: do not use json for setting value
+impl SettingMgr {
     #[async_backtrace::framed]
-    async fn set_setting(&self, setting: UserSetting) -> Result<u64> {
+    #[fastrace::trace]
+    pub async fn set_setting(&self, setting: UserSetting) -> Result<u64> {
         // Upsert.
-        let seq = MatchSeq::GE(0);
-        let val = Operation::Update(serde_json::to_vec(&setting)?);
-        let key = format!("{}/{}", self.setting_prefix, setting.name);
-        let upsert = self
-            .kv_api
-            .upsert_kv(UpsertKVReq::new(&key, seq, val, None));
+        let val = serde_json::to_vec(&setting)?;
+        let key = self.setting_key(&setting.name);
+        let upsert = self.kv_api.upsert_kv(UpsertKV::update(&key, &val));
 
-        let res = upsert.await?.added_or_else(|v| v);
-
-        match res {
-            Ok(added) => Ok(added.seq),
-            Err(existing) => Ok(existing.seq),
-        }
+        let (_prev, curr) = upsert.await?.unpack();
+        let res_seq = curr.seq();
+        Ok(res_seq)
     }
 
     #[async_backtrace::framed]
-    async fn get_settings(&self) -> Result<Vec<UserSetting>> {
-        let values = self.kv_api.prefix_list_kv(&self.setting_prefix).await?;
+    #[fastrace::trace]
+    pub async fn get_settings(&self) -> Result<Vec<UserSetting>> {
+        let prefix = self.setting_prefix();
+        let mut strm = self.kv_api.list_kv(&prefix).await?;
 
-        let mut settings = Vec::with_capacity(values.len());
-        for (_, value) in values {
-            let setting = serde_json::from_slice::<UserSetting>(&value.data)?;
+        let mut settings = Vec::new();
+        while let Some(item) = strm.try_next().await? {
+            let setting: UserSetting = serde_json::from_slice(&item.value.unwrap().data)?;
             settings.push(setting);
         }
+
         Ok(settings)
     }
 
     #[async_backtrace::framed]
-    async fn get_setting(&self, name: &str, seq: MatchSeq) -> Result<SeqV<UserSetting>> {
-        let key = format!("{}/{}", self.setting_prefix, name);
-        let kv_api = self.kv_api.clone();
-        let get_kv = async move { kv_api.get_kv(&key).await };
-        let res = get_kv.await?;
-        let seq_value =
-            res.ok_or_else(|| ErrorCode::UnknownVariable(format!("Unknown setting {}", name)))?;
+    #[fastrace::trace]
+    pub async fn get_setting(&self, name: &str) -> Result<Option<SeqV<UserSetting>>> {
+        let key = self.setting_key(name);
+        let res = self.kv_api.get_kv(&key).await?;
 
-        match seq.match_seq(&seq_value) {
-            Ok(_) => Ok(seq_value.into_seqv()?),
-            Err(_) => Err(ErrorCode::UnknownVariable(format!(
-                "Unknown setting {}",
-                name
-            ))),
-        }
+        let Some(seqv) = res else {
+            return Ok(None);
+        };
+
+        let seqv = seqv.try_map(|d| d.try_into())?;
+        Ok(Some(seqv))
     }
 
     #[async_backtrace::framed]
-    async fn try_drop_setting(&self, name: &str, seq: MatchSeq) -> Result<()> {
-        let key = format!("{}/{}", self.setting_prefix, name);
-        let kv_api = self.kv_api.clone();
-        let upsert_kv = async move {
-            kv_api
-                .upsert_kv(UpsertKVReq::new(&key, seq, Operation::Delete, None))
-                .await
-        };
-        upsert_kv.await?;
+    #[fastrace::trace]
+    pub async fn try_drop_setting(&self, name: &str) -> Result<()> {
+        let key = self.setting_key(name);
+        let _res = self.kv_api.upsert_kv(UpsertKV::delete(&key)).await?;
+
         Ok(())
     }
 }

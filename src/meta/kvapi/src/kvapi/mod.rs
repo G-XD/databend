@@ -13,20 +13,33 @@
 // limitations under the License.
 
 mod api;
+mod dir_name;
 mod helper;
+mod item;
 mod key;
 mod key_builder;
+mod key_codec;
 mod key_parser;
 mod message;
+mod pair;
 mod prefix;
 mod test_suite;
+mod value;
+mod value_with_name;
+
+pub(crate) mod testing;
 
 pub use api::ApiBuilder;
 pub use api::AsKVApi;
 pub use api::KVApi;
+pub use api::KVStream;
+pub use dir_name::DirName;
+pub use item::Item;
+pub use item::NonEmptyItem;
 pub use key::Key;
 pub use key::KeyError;
 pub use key_builder::KeyBuilder;
+pub use key_codec::KeyCodec;
 pub use key_parser::KeyParser;
 pub use message::GetKVReply;
 pub use message::GetKVReq;
@@ -35,6 +48,10 @@ pub use message::ListKVReq;
 pub use message::MGetKVReply;
 pub use message::MGetKVReq;
 pub use message::UpsertKVReply;
-pub use message::UpsertKVReq;
+pub use pair::BasicPair;
+pub use pair::Pair;
+pub use pair::SeqPair;
 pub use prefix::prefix_to_range;
 pub use test_suite::TestSuite;
+pub use value::Value;
+pub use value_with_name::ValueWithName;

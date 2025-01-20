@@ -13,16 +13,25 @@
 // limitations under the License.
 
 mod aggregate_rewriter;
-mod aggregating_index_rewriter;
+mod aggregating_index_visitor;
+mod async_function_rewriter;
+mod count_set_ops;
 mod distinct_to_groupby;
 mod grouping_check;
 mod lowering;
 mod name_resolution;
 mod type_check;
+mod udf_rewriter;
+mod view_rewriter;
+mod virtual_column_rewriter;
 mod window_check;
 
 pub use aggregate_rewriter::AggregateRewriter;
-pub use aggregating_index_rewriter::AggregatingIndexRewriter;
+pub use aggregating_index_visitor::AggregatingIndexChecker;
+pub use aggregating_index_visitor::AggregatingIndexRewriter;
+pub use aggregating_index_visitor::RefreshAggregatingIndexRewriter;
+pub(crate) use async_function_rewriter::AsyncFunctionRewriter;
+pub use count_set_ops::CountSetOps;
 pub use distinct_to_groupby::DistinctToGroupBy;
 pub use grouping_check::GroupingChecker;
 pub use lowering::*;
@@ -30,10 +39,17 @@ pub use name_resolution::compare_table_name;
 pub use name_resolution::normalize_identifier;
 pub use name_resolution::IdentifierNormalizer;
 pub use name_resolution::NameResolutionContext;
+pub use name_resolution::NameResolutionSuggest;
+pub use name_resolution::VariableNormalizer;
 pub use type_check::resolve_type_name;
 pub use type_check::resolve_type_name_by_str;
+pub use type_check::resolve_type_name_udf;
 pub use type_check::validate_function_arg;
 pub use type_check::TypeChecker;
+pub(crate) use udf_rewriter::UdfRewriter;
+pub use view_rewriter::ViewRewriter;
+pub(crate) use virtual_column_rewriter::VirtualColumnRewriter;
 pub use window_check::WindowChecker;
 
-pub(crate) const SUPPORTED_AGGREGATING_INDEX_FUNCTIONS: [&str; 4] = ["sum", "min", "max", "avg"];
+pub(crate) const SUPPORTED_AGGREGATING_INDEX_FUNCTIONS: [&str; 6] =
+    ["sum", "min", "max", "avg", "count", "approx_count_distinct"];

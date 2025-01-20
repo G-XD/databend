@@ -15,38 +15,44 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use common_ast::ast::WindowDefinition;
-use common_ast::ast::WindowSpec;
-use common_exception::ErrorCode;
-use common_exception::Result;
-use common_exception::Span;
+use databend_common_ast::ast::WindowDefinition;
+use databend_common_ast::ast::WindowSpec;
+use databend_common_ast::Span;
+use databend_common_exception::ErrorCode;
+use databend_common_exception::Result;
 
 use super::select::SelectList;
+use crate::binder::ColumnBinding;
 use crate::binder::ColumnBindingBuilder;
 use crate::optimizer::SExpr;
+use crate::plans::walk_expr_mut;
 use crate::plans::AggregateFunction;
 use crate::plans::BoundColumnRef;
-use crate::plans::CastExpr;
-use crate::plans::FunctionCall;
+use crate::plans::EvalScalar;
 use crate::plans::LagLeadFunction;
-use crate::plans::LambdaFunc;
 use crate::plans::NthValueFunction;
 use crate::plans::ScalarExpr;
 use crate::plans::ScalarItem;
+use crate::plans::Sort;
+use crate::plans::SortItem;
+use crate::plans::SubqueryExpr;
+use crate::plans::VisitorMut;
 use crate::plans::Window;
 use crate::plans::WindowFunc;
 use crate::plans::WindowFuncFrame;
 use crate::plans::WindowFuncType;
 use crate::plans::WindowOrderBy;
+use crate::plans::WindowPartition;
 use crate::BindContext;
 use crate::Binder;
+use crate::ColumnEntry;
+use crate::DerivedColumn;
 use crate::IndexType;
 use crate::MetadataRef;
 use crate::Visibility;
 
 impl Binder {
-    #[async_backtrace::framed]
-    pub(super) async fn bind_window_function(
+    pub(super) fn bind_window_function(
         &mut self,
         window_info: &WindowFunctionInfo,
         child: SExpr,
@@ -59,6 +65,74 @@ impl Binder {
             partition_by: window_info.partition_by_items.clone(),
             order_by: window_info.order_by_items.clone(),
             frame: window_info.frame.clone(),
+            limit: None,
+        };
+
+        // eval scalars before sort
+        // Generate a `EvalScalar` as the input of `Window`.
+        let mut scalar_items: Vec<ScalarItem> = Vec::new();
+        for arg in &window_plan.arguments {
+            scalar_items.push(arg.clone());
+        }
+        for part in &window_plan.partition_by {
+            scalar_items.push(part.clone());
+        }
+        for order in &window_plan.order_by {
+            scalar_items.push(order.order_by_item.clone())
+        }
+
+        let child = if !scalar_items.is_empty() {
+            let eval_scalar_plan = EvalScalar {
+                items: scalar_items,
+            };
+            SExpr::create_unary(Arc::new(eval_scalar_plan.into()), Arc::new(child))
+        } else {
+            child
+        };
+
+        let default_nulls_first = self.ctx.get_settings().get_nulls_first();
+
+        let mut sort_items: Vec<SortItem> = vec![];
+        if !window_plan.partition_by.is_empty() {
+            for part in window_plan.partition_by.iter() {
+                sort_items.push(SortItem {
+                    index: part.index,
+                    asc: true,
+                    nulls_first: default_nulls_first(true),
+                });
+            }
+        }
+
+        for order in window_plan.order_by.iter() {
+            let asc = order.asc.unwrap_or(true);
+            sort_items.push(SortItem {
+                index: order.order_by_item.index,
+                asc,
+                nulls_first: order
+                    .nulls_first
+                    .unwrap_or_else(|| default_nulls_first(asc)),
+            });
+        }
+
+        let child = if !sort_items.is_empty() {
+            let sort_plan = Sort {
+                items: sort_items,
+                limit: None,
+                after_exchange: None,
+                pre_projection: None,
+                window_partition: if window_plan.partition_by.is_empty() {
+                    None
+                } else {
+                    Some(WindowPartition {
+                        partition_by: window_plan.partition_by.clone(),
+                        top: None,
+                        func: window_plan.function.clone(),
+                    })
+                },
+            };
+            SExpr::create_unary(Arc::new(sort_plan.into()), Arc::new(child))
+        } else {
+            child
         };
 
         Ok(SExpr::create_unary(
@@ -195,11 +269,25 @@ pub struct WindowInfo {
     pub window_functions_map: HashMap<String, usize>,
 }
 
+impl WindowInfo {
+    pub fn reorder(&mut self) {
+        self.window_functions
+            .sort_by(|a, b| b.order_by_items.len().cmp(&a.order_by_items.len()));
+
+        self.window_functions_map.clear();
+        for (i, window) in self.window_functions.iter().enumerate() {
+            self.window_functions_map
+                .insert(window.display_name.clone(), i);
+        }
+    }
+}
+
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct WindowFunctionInfo {
     pub span: Span,
     pub index: IndexType,
     pub func: WindowFuncType,
+    pub display_name: String,
     pub arguments: Vec<ScalarItem>,
     pub partition_by_items: Vec<ScalarItem>,
     pub order_by_items: Vec<WindowOrderByInfo>,
@@ -216,8 +304,6 @@ pub struct WindowOrderByInfo {
 pub(super) struct WindowRewriter<'a> {
     pub bind_context: &'a mut BindContext,
     pub metadata: MetadataRef,
-    // While analyzing in-window aggregate function, we can replace it with a BoundColumnRef
-    in_window: bool,
 }
 
 impl<'a> WindowRewriter<'a> {
@@ -225,109 +311,10 @@ impl<'a> WindowRewriter<'a> {
         Self {
             bind_context,
             metadata,
-            in_window: false,
         }
     }
 
-    pub fn visit(&mut self, scalar: &ScalarExpr) -> Result<ScalarExpr> {
-        match scalar {
-            ScalarExpr::BoundColumnRef(_) => Ok(scalar.clone()),
-            ScalarExpr::ConstantExpr(_) => Ok(scalar.clone()),
-            ScalarExpr::FunctionCall(func) => {
-                let new_args = func
-                    .arguments
-                    .iter()
-                    .map(|arg| self.visit(arg))
-                    .collect::<Result<Vec<_>>>()?;
-                Ok(FunctionCall {
-                    span: func.span,
-                    func_name: func.func_name.clone(),
-                    params: func.params.clone(),
-                    arguments: new_args,
-                }
-                .into())
-            }
-            ScalarExpr::CastExpr(cast) => Ok(CastExpr {
-                span: cast.span,
-                is_try: cast.is_try,
-                argument: Box::new(self.visit(&cast.argument)?),
-                target_type: cast.target_type.clone(),
-            }
-            .into()),
-
-            // TODO(leiysky): should we recursively process subquery here?
-            ScalarExpr::SubqueryExpr(_) => Ok(scalar.clone()),
-
-            ScalarExpr::AggregateFunction(agg_func) => {
-                if self.in_window {
-                    if let Some(index) = self
-                        .bind_context
-                        .aggregate_info
-                        .aggregate_functions_map
-                        .get(&agg_func.display_name)
-                    {
-                        let agg = &self.bind_context.aggregate_info.aggregate_functions[*index];
-                        let column_binding = ColumnBindingBuilder::new(
-                            agg_func.display_name.clone(),
-                            agg.index,
-                            agg_func.return_type.clone(),
-                            Visibility::Visible,
-                        )
-                        .build();
-                        Ok(BoundColumnRef {
-                            span: None,
-                            column: column_binding,
-                        }
-                        .into())
-                    } else {
-                        Err(ErrorCode::BadArguments("Invalid window function argument"))
-                    }
-                } else {
-                    let new_args = agg_func
-                        .args
-                        .iter()
-                        .map(|arg| self.visit(arg))
-                        .collect::<Result<Vec<_>>>()?;
-                    Ok(AggregateFunction {
-                        func_name: agg_func.func_name.clone(),
-                        distinct: agg_func.distinct,
-                        params: agg_func.params.clone(),
-                        args: new_args,
-                        return_type: agg_func.return_type.clone(),
-                        display_name: agg_func.display_name.clone(),
-                    }
-                    .into())
-                }
-            }
-
-            ScalarExpr::WindowFunction(window) => {
-                self.in_window = true;
-                let scalar = self.replace_window_function(window)?;
-                self.in_window = false;
-                Ok(scalar)
-            }
-
-            ScalarExpr::LambdaFunction(lambda_func) => {
-                let new_args = lambda_func
-                    .args
-                    .iter()
-                    .map(|arg| self.visit(arg))
-                    .collect::<Result<Vec<_>>>()?;
-                Ok(LambdaFunc {
-                    span: lambda_func.span,
-                    func_name: lambda_func.func_name.clone(),
-                    display_name: lambda_func.display_name.clone(),
-                    args: new_args,
-                    params: lambda_func.params.clone(),
-                    lambda_expr: lambda_func.lambda_expr.clone(),
-                    return_type: lambda_func.return_type.clone(),
-                }
-                .into())
-            }
-        }
-    }
-
-    fn replace_window_function(&mut self, window: &WindowFunc) -> Result<ScalarExpr> {
+    fn replace_window_function(&mut self, window: &WindowFunc) -> Result<WindowFunc> {
         let mut replaced_partition_items: Vec<ScalarExpr> =
             Vec::with_capacity(window.partition_by.len());
         let mut replaced_order_by_items: Vec<WindowOrderBy> =
@@ -340,7 +327,9 @@ impl<'a> WindowRewriter<'a> {
                 // resolve aggregate function args in window function.
                 let mut replaced_args: Vec<ScalarExpr> = Vec::with_capacity(agg.args.len());
                 for (i, arg) in agg.args.iter().enumerate() {
-                    let arg = self.visit(arg)?;
+                    let mut arg = arg.clone();
+                    let mut aggregate_rewriter = self.as_window_aggregate_rewriter();
+                    aggregate_rewriter.visit(&mut arg)?;
                     let name = format!("{window_func_name}_arg_{i}");
                     let replaced_arg = self.replace_expr(&name, &arg)?;
                     window_args.push(ScalarItem {
@@ -350,6 +339,7 @@ impl<'a> WindowRewriter<'a> {
                     replaced_args.push(replaced_arg.into());
                 }
                 WindowFuncType::Aggregate(AggregateFunction {
+                    span: agg.span,
                     display_name: agg.display_name.clone(),
                     func_name: agg.func_name.clone(),
                     distinct: agg.distinct,
@@ -371,7 +361,9 @@ impl<'a> WindowRewriter<'a> {
                 })
             }
             WindowFuncType::NthValue(func) => {
-                let arg = self.visit(&func.arg)?;
+                let mut arg = (*func.arg).clone();
+                let mut aggregate_rewriter = self.as_window_aggregate_rewriter();
+                aggregate_rewriter.visit(&mut arg)?;
                 let name = format!("{window_func_name}_arg");
                 let replaced_arg = self.replace_expr(&name, &arg)?;
                 window_args.push(ScalarItem {
@@ -382,6 +374,7 @@ impl<'a> WindowRewriter<'a> {
                     n: func.n,
                     arg: Box::new(replaced_arg.into()),
                     return_type: func.return_type.clone(),
+                    ignore_null: func.ignore_null,
                 })
             }
             func => func.clone(),
@@ -390,7 +383,9 @@ impl<'a> WindowRewriter<'a> {
         // resolve partition by
         let mut partition_by_items = vec![];
         for (i, part) in window.partition_by.iter().enumerate() {
-            let part = self.visit(part)?;
+            let mut part = part.clone();
+            let mut aggregate_rewriter = self.as_window_aggregate_rewriter();
+            aggregate_rewriter.visit(&mut part)?;
             let name = format!("{window_func_name}_part_{i}");
             let replaced_part = self.replace_expr(&name, &part)?;
             partition_by_items.push(ScalarItem {
@@ -402,8 +397,11 @@ impl<'a> WindowRewriter<'a> {
 
         // resolve order by
         let mut order_by_items = vec![];
+
         for (i, order) in window.order_by.iter().enumerate() {
-            let order_expr = self.visit(&order.expr)?;
+            let mut order_expr = order.expr.clone();
+            let mut aggregate_rewriter = self.as_window_aggregate_rewriter();
+            aggregate_rewriter.visit(&mut order_expr)?;
             let name = format!("{window_func_name}_order_{i}");
             let replaced_order = self.replace_expr(&name, &order_expr)?;
             order_by_items.push(WindowOrderByInfo {
@@ -421,15 +419,17 @@ impl<'a> WindowRewriter<'a> {
             });
         }
 
-        let index = self
-            .metadata
-            .write()
-            .add_derived_column(window.display_name.clone(), window.func.return_type());
+        let index = self.metadata.write().add_derived_column(
+            window.display_name.clone(),
+            window.func.return_type(),
+            Some(ScalarExpr::WindowFunction(window.clone())),
+        );
 
         // create window info
         let window_info = WindowFunctionInfo {
             span: window.span,
             index,
+            display_name: window.display_name.clone(),
             func: func.clone(),
             arguments: window_args,
             partition_by_items,
@@ -437,14 +437,17 @@ impl<'a> WindowRewriter<'a> {
             frame: window.frame.clone(),
         };
 
-        let window_infos = &mut self.bind_context.windows;
         // push window info to BindContext
+        let window_infos = &mut self.bind_context.windows;
         window_infos.window_functions.push(window_info);
         window_infos.window_functions_map.insert(
             window.display_name.clone(),
             window_infos.window_functions.len() - 1,
         );
 
+        // we want the window with more order by items resolve firstly
+        // thus we can eliminate some useless order by items
+        window_infos.reorder();
         let replaced_window = WindowFunc {
             span: window.span,
             display_name: window.display_name.clone(),
@@ -454,7 +457,7 @@ impl<'a> WindowRewriter<'a> {
             frame: window.frame.clone(),
         };
 
-        Ok(replaced_window.into())
+        Ok(replaced_window)
     }
 
     fn replace_lag_lead_args(
@@ -463,7 +466,9 @@ impl<'a> WindowRewriter<'a> {
         window_func_name: &String,
         f: &LagLeadFunction,
     ) -> Result<(ScalarExpr, Option<Box<ScalarExpr>>)> {
-        let arg = self.visit(&f.arg)?;
+        let mut arg = (*f.arg).clone();
+        let mut aggregate_rewriter = self.as_window_aggregate_rewriter();
+        aggregate_rewriter.visit(&mut arg)?;
         let name = format!("{window_func_name}_arg");
         let replaced_arg = self.replace_expr(&name, &arg)?;
         window_args.push(ScalarItem {
@@ -473,7 +478,9 @@ impl<'a> WindowRewriter<'a> {
         let new_default = match &f.default {
             None => None,
             Some(d) => {
-                let d = self.visit(d)?;
+                let mut d = (**d).clone();
+                let mut aggregate_rewriter = self.as_window_aggregate_rewriter();
+                aggregate_rewriter.visit(&mut d)?;
                 let name = format!("{window_func_name}_default_value");
                 let replaced_default = self.replace_expr(&name, &d)?;
                 window_args.push(ScalarItem {
@@ -483,6 +490,7 @@ impl<'a> WindowRewriter<'a> {
                 Some(Box::new(replaced_default.into()))
             }
         };
+
         Ok((replaced_arg.into(), new_default))
     }
 
@@ -490,11 +498,39 @@ impl<'a> WindowRewriter<'a> {
         if let ScalarExpr::BoundColumnRef(col) = &arg {
             Ok(col.clone())
         } else {
+            for entry in self.metadata.read().columns() {
+                if let ColumnEntry::DerivedColumn(DerivedColumn {
+                    scalar_expr,
+                    alias,
+                    column_index,
+                    data_type,
+                    ..
+                }) = entry
+                {
+                    if scalar_expr.as_ref() == Some(arg) {
+                        // Generate a ColumnBinding for each argument of aggregates
+                        let column = ColumnBindingBuilder::new(
+                            alias.to_string(),
+                            *column_index,
+                            Box::new(data_type.clone()),
+                            Visibility::Visible,
+                        )
+                        .build();
+
+                        return Ok(BoundColumnRef {
+                            span: arg.span(),
+                            column,
+                        });
+                    }
+                }
+            }
             let ty = arg.data_type()?;
-            let index = self
-                .metadata
-                .write()
-                .add_derived_column(name.to_string(), ty.clone());
+
+            let index = self.metadata.write().add_derived_column(
+                name.to_string(),
+                ty.clone(),
+                Some(arg.clone()),
+            );
 
             // Generate a ColumnBinding for each argument of aggregates
             let column = ColumnBindingBuilder::new(
@@ -510,6 +546,102 @@ impl<'a> WindowRewriter<'a> {
             })
         }
     }
+
+    pub fn as_window_aggregate_rewriter(&self) -> WindowAggregateRewriter {
+        WindowAggregateRewriter {
+            bind_context: self.bind_context,
+        }
+    }
+}
+
+impl<'a> VisitorMut<'a> for WindowRewriter<'a> {
+    fn visit(&mut self, expr: &'a mut ScalarExpr) -> Result<()> {
+        if let ScalarExpr::WindowFunction(window) = expr {
+            *expr = {
+                let window_infos = &self.bind_context.windows;
+
+                if let Some(column) =
+                    find_replaced_window_function(window_infos, window, &window.display_name)
+                {
+                    BoundColumnRef { span: None, column }.into()
+                } else {
+                    self.replace_window_function(window)?.into()
+                }
+            };
+            return Ok(());
+        }
+        walk_expr_mut(self, expr)
+    }
+    fn visit_window_function(&mut self, window: &'a mut WindowFunc) -> Result<()> {
+        *window = self.replace_window_function(window)?;
+        Ok(())
+    }
+
+    fn visit_subquery_expr(&mut self, _: &'a mut SubqueryExpr) -> Result<()> {
+        // TODO(leiysky): should we recursively process subquery here?
+        Ok(())
+    }
+}
+
+pub struct WindowAggregateRewriter<'a> {
+    pub bind_context: &'a BindContext,
+}
+
+impl<'a> VisitorMut<'a> for WindowAggregateRewriter<'a> {
+    fn visit(&mut self, expr: &'a mut ScalarExpr) -> Result<()> {
+        if let ScalarExpr::AggregateFunction(agg_func) = expr {
+            let Some(agg) = self
+                .bind_context
+                .aggregate_info
+                .get_aggregate_function(&agg_func.display_name)
+            else {
+                return Err(ErrorCode::BadArguments("Invalid window function argument"));
+            };
+
+            let column_binding = ColumnBindingBuilder::new(
+                agg_func.display_name.clone(),
+                agg.index,
+                agg_func.return_type.clone(),
+                Visibility::Visible,
+            )
+            .build();
+
+            *expr = BoundColumnRef {
+                span: None,
+                column: column_binding,
+            }
+            .into();
+
+            return Ok(());
+        }
+
+        walk_expr_mut(self, expr)
+    }
+}
+
+/// Replace [`WindowFunction`] with a [`ColumnBinding`] if the function is already replaced.
+pub fn find_replaced_window_function(
+    window_info: &WindowInfo,
+    window: &WindowFunc,
+    new_name: &str,
+) -> Option<ColumnBinding> {
+    window_info
+        .window_functions_map
+        .get(&window.display_name)
+        .map(|i| {
+            let window_func_info = &window_info.window_functions[*i];
+            debug_assert_eq!(
+                window_func_info.func.return_type(),
+                window.func.return_type()
+            );
+            ColumnBindingBuilder::new(
+                new_name.to_string(),
+                window_func_info.index,
+                Box::new(window.func.return_type()),
+                Visibility::Visible,
+            )
+            .build()
+        })
 }
 
 impl Binder {
@@ -520,10 +652,9 @@ impl Binder {
         bind_context: &mut BindContext,
         select_list: &mut SelectList,
     ) -> Result<()> {
+        let mut rewriter = WindowRewriter::new(bind_context, self.metadata.clone());
         for item in select_list.items.iter_mut() {
-            let mut rewriter = WindowRewriter::new(bind_context, self.metadata.clone());
-            let new_scalar = rewriter.visit(&item.scalar)?;
-            item.scalar = new_scalar;
+            rewriter.visit(&mut item.scalar)?;
         }
 
         Ok(())

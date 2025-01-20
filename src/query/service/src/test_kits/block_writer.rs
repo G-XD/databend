@@ -13,27 +13,27 @@
 // limitations under the License.
 
 use chrono::Utc;
-use common_arrow::parquet::metadata::ThriftFileMetaData;
-use common_exception::Result;
-use common_expression::DataBlock;
-use common_expression::FunctionContext;
-use common_expression::TableSchemaRef;
-use common_io::constants::DEFAULT_BLOCK_BUFFER_SIZE;
-use common_io::constants::DEFAULT_BLOCK_INDEX_BUFFER_SIZE;
-use common_sql::BloomIndexColumns;
-use common_storages_fuse::io::serialize_block;
-use common_storages_fuse::io::TableMetaLocationGenerator;
-use common_storages_fuse::io::WriteSettings;
-use common_storages_fuse::FuseStorageFormat;
+use databend_common_exception::Result;
+use databend_common_expression::DataBlock;
+use databend_common_expression::FunctionContext;
+use databend_common_expression::TableSchemaRef;
+use databend_common_io::constants::DEFAULT_BLOCK_BUFFER_SIZE;
+use databend_common_io::constants::DEFAULT_BLOCK_INDEX_BUFFER_SIZE;
+use databend_common_sql::BloomIndexColumns;
+use databend_common_storages_fuse::io::serialize_block;
+use databend_common_storages_fuse::io::TableMetaLocationGenerator;
+use databend_common_storages_fuse::io::WriteSettings;
+use databend_common_storages_fuse::FuseStorageFormat;
+use databend_storages_common_blocks::blocks_to_parquet;
+use databend_storages_common_index::BloomIndex;
+use databend_storages_common_table_meta::meta::BlockMeta;
+use databend_storages_common_table_meta::meta::ClusterStatistics;
+use databend_storages_common_table_meta::meta::Compression;
+use databend_storages_common_table_meta::meta::Location;
+use databend_storages_common_table_meta::meta::StatisticsOfColumns;
+use databend_storages_common_table_meta::table::TableCompression;
 use opendal::Operator;
-use storages_common_blocks::blocks_to_parquet;
-use storages_common_index::BloomIndex;
-use storages_common_table_meta::meta::BlockMeta;
-use storages_common_table_meta::meta::ClusterStatistics;
-use storages_common_table_meta::meta::Compression;
-use storages_common_table_meta::meta::Location;
-use storages_common_table_meta::meta::StatisticsOfColumns;
-use storages_common_table_meta::table::TableCompression;
+use parquet::format::FileMetaData;
 use uuid::Uuid;
 
 pub struct BlockWriter<'a> {
@@ -59,7 +59,7 @@ impl<'a> BlockWriter<'a> {
         block: DataBlock,
         col_stats: StatisticsOfColumns,
         cluster_stats: Option<ClusterStatistics>,
-    ) -> Result<(BlockMeta, Option<ThriftFileMetaData>)> {
+    ) -> Result<(BlockMeta, Option<FileMetaData>)> {
         let (location, block_id) = self.location_generator.gen_block_location();
 
         let data_accessor = &self.data_accessor;
@@ -75,7 +75,8 @@ impl<'a> BlockWriter<'a> {
         };
 
         let mut buf = Vec::with_capacity(DEFAULT_BLOCK_BUFFER_SIZE);
-        let (file_size, col_metas) = serialize_block(&write_settings, schema, block, &mut buf)?;
+        let col_metas = serialize_block(&write_settings, schema, block, &mut buf)?;
+        let file_size = buf.len() as u64;
 
         data_accessor.write(&location.0, buf).await?;
 
@@ -89,6 +90,7 @@ impl<'a> BlockWriter<'a> {
             location,
             bloom_filter_index_location,
             bloom_filter_index_size,
+            None,
             Compression::Lz4Raw,
             Some(Utc::now()),
         );
@@ -101,7 +103,7 @@ impl<'a> BlockWriter<'a> {
         schema: TableSchemaRef,
         block: &DataBlock,
         block_id: Uuid,
-    ) -> Result<(u64, Option<Location>, Option<ThriftFileMetaData>)> {
+    ) -> Result<(u64, Option<Location>, Option<FileMetaData>)> {
         let location = self
             .location_generator
             .block_bloom_index_location(&block_id);
@@ -112,7 +114,7 @@ impl<'a> BlockWriter<'a> {
         let maybe_bloom_index = BloomIndex::try_create(
             FunctionContext::default(),
             location.1,
-            &[block],
+            block,
             bloom_columns_map,
         )?;
         if let Some(bloom_index) = maybe_bloom_index {
@@ -120,12 +122,13 @@ impl<'a> BlockWriter<'a> {
             let filter_schema = bloom_index.filter_schema;
             let mut data = Vec::with_capacity(DEFAULT_BLOCK_INDEX_BUFFER_SIZE);
             let index_block_schema = &filter_schema;
-            let (size, meta) = blocks_to_parquet(
+            let meta = blocks_to_parquet(
                 index_block_schema,
                 vec![index_block],
                 &mut data,
                 TableCompression::None,
             )?;
+            let size = data.len() as u64;
             data_accessor.write(&location.0, data).await?;
             Ok((size, Some(location), Some(meta)))
         } else {

@@ -12,74 +12,109 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::borrow::Cow;
+use std::collections::BTreeSet;
 use std::collections::HashSet;
+use std::iter::once;
 use std::sync::Arc;
 
 use bstr::ByteSlice;
-use chrono::Datelike;
-use common_arrow::arrow::temporal_conversions::EPOCH_DAYS_FROM_CE;
-use common_expression::types::date::string_to_date;
-use common_expression::types::nullable::NullableColumn;
-use common_expression::types::nullable::NullableDomain;
-use common_expression::types::number::*;
-use common_expression::types::string::StringColumnBuilder;
-use common_expression::types::timestamp::string_to_timestamp;
-use common_expression::types::variant::cast_scalar_to_variant;
-use common_expression::types::variant::cast_scalars_to_variants;
-use common_expression::types::AnyType;
-use common_expression::types::BooleanType;
-use common_expression::types::DataType;
-use common_expression::types::DateType;
-use common_expression::types::GenericType;
-use common_expression::types::NullableType;
-use common_expression::types::NumberDataType;
-use common_expression::types::NumberType;
-use common_expression::types::StringType;
-use common_expression::types::TimestampType;
-use common_expression::types::VariantType;
-use common_expression::types::ALL_NUMERICS_TYPES;
-use common_expression::utils::arrow::constant_bitmap;
-use common_expression::vectorize_1_arg;
-use common_expression::vectorize_with_builder_1_arg;
-use common_expression::vectorize_with_builder_2_arg;
-use common_expression::with_number_mapped_type;
-use common_expression::Column;
-use common_expression::ColumnBuilder;
-use common_expression::EvalContext;
-use common_expression::Function;
-use common_expression::FunctionDomain;
-use common_expression::FunctionEval;
-use common_expression::FunctionRegistry;
-use common_expression::FunctionSignature;
-use common_expression::Scalar;
-use common_expression::ScalarRef;
-use common_expression::Value;
-use common_expression::ValueRef;
+use databend_common_expression::types::binary::BinaryColumnBuilder;
+use databend_common_expression::types::date::string_to_date;
+use databend_common_expression::types::nullable::NullableColumn;
+use databend_common_expression::types::nullable::NullableColumnBuilder;
+use databend_common_expression::types::nullable::NullableDomain;
+use databend_common_expression::types::number::*;
+use databend_common_expression::types::string::StringColumnBuilder;
+use databend_common_expression::types::timestamp::string_to_timestamp;
+use databend_common_expression::types::variant::cast_scalar_to_variant;
+use databend_common_expression::types::variant::cast_scalars_to_variants;
+use databend_common_expression::types::AnyType;
+use databend_common_expression::types::ArrayType;
+use databend_common_expression::types::Bitmap;
+use databend_common_expression::types::BooleanType;
+use databend_common_expression::types::DataType;
+use databend_common_expression::types::DateType;
+use databend_common_expression::types::GenericType;
+use databend_common_expression::types::MutableBitmap;
+use databend_common_expression::types::NullableType;
+use databend_common_expression::types::NumberDataType;
+use databend_common_expression::types::NumberType;
+use databend_common_expression::types::StringType;
+use databend_common_expression::types::TimestampType;
+use databend_common_expression::types::VariantType;
+use databend_common_expression::types::ALL_NUMERICS_TYPES;
+use databend_common_expression::vectorize_1_arg;
+use databend_common_expression::vectorize_with_builder_1_arg;
+use databend_common_expression::vectorize_with_builder_2_arg;
+use databend_common_expression::vectorize_with_builder_3_arg;
+use databend_common_expression::with_number_mapped_type;
+use databend_common_expression::Column;
+use databend_common_expression::ColumnBuilder;
+use databend_common_expression::Domain;
+use databend_common_expression::EvalContext;
+use databend_common_expression::Function;
+use databend_common_expression::FunctionDomain;
+use databend_common_expression::FunctionEval;
+use databend_common_expression::FunctionRegistry;
+use databend_common_expression::FunctionSignature;
+use databend_common_expression::Scalar;
+use databend_common_expression::ScalarRef;
+use databend_common_expression::Value;
+use jiff::civil::date;
+use jiff::Unit;
+use jsonb::array_distinct;
+use jsonb::array_except;
+use jsonb::array_insert;
+use jsonb::array_intersection;
 use jsonb::array_length;
+use jsonb::array_overlap;
 use jsonb::as_bool;
 use jsonb::as_f64;
 use jsonb::as_i64;
 use jsonb::as_str;
+use jsonb::build_array;
 use jsonb::build_object;
+use jsonb::concat;
+use jsonb::contains;
+use jsonb::delete_by_index;
+use jsonb::delete_by_keypath;
+use jsonb::delete_by_name;
+use jsonb::exists_all_keys;
+use jsonb::exists_any_keys;
 use jsonb::get_by_index;
+use jsonb::get_by_keypath;
 use jsonb::get_by_name;
 use jsonb::get_by_path;
 use jsonb::get_by_path_array;
 use jsonb::get_by_path_first;
 use jsonb::is_array;
+use jsonb::is_boolean;
+use jsonb::is_f64;
+use jsonb::is_i64;
+use jsonb::is_null;
 use jsonb::is_object;
+use jsonb::is_string;
 use jsonb::jsonpath::parse_json_path;
+use jsonb::jsonpath::JsonPath;
+use jsonb::keypath::parse_key_paths;
 use jsonb::object_keys;
 use jsonb::parse_value;
+use jsonb::path_exists;
+use jsonb::path_match;
+use jsonb::strip_nulls;
 use jsonb::to_bool;
 use jsonb::to_f64;
 use jsonb::to_i64;
+use jsonb::to_pretty_string;
 use jsonb::to_str;
 use jsonb::to_string;
 use jsonb::to_u64;
+use jsonb::type_of;
 
 pub fn register(registry: &mut FunctionRegistry) {
     registry.register_aliases("json_object_keys", &["object_keys"]);
+    registry.register_aliases("to_string", &["json_to_string"]);
 
     registry.register_passthrough_nullable_1_arg::<VariantType, VariantType, _, _>(
         "parse_json",
@@ -98,7 +133,11 @@ pub fn register(registry: &mut FunctionRegistry) {
                     value.write_to_vec(&mut output.data);
                 }
                 Err(err) => {
-                    ctx.set_error(output.len(), err.to_string());
+                    if ctx.func_ctx.disable_variant_check {
+                        output.put_str("");
+                    } else {
+                        ctx.set_error(output.len(), err.to_string());
+                    }
                 }
             }
             output.commit_row();
@@ -115,12 +154,16 @@ pub fn register(registry: &mut FunctionRegistry) {
                     return;
                 }
             }
-            match parse_value(s) {
+            match parse_value(s.as_bytes()) {
                 Ok(value) => {
                     value.write_to_vec(&mut output.data);
                 }
                 Err(err) => {
-                    ctx.set_error(output.len(), err.to_string());
+                    if ctx.func_ctx.disable_variant_check {
+                        output.put_str("");
+                    } else {
+                        ctx.set_error(output.len(), err.to_string());
+                    }
                 }
             }
             output.commit_row();
@@ -160,7 +203,7 @@ pub fn register(registry: &mut FunctionRegistry) {
                     return;
                 }
             }
-            match parse_value(s) {
+            match parse_value(s.as_bytes()) {
                 Ok(value) => {
                     output.validity.push(true);
                     value.write_to_vec(&mut output.builder.data);
@@ -185,7 +228,7 @@ pub fn register(registry: &mut FunctionRegistry) {
             let val = to_string(s);
             match parse_value(val.as_bytes()) {
                 Ok(_) => output.push_null(),
-                Err(e) => output.push(e.to_string().as_bytes()),
+                Err(e) => output.push(&e.to_string()),
             }
         }),
     );
@@ -200,9 +243,9 @@ pub fn register(registry: &mut FunctionRegistry) {
                     return;
                 }
             }
-            match parse_value(s) {
+            match parse_value(s.as_bytes()) {
                 Ok(_) => output.push_null(),
-                Err(e) => output.push(e.to_string().as_bytes()),
+                Err(e) => output.push(&e.to_string()),
             }
         }),
     );
@@ -223,9 +266,55 @@ pub fn register(registry: &mut FunctionRegistry) {
         }),
     );
 
+    registry.register_function_factory("get_by_keypath", |_, args_type| {
+        if args_type.len() != 2 {
+            return None;
+        }
+        if (args_type[0].remove_nullable() != DataType::Variant && args_type[0] != DataType::Null)
+            || (args_type[1].remove_nullable() != DataType::String
+                && args_type[1] != DataType::Null)
+        {
+            return None;
+        }
+        Some(Arc::new(Function {
+            signature: FunctionSignature {
+                name: "get_by_keypath".to_string(),
+                args_type: args_type.to_vec(),
+                return_type: DataType::Nullable(Box::new(DataType::Variant)),
+            },
+            eval: FunctionEval::Scalar {
+                calc_domain: Box::new(|_, _| FunctionDomain::MayThrow),
+                eval: Box::new(|args, ctx| get_by_keypath_fn(args, ctx, false)),
+            },
+        }))
+    });
+
+    registry.register_function_factory("get_by_keypath_string", |_, args_type| {
+        if args_type.len() != 2 {
+            return None;
+        }
+        if (args_type[0].remove_nullable() != DataType::Variant && args_type[0] != DataType::Null)
+            || (args_type[1].remove_nullable() != DataType::String
+                && args_type[1] != DataType::Null)
+        {
+            return None;
+        }
+        Some(Arc::new(Function {
+            signature: FunctionSignature {
+                name: "get_by_keypath_string".to_string(),
+                args_type: args_type.to_vec(),
+                return_type: DataType::Nullable(Box::new(DataType::String)),
+            },
+            eval: FunctionEval::Scalar {
+                calc_domain: Box::new(|_, _| FunctionDomain::MayThrow),
+                eval: Box::new(|args, ctx| get_by_keypath_fn(args, ctx, true)),
+            },
+        }))
+    });
+
     registry.register_combine_nullable_2_arg::<VariantType, StringType, VariantType, _, _>(
         "get",
-        |_, _, _| FunctionDomain::MayThrow,
+        |_, _, _| FunctionDomain::Full,
         vectorize_with_builder_2_arg::<VariantType, StringType, NullableType<VariantType>>(
             |val, name, output, ctx| {
                 if let Some(validity) = &ctx.validity {
@@ -234,24 +323,11 @@ pub fn register(registry: &mut FunctionRegistry) {
                         return;
                     }
                 }
-                match std::str::from_utf8(name) {
-                    Ok(name) => match get_by_name(val, name, false) {
-                        Some(v) => {
-                            output.push(&v);
-                        }
-                        None => {
-                            output.push_null();
-                        }
-                    },
-                    Err(err) => {
-                        ctx.set_error(
-                            output.len(),
-                            format!(
-                                "Unable convert name '{}' to string: {}",
-                                &String::from_utf8_lossy(name),
-                                err
-                            ),
-                        );
+                match get_by_name(val, name, false) {
+                    Some(v) => {
+                        output.push(&v);
+                    }
+                    None => {
                         output.push_null();
                     }
                 }
@@ -270,7 +346,7 @@ pub fn register(registry: &mut FunctionRegistry) {
                         return;
                     }
                 }
-                if idx < 0 || idx > i32::MAX.into() {
+                if idx < 0 || idx > i32::MAX as i64 {
                     output.push_null();
                 } else {
                     match get_by_index(val, idx as usize) {
@@ -288,7 +364,7 @@ pub fn register(registry: &mut FunctionRegistry) {
 
     registry.register_combine_nullable_2_arg::<VariantType, StringType, VariantType, _, _>(
         "get_ignore_case",
-        |_, _, _| FunctionDomain::MayThrow,
+        |_, _, _| FunctionDomain::Full,
         vectorize_with_builder_2_arg::<VariantType, StringType, NullableType<VariantType>>(
             |val, name, output, ctx| {
                 if let Some(validity) = &ctx.validity {
@@ -297,21 +373,58 @@ pub fn register(registry: &mut FunctionRegistry) {
                         return;
                     }
                 }
-                match std::str::from_utf8(name) {
-                    Ok(name) => match get_by_name(val, name, true) {
-                        Some(v) => output.push(&v),
-                        None => output.push_null(),
-                    },
-                    Err(err) => {
-                        ctx.set_error(
-                            output.len(),
-                            format!(
-                                "Unable convert name '{}' to string: {}",
-                                &String::from_utf8_lossy(name),
-                                err
-                            ),
-                        );
+                match get_by_name(val, name, true) {
+                    Some(v) => output.push(&v),
+                    None => output.push_null(),
+                }
+            },
+        ),
+    );
+
+    registry.register_combine_nullable_2_arg::<VariantType, StringType, StringType, _, _>(
+        "get_string",
+        |_, _, _| FunctionDomain::Full,
+        vectorize_with_builder_2_arg::<VariantType, StringType, NullableType<StringType>>(
+            |val, name, output, ctx| {
+                if let Some(validity) = &ctx.validity {
+                    if !validity.get_bit(output.len()) {
                         output.push_null();
+                        return;
+                    }
+                }
+                match get_by_name(val, name, false) {
+                    Some(v) => {
+                        let json_str = cast_to_string(&v);
+                        output.push(&json_str);
+                    }
+                    None => output.push_null(),
+                }
+            },
+        ),
+    );
+
+    registry.register_combine_nullable_2_arg::<VariantType, Int64Type, StringType, _, _>(
+        "get_string",
+        |_, _, _| FunctionDomain::Full,
+        vectorize_with_builder_2_arg::<VariantType, Int64Type, NullableType<StringType>>(
+            |val, idx, output, ctx| {
+                if let Some(validity) = &ctx.validity {
+                    if !validity.get_bit(output.len()) {
+                        output.push_null();
+                        return;
+                    }
+                }
+                if idx < 0 || idx > i32::MAX as i64 {
+                    output.push_null();
+                } else {
+                    match get_by_index(val, idx as usize) {
+                        Some(v) => {
+                            let json_str = cast_to_string(&v);
+                            output.push(&json_str);
+                        }
+                        None => {
+                            output.push_null();
+                        }
                     }
                 }
             },
@@ -329,25 +442,32 @@ pub fn register(registry: &mut FunctionRegistry) {
                         return;
                     }
                 }
-                match parse_json_path(path) {
+                match parse_json_path(path.as_bytes()) {
                     Ok(json_path) => {
-                        get_by_path_array(
+                        match get_by_path_array(
                             val,
                             json_path,
                             &mut output.builder.data,
                             &mut output.builder.offsets,
-                        );
-                        if output.builder.offsets.len() == output.len() + 1 {
-                            output.push_null();
-                        } else {
-                            output.validity.push(true);
+                        ) {
+                            Ok(()) => {
+                                if output.builder.offsets.len() == output.len() + 1 {
+                                    output.push_null();
+                                } else {
+                                    output.validity.push(true);
+                                }
+                            }
+                            Err(_) => {
+                                ctx.set_error(
+                                    output.len(),
+                                    format!("Invalid JSONB value '0x{}'", hex::encode(val)),
+                                );
+                                output.push_null();
+                            }
                         }
                     }
                     Err(_) => {
-                        ctx.set_error(
-                            output.len(),
-                            format!("Invalid JSON Path '{}'", &String::from_utf8_lossy(path),),
-                        );
+                        ctx.set_error(output.len(), format!("Invalid JSON Path '{path}'"));
                         output.push_null();
                     }
                 }
@@ -366,31 +486,86 @@ pub fn register(registry: &mut FunctionRegistry) {
                         return;
                     }
                 }
-                match parse_json_path(path) {
+                match parse_json_path(path.as_bytes()) {
                     Ok(json_path) => {
-                        get_by_path_first(
+                        match get_by_path_first(
                             val,
                             json_path,
                             &mut output.builder.data,
                             &mut output.builder.offsets,
-                        );
-                        if output.builder.offsets.len() == output.len() + 1 {
-                            output.push_null();
-                        } else {
-                            output.validity.push(true);
+                        ) {
+                            Ok(()) => {
+                                if output.builder.offsets.len() == output.len() + 1 {
+                                    output.push_null();
+                                } else {
+                                    output.validity.push(true);
+                                }
+                            }
+                            Err(_) => {
+                                ctx.set_error(
+                                    output.len(),
+                                    format!("Invalid JSONB value '0x{}'", hex::encode(val)),
+                                );
+                                output.push_null();
+                            }
                         }
                     }
                     Err(_) => {
-                        ctx.set_error(
-                            output.len(),
-                            format!("Invalid JSON Path '{}'", &String::from_utf8_lossy(path),),
-                        );
+                        ctx.set_error(output.len(), format!("Invalid JSON Path '{path}'"));
                         output.push_null();
                     }
                 }
             },
         ),
     );
+
+    registry.register_function_factory("json_path_match", |_, args_type| {
+        if args_type.len() != 2 {
+            return None;
+        }
+        if (args_type[0].remove_nullable() != DataType::Variant && args_type[0] != DataType::Null)
+            || (args_type[1].remove_nullable() != DataType::String
+                && args_type[1] != DataType::Null)
+        {
+            return None;
+        }
+        Some(Arc::new(Function {
+            signature: FunctionSignature {
+                name: "json_path_match".to_string(),
+                args_type: args_type.to_vec(),
+                return_type: DataType::Nullable(Box::new(DataType::Boolean)),
+            },
+            eval: FunctionEval::Scalar {
+                calc_domain: Box::new(|_, _| FunctionDomain::MayThrow),
+                eval: Box::new(|args, ctx| path_predicate_fn(args, ctx, path_match)),
+            },
+        }))
+    });
+
+    registry.register_function_factory("json_path_exists", |_, args_type| {
+        if args_type.len() != 2 {
+            return None;
+        }
+        if (args_type[0].remove_nullable() != DataType::Variant && args_type[0] != DataType::Null)
+            || (args_type[1].remove_nullable() != DataType::String
+                && args_type[1] != DataType::Null)
+        {
+            return None;
+        }
+        Some(Arc::new(Function {
+            signature: FunctionSignature {
+                name: "json_path_exists".to_string(),
+                args_type: args_type.to_vec(),
+                return_type: DataType::Nullable(Box::new(DataType::Boolean)),
+            },
+            eval: FunctionEval::Scalar {
+                calc_domain: Box::new(|_, _| FunctionDomain::Full),
+                eval: Box::new(|args, ctx| {
+                    path_predicate_fn(args, ctx, |json, path| path_exists(json, path))
+                }),
+            },
+        }))
+    });
 
     registry.register_combine_nullable_2_arg::<VariantType, StringType, VariantType, _, _>(
         "get_path",
@@ -403,25 +578,32 @@ pub fn register(registry: &mut FunctionRegistry) {
                         return;
                     }
                 }
-                match parse_json_path(path) {
+                match parse_json_path(path.as_bytes()) {
                     Ok(json_path) => {
-                        get_by_path(
+                        match get_by_path(
                             val,
                             json_path,
                             &mut output.builder.data,
                             &mut output.builder.offsets,
-                        );
-                        if output.builder.offsets.len() == output.len() + 1 {
-                            output.push_null();
-                        } else {
-                            output.validity.push(true);
+                        ) {
+                            Ok(()) => {
+                                if output.builder.offsets.len() == output.len() + 1 {
+                                    output.push_null();
+                                } else {
+                                    output.validity.push(true);
+                                }
+                            }
+                            Err(_) => {
+                                ctx.set_error(
+                                    output.len(),
+                                    format!("Invalid JSONB value '0x{}'", hex::encode(val)),
+                                );
+                                output.push_null();
+                            }
                         }
                     }
                     Err(_) => {
-                        ctx.set_error(
-                            output.len(),
-                            format!("Invalid JSON Path '{}'", &String::from_utf8_lossy(path),),
-                        );
+                        ctx.set_error(output.len(), format!("Invalid JSON Path '{path}'"));
                         output.push_null();
                     }
                 }
@@ -440,32 +622,34 @@ pub fn register(registry: &mut FunctionRegistry) {
                         return;
                     }
                 }
-                match parse_value(s) {
+                match parse_value(s.as_bytes()) {
                     Ok(val) => {
                         let mut buf = Vec::new();
                         val.write_to_vec(&mut buf);
-                        match parse_json_path(path) {
+                        match parse_json_path(path.as_bytes()) {
                             Ok(json_path) => {
                                 let mut out_buf = Vec::new();
                                 let mut out_offsets = Vec::new();
-                                get_by_path(&buf, json_path, &mut out_buf, &mut out_offsets);
-                                if out_offsets.is_empty() {
-                                    output.push_null();
-                                } else {
-                                    let json_str = to_string(&out_buf);
-                                    output.builder.put(json_str.as_bytes());
-                                    output.builder.commit_row();
-                                    output.validity.push(true);
+                                match get_by_path(&buf, json_path, &mut out_buf, &mut out_offsets) {
+                                    Ok(()) => {
+                                        if out_offsets.is_empty() {
+                                            output.push_null();
+                                        } else {
+                                            let json_str = cast_to_string(&out_buf);
+                                            output.push(&json_str);
+                                        }
+                                    }
+                                    Err(_) => {
+                                        ctx.set_error(
+                                            output.len(),
+                                            format!("Invalid JSONB value '0x{}'", hex::encode(buf)),
+                                        );
+                                        output.push_null();
+                                    }
                                 }
                             }
                             Err(_) => {
-                                ctx.set_error(
-                                    output.len(),
-                                    format!(
-                                        "Invalid JSON Path '{}'",
-                                        &String::from_utf8_lossy(path),
-                                    ),
-                                );
+                                ctx.set_error(output.len(), format!("Invalid JSON Path '{path}'"));
                                 output.push_null();
                             }
                         }
@@ -541,7 +725,7 @@ pub fn register(registry: &mut FunctionRegistry) {
                 }
             }
             match as_str(v) {
-                Some(val) => output.push(val.as_bytes()),
+                Some(val) => output.push(&val),
                 None => output.push_null(),
             }
         }),
@@ -583,42 +767,195 @@ pub fn register(registry: &mut FunctionRegistry) {
         }),
     );
 
-    registry.register_passthrough_nullable_1_arg::<GenericType<0>, VariantType, _, _>(
-        "to_variant",
+    registry.register_passthrough_nullable_1_arg::<VariantType, BooleanType, _, _>(
+        "is_null_value",
         |_, _| FunctionDomain::Full,
-        |val, ctx| match val {
-            ValueRef::Scalar(scalar) => {
-                let mut buf = Vec::new();
-                cast_scalar_to_variant(scalar, ctx.func_ctx.tz, &mut buf);
-                Value::Scalar(buf)
+        vectorize_with_builder_1_arg::<VariantType, BooleanType>(|val, output, ctx| {
+            if let Some(validity) = &ctx.validity {
+                if !validity.get_bit(output.len()) {
+                    output.push(false);
+                    return;
+                }
             }
-            ValueRef::Column(col) => {
-                let new_col = cast_scalars_to_variants(col.iter(), ctx.func_ctx.tz);
-                Value::Column(new_col)
-            }
-        },
+            output.push(is_null(val));
+        }),
     );
+
+    registry.register_passthrough_nullable_1_arg::<VariantType, BooleanType, _, _>(
+        "is_boolean",
+        |_, _| FunctionDomain::Full,
+        vectorize_with_builder_1_arg::<VariantType, BooleanType>(|val, output, ctx| {
+            if let Some(validity) = &ctx.validity {
+                if !validity.get_bit(output.len()) {
+                    output.push(false);
+                    return;
+                }
+            }
+            output.push(is_boolean(val));
+        }),
+    );
+
+    registry.register_passthrough_nullable_1_arg::<VariantType, BooleanType, _, _>(
+        "is_integer",
+        |_, _| FunctionDomain::Full,
+        vectorize_with_builder_1_arg::<VariantType, BooleanType>(|val, output, ctx| {
+            if let Some(validity) = &ctx.validity {
+                if !validity.get_bit(output.len()) {
+                    output.push(false);
+                    return;
+                }
+            }
+            output.push(is_i64(val));
+        }),
+    );
+
+    registry.register_passthrough_nullable_1_arg::<VariantType, BooleanType, _, _>(
+        "is_float",
+        |_, _| FunctionDomain::Full,
+        vectorize_with_builder_1_arg::<VariantType, BooleanType>(|val, output, ctx| {
+            if let Some(validity) = &ctx.validity {
+                if !validity.get_bit(output.len()) {
+                    output.push(false);
+                    return;
+                }
+            }
+            output.push(is_f64(val));
+        }),
+    );
+
+    registry.register_passthrough_nullable_1_arg::<VariantType, BooleanType, _, _>(
+        "is_string",
+        |_, _| FunctionDomain::Full,
+        vectorize_with_builder_1_arg::<VariantType, BooleanType>(|val, output, ctx| {
+            if let Some(validity) = &ctx.validity {
+                if !validity.get_bit(output.len()) {
+                    output.push(false);
+                    return;
+                }
+            }
+            output.push(is_string(val));
+        }),
+    );
+
+    registry.register_passthrough_nullable_1_arg::<VariantType, BooleanType, _, _>(
+        "is_array",
+        |_, _| FunctionDomain::Full,
+        vectorize_with_builder_1_arg::<VariantType, BooleanType>(|val, output, ctx| {
+            if let Some(validity) = &ctx.validity {
+                if !validity.get_bit(output.len()) {
+                    output.push(false);
+                    return;
+                }
+            }
+            output.push(is_array(val));
+        }),
+    );
+
+    registry.register_passthrough_nullable_1_arg::<VariantType, BooleanType, _, _>(
+        "is_object",
+        |_, _| FunctionDomain::Full,
+        vectorize_with_builder_1_arg::<VariantType, BooleanType>(|val, output, ctx| {
+            if let Some(validity) = &ctx.validity {
+                if !validity.get_bit(output.len()) {
+                    output.push(false);
+                    return;
+                }
+            }
+            output.push(is_object(val));
+        }),
+    );
+
+    registry.register_function_factory("to_variant", |_, args_type| {
+        if args_type.len() != 1 {
+            return None;
+        }
+        let return_type = if args_type[0].is_nullable_or_null() {
+            DataType::Nullable(Box::new(DataType::Variant))
+        } else {
+            DataType::Variant
+        };
+
+        Some(Arc::new(Function {
+            signature: FunctionSignature {
+                name: "to_variant".to_string(),
+                args_type: vec![DataType::Generic(0)],
+                return_type,
+            },
+            eval: FunctionEval::Scalar {
+                calc_domain: Box::new(|_, args_domain| match &args_domain[0] {
+                    Domain::Nullable(nullable_domain) => {
+                        FunctionDomain::Domain(Domain::Nullable(NullableDomain {
+                            has_null: nullable_domain.has_null,
+                            value: Some(Box::new(Domain::Undefined)),
+                        }))
+                    }
+                    _ => FunctionDomain::Domain(Domain::Undefined),
+                }),
+                eval: Box::new(|args, ctx| match &args[0] {
+                    Value::Scalar(scalar) => match scalar {
+                        Scalar::Null => Value::Scalar(Scalar::Null),
+                        _ => {
+                            let mut buf = Vec::new();
+                            cast_scalar_to_variant(
+                                scalar.as_ref(),
+                                &ctx.func_ctx.jiff_tz,
+                                &mut buf,
+                            );
+                            Value::Scalar(Scalar::Variant(buf))
+                        }
+                    },
+                    Value::Column(col) => {
+                        let validity = match col {
+                            Column::Null { len } => Some(Bitmap::new_constant(false, *len)),
+                            Column::Nullable(box ref nullable_column) => {
+                                Some(nullable_column.validity.clone())
+                            }
+                            _ => None,
+                        };
+                        let new_col = cast_scalars_to_variants(col.iter(), &ctx.func_ctx.jiff_tz);
+                        if let Some(validity) = validity {
+                            Value::Column(NullableColumn::new_column(
+                                Column::Variant(new_col),
+                                validity,
+                            ))
+                        } else {
+                            Value::Column(Column::Variant(new_col))
+                        }
+                    }
+                }),
+            },
+        }))
+    });
 
     registry.register_combine_nullable_1_arg::<GenericType<0>, VariantType, _, _>(
         "try_to_variant",
-        |_, _| {
+        |_, domain| {
+            let has_null = match domain {
+                Domain::Nullable(nullable_domain) => nullable_domain.has_null,
+                _ => false,
+            };
             FunctionDomain::Domain(NullableDomain {
-                has_null: false,
+                has_null,
                 value: Some(Box::new(())),
             })
         },
         |val, ctx| match val {
-            ValueRef::Scalar(scalar) => {
-                let mut buf = Vec::new();
-                cast_scalar_to_variant(scalar, ctx.func_ctx.tz, &mut buf);
-                Value::Scalar(Some(buf))
-            }
-            ValueRef::Column(col) => {
-                let new_col = cast_scalars_to_variants(col.iter(), ctx.func_ctx.tz);
-                Value::Column(NullableColumn {
-                    validity: constant_bitmap(true, new_col.len()).into(),
-                    column: new_col,
-                })
+            Value::Scalar(scalar) => match scalar {
+                Scalar::Null => Value::Scalar(None),
+                _ => {
+                    let mut buf = Vec::new();
+                    cast_scalar_to_variant(scalar.as_ref(), &ctx.func_ctx.jiff_tz, &mut buf);
+                    Value::Scalar(Some(buf))
+                }
+            },
+            Value::Column(col) => {
+                let validity = match col {
+                    Column::Null { len } => Bitmap::new_constant(false, len),
+                    Column::Nullable(box ref nullable_column) => nullable_column.validity.clone(),
+                    _ => Bitmap::new_constant(true, col.len()),
+                };
+                let new_col = cast_scalars_to_variants(col.iter(), &ctx.func_ctx.jiff_tz);
+                Value::Column(NullableColumn::new(new_col, validity))
             }
         },
     );
@@ -666,7 +1003,7 @@ pub fn register(registry: &mut FunctionRegistry) {
 
     registry.register_passthrough_nullable_1_arg::<VariantType, StringType, _, _>(
         "to_string",
-        |_, _| FunctionDomain::MayThrow,
+        |_, _| FunctionDomain::Full,
         vectorize_with_builder_1_arg::<VariantType, StringType>(|val, output, ctx| {
             if let Some(validity) = &ctx.validity {
                 if !validity.get_bit(output.len()) {
@@ -674,13 +1011,8 @@ pub fn register(registry: &mut FunctionRegistry) {
                     return;
                 }
             }
-            match to_str(val) {
-                Ok(value) => output.put_slice(value.as_bytes()),
-                Err(err) => {
-                    ctx.set_error(output.len(), err.to_string());
-                }
-            }
-            output.commit_row();
+            let json_str = cast_to_string(val);
+            output.put_and_commit(json_str);
         }),
     );
 
@@ -695,14 +1027,8 @@ pub fn register(registry: &mut FunctionRegistry) {
                         return;
                     }
                 }
-                match to_str(val) {
-                    Ok(value) => {
-                        output.validity.push(true);
-                        output.builder.put_slice(value.as_bytes());
-                        output.builder.commit_row();
-                    }
-                    Err(_) => output.push_null(),
-                }
+                let json_str = cast_to_string(val);
+                output.push(&json_str);
             },
         ),
     );
@@ -717,8 +1043,27 @@ pub fn register(registry: &mut FunctionRegistry) {
                     return;
                 }
             }
-            match as_str(val).and_then(|val| string_to_date(val.as_bytes(), ctx.func_ctx.tz.tz)) {
-                Some(d) => output.push(d.num_days_from_ce() - EPOCH_DAYS_FROM_CE),
+            let val = as_str(val);
+            match val {
+                Some(val) => match string_to_date(val.as_bytes(), &ctx.func_ctx.jiff_tz) {
+                    Ok(d) => match d.since((Unit::Day, date(1970, 1, 1))) {
+                        Ok(s) => output.push(s.get_days()),
+                        Err(e) => {
+                            ctx.set_error(
+                                output.len(),
+                                format!("cannot parse to type `DATE`. {}", e),
+                            );
+                            output.push(0);
+                        }
+                    },
+                    Err(e) => {
+                        ctx.set_error(
+                            output.len(),
+                            format!("unable to cast to type `DATE`. {}", e),
+                        );
+                        output.push(0);
+                    }
+                },
                 None => {
                     ctx.set_error(output.len(), "unable to cast to type `DATE`");
                     output.push(0);
@@ -737,10 +1082,21 @@ pub fn register(registry: &mut FunctionRegistry) {
                     return;
                 }
             }
-            match as_str(val)
-                .and_then(|str_value| string_to_date(str_value.as_bytes(), ctx.func_ctx.tz.tz))
-            {
-                Some(date) => output.push(date.num_days_from_ce() - EPOCH_DAYS_FROM_CE),
+            let val = as_str(val);
+            match val {
+                Some(val) => match string_to_date(val.as_bytes(), &ctx.func_ctx.jiff_tz) {
+                    Ok(d) => match d.since((Unit::Day, date(1970, 1, 1))) {
+                        Ok(s) => output.push(s.get_days()),
+                        Err(e) => {
+                            ctx.set_error(
+                                output.len(),
+                                format!("cannot parse to type `DATE`. {}", e),
+                            );
+                            output.push(0);
+                        }
+                    },
+                    Err(_) => output.push_null(),
+                },
                 None => output.push_null(),
             }
         }),
@@ -756,10 +1112,18 @@ pub fn register(registry: &mut FunctionRegistry) {
                     return;
                 }
             }
-            match as_str(val)
-                .and_then(|val| string_to_timestamp(val.as_bytes(), ctx.func_ctx.tz.tz))
-            {
-                Some(ts) => output.push(ts.timestamp_micros()),
+            let val = as_str(val);
+            match val {
+                Some(val) => match string_to_timestamp(val.as_bytes(), &ctx.func_ctx.jiff_tz) {
+                    Ok(ts) => output.push(ts.timestamp().as_microsecond()),
+                    Err(e) => {
+                        ctx.set_error(
+                            output.len(),
+                            format!("unable to cast to type `TIMESTAMP`. {}", e),
+                        );
+                        output.push(0);
+                    }
+                },
                 None => {
                     ctx.set_error(output.len(), "unable to cast to type `TIMESTAMP`");
                     output.push(0);
@@ -779,16 +1143,17 @@ pub fn register(registry: &mut FunctionRegistry) {
                         return;
                     }
                 }
-                match as_str(val) {
-                    Some(str_val) => {
-                        let timestamp = string_to_timestamp(str_val.as_bytes(), ctx.func_ctx.tz.tz)
-                            .map(|ts| ts.timestamp_micros());
-                        match timestamp {
-                            Some(timestamp) => output.push(timestamp),
-                            None => output.push_null(),
+                let val = as_str(val);
+                match val {
+                    Some(val) => match string_to_timestamp(val.as_bytes(), &ctx.func_ctx.jiff_tz) {
+                        Ok(ts) => output.push(ts.timestamp().as_microsecond()),
+                        Err(_) => {
+                            output.push_null();
                         }
+                    },
+                    None => {
+                        output.push_null();
                     }
-                    None => output.push_null(),
                 }
             },
         ),
@@ -886,7 +1251,7 @@ pub fn register(registry: &mut FunctionRegistry) {
     }
 
     registry.register_passthrough_nullable_1_arg::<VariantType, StringType, _, _>(
-        "json_to_string",
+        "json_pretty",
         |_, _| FunctionDomain::Full,
         vectorize_with_builder_1_arg::<VariantType, StringType>(|val, output, ctx| {
             if let Some(validity) = &ctx.validity {
@@ -895,8 +1260,235 @@ pub fn register(registry: &mut FunctionRegistry) {
                     return;
                 }
             }
-            let s = to_string(val);
-            output.put_slice(s.as_bytes());
+            let s = to_pretty_string(val);
+            output.put_str(&s);
+            output.commit_row();
+        }),
+    );
+
+    registry.register_passthrough_nullable_1_arg(
+        "json_strip_nulls",
+        |_, _| FunctionDomain::MayThrow,
+        vectorize_with_builder_1_arg::<VariantType, VariantType>(|val, output, ctx| {
+            if let Some(validity) = &ctx.validity {
+                if !validity.get_bit(output.len()) {
+                    output.commit_row();
+                    return;
+                }
+            }
+            if let Err(err) = strip_nulls(val, &mut output.data) {
+                ctx.set_error(output.len(), err.to_string());
+            };
+            output.commit_row();
+        }),
+    );
+
+    registry.register_passthrough_nullable_2_arg(
+        "concat",
+        |_, _, _| FunctionDomain::MayThrow,
+        vectorize_with_builder_2_arg::<VariantType, VariantType, VariantType>(
+            |left, right, output, ctx| {
+                if let Some(validity) = &ctx.validity {
+                    if !validity.get_bit(output.len()) {
+                        output.commit_row();
+                        return;
+                    }
+                }
+                if let Err(err) = concat(left, right, &mut output.data) {
+                    ctx.set_error(output.len(), err.to_string());
+                };
+                output.commit_row();
+            },
+        ),
+    );
+
+    registry.register_passthrough_nullable_2_arg(
+        "minus",
+        |_, _, _| FunctionDomain::MayThrow,
+        vectorize_with_builder_2_arg::<VariantType, Int32Type, VariantType>(
+            |val, index, output, ctx| {
+                if let Some(validity) = &ctx.validity {
+                    if !validity.get_bit(output.len()) {
+                        output.commit_row();
+                        return;
+                    }
+                }
+                if let Err(err) = delete_by_index(val, index, &mut output.data) {
+                    ctx.set_error(output.len(), err.to_string());
+                };
+                output.commit_row();
+            },
+        ),
+    );
+
+    registry.register_passthrough_nullable_2_arg(
+        "minus",
+        |_, _, _| FunctionDomain::MayThrow,
+        vectorize_with_builder_2_arg::<VariantType, StringType, VariantType>(
+            |val, name, output, ctx| {
+                if let Some(validity) = &ctx.validity {
+                    if !validity.get_bit(output.len()) {
+                        output.commit_row();
+                        return;
+                    }
+                }
+                if let Err(err) = delete_by_name(val, name, &mut output.data) {
+                    ctx.set_error(output.len(), err.to_string());
+                };
+                output.commit_row();
+            },
+        ),
+    );
+
+    registry.register_passthrough_nullable_3_arg::<VariantType, Int32Type, VariantType, VariantType, _, _>(
+        "json_array_insert",
+        |_, _, _, _| FunctionDomain::MayThrow,
+        vectorize_with_builder_3_arg::<VariantType, Int32Type, VariantType, VariantType>(
+            |val, pos, new_val, output, ctx| {
+                if let Some(validity) = &ctx.validity {
+                    if !validity.get_bit(output.len()) {
+                        output.commit_row();
+                        return;
+                    }
+                }
+                match array_insert(val, pos, new_val, &mut output.data) {
+                    Ok(_) => {}
+                    Err(err) => {
+                        ctx.set_error(output.len(), err.to_string());
+                    }
+                }
+                output.commit_row();
+            },
+        ),
+    );
+
+    registry.register_passthrough_nullable_1_arg::<VariantType, VariantType, _, _>(
+        "json_array_distinct",
+        |_, _| FunctionDomain::MayThrow,
+        vectorize_with_builder_1_arg::<VariantType, VariantType>(|val, output, ctx| {
+            if let Some(validity) = &ctx.validity {
+                if !validity.get_bit(output.len()) {
+                    output.commit_row();
+                    return;
+                }
+            }
+            match array_distinct(val, &mut output.data) {
+                Ok(_) => {}
+                Err(err) => {
+                    ctx.set_error(output.len(), err.to_string());
+                }
+            }
+            output.commit_row();
+        }),
+    );
+
+    registry.register_passthrough_nullable_2_arg::<VariantType, VariantType, VariantType, _, _>(
+        "json_array_intersection",
+        |_, _, _| FunctionDomain::MayThrow,
+        vectorize_with_builder_2_arg::<VariantType, VariantType, VariantType>(
+            |val1, val2, output, ctx| {
+                if let Some(validity) = &ctx.validity {
+                    if !validity.get_bit(output.len()) {
+                        output.commit_row();
+                        return;
+                    }
+                }
+                match array_intersection(val1, val2, &mut output.data) {
+                    Ok(_) => {}
+                    Err(err) => {
+                        ctx.set_error(output.len(), err.to_string());
+                    }
+                }
+                output.commit_row();
+            },
+        ),
+    );
+
+    registry.register_passthrough_nullable_2_arg::<VariantType, VariantType, VariantType, _, _>(
+        "json_array_except",
+        |_, _, _| FunctionDomain::MayThrow,
+        vectorize_with_builder_2_arg::<VariantType, VariantType, VariantType>(
+            |val1, val2, output, ctx| {
+                if let Some(validity) = &ctx.validity {
+                    if !validity.get_bit(output.len()) {
+                        output.commit_row();
+                        return;
+                    }
+                }
+                match array_except(val1, val2, &mut output.data) {
+                    Ok(_) => {}
+                    Err(err) => {
+                        ctx.set_error(output.len(), err.to_string());
+                    }
+                }
+                output.commit_row();
+            },
+        ),
+    );
+
+    registry.register_passthrough_nullable_2_arg::<VariantType, VariantType, BooleanType, _, _>(
+        "json_array_overlap",
+        |_, _, _| FunctionDomain::MayThrow,
+        vectorize_with_builder_2_arg::<VariantType, VariantType, BooleanType>(
+            |val1, val2, output, ctx| {
+                if let Some(validity) = &ctx.validity {
+                    if !validity.get_bit(output.len()) {
+                        output.push(false);
+                        return;
+                    }
+                }
+                match array_overlap(val1, val2) {
+                    Ok(res) => {
+                        output.push(res);
+                    }
+                    Err(err) => {
+                        output.push(false);
+                        ctx.set_error(output.len(), err.to_string());
+                    }
+                }
+            },
+        ),
+    );
+
+    registry.register_function_factory("delete_by_keypath", |_, args_type| {
+        if args_type.len() != 2 {
+            return None;
+        }
+        if (args_type[0].remove_nullable() != DataType::Variant && args_type[0] != DataType::Null)
+            || (args_type[1].remove_nullable() != DataType::String
+                && args_type[1] != DataType::Null)
+        {
+            return None;
+        }
+        Some(Arc::new(Function {
+            signature: FunctionSignature {
+                name: "delete_by_keypath".to_string(),
+                args_type: args_type.to_vec(),
+                return_type: DataType::Nullable(Box::new(DataType::Variant)),
+            },
+            eval: FunctionEval::Scalar {
+                calc_domain: Box::new(|_, _| FunctionDomain::MayThrow),
+                eval: Box::new(delete_by_keypath_fn),
+            },
+        }))
+    });
+
+    registry.register_passthrough_nullable_1_arg(
+        "json_typeof",
+        |_, _| FunctionDomain::MayThrow,
+        vectorize_with_builder_1_arg::<VariantType, StringType>(|val, output, ctx| {
+            if let Some(validity) = &ctx.validity {
+                if !validity.get_bit(output.len()) {
+                    output.commit_row();
+                    return;
+                }
+            }
+            match type_of(val) {
+                Ok(result) => output.put_str(result),
+                Err(err) => {
+                    ctx.set_error(output.len(), err.to_string());
+                }
+            };
             output.commit_row();
         }),
     );
@@ -910,9 +1502,24 @@ pub fn register(registry: &mut FunctionRegistry) {
             },
             eval: FunctionEval::Scalar {
                 calc_domain: Box::new(|_, _| FunctionDomain::MayThrow),
-                eval: Box::new(move |args, ctx| json_object_fn(args, ctx, false)),
+                eval: Box::new(json_object_fn),
             },
         }))
+    });
+
+    registry.register_function_factory("try_json_object", |_, args_type| {
+        let f = Function {
+            signature: FunctionSignature {
+                name: "try_json_object".to_string(),
+                args_type: (0..args_type.len()).map(DataType::Generic).collect(),
+                return_type: DataType::Variant,
+            },
+            eval: FunctionEval::Scalar {
+                calc_domain: Box::new(|_, _| FunctionDomain::Full),
+                eval: Box::new(json_object_fn),
+            },
+        };
+        Some(Arc::new(f.error_to_null()))
     });
 
     registry.register_function_factory("json_object_keep_null", |_, args_type| {
@@ -924,46 +1531,280 @@ pub fn register(registry: &mut FunctionRegistry) {
             },
             eval: FunctionEval::Scalar {
                 calc_domain: Box::new(|_, _| FunctionDomain::MayThrow),
-                eval: Box::new(move |args, ctx| json_object_fn(args, ctx, true)),
+                eval: Box::new(json_object_keep_null_fn),
+            },
+        }))
+    });
+
+    registry.register_function_factory("try_json_object_keep_null", |_, args_type| {
+        let f = Function {
+            signature: FunctionSignature {
+                name: "try_json_object_keep_null".to_string(),
+                args_type: (0..args_type.len()).map(DataType::Generic).collect(),
+                return_type: DataType::Variant,
+            },
+            eval: FunctionEval::Scalar {
+                calc_domain: Box::new(|_, _| FunctionDomain::Full),
+                eval: Box::new(json_object_keep_null_fn),
+            },
+        };
+        Some(Arc::new(f.error_to_null()))
+    });
+
+    registry.register_function_factory("json_array", |_, args_type| {
+        Some(Arc::new(Function {
+            signature: FunctionSignature {
+                name: "json_array".to_string(),
+                args_type: (0..args_type.len()).map(DataType::Generic).collect(),
+                return_type: DataType::Variant,
+            },
+            eval: FunctionEval::Scalar {
+                calc_domain: Box::new(|_, _| FunctionDomain::MayThrow),
+                eval: Box::new(json_array_fn),
+            },
+        }))
+    });
+
+    registry.register_passthrough_nullable_2_arg(
+        "json_contains_in_left",
+        |_, _, _| FunctionDomain::Full,
+        vectorize_with_builder_2_arg::<VariantType, VariantType, BooleanType>(
+            |left, right, output, ctx| {
+                if let Some(validity) = &ctx.validity {
+                    if !validity.get_bit(output.len()) {
+                        output.push(false);
+                        return;
+                    }
+                }
+                let result = contains(left, right);
+                output.push(result);
+            },
+        ),
+    );
+
+    registry.register_passthrough_nullable_2_arg(
+        "json_contains_in_right",
+        |_, _, _| FunctionDomain::Full,
+        vectorize_with_builder_2_arg::<VariantType, VariantType, BooleanType>(
+            |left, right, output, ctx| {
+                if let Some(validity) = &ctx.validity {
+                    if !validity.get_bit(output.len()) {
+                        output.push(false);
+                        return;
+                    }
+                }
+                let result = contains(right, left);
+                output.push(result);
+            },
+        ),
+    );
+
+    registry.register_passthrough_nullable_2_arg(
+        "json_exists_any_keys",
+        |_, _, _| FunctionDomain::Full,
+        vectorize_with_builder_2_arg::<VariantType, ArrayType<StringType>, BooleanType>(
+            |val, keys, output, ctx| {
+                if let Some(validity) = &ctx.validity {
+                    if !validity.get_bit(output.len()) {
+                        output.push(false);
+                        return;
+                    }
+                }
+                let result = exists_any_keys(val, keys.iter().map(|k| k.as_bytes()));
+                output.push(result);
+            },
+        ),
+    );
+
+    registry.register_passthrough_nullable_2_arg(
+        "json_exists_all_keys",
+        |_, _, _| FunctionDomain::Full,
+        vectorize_with_builder_2_arg::<VariantType, ArrayType<StringType>, BooleanType>(
+            |val, keys, output, ctx| {
+                if let Some(validity) = &ctx.validity {
+                    if !validity.get_bit(output.len()) {
+                        output.push(false);
+                        return;
+                    }
+                }
+                let result = exists_all_keys(val, keys.iter().map(|k| k.as_bytes()));
+                output.push(result);
+            },
+        ),
+    );
+
+    registry.register_passthrough_nullable_2_arg(
+        "json_exists_key",
+        |_, _, _| FunctionDomain::Full,
+        vectorize_with_builder_2_arg::<VariantType, StringType, BooleanType>(
+            |val, key, output, ctx| {
+                if let Some(validity) = &ctx.validity {
+                    if !validity.get_bit(output.len()) {
+                        output.push(false);
+                        return;
+                    }
+                }
+                let result = exists_all_keys(val, once(key.as_bytes()));
+                output.push(result);
+            },
+        ),
+    );
+
+    registry.register_function_factory("json_object_insert", |_, args_type| {
+        if args_type.len() != 3 && args_type.len() != 4 {
+            return None;
+        }
+        if (args_type[0].remove_nullable() != DataType::Variant && args_type[0] != DataType::Null)
+            || (args_type[1].remove_nullable() != DataType::String
+                && args_type[1] != DataType::Null)
+        {
+            return None;
+        }
+        if args_type.len() == 4
+            && args_type[3].remove_nullable() != DataType::Boolean
+            && args_type[3] != DataType::Null
+        {
+            return None;
+        }
+        let is_nullable = args_type[0].is_nullable_or_null();
+        let return_type = if is_nullable {
+            DataType::Nullable(Box::new(DataType::Variant))
+        } else {
+            DataType::Variant
+        };
+        Some(Arc::new(Function {
+            signature: FunctionSignature {
+                name: "json_object_insert".to_string(),
+                args_type: args_type.to_vec(),
+                return_type,
+            },
+            eval: FunctionEval::Scalar {
+                calc_domain: Box::new(|_, _| FunctionDomain::MayThrow),
+                eval: Box::new(move |args, ctx| json_object_insert_fn(args, ctx, is_nullable)),
+            },
+        }))
+    });
+
+    registry.register_function_factory("json_object_pick", |_, args_type| {
+        if args_type.len() < 2 {
+            return None;
+        }
+        if args_type[0].remove_nullable() != DataType::Variant && args_type[0] != DataType::Null {
+            return None;
+        }
+        for arg_type in args_type.iter().skip(1) {
+            if arg_type.remove_nullable() != DataType::String && *arg_type != DataType::Null {
+                return None;
+            }
+        }
+        let is_nullable = args_type[0].is_nullable_or_null();
+        let return_type = if is_nullable {
+            DataType::Nullable(Box::new(DataType::Variant))
+        } else {
+            DataType::Variant
+        };
+        Some(Arc::new(Function {
+            signature: FunctionSignature {
+                name: "json_object_pick".to_string(),
+                args_type: args_type.to_vec(),
+                return_type,
+            },
+            eval: FunctionEval::Scalar {
+                calc_domain: Box::new(|_, _| FunctionDomain::MayThrow),
+                eval: Box::new(move |args, ctx| {
+                    json_object_pick_or_delete_fn(args, ctx, true, is_nullable)
+                }),
+            },
+        }))
+    });
+
+    registry.register_function_factory("json_object_delete", |_, args_type| {
+        if args_type.len() < 2 {
+            return None;
+        }
+        if args_type[0].remove_nullable() != DataType::Variant && args_type[0] != DataType::Null {
+            return None;
+        }
+        for arg_type in args_type.iter().skip(1) {
+            if arg_type.remove_nullable() != DataType::String && *arg_type != DataType::Null {
+                return None;
+            }
+        }
+        let is_nullable = args_type[0].is_nullable_or_null();
+        let return_type = if is_nullable {
+            DataType::Nullable(Box::new(DataType::Variant))
+        } else {
+            DataType::Variant
+        };
+        Some(Arc::new(Function {
+            signature: FunctionSignature {
+                name: "json_object_delete".to_string(),
+                args_type: args_type.to_vec(),
+                return_type,
+            },
+            eval: FunctionEval::Scalar {
+                calc_domain: Box::new(|_, _| FunctionDomain::MayThrow),
+                eval: Box::new(move |args, ctx| {
+                    json_object_pick_or_delete_fn(args, ctx, false, is_nullable)
+                }),
             },
         }))
     });
 }
 
-fn json_object_fn(
-    args: &[ValueRef<AnyType>],
+fn json_array_fn(args: &[Value<AnyType>], ctx: &mut EvalContext) -> Value<AnyType> {
+    let (columns, len) = prepare_args_columns(args, ctx);
+    let cap = len.unwrap_or(1);
+    let mut builder = BinaryColumnBuilder::with_capacity(cap, cap * 50);
+    let mut items = Vec::with_capacity(columns.len());
+
+    for idx in 0..cap {
+        items.clear();
+        for column in &columns {
+            let v = unsafe { column.index_unchecked(idx) };
+            let mut val = vec![];
+            cast_scalar_to_variant(v, &ctx.func_ctx.jiff_tz, &mut val);
+            items.push(val);
+        }
+        if let Err(err) = build_array(items.iter().map(|b| &b[..]), &mut builder.data) {
+            ctx.set_error(builder.len(), err.to_string());
+        };
+        builder.commit_row();
+    }
+    match len {
+        Some(_) => Value::Column(Column::Variant(builder.build())),
+        None => Value::Scalar(Scalar::Variant(builder.build_scalar())),
+    }
+}
+
+fn json_object_fn(args: &[Value<AnyType>], ctx: &mut EvalContext) -> Value<AnyType> {
+    json_object_impl_fn(args, ctx, false)
+}
+
+fn json_object_keep_null_fn(args: &[Value<AnyType>], ctx: &mut EvalContext) -> Value<AnyType> {
+    json_object_impl_fn(args, ctx, true)
+}
+
+fn json_object_impl_fn(
+    args: &[Value<AnyType>],
     ctx: &mut EvalContext,
     keep_null: bool,
 ) -> Value<AnyType> {
-    let len = args.iter().find_map(|arg| match arg {
-        ValueRef::Column(col) => Some(col.len()),
-        _ => None,
-    });
-
-    let mut columns = Vec::with_capacity(args.len());
-    for (i, arg) in args.iter().enumerate() {
-        let column = match arg {
-            ValueRef::Column(column) => column.clone(),
-            ValueRef::Scalar(s) => {
-                let column_builder = ColumnBuilder::repeat(s, 1, &ctx.generics[i]);
-                column_builder.build()
-            }
-        };
-        columns.push(column);
-    }
-
+    let (columns, len) = prepare_args_columns(args, ctx);
     let cap = len.unwrap_or(1);
-    let mut builder = StringColumnBuilder::with_capacity(cap, cap * 50);
+    let mut builder = BinaryColumnBuilder::with_capacity(cap, cap * 50);
     if columns.len() % 2 != 0 {
-        ctx.set_error(0, "The number of keys and values must be equal");
-        for _ in 0..(len.unwrap_or(1)) {
+        for i in 0..cap {
+            ctx.set_error(i, "The number of keys and values must be equal");
             builder.commit_row();
         }
     } else {
         let mut set = HashSet::new();
-        for idx in 0..(len.unwrap_or(1)) {
+        let mut kvs = Vec::with_capacity(columns.len() / 2);
+        for idx in 0..cap {
             set.clear();
-            let mut kvs = Vec::with_capacity(columns.len() / 2);
+            kvs.clear();
+            let mut has_err = false;
             for i in (0..columns.len()).step_by(2) {
                 let k = unsafe { columns[i].index_unchecked(idx) };
                 if k == ScalarRef::Null {
@@ -974,24 +1815,29 @@ fn json_object_fn(
                     continue;
                 }
                 let key = match k {
-                    ScalarRef::String(v) => unsafe { String::from_utf8_unchecked(v.to_vec()) },
+                    ScalarRef::String(v) => v,
                     _ => {
+                        has_err = true;
                         ctx.set_error(builder.len(), "Key must be a string value");
                         break;
                     }
                 };
                 if set.contains(&key) {
+                    has_err = true;
                     ctx.set_error(builder.len(), "Keys have to be unique");
                     break;
                 }
-                set.insert(key.clone());
+                set.insert(key);
                 let mut val = vec![];
-                cast_scalar_to_variant(v, ctx.func_ctx.tz, &mut val);
+                cast_scalar_to_variant(v, &ctx.func_ctx.jiff_tz, &mut val);
                 kvs.push((key, val));
             }
-            if let Err(err) = build_object(kvs.iter().map(|(k, v)| (k, &v[..])), &mut builder.data)
-            {
-                ctx.set_error(builder.len(), err.to_string());
+            if !has_err {
+                if let Err(err) =
+                    build_object(kvs.iter().map(|(k, v)| (k, &v[..])), &mut builder.data)
+                {
+                    ctx.set_error(builder.len(), err.to_string());
+                }
             }
             builder.commit_row();
         }
@@ -999,5 +1845,463 @@ fn json_object_fn(
     match len {
         Some(_) => Value::Column(Column::Variant(builder.build())),
         None => Value::Scalar(Scalar::Variant(builder.build_scalar())),
+    }
+}
+
+fn prepare_args_columns(
+    args: &[Value<AnyType>],
+    ctx: &EvalContext,
+) -> (Vec<Column>, Option<usize>) {
+    let len_opt = args.iter().find_map(|arg| match arg {
+        Value::Column(col) => Some(col.len()),
+        _ => None,
+    });
+    let len = len_opt.unwrap_or(1);
+    let mut columns = Vec::with_capacity(args.len());
+    for (i, arg) in args.iter().enumerate() {
+        let column = match arg {
+            Value::Column(column) => column.clone(),
+            Value::Scalar(s) => {
+                let column_builder = ColumnBuilder::repeat(&s.as_ref(), len, &ctx.generics[i]);
+                column_builder.build()
+            }
+        };
+        columns.push(column);
+    }
+    (columns, len_opt)
+}
+
+fn delete_by_keypath_fn(args: &[Value<AnyType>], ctx: &mut EvalContext) -> Value<AnyType> {
+    let scalar_keypath = match &args[1] {
+        Value::Scalar(Scalar::String(v)) => Some(parse_key_paths(v.as_bytes())),
+        _ => None,
+    };
+    let len_opt = args.iter().find_map(|arg| match arg {
+        Value::Column(col) => Some(col.len()),
+        _ => None,
+    });
+    let len = len_opt.unwrap_or(1);
+
+    let mut builder = BinaryColumnBuilder::with_capacity(len, len * 50);
+    let mut validity = MutableBitmap::with_capacity(len);
+
+    for idx in 0..len {
+        let keypath = match &args[1] {
+            Value::Scalar(_) => Cow::Borrowed(&scalar_keypath),
+            Value::Column(col) => {
+                let scalar = unsafe { col.index_unchecked(idx) };
+                let path = match scalar {
+                    ScalarRef::String(buf) => Some(parse_key_paths(buf.as_bytes())),
+                    _ => None,
+                };
+                Cow::Owned(path)
+            }
+        };
+        match keypath.as_ref() {
+            Some(result) => match result {
+                Ok(path) => {
+                    let json_row = match &args[0] {
+                        Value::Scalar(scalar) => scalar.as_ref(),
+                        Value::Column(col) => unsafe { col.index_unchecked(idx) },
+                    };
+                    match json_row {
+                        ScalarRef::Variant(json) => {
+                            match delete_by_keypath(json, path.paths.iter(), &mut builder.data) {
+                                Ok(_) => validity.push(true),
+                                Err(err) => {
+                                    ctx.set_error(builder.len(), err.to_string());
+                                    validity.push(false);
+                                }
+                            }
+                        }
+                        _ => validity.push(false),
+                    }
+                }
+                Err(err) => {
+                    ctx.set_error(builder.len(), err.to_string());
+                    validity.push(false);
+                }
+            },
+            None => validity.push(false),
+        }
+        builder.commit_row();
+    }
+
+    let validity: Bitmap = validity.into();
+
+    match len_opt {
+        Some(_) => Value::Column(Column::Variant(builder.build())).wrap_nullable(Some(validity)),
+        None => {
+            if !validity.get_bit(0) {
+                Value::Scalar(Scalar::Null)
+            } else {
+                Value::Scalar(Scalar::Variant(builder.build_scalar()))
+            }
+        }
+    }
+}
+
+fn get_by_keypath_fn(
+    args: &[Value<AnyType>],
+    ctx: &mut EvalContext,
+    string_res: bool,
+) -> Value<AnyType> {
+    let scalar_keypath = match &args[1] {
+        Value::Scalar(Scalar::String(v)) => Some(parse_key_paths(v.as_bytes())),
+        _ => None,
+    };
+    let len_opt = args.iter().find_map(|arg| match arg {
+        Value::Column(col) => Some(col.len()),
+        _ => None,
+    });
+    let len = len_opt.unwrap_or(1);
+
+    let mut builder = if string_res {
+        ColumnBuilder::String(StringColumnBuilder::with_capacity(len))
+    } else {
+        ColumnBuilder::Variant(BinaryColumnBuilder::with_capacity(len, len * 50))
+    };
+
+    let mut validity = MutableBitmap::with_capacity(len);
+
+    for idx in 0..len {
+        let keypath = match &args[1] {
+            Value::Scalar(_) => Cow::Borrowed(&scalar_keypath),
+            Value::Column(col) => {
+                let scalar = unsafe { col.index_unchecked(idx) };
+                let path = match scalar {
+                    ScalarRef::String(buf) => Some(parse_key_paths(buf.as_bytes())),
+                    _ => None,
+                };
+                Cow::Owned(path)
+            }
+        };
+
+        match keypath.as_ref() {
+            Some(result) => match result {
+                Ok(path) => {
+                    let json_row = match &args[0] {
+                        Value::Scalar(scalar) => scalar.as_ref(),
+                        Value::Column(col) => unsafe { col.index_unchecked(idx) },
+                    };
+                    match json_row {
+                        ScalarRef::Variant(json) => match get_by_keypath(json, path.paths.iter()) {
+                            Some(res) => {
+                                match &mut builder {
+                                    ColumnBuilder::String(builder) => {
+                                        let json_str = cast_to_string(&res);
+                                        builder.put_str(&json_str);
+                                    }
+                                    ColumnBuilder::Variant(builder) => {
+                                        builder.put_slice(&res);
+                                    }
+                                    _ => unreachable!(),
+                                }
+                                validity.push(true);
+                            }
+                            None => validity.push(false),
+                        },
+                        _ => validity.push(false),
+                    }
+                }
+                Err(err) => {
+                    ctx.set_error(builder.len(), err.to_string());
+                    validity.push(false);
+                }
+            },
+            None => validity.push(false),
+        }
+
+        match &mut builder {
+            ColumnBuilder::String(builder) => {
+                builder.commit_row();
+            }
+            ColumnBuilder::Variant(builder) => {
+                builder.commit_row();
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    let builder = ColumnBuilder::Nullable(Box::new(NullableColumnBuilder { builder, validity }));
+
+    match len_opt {
+        Some(_) => Value::Column(builder.build()),
+        None => Value::Scalar(builder.build_scalar()),
+    }
+}
+
+fn path_predicate_fn<'a, P>(
+    args: &'a [Value<AnyType>],
+    ctx: &'a mut EvalContext,
+    predicate: P,
+) -> Value<AnyType>
+where
+    P: Fn(&'a [u8], JsonPath<'a>) -> Result<bool, jsonb::Error>,
+{
+    let scalar_jsonpath = match &args[1] {
+        Value::Scalar(Scalar::String(v)) => {
+            let res = parse_json_path(v.as_bytes()).map_err(|_| format!("Invalid JSON Path '{v}'"));
+            Some(res)
+        }
+        _ => None,
+    };
+
+    let len_opt = args.iter().find_map(|arg| match arg {
+        Value::Column(col) => Some(col.len()),
+        _ => None,
+    });
+    let len = len_opt.unwrap_or(1);
+
+    let mut output = MutableBitmap::with_capacity(len);
+    let mut validity = MutableBitmap::with_capacity(len);
+
+    for idx in 0..len {
+        let jsonpath = match &args[1] {
+            Value::Scalar(_) => scalar_jsonpath.clone(),
+            Value::Column(col) => {
+                let scalar = unsafe { col.index_unchecked(idx) };
+                match scalar {
+                    ScalarRef::String(buf) => {
+                        let res = parse_json_path(buf.as_bytes())
+                            .map_err(|_| format!("Invalid JSON Path '{buf}'"));
+                        Some(res)
+                    }
+                    _ => None,
+                }
+            }
+        };
+        match jsonpath {
+            Some(result) => match result {
+                Ok(path) => {
+                    let json_row = match &args[0] {
+                        Value::Scalar(scalar) => scalar.as_ref(),
+                        Value::Column(col) => unsafe { col.index_unchecked(idx) },
+                    };
+                    match json_row {
+                        ScalarRef::Variant(json) => match predicate(json, path) {
+                            Ok(r) => {
+                                output.push(r);
+                                validity.push(true);
+                            }
+                            Err(err) => {
+                                ctx.set_error(output.len(), err.to_string());
+                                output.push(false);
+                                validity.push(false);
+                            }
+                        },
+                        _ => {
+                            output.push(false);
+                            validity.push(false);
+                        }
+                    }
+                }
+                Err(err) => {
+                    ctx.set_error(output.len(), err);
+                    output.push(false);
+                    validity.push(false);
+                }
+            },
+            None => {
+                output.push(false);
+                validity.push(false);
+            }
+        }
+    }
+
+    let validity: Bitmap = validity.into();
+
+    match len_opt {
+        Some(_) => Value::Column(Column::Boolean(output.into())).wrap_nullable(Some(validity)),
+        None => {
+            if !validity.get_bit(0) {
+                Value::Scalar(Scalar::Null)
+            } else {
+                Value::Scalar(Scalar::Boolean(output.get(0)))
+            }
+        }
+    }
+}
+
+fn json_object_insert_fn(
+    args: &[Value<AnyType>],
+    ctx: &mut EvalContext,
+    is_nullable: bool,
+) -> Value<AnyType> {
+    let len_opt = args.iter().find_map(|arg| match arg {
+        Value::Column(col) => Some(col.len()),
+        _ => None,
+    });
+    let len = len_opt.unwrap_or(1);
+    let mut validity = MutableBitmap::with_capacity(len);
+    let mut builder = BinaryColumnBuilder::with_capacity(len, len * 50);
+    for idx in 0..len {
+        let value = match &args[0] {
+            Value::Scalar(scalar) => scalar.as_ref(),
+            Value::Column(col) => unsafe { col.index_unchecked(idx) },
+        };
+        if value == ScalarRef::Null {
+            builder.commit_row();
+            validity.push(false);
+            continue;
+        }
+        let value = value.as_variant().unwrap();
+        if !is_object(value) {
+            ctx.set_error(builder.len(), "Invalid json object");
+            builder.commit_row();
+            validity.push(false);
+            continue;
+        }
+        let new_key = match &args[1] {
+            Value::Scalar(scalar) => scalar.as_ref(),
+            Value::Column(col) => unsafe { col.index_unchecked(idx) },
+        };
+        let new_val = match &args[2] {
+            Value::Scalar(scalar) => scalar.as_ref(),
+            Value::Column(col) => unsafe { col.index_unchecked(idx) },
+        };
+        if new_key == ScalarRef::Null || new_val == ScalarRef::Null {
+            builder.put(value);
+            builder.commit_row();
+            validity.push(true);
+            continue;
+        }
+        let update_flag = if args.len() == 4 {
+            let v = match &args[3] {
+                Value::Scalar(scalar) => scalar.as_ref(),
+                Value::Column(col) => unsafe { col.index_unchecked(idx) },
+            };
+            match v {
+                ScalarRef::Boolean(v) => v,
+                _ => false,
+            }
+        } else {
+            false
+        };
+        let new_key = new_key.as_string().unwrap();
+        let res = match new_val {
+            ScalarRef::Variant(new_val) => {
+                jsonb::object_insert(value, new_key, new_val, update_flag, &mut builder.data)
+            }
+            _ => {
+                // if the new value is not a json value, cast it to json.
+                let mut new_val_buf = vec![];
+                cast_scalar_to_variant(new_val.clone(), &ctx.func_ctx.jiff_tz, &mut new_val_buf);
+                jsonb::object_insert(value, new_key, &new_val_buf, update_flag, &mut builder.data)
+            }
+        };
+        if let Err(err) = res {
+            validity.push(false);
+            ctx.set_error(builder.len(), err.to_string());
+        } else {
+            validity.push(true);
+        }
+        builder.commit_row();
+    }
+    if is_nullable {
+        let validity: Bitmap = validity.into();
+        match len_opt {
+            Some(_) => {
+                Value::Column(Column::Variant(builder.build())).wrap_nullable(Some(validity))
+            }
+            None => {
+                if !validity.get_bit(0) {
+                    Value::Scalar(Scalar::Null)
+                } else {
+                    Value::Scalar(Scalar::Variant(builder.build_scalar()))
+                }
+            }
+        }
+    } else {
+        match len_opt {
+            Some(_) => Value::Column(Column::Variant(builder.build())),
+            None => Value::Scalar(Scalar::Variant(builder.build_scalar())),
+        }
+    }
+}
+
+fn json_object_pick_or_delete_fn(
+    args: &[Value<AnyType>],
+    ctx: &mut EvalContext,
+    is_pick: bool,
+    is_nullable: bool,
+) -> Value<AnyType> {
+    let len_opt = args.iter().find_map(|arg| match arg {
+        Value::Column(col) => Some(col.len()),
+        _ => None,
+    });
+    let len = len_opt.unwrap_or(1);
+    let mut keys = BTreeSet::new();
+    let mut validity = MutableBitmap::with_capacity(len);
+    let mut builder = BinaryColumnBuilder::with_capacity(len, len * 50);
+    for idx in 0..len {
+        let value = match &args[0] {
+            Value::Scalar(scalar) => scalar.as_ref(),
+            Value::Column(col) => unsafe { col.index_unchecked(idx) },
+        };
+        if value == ScalarRef::Null {
+            builder.commit_row();
+            validity.push(false);
+            continue;
+        }
+        let value = value.as_variant().unwrap();
+        if !is_object(value) {
+            ctx.set_error(builder.len(), "Invalid json object");
+            builder.commit_row();
+            validity.push(false);
+            continue;
+        }
+        keys.clear();
+        for arg in args.iter().skip(1) {
+            let key = match &arg {
+                Value::Scalar(scalar) => scalar.as_ref(),
+                Value::Column(col) => unsafe { col.index_unchecked(idx) },
+            };
+            if key == ScalarRef::Null {
+                continue;
+            }
+            let key = key.as_string().unwrap();
+            keys.insert(*key);
+        }
+        let res = if is_pick {
+            jsonb::object_pick(value, &keys, &mut builder.data)
+        } else {
+            jsonb::object_delete(value, &keys, &mut builder.data)
+        };
+        if let Err(err) = res {
+            validity.push(false);
+            ctx.set_error(builder.len(), err.to_string());
+        } else {
+            validity.push(true);
+        }
+        builder.commit_row();
+    }
+    if is_nullable {
+        let validity: Bitmap = validity.into();
+        match len_opt {
+            Some(_) => {
+                Value::Column(Column::Variant(builder.build())).wrap_nullable(Some(validity))
+            }
+            None => {
+                if !validity.get_bit(0) {
+                    Value::Scalar(Scalar::Null)
+                } else {
+                    Value::Scalar(Scalar::Variant(builder.build_scalar()))
+                }
+            }
+        }
+    } else {
+        match len_opt {
+            Some(_) => Value::Column(Column::Variant(builder.build())),
+            None => Value::Scalar(Scalar::Variant(builder.build_scalar())),
+        }
+    }
+}
+
+// Extract string for string type, other types convert to JSON string.
+fn cast_to_string(v: &[u8]) -> String {
+    match to_str(v) {
+        Ok(v) => v,
+        Err(_) => to_string(v),
     }
 }

@@ -13,68 +13,15 @@
 // limitations under the License.
 
 use std::cmp::Ordering;
-use std::fmt;
-use std::fmt::Debug;
 
-use common_exception::Result;
-use common_expression::arithmetics_type::ResultTypeOfUnary;
+use databend_common_base::base::OrderedFloat;
+use databend_common_exception::Result;
+use databend_common_expression::arithmetics_type::ResultTypeOfUnary;
+use databend_common_storage::Datum;
+use databend_common_storage::Histogram;
+use databend_common_storage::HistogramBucket;
 
-use crate::optimizer::property::datum::Datum;
-
-pub const DEFAULT_HISTOGRAM_BUCKETS: usize = 100;
-
-/// A histogram is a representation of the distribution of a column.
-///
-/// We are constructing this in an "Equi-height" fashion, which means
-/// every bucket has roughly the same number of rows.
-///
-/// Real-world data distribution is often skewed,
-/// so an equal-height histogram is better than an equal-width histogram,
-/// the former can use multiple buckets to show the skew data, but for the latter,
-/// it is difficult to give the exact frequency of the skew data
-/// when the skew data and other data fall into the same bucket
-///
-/// We choose this approach because so far the histogram is originally
-/// constructed from NDV(number of distinct values) and the total number
-/// of rows instead of maintaining a real histogram for each column,
-/// which brings the assumption that the data is uniformly distributed.
-#[derive(Debug, Clone)]
-pub struct Histogram {
-    pub buckets: Vec<HistogramBucket>,
-}
-
-impl Histogram {
-    pub fn new(buckets: Vec<HistogramBucket>) -> Self {
-        Self { buckets }
-    }
-
-    /// Get number of buckets
-    pub fn num_buckets(&self) -> usize {
-        self.buckets.len()
-    }
-
-    /// Get number of values
-    pub fn num_values(&self) -> f64 {
-        self.buckets
-            .iter()
-            .fold(0.0, |acc, bucket| acc + bucket.num_values())
-    }
-
-    /// Get number of distinct values
-    /// TODO(leiysky): this is not accurate, find a better way to calculate NDV
-    pub fn num_distinct_values(&self) -> f64 {
-        self.buckets
-            .iter()
-            .fold(0.0, |acc, bucket| acc + bucket.num_distinct())
-    }
-
-    /// Get iterator of buckets
-    pub fn buckets_iter(
-        &self,
-    ) -> impl Iterator<Item = &HistogramBucket> + DoubleEndedIterator<Item = &HistogramBucket> {
-        self.buckets.iter()
-    }
-}
+pub type F64 = OrderedFloat<f64>;
 
 /// Construct a histogram from NDV and total number of rows.
 ///
@@ -88,7 +35,7 @@ pub fn histogram_from_ndv(
     num_rows: u64,
     bound: Option<(Datum, Datum)>,
     num_buckets: usize,
-) -> Result<Histogram, String> {
+) -> std::result::Result<Histogram, String> {
     if ndv <= 2 {
         return if num_rows != 0 {
             Err(format!(
@@ -96,7 +43,10 @@ pub fn histogram_from_ndv(
                 ndv, num_rows
             ))
         } else {
-            Ok(Histogram { buckets: vec![] })
+            Ok(Histogram {
+                buckets: vec![],
+                accuracy: false,
+            })
         };
     }
 
@@ -112,7 +62,7 @@ pub fn histogram_from_ndv(
     }
 
     let (min, max) = match bound {
-        Some((min, max)) => (min, max),
+        Some((min, max)) => (min.to_float(), max.to_float()),
         None => {
             return Err(format!(
                 "Must have min and max value when NDV is greater than 0, got NDV: {}",
@@ -130,73 +80,34 @@ pub fn histogram_from_ndv(
     let mut buckets: Vec<HistogramBucket> = Vec::with_capacity(num_buckets);
     let sample_set = UniformSampleSet { min, max };
 
-    for idx in 0..num_buckets + 1 {
-        let upper_bound = sample_set.get_upper_bound(num_buckets, idx)?;
-        if idx == 0 {
-            // The first bucket is a dummy bucket
-            // which is used to record the min value of the column
-            // So we don't need to record the min value for each bucket
-            buckets.push(HistogramBucket {
-                upper_bound,
-                num_values: 1.0,
-                num_distinct: 1.0,
-            });
-            continue;
-        }
-        let bucket = HistogramBucket {
-            upper_bound,
-            num_values: (num_rows / num_buckets as u64) as f64,
-            num_distinct: (ndv / num_buckets as u64) as f64,
+    for idx in 0..num_buckets {
+        let lower_bound = if idx == 0 {
+            sample_set.min.clone()
+        } else {
+            buckets[idx - 1].upper_bound().clone()
         };
+        let upper_bound = sample_set.get_upper_bound(num_buckets, idx + 1)?;
+        let bucket = HistogramBucket::new(
+            lower_bound,
+            upper_bound,
+            (num_rows / num_buckets as u64) as f64,
+            (ndv / num_buckets as u64) as f64,
+        );
         buckets.push(bucket);
     }
 
-    Ok(Histogram { buckets })
-}
-
-#[derive(Debug, Clone)]
-pub struct HistogramBucket {
-    /// Upper bound value of the bucket.
-    upper_bound: Datum,
-    /// Estimated number of values in the bucket.
-    num_values: f64,
-    /// Estimated number of distinct values in the bucket.
-    num_distinct: f64,
-}
-
-impl HistogramBucket {
-    pub fn new(upper_bound: Datum, num_values: f64, num_distinct: f64) -> Self {
-        Self {
-            upper_bound,
-            num_values,
-            num_distinct,
-        }
-    }
-
-    pub fn upper_bound(&self) -> &Datum {
-        &self.upper_bound
-    }
-
-    pub fn num_values(&self) -> f64 {
-        self.num_values
-    }
-
-    pub fn num_distinct(&self) -> f64 {
-        self.num_distinct
-    }
-
-    pub fn aggregate_values(&mut self) {
-        self.num_values = self.num_distinct;
-    }
-
-    pub fn update(&mut self, selectivity: f64) {
-        self.num_values *= selectivity;
-        self.num_distinct *= selectivity
-    }
+    Ok(Histogram {
+        buckets,
+        accuracy: false,
+    })
 }
 
 trait SampleSet {
-    fn get_upper_bound(&self, num_buckets: usize, bucket_index: usize) -> Result<Datum, String>;
+    fn get_upper_bound(
+        &self,
+        num_buckets: usize,
+        bucket_index: usize,
+    ) -> std::result::Result<Datum, String>;
 }
 
 pub struct UniformSampleSet {
@@ -225,9 +136,7 @@ impl UniformSampleSet {
 
     pub fn intersection(&self, other: &UniformSampleSet) -> Result<(Option<Datum>, Option<Datum>)> {
         match (&self.min, &other.min) {
-            (Datum::Bytes(_), Datum::Bytes(_)) | (Datum::Bool(_), Datum::Bool(_)) => {
-                Ok((None, None))
-            }
+            (Datum::Bytes(_), Datum::Bytes(_)) => Ok((None, None)),
             _ => {
                 let left_min = self.min.to_double()?;
                 let left_max = self.max.to_double()?;
@@ -250,7 +159,11 @@ impl UniformSampleSet {
 }
 
 impl SampleSet for UniformSampleSet {
-    fn get_upper_bound(&self, num_buckets: usize, bucket_index: usize) -> Result<Datum, String> {
+    fn get_upper_bound(
+        &self,
+        num_buckets: usize,
+        bucket_index: usize,
+    ) -> std::result::Result<Datum, String> {
         match (&self.min, &self.max) {
             (Datum::Int(min), Datum::Int(max)) => {
                 let min = *min;
@@ -272,7 +185,7 @@ impl SampleSet for UniformSampleSet {
 
             (Datum::Float(min), Datum::Float(max)) => {
                 let min = *min;
-                let max = *max;
+                let max = (*max).checked_add(F64::from(1.0)).ok_or("overflowed")?;
                 // TODO(xudong): better histogram computation.
                 let bucket_range = max.checked_sub(min).ok_or("overflowed")? / num_buckets as f64;
                 let upper_bound = min + bucket_range * bucket_index as f64;
@@ -284,28 +197,5 @@ impl SampleSet for UniformSampleSet {
                 self.min, self.max
             )),
         }
-    }
-}
-
-pub struct InterleavedBucket {
-    pub left_ndv: f64,
-    pub right_ndv: f64,
-    pub left_num_rows: f64,
-    pub right_num_rows: f64,
-    pub max_val: f64,
-}
-
-impl fmt::Display for Histogram {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        for bucket in &self.buckets {
-            writeln!(
-                f,
-                "{}: {} values, {} distinct values",
-                bucket.upper_bound(),
-                bucket.num_values,
-                bucket.num_distinct
-            )?;
-        }
-        Ok(())
     }
 }

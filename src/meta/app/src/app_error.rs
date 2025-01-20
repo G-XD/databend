@@ -14,10 +14,22 @@
 
 use std::fmt::Display;
 
-use common_exception::ErrorCode;
-use common_meta_types::MatchSeq;
-use serde::Deserialize;
-use serde::Serialize;
+use databend_common_exception::ErrorCode;
+use databend_common_meta_types::MatchSeq;
+
+use crate::background::job_ident;
+use crate::data_mask::data_mask_name_ident;
+use crate::principal::procedure_name_ident;
+use crate::principal::ProcedureIdentity;
+use crate::schema::catalog_name_ident;
+use crate::schema::dictionary_name_ident;
+use crate::schema::index_name_ident;
+use crate::schema::virtual_column_ident;
+use crate::schema::DictionaryIdentity;
+use crate::schema::SequenceRsc;
+use crate::tenant_key::errors::ExistError;
+use crate::tenant_key::errors::UnknownError;
+use crate::tenant_key::ident::TIdent;
 
 /// Output message for end users, with sensitive info stripped.
 pub trait AppErrorMessage: Display {
@@ -26,7 +38,27 @@ pub trait AppErrorMessage: Display {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("Tenant is empty when: `{context}`")]
+pub struct TenantIsEmpty {
+    context: String,
+}
+
+impl TenantIsEmpty {
+    pub fn new(context: impl ToString) -> Self {
+        Self {
+            context: context.to_string(),
+        }
+    }
+}
+
+impl From<TenantIsEmpty> for ErrorCode {
+    fn from(err: TenantIsEmpty) -> Self {
+        ErrorCode::TenantIsEmpty(err.to_string())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("DatabaseAlreadyExists: `{db_name}` while `{context}`")]
 pub struct DatabaseAlreadyExists {
     db_name: String,
@@ -42,69 +74,21 @@ impl DatabaseAlreadyExists {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, thiserror::Error)]
-#[error("CatalogAlreadyExists: `{catalog_name}` while `{context}`")]
-pub struct CatalogAlreadyExists {
-    catalog_name: String,
-    context: String,
-}
-
-impl CatalogAlreadyExists {
-    pub fn new(catalog_name: impl Into<String>, context: impl Into<String>) -> Self {
-        Self {
-            catalog_name: catalog_name.into(),
-            context: context.into(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, thiserror::Error)]
-#[error("DatamaskAlreadyExists: `{name}` while `{context}`")]
-pub struct DatamaskAlreadyExists {
-    name: String,
-    context: String,
-}
-
-impl DatamaskAlreadyExists {
-    pub fn new(name: impl Into<String>, context: impl Into<String>) -> Self {
-        Self {
-            name: name.into(),
-            context: context.into(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, thiserror::Error)]
-#[error("BackgroundJobAlreadyExists: `{name}` while `{context}`")]
-pub struct BackgroundJobAlreadyExists {
-    name: String,
-    context: String,
-}
-
-impl BackgroundJobAlreadyExists {
-    pub fn new(name: impl Into<String>, context: impl Into<String>) -> Self {
-        Self {
-            name: name.into(),
-            context: context.into(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("CreateDatabaseWithDropTime: `{db_name}` with drop_on")]
 pub struct CreateDatabaseWithDropTime {
     db_name: String,
 }
 
 impl CreateDatabaseWithDropTime {
-    pub fn new(db_name: impl Into<String>) -> Self {
+    pub fn new(db_name: impl ToString) -> Self {
         Self {
-            db_name: db_name.into(),
+            db_name: db_name.to_string(),
         }
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("DropDbWithDropTime: drop {db_name} with drop_on time")]
 pub struct DropDbWithDropTime {
     db_name: String,
@@ -118,7 +102,7 @@ impl DropDbWithDropTime {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("UndropDbWithNoDropTime: undrop {db_name} with no drop_on time")]
 pub struct UndropDbWithNoDropTime {
     db_name: String,
@@ -132,7 +116,7 @@ impl UndropDbWithNoDropTime {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("UndropDbHasNoHistory: undrop {db_name} has no db id history")]
 pub struct UndropDbHasNoHistory {
     db_name: String,
@@ -146,7 +130,23 @@ impl UndropDbHasNoHistory {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("CommitTableMetaError: {table_name} while {context}")]
+pub struct CommitTableMetaError {
+    table_name: String,
+    context: String,
+}
+
+impl CommitTableMetaError {
+    pub fn new(table_name: impl Into<String>, context: impl Into<String>) -> Self {
+        Self {
+            table_name: table_name.into(),
+            context: context.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("TableAlreadyExists: {table_name} while {context}")]
 pub struct TableAlreadyExists {
     table_name: String,
@@ -162,7 +162,23 @@ impl TableAlreadyExists {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("ViewAlreadyExists: {view_name} while {context}")]
+pub struct ViewAlreadyExists {
+    view_name: String,
+    context: String,
+}
+
+impl ViewAlreadyExists {
+    pub fn new(view_name: impl Into<String>, context: impl Into<String>) -> Self {
+        Self {
+            view_name: view_name.into(),
+            context: context.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("CreateTableWithDropTime: create {table_name} with drop time")]
 pub struct CreateTableWithDropTime {
     table_name: String,
@@ -176,7 +192,21 @@ impl CreateTableWithDropTime {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("CreateAsDropTableWithoutDropTime: create as_drop {table_name} without drop time")]
+pub struct CreateAsDropTableWithoutDropTime {
+    table_name: String,
+}
+
+impl CreateAsDropTableWithoutDropTime {
+    pub fn new(table_name: impl Into<String>) -> Self {
+        Self {
+            table_name: table_name.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("UndropTableAlreadyExists: undrop {table_name} already exists")]
 pub struct UndropTableAlreadyExists {
     table_name: String,
@@ -190,7 +220,7 @@ impl UndropTableAlreadyExists {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("UndropTableWithNoDropTime: undrop {table_name} with no drop_on time")]
 pub struct UndropTableWithNoDropTime {
     table_name: String,
@@ -204,7 +234,7 @@ impl UndropTableWithNoDropTime {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("DropTableWithDropTime: drop {table_name} with drop_on time")]
 pub struct DropTableWithDropTime {
     table_name: String,
@@ -218,7 +248,7 @@ impl DropTableWithDropTime {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("UndropTableHasNoHistory: undrop {table_name} has no table id history")]
 pub struct UndropTableHasNoHistory {
     table_name: String,
@@ -232,7 +262,7 @@ impl UndropTableHasNoHistory {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("TableVersionMismatched: {table_id} expect `{expect}` but `{curr}`  while `{context}`")]
 pub struct TableVersionMismatched {
     table_id: u64,
@@ -252,7 +282,87 @@ impl TableVersionMismatched {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("StreamAlreadyExists: {name} while {context}")]
+pub struct StreamAlreadyExists {
+    name: String,
+    context: String,
+}
+
+impl StreamAlreadyExists {
+    pub fn new(name: impl Into<String>, context: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            context: context.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("StreamVersionMismatched: {stream_id} expect `{expect}` but `{curr}`  while `{context}`")]
+pub struct StreamVersionMismatched {
+    stream_id: u64,
+    expect: MatchSeq,
+    curr: u64,
+    context: String,
+}
+
+impl StreamVersionMismatched {
+    pub fn new(stream_id: u64, expect: MatchSeq, curr: u64, context: impl Into<String>) -> Self {
+        Self {
+            stream_id,
+            expect,
+            curr,
+            context: context.into(),
+        }
+    }
+}
+
+#[derive(thiserror::Error, Debug, Clone, PartialEq, Eq)]
+#[error("UnknownStreamId: `{stream_id}` while `{context}`")]
+pub struct UnknownStreamId {
+    stream_id: u64,
+    context: String,
+}
+
+impl UnknownStreamId {
+    pub fn new(stream_id: u64, context: impl Into<String>) -> UnknownStreamId {
+        Self {
+            stream_id,
+            context: context.into(),
+        }
+    }
+}
+
+#[derive(thiserror::Error, Debug, Clone, PartialEq, Eq)]
+#[error("MultiStmtTxnCommitFailed: {context}")]
+pub struct MultiStmtTxnCommitFailed {
+    context: String,
+}
+
+impl MultiStmtTxnCommitFailed {
+    pub fn new(context: impl Into<String>) -> MultiStmtTxnCommitFailed {
+        Self {
+            context: context.into(),
+        }
+    }
+}
+
+#[derive(thiserror::Error, Debug, Clone, PartialEq, Eq)]
+#[error("UpdateStreamMetasFailed: {message}")]
+pub struct UpdateStreamMetasFailed {
+    message: String,
+}
+
+impl crate::app_error::UpdateStreamMetasFailed {
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("DuplicatedUpsertFiles: {table_id} , in operation `{context}`")]
 pub struct DuplicatedUpsertFiles {
     table_id: u64,
@@ -268,7 +378,7 @@ impl DuplicatedUpsertFiles {
     }
 }
 
-#[derive(thiserror::Error, Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(thiserror::Error, Debug, Clone, PartialEq, Eq)]
 #[error("UnknownDatabase: `{db_name}` while `{context}`")]
 pub struct UnknownDatabase {
     db_name: String,
@@ -284,7 +394,7 @@ impl UnknownDatabase {
     }
 }
 
-#[derive(thiserror::Error, Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(thiserror::Error, Debug, Clone, PartialEq, Eq)]
 #[error("UnknownCatalog: `{catalog_name}` while `{context}`")]
 pub struct UnknownCatalog {
     catalog_name: String,
@@ -300,7 +410,7 @@ impl UnknownCatalog {
     }
 }
 
-#[derive(thiserror::Error, Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(thiserror::Error, Debug, Clone, PartialEq, Eq)]
 #[error("UnknownDatamask: `{name}` while `{context}`")]
 pub struct UnknownDatamask {
     name: String,
@@ -316,23 +426,7 @@ impl UnknownDatamask {
     }
 }
 
-#[derive(thiserror::Error, Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-#[error("UnknownBackgroundJob: `{name}` while `{context}`")]
-pub struct UnknownBackgroundJob {
-    name: String,
-    context: String,
-}
-
-impl UnknownBackgroundJob {
-    pub fn new(name: impl Into<String>, context: impl Into<String>) -> Self {
-        Self {
-            name: name.into(),
-            context: context.into(),
-        }
-    }
-}
-
-#[derive(thiserror::Error, Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(thiserror::Error, Debug, Clone, PartialEq, Eq)]
 #[error("UnknownDatabaseId: `{db_id}` while `{context}`")]
 pub struct UnknownDatabaseId {
     db_id: u64,
@@ -348,7 +442,7 @@ impl UnknownDatabaseId {
     }
 }
 
-#[derive(thiserror::Error, Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(thiserror::Error, Debug, Clone, PartialEq, Eq)]
 #[error("UnmatchColumnDataType: `{name}`:`{data_type}` while `{context}`")]
 pub struct UnmatchColumnDataType {
     name: String,
@@ -370,7 +464,34 @@ impl UnmatchColumnDataType {
     }
 }
 
-#[derive(thiserror::Error, Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(thiserror::Error, Debug, Clone, PartialEq, Eq)]
+#[error(
+    "UnmatchMaskPolicyReturnType: `{arg_name}`:`{arg_type}` mismatch with return type `{return_type}` while `{context}`"
+)]
+pub struct UnmatchMaskPolicyReturnType {
+    arg_name: String,
+    arg_type: String,
+    return_type: String,
+    context: String,
+}
+
+impl UnmatchMaskPolicyReturnType {
+    pub fn new(
+        arg_name: impl Into<String>,
+        arg_type: impl Into<String>,
+        return_type: impl Into<String>,
+        context: impl Into<String>,
+    ) -> Self {
+        Self {
+            arg_name: arg_name.into(),
+            arg_type: arg_type.into(),
+            return_type: return_type.into(),
+            context: context.into(),
+        }
+    }
+}
+
+#[derive(thiserror::Error, Debug, Clone, PartialEq, Eq)]
 #[error("UnknownTable: `{table_name}` while `{context}`")]
 pub struct UnknownTable {
     table_name: String,
@@ -386,7 +507,7 @@ impl UnknownTable {
     }
 }
 
-#[derive(thiserror::Error, Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(thiserror::Error, Debug, Clone, PartialEq, Eq)]
 #[error("UnknownTableId: `{table_id}` while `{context}`")]
 pub struct UnknownTableId {
     table_id: u64,
@@ -402,7 +523,7 @@ impl UnknownTableId {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("ShareAlreadyExists: {share_name} while {context}")]
 pub struct ShareAlreadyExists {
     share_name: String,
@@ -418,7 +539,7 @@ impl ShareAlreadyExists {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("ShareEndpointAlreadyExists: {endpoint} while {context}")]
 pub struct ShareEndpointAlreadyExists {
     endpoint: String,
@@ -426,15 +547,15 @@ pub struct ShareEndpointAlreadyExists {
 }
 
 impl ShareEndpointAlreadyExists {
-    pub fn new(endpoint: impl Into<String>, context: impl Into<String>) -> Self {
+    pub fn new(endpoint: impl ToString, context: impl ToString) -> Self {
         Self {
-            endpoint: endpoint.into(),
-            context: context.into(),
+            endpoint: endpoint.to_string(),
+            context: context.to_string(),
         }
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("ShareAccountsAlreadyExists: {share_name} while {context}")]
 pub struct ShareAccountsAlreadyExists {
     share_name: String,
@@ -456,7 +577,7 @@ impl ShareAccountsAlreadyExists {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("UnknownShareAccounts: {share_id} while {context}")]
 pub struct UnknownShareAccounts {
     accounts: Vec<String>,
@@ -474,21 +595,35 @@ impl UnknownShareAccounts {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("WrongShareObject: {obj_name} does not belong to the database that is being shared")]
 pub struct WrongShareObject {
     obj_name: String,
 }
 
 impl WrongShareObject {
-    pub fn new(obj_name: impl Into<String>) -> Self {
+    pub fn new(obj_name: impl ToString) -> Self {
         Self {
-            obj_name: obj_name.into(),
+            obj_name: obj_name.to_string(),
         }
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("WrongSharePrivileges: wrong share privileges of {obj_name}")]
+pub struct WrongSharePrivileges {
+    obj_name: String,
+}
+
+impl WrongSharePrivileges {
+    pub fn new(obj_name: impl ToString) -> Self {
+        Self {
+            obj_name: obj_name.to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("ShareHasNoGrantedDatabase: {tenant}.{share_name} has no granted database")]
 pub struct ShareHasNoGrantedDatabase {
     pub tenant: String,
@@ -504,7 +639,7 @@ impl ShareHasNoGrantedDatabase {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("ShareHasNoGrantedPrivilege: {tenant}.{share_name} has no proper granted privilege")]
 pub struct ShareHasNoGrantedPrivilege {
     pub tenant: String,
@@ -520,15 +655,17 @@ impl ShareHasNoGrantedPrivilege {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, thiserror::Error)]
-#[error("UnknownShareTable: {tenant}.{share_name} has no share table {table_name}")]
-pub struct UnknownShareTable {
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "CannotAccessShareTable: cannot access share table {table_name} from {tenant}.{share_name}"
+)]
+pub struct CannotAccessShareTable {
     pub tenant: String,
     pub share_name: String,
     pub table_name: String,
 }
 
-impl UnknownShareTable {
+impl CannotAccessShareTable {
     pub fn new(
         tenant: impl Into<String>,
         share_name: impl Into<String>,
@@ -542,7 +679,7 @@ impl UnknownShareTable {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("WrongShare: {share_name} has the wrong format")]
 pub struct WrongShare {
     share_name: String,
@@ -556,7 +693,7 @@ impl WrongShare {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("UnknownShare: {share_name} while {context}")]
 pub struct UnknownShare {
     share_name: String,
@@ -572,7 +709,7 @@ impl UnknownShare {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("UnknownShareID: {share_id} while {context}")]
 pub struct UnknownShareId {
     share_id: u64,
@@ -588,7 +725,7 @@ impl UnknownShareId {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("UnknownShareEndpoint: {endpoint} while {context}")]
 pub struct UnknownShareEndpoint {
     endpoint: String,
@@ -604,7 +741,7 @@ impl UnknownShareEndpoint {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("UnknownShareEndpointId: {share_endpoint_id} while {context}")]
 pub struct UnknownShareEndpointId {
     share_endpoint_id: u64,
@@ -620,7 +757,23 @@ impl UnknownShareEndpointId {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("TableLockExpired: `{table_id}` while `{context}`")]
+pub struct TableLockExpired {
+    table_id: u64,
+    context: String,
+}
+
+impl TableLockExpired {
+    pub fn new(table_id: u64, context: impl Into<String>) -> Self {
+        Self {
+            table_id,
+            context: context.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error(
     "CannotShareDatabaseCreatedFromShare: cannot share database {database_name} which created from share while {context}"
 )]
@@ -638,7 +791,7 @@ impl CannotShareDatabaseCreatedFromShare {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("TxnRetryMaxTimes: Txn {op} has retry {max_retry} times, abort.")]
 pub struct TxnRetryMaxTimes {
     op: String,
@@ -654,7 +807,7 @@ impl TxnRetryMaxTimes {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("CreateIndexWithDropTime: create {index_name} with drop time")]
 pub struct CreateIndexWithDropTime {
     index_name: String,
@@ -668,39 +821,7 @@ impl CreateIndexWithDropTime {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, thiserror::Error)]
-#[error("IndexAlreadyExists: `{index_name}` while `{context}`")]
-pub struct IndexAlreadyExists {
-    index_name: String,
-    context: String,
-}
-
-impl IndexAlreadyExists {
-    pub fn new(index_name: impl Into<String>, context: impl Into<String>) -> Self {
-        Self {
-            index_name: index_name.into(),
-            context: context.into(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, thiserror::Error)]
-#[error("CreateIndexWithDropTime: create {index_name} with drop time")]
-pub struct UnknownIndex {
-    index_name: String,
-    context: String,
-}
-
-impl UnknownIndex {
-    pub fn new(index_name: impl Into<String>, context: impl Into<String>) -> Self {
-        Self {
-            index_name: index_name.into(),
-            context: context.into(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("DropIndexWithDropTime: drop {index_name} with drop time")]
 pub struct DropIndexWithDropTime {
     index_name: String,
@@ -714,48 +835,64 @@ impl DropIndexWithDropTime {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, thiserror::Error)]
-#[error("GetIndexWithDropTime: get {index_name} with drop time")]
-pub struct GetIndexWithDropTime {
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("DuplicatedIndexColumnId: {column_id} is duplicated with index {index_name}")]
+pub struct DuplicatedIndexColumnId {
+    column_id: u32,
     index_name: String,
 }
 
-impl GetIndexWithDropTime {
-    pub fn new(index_name: impl Into<String>) -> Self {
+impl DuplicatedIndexColumnId {
+    pub fn new(column_id: u32, index_name: impl Into<String>) -> Self {
         Self {
+            column_id,
             index_name: index_name.into(),
         }
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, thiserror::Error)]
-#[error("VirtualColumnAlreadyExists: `{table_id}` while `{context}`")]
-pub struct VirtualColumnAlreadyExists {
-    table_id: u64,
-    context: String,
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("IndexColumnIdNotFound: index {index_name} column id {column_id} is not found")]
+pub struct IndexColumnIdNotFound {
+    column_id: u32,
+    index_name: String,
 }
 
-impl VirtualColumnAlreadyExists {
-    pub fn new(table_id: impl Into<u64>, context: impl Into<String>) -> Self {
+impl IndexColumnIdNotFound {
+    pub fn new(column_id: u32, index_name: impl Into<String>) -> Self {
         Self {
-            table_id: table_id.into(),
-            context: context.into(),
+            column_id,
+            index_name: index_name.into(),
         }
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, thiserror::Error)]
-#[error("VirtualColumnNotFound: `{table_id}` while `{context}`")]
-pub struct VirtualColumnNotFound {
-    table_id: u64,
+#[derive(thiserror::Error, Debug, Clone, PartialEq, Eq)]
+#[error("OutofSequenceRange: `{name}` while `{context}`")]
+pub struct OutofSequenceRange {
+    name: String,
     context: String,
 }
 
-impl VirtualColumnNotFound {
-    pub fn new(table_id: impl Into<u64>, context: impl Into<String>) -> Self {
+impl OutofSequenceRange {
+    pub fn new(name: impl ToString, context: impl ToString) -> Self {
         Self {
-            table_id: table_id.into(),
-            context: context.into(),
+            name: name.to_string(),
+            context: context.to_string(),
+        }
+    }
+}
+
+#[derive(thiserror::Error, Debug, Clone, PartialEq, Eq)]
+#[error("WrongSequenceCount: `{name}`")]
+pub struct WrongSequenceCount {
+    name: String,
+}
+
+impl WrongSequenceCount {
+    pub fn new(name: impl ToString) -> Self {
+        Self {
+            name: name.to_string(),
         }
     }
 }
@@ -763,8 +900,11 @@ impl VirtualColumnNotFound {
 /// Application error.
 ///
 /// The application does not get expected result but there is nothing wrong with meta-service.
-#[derive(thiserror::Error, serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(thiserror::Error, Debug, Clone, PartialEq, Eq)]
 pub enum AppError {
+    #[error(transparent)]
+    TenantIsEmpty(#[from] TenantIsEmpty),
+
     #[error(transparent)]
     TableVersionMismatched(#[from] TableVersionMismatched),
 
@@ -772,10 +912,19 @@ pub enum AppError {
     DuplicatedUpsertFiles(#[from] DuplicatedUpsertFiles),
 
     #[error(transparent)]
+    CommitTableMetaError(#[from] CommitTableMetaError),
+
+    #[error(transparent)]
     TableAlreadyExists(#[from] TableAlreadyExists),
 
     #[error(transparent)]
+    ViewAlreadyExists(#[from] ViewAlreadyExists),
+
+    #[error(transparent)]
     CreateTableWithDropTime(#[from] CreateTableWithDropTime),
+
+    #[error(transparent)]
+    CreateAsDropTableWithoutDropTime(#[from] CreateAsDropTableWithoutDropTime),
 
     #[error(transparent)]
     UndropTableAlreadyExists(#[from] UndropTableAlreadyExists),
@@ -793,7 +942,7 @@ pub enum AppError {
     DatabaseAlreadyExists(#[from] DatabaseAlreadyExists),
 
     #[error(transparent)]
-    CatalogAlreadyExists(#[from] CatalogAlreadyExists),
+    CatalogAlreadyExists(#[from] ExistError<catalog_name_ident::CatalogNameRsc>),
 
     #[error(transparent)]
     CreateDatabaseWithDropTime(#[from] CreateDatabaseWithDropTime),
@@ -811,7 +960,7 @@ pub enum AppError {
     UnknownDatabase(#[from] UnknownDatabase),
 
     #[error(transparent)]
-    UnknownCatalog(#[from] UnknownCatalog),
+    UnknownCatalog(#[from] UnknownError<catalog_name_ident::CatalogNameRsc>),
 
     #[error(transparent)]
     UnknownDatabaseId(#[from] UnknownDatabaseId),
@@ -845,13 +994,16 @@ pub enum AppError {
     WrongShareObject(#[from] WrongShareObject),
 
     #[error(transparent)]
+    WrongSharePrivileges(#[from] WrongSharePrivileges),
+
+    #[error(transparent)]
     ShareHasNoGrantedDatabase(#[from] ShareHasNoGrantedDatabase),
 
     #[error(transparent)]
     ShareHasNoGrantedPrivilege(#[from] ShareHasNoGrantedPrivilege),
 
     #[error(transparent)]
-    UnknownShareTable(#[from] UnknownShareTable),
+    CannotAccessShareTable(#[from] CannotAccessShareTable),
 
     #[error(transparent)]
     WrongShare(#[from] WrongShare),
@@ -866,54 +1018,131 @@ pub enum AppError {
     UnknownShareEndpointId(#[from] UnknownShareEndpointId),
 
     #[error(transparent)]
+    TableLockExpired(#[from] TableLockExpired),
+
+    #[error(transparent)]
     CannotShareDatabaseCreatedFromShare(#[from] CannotShareDatabaseCreatedFromShare),
 
     #[error(transparent)]
     CreateIndexWithDropTime(#[from] CreateIndexWithDropTime),
 
     #[error(transparent)]
-    IndexAlreadyExists(#[from] IndexAlreadyExists),
+    IndexAlreadyExists(#[from] ExistError<index_name_ident::IndexName>),
 
     #[error(transparent)]
-    UnknownIndex(#[from] UnknownIndex),
+    UnknownIndex(#[from] UnknownError<index_name_ident::IndexName>),
 
     #[error(transparent)]
     DropIndexWithDropTime(#[from] DropIndexWithDropTime),
 
     #[error(transparent)]
-    GetIndexWithDropTIme(#[from] GetIndexWithDropTime),
+    DuplicatedIndexColumnId(#[from] DuplicatedIndexColumnId),
 
     #[error(transparent)]
-    DatamaskAlreadyExists(#[from] DatamaskAlreadyExists),
+    IndexColumnIdNotFound(#[from] IndexColumnIdNotFound),
 
     #[error(transparent)]
-    UnknownDatamask(#[from] UnknownDatamask),
+    DatamaskAlreadyExists(#[from] ExistError<data_mask_name_ident::Resource>),
 
     #[error(transparent)]
-    BackgroundJobAlreadyExists(#[from] BackgroundJobAlreadyExists),
+    UnknownDataMask(#[from] UnknownError<data_mask_name_ident::Resource>),
 
     #[error(transparent)]
-    UnknownBackgroundJob(#[from] UnknownBackgroundJob),
+    BackgroundJobAlreadyExists(#[from] ExistError<job_ident::BackgroundJobName>),
+
+    #[error(transparent)]
+    UnknownBackgroundJob(#[from] UnknownError<job_ident::BackgroundJobName>),
 
     #[error(transparent)]
     UnmatchColumnDataType(#[from] UnmatchColumnDataType),
 
     #[error(transparent)]
-    VirtualColumnNotFound(#[from] VirtualColumnNotFound),
+    UnmatchMaskPolicyReturnType(#[from] UnmatchMaskPolicyReturnType),
 
     #[error(transparent)]
-    VirtualColumnAlreadyExists(#[from] VirtualColumnAlreadyExists),
+    VirtualColumnNotFound(#[from] UnknownError<virtual_column_ident::Resource, u64>),
+
+    #[error(transparent)]
+    VirtualColumnAlreadyExists(#[from] ExistError<virtual_column_ident::Resource, u64>),
+
+    #[error(transparent)]
+    StreamAlreadyExists(#[from] StreamAlreadyExists),
+
+    #[error(transparent)]
+    StreamVersionMismatched(#[from] StreamVersionMismatched),
+
+    #[error(transparent)]
+    UnknownStreamId(#[from] UnknownStreamId),
+
+    #[error(transparent)]
+    MultiStatementTxnCommitFailed(#[from] MultiStmtTxnCommitFailed),
+
+    // sequence
+    #[error(transparent)]
+    SequenceError(#[from] SequenceError),
+
+    #[error(transparent)]
+    UpdateStreamMetasFailed(#[from] UpdateStreamMetasFailed),
+
+    // dictionary
+    #[error(transparent)]
+    DictionaryAlreadyExists(
+        #[from] ExistError<dictionary_name_ident::DictionaryNameRsc, DictionaryIdentity>,
+    ),
+
+    #[error(transparent)]
+    UnknownDictionary(
+        #[from] UnknownError<dictionary_name_ident::DictionaryNameRsc, DictionaryIdentity>,
+    ),
+
+    // Procedure
+    #[error(transparent)]
+    ProcedureAlreadyExists(
+        #[from] ExistError<procedure_name_ident::ProcedureName, ProcedureIdentity>,
+    ),
+
+    #[error(transparent)]
+    UnknownProcedure(#[from] UnknownError<procedure_name_ident::ProcedureName, ProcedureIdentity>),
 }
 
-impl AppErrorMessage for UnknownBackgroundJob {
-    fn message(&self) -> String {
-        format!("Unknown background job '{}'", self.name)
+impl AppError {
+    /// Create an `unknown` TIdent error.
+    pub fn unknown<R, N>(ident: &TIdent<R, N>, ctx: impl Display) -> AppError
+    where
+        N: Clone,
+        AppError: From<UnknownError<R, N>>,
+    {
+        AppError::from(ident.unknown_error(ctx))
+    }
+
+    /// Create an `exist` TIdent error.
+    pub fn exists<R, N>(ident: &TIdent<R, N>, ctx: impl Display) -> AppError
+    where
+        N: Clone,
+        AppError: From<ExistError<R, N>>,
+    {
+        AppError::from(ident.exist_error(ctx))
     }
 }
 
-impl AppErrorMessage for BackgroundJobAlreadyExists {
+#[derive(thiserror::Error, Debug, Clone, PartialEq, Eq)]
+pub enum SequenceError {
+    #[error(transparent)]
+    SequenceAlreadyExists(#[from] ExistError<SequenceRsc>),
+
+    #[error(transparent)]
+    UnknownSequence(#[from] UnknownError<SequenceRsc>),
+
+    #[error(transparent)]
+    OutofSequenceRange(#[from] OutofSequenceRange),
+
+    #[error(transparent)]
+    WrongSequenceCount(#[from] WrongSequenceCount),
+}
+
+impl AppErrorMessage for TenantIsEmpty {
     fn message(&self) -> String {
-        format!("Background job '{}' already exists", self.name)
+        self.to_string()
     }
 }
 
@@ -923,21 +1152,9 @@ impl AppErrorMessage for UnknownDatabase {
     }
 }
 
-impl AppErrorMessage for UnknownCatalog {
-    fn message(&self) -> String {
-        format!("Unknown catalog '{}'", self.catalog_name)
-    }
-}
-
 impl AppErrorMessage for DatabaseAlreadyExists {
     fn message(&self) -> String {
         format!("Database '{}' already exists", self.db_name)
-    }
-}
-
-impl AppErrorMessage for CatalogAlreadyExists {
-    fn message(&self) -> String {
-        format!("Catalog '{}' already exists", self.catalog_name)
     }
 }
 
@@ -965,7 +1182,27 @@ impl AppErrorMessage for UnknownDatabaseId {}
 
 impl AppErrorMessage for TableVersionMismatched {}
 
+impl AppErrorMessage for StreamAlreadyExists {
+    fn message(&self) -> String {
+        format!("'{}' as stream Already Exists", self.name)
+    }
+}
+
+impl AppErrorMessage for StreamVersionMismatched {}
+
+impl AppErrorMessage for UnknownStreamId {}
+
+impl AppErrorMessage for MultiStmtTxnCommitFailed {}
+
+impl AppErrorMessage for UpdateStreamMetasFailed {}
+
 impl AppErrorMessage for DuplicatedUpsertFiles {}
+
+impl AppErrorMessage for CommitTableMetaError {
+    fn message(&self) -> String {
+        format!("Commit table '{}' fail", self.table_name)
+    }
+}
 
 impl AppErrorMessage for TableAlreadyExists {
     fn message(&self) -> String {
@@ -973,9 +1210,24 @@ impl AppErrorMessage for TableAlreadyExists {
     }
 }
 
+impl AppErrorMessage for ViewAlreadyExists {
+    fn message(&self) -> String {
+        format!("'{}' as view Already Exists", self.view_name)
+    }
+}
+
 impl AppErrorMessage for CreateTableWithDropTime {
     fn message(&self) -> String {
         format!("Create Table '{}' with drop time", self.table_name)
+    }
+}
+
+impl AppErrorMessage for CreateAsDropTableWithoutDropTime {
+    fn message(&self) -> String {
+        format!(
+            "Create as drop Table '{}' without drop time",
+            self.table_name
+        )
     }
 }
 
@@ -1036,6 +1288,12 @@ impl AppErrorMessage for WrongShareObject {
     }
 }
 
+impl AppErrorMessage for WrongSharePrivileges {
+    fn message(&self) -> String {
+        format!("wrong share privileges of {}", self.obj_name)
+    }
+}
+
 impl AppErrorMessage for ShareHasNoGrantedDatabase {
     fn message(&self) -> String {
         format!(
@@ -1054,10 +1312,10 @@ impl AppErrorMessage for ShareHasNoGrantedPrivilege {
     }
 }
 
-impl AppErrorMessage for UnknownShareTable {
+impl AppErrorMessage for CannotAccessShareTable {
     fn message(&self) -> String {
         format!(
-            "unknown share table {} of share {}.{}",
+            "cannot access to share table {} from share {}.{}",
             self.table_name, self.tenant, self.share_name
         )
     }
@@ -1084,6 +1342,15 @@ impl AppErrorMessage for UnknownShareEndpoint {
 impl AppErrorMessage for UnknownShareEndpointId {
     fn message(&self) -> String {
         format!("Unknown share endpoint id '{}'", self.share_endpoint_id)
+    }
+}
+
+impl AppErrorMessage for TableLockExpired {
+    fn message(&self) -> String {
+        format!(
+            "the acquired table lock in '{}' has been expired",
+            self.table_id
+        )
     }
 }
 
@@ -1135,33 +1402,27 @@ impl AppErrorMessage for CreateIndexWithDropTime {
     }
 }
 
-impl AppErrorMessage for IndexAlreadyExists {
-    fn message(&self) -> String {
-        format!("Index '{}' already exists", self.index_name)
-    }
-}
-
-impl AppErrorMessage for UnknownIndex {
-    fn message(&self) -> String {
-        format!("Unknown index '{}'", self.index_name)
-    }
-}
-
 impl AppErrorMessage for DropIndexWithDropTime {
     fn message(&self) -> String {
         format!("Drop Index '{}' with drop time", self.index_name)
     }
 }
 
-impl AppErrorMessage for GetIndexWithDropTime {
+impl AppErrorMessage for DuplicatedIndexColumnId {
     fn message(&self) -> String {
-        format!("Get Index '{}' with drop time", self.index_name)
+        format!(
+            "{} is duplicated with index '{}'",
+            self.column_id, self.index_name
+        )
     }
 }
 
-impl AppErrorMessage for DatamaskAlreadyExists {
+impl AppErrorMessage for IndexColumnIdNotFound {
     fn message(&self) -> String {
-        format!("Datamask '{}' already exists", self.name)
+        format!(
+            "index '{}' column id {} is not found",
+            self.index_name, self.column_id
+        )
     }
 }
 
@@ -1180,24 +1441,48 @@ impl AppErrorMessage for UnmatchColumnDataType {
     }
 }
 
-impl AppErrorMessage for VirtualColumnNotFound {
+impl AppErrorMessage for UnmatchMaskPolicyReturnType {
     fn message(&self) -> String {
-        format!("Virtual Column for table '{}' not found", self.table_id)
+        format!(
+            "'{}':'{}' mismatch with return type '{}'",
+            self.arg_name, self.arg_type, self.return_type
+        )
     }
 }
 
-impl AppErrorMessage for VirtualColumnAlreadyExists {
+impl AppErrorMessage for OutofSequenceRange {
     fn message(&self) -> String {
-        format!(
-            "Virtual Column for table '{}' already exists",
-            self.table_id
-        )
+        format!("Sequence '{}' out of range", self.name)
+    }
+}
+
+impl AppErrorMessage for WrongSequenceCount {
+    fn message(&self) -> String {
+        format!("Require zero Sequence count for '{}'", self.name)
+    }
+}
+
+impl AppErrorMessage for SequenceError {
+    fn message(&self) -> String {
+        match self {
+            SequenceError::SequenceAlreadyExists(e) => {
+                format!("SequenceAlreadyExists: '{}'", e.message())
+            }
+            SequenceError::UnknownSequence(e) => format!("UnknownSequence: '{}'", e.message()),
+            SequenceError::OutofSequenceRange(e) => {
+                format!("OutofSequenceRange: '{}'", e.message())
+            }
+            SequenceError::WrongSequenceCount(e) => {
+                format!("SequenceAlreadyExists: '{}'", e.message())
+            }
+        }
     }
 }
 
 impl From<AppError> for ErrorCode {
     fn from(app_err: AppError) -> Self {
         match app_err {
+            AppError::TenantIsEmpty(err) => ErrorCode::TenantIsEmpty(err.message()),
             AppError::UnknownDatabase(err) => ErrorCode::UnknownDatabase(err.message()),
             AppError::UnknownDatabaseId(err) => ErrorCode::UnknownDatabaseId(err.message()),
             AppError::UnknownTableId(err) => ErrorCode::UnknownTableId(err.message()),
@@ -1217,9 +1502,14 @@ impl From<AppError> for ErrorCode {
             AppError::UndropDbWithNoDropTime(err) => {
                 ErrorCode::UndropDbWithNoDropTime(err.message())
             }
+            AppError::CommitTableMetaError(err) => ErrorCode::CommitTableMetaError(err.message()),
             AppError::TableAlreadyExists(err) => ErrorCode::TableAlreadyExists(err.message()),
+            AppError::ViewAlreadyExists(err) => ErrorCode::ViewAlreadyExists(err.message()),
             AppError::CreateTableWithDropTime(err) => {
                 ErrorCode::CreateTableWithDropTime(err.message())
+            }
+            AppError::CreateAsDropTableWithoutDropTime(err) => {
+                ErrorCode::CreateAsDropTableWithoutDropTime(err.message())
             }
             AppError::UndropTableAlreadyExists(err) => {
                 ErrorCode::UndropTableAlreadyExists(err.message())
@@ -1230,6 +1520,11 @@ impl From<AppError> for ErrorCode {
             AppError::TableVersionMismatched(err) => {
                 ErrorCode::TableVersionMismatched(err.message())
             }
+            AppError::StreamAlreadyExists(err) => ErrorCode::StreamAlreadyExists(err.message()),
+            AppError::StreamVersionMismatched(err) => {
+                ErrorCode::StreamVersionMismatched(err.message())
+            }
+            AppError::UnknownStreamId(err) => ErrorCode::UnknownStreamId(err.message()),
             AppError::ShareAlreadyExists(err) => ErrorCode::ShareAlreadyExists(err.message()),
             AppError::UnknownShare(err) => ErrorCode::UnknownShare(err.message()),
             AppError::UnknownShareId(err) => ErrorCode::UnknownShareId(err.message()),
@@ -1238,13 +1533,16 @@ impl From<AppError> for ErrorCode {
             }
             AppError::UnknownShareAccounts(err) => ErrorCode::UnknownShareAccounts(err.message()),
             AppError::WrongShareObject(err) => ErrorCode::WrongShareObject(err.message()),
+            AppError::WrongSharePrivileges(err) => ErrorCode::WrongSharePrivileges(err.message()),
             AppError::ShareHasNoGrantedDatabase(err) => {
                 ErrorCode::ShareHasNoGrantedDatabase(err.message())
             }
             AppError::ShareHasNoGrantedPrivilege(err) => {
                 ErrorCode::ShareHasNoGrantedPrivilege(err.message())
             }
-            AppError::UnknownShareTable(err) => ErrorCode::UnknownShareTable(err.message()),
+            AppError::CannotAccessShareTable(err) => {
+                ErrorCode::CannotAccessShareTable(err.message())
+            }
             AppError::WrongShare(err) => ErrorCode::WrongShare(err.message()),
             AppError::ShareEndpointAlreadyExists(err) => {
                 ErrorCode::ShareEndpointAlreadyExists(err.message())
@@ -1253,6 +1551,7 @@ impl From<AppError> for ErrorCode {
             AppError::UnknownShareEndpointId(err) => {
                 ErrorCode::UnknownShareEndpointId(err.message())
             }
+            AppError::TableLockExpired(err) => ErrorCode::TableLockExpired(err.message()),
             AppError::CannotShareDatabaseCreatedFromShare(err) => {
                 ErrorCode::CannotShareDatabaseCreatedFromShare(err.message())
             }
@@ -1264,19 +1563,51 @@ impl From<AppError> for ErrorCode {
             AppError::IndexAlreadyExists(err) => ErrorCode::IndexAlreadyExists(err.message()),
             AppError::UnknownIndex(err) => ErrorCode::UnknownIndex(err.message()),
             AppError::DropIndexWithDropTime(err) => ErrorCode::DropIndexWithDropTime(err.message()),
-            AppError::GetIndexWithDropTIme(err) => ErrorCode::GetIndexWithDropTime(err.message()),
+            AppError::DuplicatedIndexColumnId(err) => {
+                ErrorCode::DuplicatedIndexColumnId(err.message())
+            }
+            AppError::IndexColumnIdNotFound(err) => ErrorCode::IndexColumnIdNotFound(err.message()),
+
             AppError::DatamaskAlreadyExists(err) => ErrorCode::DatamaskAlreadyExists(err.message()),
-            AppError::UnknownDatamask(err) => ErrorCode::UnknownDatamask(err.message()),
+            AppError::UnknownDataMask(err) => ErrorCode::UnknownDatamask(err.message()),
 
             AppError::BackgroundJobAlreadyExists(err) => {
                 ErrorCode::BackgroundJobAlreadyExists(err.message())
             }
             AppError::UnknownBackgroundJob(err) => ErrorCode::UnknownBackgroundJob(err.message()),
             AppError::UnmatchColumnDataType(err) => ErrorCode::UnmatchColumnDataType(err.message()),
+            AppError::UnmatchMaskPolicyReturnType(err) => {
+                ErrorCode::UnmatchMaskPolicyReturnType(err.message())
+            }
             AppError::VirtualColumnNotFound(err) => ErrorCode::VirtualColumnNotFound(err.message()),
             AppError::VirtualColumnAlreadyExists(err) => {
                 ErrorCode::VirtualColumnAlreadyExists(err.message())
             }
+            AppError::MultiStatementTxnCommitFailed(err) => {
+                ErrorCode::UnresolvableConflict(err.message())
+            }
+            AppError::SequenceError(err) => ErrorCode::SequenceError(err.message()),
+            AppError::UpdateStreamMetasFailed(e) => ErrorCode::UnresolvableConflict(e.message()),
+            // dictionary
+            AppError::DictionaryAlreadyExists(err) => {
+                ErrorCode::DictionaryAlreadyExists(err.message())
+            }
+            AppError::UnknownDictionary(err) => ErrorCode::UnknownDictionary(err.message()),
+            AppError::UnknownProcedure(err) => ErrorCode::UnknownProcedure(err.message()),
+            AppError::ProcedureAlreadyExists(err) => {
+                ErrorCode::ProcedureAlreadyExists(err.message())
+            }
+        }
+    }
+}
+
+impl From<SequenceError> for ErrorCode {
+    fn from(app_err: SequenceError) -> Self {
+        match app_err {
+            SequenceError::SequenceAlreadyExists(err) => ErrorCode::SequenceError(err.message()),
+            SequenceError::UnknownSequence(err) => ErrorCode::SequenceError(err.message()),
+            SequenceError::OutofSequenceRange(err) => ErrorCode::SequenceError(err.message()),
+            SequenceError::WrongSequenceCount(err) => ErrorCode::SequenceError(err.message()),
         }
     }
 }

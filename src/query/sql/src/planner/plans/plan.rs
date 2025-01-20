@@ -13,109 +13,155 @@
 // limitations under the License.
 
 use std::fmt::Display;
-use std::ops::Deref;
+use std::fmt::Formatter;
 use std::sync::Arc;
 
-use common_ast::ast::ExplainKind;
-use common_expression::types::DataType;
-use common_expression::DataField;
-use common_expression::DataSchema;
-use common_expression::DataSchemaRef;
-use common_expression::DataSchemaRefExt;
+use databend_common_ast::ast::ExplainKind;
+use databend_common_ast::ast::Query;
+use databend_common_catalog::query_kind::QueryKind;
+use databend_common_expression::types::DataType;
+use databend_common_expression::DataField;
+use databend_common_expression::DataSchema;
+use databend_common_expression::DataSchemaRef;
+use databend_common_expression::DataSchemaRefExt;
 
-use super::data_mask::CreateDatamaskPolicyPlan;
-use super::CopyIntoTableMode;
-use super::CreateIndexPlan;
-use super::CreateShareEndpointPlan;
-use super::DescDatamaskPolicyPlan;
-use super::DropDatamaskPolicyPlan;
-use super::DropIndexPlan;
-use super::DropShareEndpointPlan;
-use super::ModifyTableColumnPlan;
-use super::RenameTableColumnPlan;
-use super::SetOptionsPlan;
-use super::VacuumDropTablePlan;
-use super::VacuumTablePlan;
+use super::CreateDictionaryPlan;
+use super::DropDictionaryPlan;
+use super::RenameDictionaryPlan;
+use super::ShowCreateDictionaryPlan;
+use crate::binder::ExplainConfig;
 use crate::optimizer::SExpr;
-use crate::plans::copy::CopyPlan;
-use crate::plans::insert::Insert;
-use crate::plans::presign::PresignPlan;
-use crate::plans::recluster_table::ReclusterTablePlan;
-use crate::plans::share::AlterShareTenantsPlan;
-use crate::plans::share::CreateSharePlan;
-use crate::plans::share::DescSharePlan;
-use crate::plans::share::DropSharePlan;
-use crate::plans::share::GrantShareObjectPlan;
-use crate::plans::share::RevokeShareObjectPlan;
-use crate::plans::share::ShowGrantTenantsOfSharePlan;
-use crate::plans::share::ShowObjectGrantPrivilegesPlan;
-use crate::plans::share::ShowSharesPlan;
+use crate::plans::copy_into_location::CopyIntoLocationPlan;
 use crate::plans::AddTableColumnPlan;
+use crate::plans::AddWarehouseClusterPlan;
 use crate::plans::AlterNetworkPolicyPlan;
+use crate::plans::AlterNotificationPlan;
+use crate::plans::AlterPasswordPolicyPlan;
 use crate::plans::AlterTableClusterKeyPlan;
+use crate::plans::AlterTaskPlan;
 use crate::plans::AlterUDFPlan;
 use crate::plans::AlterUserPlan;
 use crate::plans::AlterViewPlan;
-use crate::plans::AlterVirtualColumnsPlan;
+use crate::plans::AlterVirtualColumnPlan;
 use crate::plans::AnalyzeTablePlan;
-use crate::plans::CallPlan;
+use crate::plans::AssignWarehouseNodesPlan;
+use crate::plans::CallProcedurePlan;
+use crate::plans::CopyIntoTableMode;
+use crate::plans::CopyIntoTablePlan;
 use crate::plans::CreateCatalogPlan;
+use crate::plans::CreateConnectionPlan;
 use crate::plans::CreateDatabasePlan;
+use crate::plans::CreateDatamaskPolicyPlan;
+use crate::plans::CreateDynamicTablePlan;
 use crate::plans::CreateFileFormatPlan;
+use crate::plans::CreateIndexPlan;
 use crate::plans::CreateNetworkPolicyPlan;
+use crate::plans::CreateNotificationPlan;
+use crate::plans::CreatePasswordPolicyPlan;
+use crate::plans::CreateProcedurePlan;
 use crate::plans::CreateRolePlan;
+use crate::plans::CreateSequencePlan;
 use crate::plans::CreateStagePlan;
+use crate::plans::CreateStreamPlan;
+use crate::plans::CreateTableIndexPlan;
 use crate::plans::CreateTablePlan;
+use crate::plans::CreateTaskPlan;
 use crate::plans::CreateUDFPlan;
 use crate::plans::CreateUserPlan;
 use crate::plans::CreateViewPlan;
-use crate::plans::CreateVirtualColumnsPlan;
-use crate::plans::DeletePlan;
+use crate::plans::CreateVirtualColumnPlan;
+use crate::plans::CreateWarehousePlan;
+use crate::plans::DescConnectionPlan;
+use crate::plans::DescDatamaskPolicyPlan;
 use crate::plans::DescNetworkPolicyPlan;
+use crate::plans::DescNotificationPlan;
+use crate::plans::DescPasswordPolicyPlan;
+use crate::plans::DescUserPlan;
 use crate::plans::DescribeTablePlan;
+use crate::plans::DescribeTaskPlan;
+use crate::plans::DescribeViewPlan;
 use crate::plans::DropCatalogPlan;
+use crate::plans::DropConnectionPlan;
 use crate::plans::DropDatabasePlan;
+use crate::plans::DropDatamaskPolicyPlan;
 use crate::plans::DropFileFormatPlan;
+use crate::plans::DropIndexPlan;
 use crate::plans::DropNetworkPolicyPlan;
+use crate::plans::DropNotificationPlan;
+use crate::plans::DropPasswordPolicyPlan;
+use crate::plans::DropProcedurePlan;
 use crate::plans::DropRolePlan;
+use crate::plans::DropSequencePlan;
 use crate::plans::DropStagePlan;
+use crate::plans::DropStreamPlan;
 use crate::plans::DropTableClusterKeyPlan;
 use crate::plans::DropTableColumnPlan;
+use crate::plans::DropTableIndexPlan;
 use crate::plans::DropTablePlan;
+use crate::plans::DropTaskPlan;
 use crate::plans::DropUDFPlan;
 use crate::plans::DropUserPlan;
 use crate::plans::DropViewPlan;
-use crate::plans::DropVirtualColumnsPlan;
+use crate::plans::DropVirtualColumnPlan;
+use crate::plans::DropWarehouseClusterPlan;
+use crate::plans::DropWarehousePlan;
+use crate::plans::Exchange;
+use crate::plans::ExecuteImmediatePlan;
+use crate::plans::ExecuteTaskPlan;
 use crate::plans::ExistsTablePlan;
-use crate::plans::GenerateVirtualColumnsPlan;
 use crate::plans::GrantPrivilegePlan;
 use crate::plans::GrantRolePlan;
+use crate::plans::Insert;
+use crate::plans::InsertMultiTable;
+use crate::plans::InspectWarehousePlan;
 use crate::plans::KillPlan;
-use crate::plans::OptimizeTablePlan;
+use crate::plans::ModifyTableColumnPlan;
+use crate::plans::ModifyTableCommentPlan;
+use crate::plans::OptimizeCompactSegmentPlan;
+use crate::plans::OptimizePurgePlan;
+use crate::plans::PresignPlan;
 use crate::plans::RefreshIndexPlan;
+use crate::plans::RefreshTableIndexPlan;
+use crate::plans::RefreshVirtualColumnPlan;
+use crate::plans::RelOperator;
 use crate::plans::RemoveStagePlan;
 use crate::plans::RenameDatabasePlan;
+use crate::plans::RenameTableColumnPlan;
 use crate::plans::RenameTablePlan;
+use crate::plans::RenameWarehouseClusterPlan;
+use crate::plans::RenameWarehousePlan;
 use crate::plans::Replace;
+use crate::plans::ResumeWarehousePlan;
 use crate::plans::RevertTablePlan;
 use crate::plans::RevokePrivilegePlan;
 use crate::plans::RevokeRolePlan;
+use crate::plans::SetOptionsPlan;
+use crate::plans::SetPlan;
+use crate::plans::SetPriorityPlan;
 use crate::plans::SetRolePlan;
-use crate::plans::SettingPlan;
+use crate::plans::SetSecondaryRolesPlan;
+use crate::plans::ShowConnectionsPlan;
 use crate::plans::ShowCreateCatalogPlan;
 use crate::plans::ShowCreateDatabasePlan;
 use crate::plans::ShowCreateTablePlan;
 use crate::plans::ShowFileFormatsPlan;
-use crate::plans::ShowGrantsPlan;
 use crate::plans::ShowNetworkPoliciesPlan;
 use crate::plans::ShowRolesPlan;
-use crate::plans::ShowShareEndpointPlan;
+use crate::plans::ShowTasksPlan;
+use crate::plans::SuspendWarehousePlan;
+use crate::plans::SystemPlan;
 use crate::plans::TruncateTablePlan;
-use crate::plans::UnSettingPlan;
+use crate::plans::UnassignWarehouseNodesPlan;
 use crate::plans::UndropDatabasePlan;
 use crate::plans::UndropTablePlan;
-use crate::plans::UpdatePlan;
+use crate::plans::UnsetOptionsPlan;
+use crate::plans::UnsetPlan;
+use crate::plans::UseCatalogPlan;
 use crate::plans::UseDatabasePlan;
+use crate::plans::UseWarehousePlan;
+use crate::plans::VacuumDropTablePlan;
+use crate::plans::VacuumTablePlan;
+use crate::plans::VacuumTemporaryFilesPlan;
 use crate::BindContext;
 use crate::MetadataRef;
 
@@ -134,6 +180,7 @@ pub enum Plan {
 
     Explain {
         kind: ExplainKind,
+        config: ExplainConfig,
         plan: Box<Plan>,
     },
     ExplainAst {
@@ -143,19 +190,35 @@ pub enum Plan {
         formatted_sql: String,
     },
     ExplainAnalyze {
+        partial: bool,
+        graphical: bool,
         plan: Box<Plan>,
     },
 
-    // Copy
-    Copy(Box<CopyPlan>),
-
-    // Call
-    Call(Box<CallPlan>),
+    // Call is rewrite into Query
+    // Call(Box<CallPlan>),
 
     // Catalogs
     ShowCreateCatalog(Box<ShowCreateCatalogPlan>),
     CreateCatalog(Box<CreateCatalogPlan>),
     DropCatalog(Box<DropCatalogPlan>),
+    UseCatalog(Box<UseCatalogPlan>),
+
+    // Warehouses
+    ShowOnlineNodes,
+    ShowWarehouses,
+    UseWarehouse(Box<UseWarehousePlan>),
+    CreateWarehouse(Box<CreateWarehousePlan>),
+    DropWarehouse(Box<DropWarehousePlan>),
+    ResumeWarehouse(Box<ResumeWarehousePlan>),
+    SuspendWarehouse(Box<SuspendWarehousePlan>),
+    RenameWarehouse(Box<RenameWarehousePlan>),
+    InspectWarehouse(Box<InspectWarehousePlan>),
+    AddWarehouseCluster(Box<AddWarehouseClusterPlan>),
+    DropWarehouseCluster(Box<DropWarehouseClusterPlan>),
+    RenameWarehouseCluster(Box<RenameWarehouseClusterPlan>),
+    AssignWarehouseNodes(Box<AssignWarehouseNodesPlan>),
+    UnassignWarehouseNodes(Box<UnassignWarehouseNodesPlan>),
 
     // Databases
     ShowCreateDatabase(Box<ShowCreateDatabasePlan>),
@@ -172,48 +235,78 @@ pub enum Plan {
     DropTable(Box<DropTablePlan>),
     UndropTable(Box<UndropTablePlan>),
     RenameTable(Box<RenameTablePlan>),
+    ModifyTableComment(Box<ModifyTableCommentPlan>),
     RenameTableColumn(Box<RenameTableColumnPlan>),
     AddTableColumn(Box<AddTableColumnPlan>),
     DropTableColumn(Box<DropTableColumnPlan>),
     ModifyTableColumn(Box<ModifyTableColumnPlan>),
     AlterTableClusterKey(Box<AlterTableClusterKeyPlan>),
     DropTableClusterKey(Box<DropTableClusterKeyPlan>),
-    ReclusterTable(Box<ReclusterTablePlan>),
+    ReclusterTable {
+        s_expr: Box<SExpr>,
+        hilbert_query: Option<Box<Query>>,
+        is_final: bool,
+    },
     RevertTable(Box<RevertTablePlan>),
     TruncateTable(Box<TruncateTablePlan>),
-    OptimizeTable(Box<OptimizeTablePlan>),
     VacuumTable(Box<VacuumTablePlan>),
     VacuumDropTable(Box<VacuumDropTablePlan>),
+    VacuumTemporaryFiles(Box<VacuumTemporaryFilesPlan>),
     AnalyzeTable(Box<AnalyzeTablePlan>),
     ExistsTable(Box<ExistsTablePlan>),
     SetOptions(Box<SetOptionsPlan>),
+    UnsetOptions(Box<UnsetOptionsPlan>),
+
+    // Optimize
+    OptimizePurge(Box<OptimizePurgePlan>),
+    OptimizeCompactSegment(Box<OptimizeCompactSegmentPlan>),
+    OptimizeCompactBlock {
+        s_expr: Box<SExpr>,
+        need_purge: bool,
+    },
 
     // Insert
     Insert(Box<Insert>),
+    InsertMultiTable(Box<InsertMultiTable>),
     Replace(Box<Replace>),
-    Delete(Box<DeletePlan>),
-    Update(Box<UpdatePlan>),
+    DataMutation {
+        s_expr: Box<SExpr>,
+        schema: DataSchemaRef,
+        metadata: MetadataRef,
+    },
+
+    CopyIntoTable(Box<CopyIntoTablePlan>),
+    CopyIntoLocation(CopyIntoLocationPlan),
 
     // Views
     CreateView(Box<CreateViewPlan>),
     AlterView(Box<AlterViewPlan>),
     DropView(Box<DropViewPlan>),
+    DescribeView(Box<DescribeViewPlan>),
+
+    // Streams
+    CreateStream(Box<CreateStreamPlan>),
+    DropStream(Box<DropStreamPlan>),
 
     // Indexes
     CreateIndex(Box<CreateIndexPlan>),
     DropIndex(Box<DropIndexPlan>),
     RefreshIndex(Box<RefreshIndexPlan>),
+    CreateTableIndex(Box<CreateTableIndexPlan>),
+    DropTableIndex(Box<DropTableIndexPlan>),
+    RefreshTableIndex(Box<RefreshTableIndexPlan>),
 
     // Virtual Columns
-    CreateVirtualColumns(Box<CreateVirtualColumnsPlan>),
-    AlterVirtualColumns(Box<AlterVirtualColumnsPlan>),
-    DropVirtualColumns(Box<DropVirtualColumnsPlan>),
-    GenerateVirtualColumns(Box<GenerateVirtualColumnsPlan>),
+    CreateVirtualColumn(Box<CreateVirtualColumnPlan>),
+    AlterVirtualColumn(Box<AlterVirtualColumnPlan>),
+    DropVirtualColumn(Box<DropVirtualColumnPlan>),
+    RefreshVirtualColumn(Box<RefreshVirtualColumnPlan>),
 
     // Account
     AlterUser(Box<AlterUserPlan>),
     CreateUser(Box<CreateUserPlan>),
     DropUser(Box<DropUserPlan>),
+    DescUser(Box<DescUserPlan>),
 
     // UDF
     CreateUDF(Box<CreateUDFPlan>),
@@ -226,10 +319,10 @@ pub enum Plan {
     DropRole(Box<DropRolePlan>),
     GrantRole(Box<GrantRolePlan>),
     GrantPriv(Box<GrantPrivilegePlan>),
-    ShowGrants(Box<ShowGrantsPlan>),
     RevokePriv(Box<RevokePrivilegePlan>),
     RevokeRole(Box<RevokeRolePlan>),
     SetRole(Box<SetRolePlan>),
+    SetSecondaryRoles(Box<SetSecondaryRolesPlan>),
 
     // FileFormat
     CreateFileFormat(Box<CreateFileFormatPlan>),
@@ -241,27 +334,21 @@ pub enum Plan {
     DropStage(Box<DropStagePlan>),
     RemoveStage(Box<RemoveStagePlan>),
 
+    // Connection
+    CreateConnection(Box<CreateConnectionPlan>),
+    DescConnection(Box<DescConnectionPlan>),
+    DropConnection(Box<DropConnectionPlan>),
+    ShowConnections(Box<ShowConnectionsPlan>),
+
     // Presign
     Presign(Box<PresignPlan>),
 
     // Set
-    SetVariable(Box<SettingPlan>),
-    UnSetVariable(Box<UnSettingPlan>),
+    Set(Box<SetPlan>),
+    Unset(Box<UnsetPlan>),
     Kill(Box<KillPlan>),
-
-    // Share
-    CreateShareEndpoint(Box<CreateShareEndpointPlan>),
-    ShowShareEndpoint(Box<ShowShareEndpointPlan>),
-    DropShareEndpoint(Box<DropShareEndpointPlan>),
-    CreateShare(Box<CreateSharePlan>),
-    DropShare(Box<DropSharePlan>),
-    GrantShareObject(Box<GrantShareObjectPlan>),
-    RevokeShareObject(Box<RevokeShareObjectPlan>),
-    AlterShareTenants(Box<AlterShareTenantsPlan>),
-    DescShare(Box<DescSharePlan>),
-    ShowShares(Box<ShowSharesPlan>),
-    ShowObjectGrantPrivileges(Box<ShowObjectGrantPrivilegesPlan>),
-    ShowGrantTenantsOfShare(Box<ShowGrantTenantsOfSharePlan>),
+    SetPriority(Box<SetPriorityPlan>),
+    System(Box<SystemPlan>),
 
     // Data mask
     CreateDatamaskPolicy(Box<CreateDatamaskPolicyPlan>),
@@ -274,23 +361,77 @@ pub enum Plan {
     DropNetworkPolicy(Box<DropNetworkPolicyPlan>),
     DescNetworkPolicy(Box<DescNetworkPolicyPlan>),
     ShowNetworkPolicies(Box<ShowNetworkPoliciesPlan>),
+
+    // Password policy
+    CreatePasswordPolicy(Box<CreatePasswordPolicyPlan>),
+    AlterPasswordPolicy(Box<AlterPasswordPolicyPlan>),
+    DropPasswordPolicy(Box<DropPasswordPolicyPlan>),
+    DescPasswordPolicy(Box<DescPasswordPolicyPlan>),
+
+    // Task
+    CreateTask(Box<CreateTaskPlan>),
+    AlterTask(Box<AlterTaskPlan>),
+    DropTask(Box<DropTaskPlan>),
+    DescribeTask(Box<DescribeTaskPlan>),
+    ShowTasks(Box<ShowTasksPlan>),
+    ExecuteTask(Box<ExecuteTaskPlan>),
+
+    CreateDynamicTable(Box<CreateDynamicTablePlan>),
+
+    // Txn
+    Begin,
+    Commit,
+    Abort,
+
+    // Notifications
+    CreateNotification(Box<CreateNotificationPlan>),
+    AlterNotification(Box<AlterNotificationPlan>),
+    DropNotification(Box<DropNotificationPlan>),
+    DescNotification(Box<DescNotificationPlan>),
+
+    // Stored procedures
+    ExecuteImmediate(Box<ExecuteImmediatePlan>),
+    // ShowCreateProcedure(Box<ShowCreateProcedurePlan>),
+    DropProcedure(Box<DropProcedurePlan>),
+    CreateProcedure(Box<CreateProcedurePlan>),
+    CallProcedure(Box<CallProcedurePlan>),
+    // RenameProcedure(Box<RenameProcedurePlan>),
+
+    // sequence
+    CreateSequence(Box<CreateSequencePlan>),
+    DropSequence(Box<DropSequencePlan>),
+
+    // Dictionary
+    CreateDictionary(Box<CreateDictionaryPlan>),
+    DropDictionary(Box<DropDictionaryPlan>),
+    ShowCreateDictionary(Box<ShowCreateDictionaryPlan>),
+    RenameDictionary(Box<RenameDictionaryPlan>),
 }
 
 #[derive(Clone, Debug)]
 pub enum RewriteKind {
     ShowSettings,
+    ShowVariables,
     ShowMetrics,
     ShowProcessList,
     ShowEngines,
     ShowIndexes,
 
+    ShowLocks,
+
     ShowCatalogs,
     ShowDatabases,
-    ShowTables(String),
-    ShowColumns(String, String),
+    ShowDropDatabases,
+    ShowTables(String, String),
+    ShowColumns(String, String, String),
     ShowTablesStatus,
+    ShowVirtualColumns,
+    ShowDictionaries(String),
+
+    ShowStreams(String),
 
     ShowFunctions,
+    ShowUserFunctions,
     ShowTableFunctions,
 
     ShowUsers,
@@ -298,128 +439,43 @@ pub enum RewriteKind {
     DescribeStage,
     ListStage,
     ShowRoles,
+    ShowPasswordPolicies,
+    ShowGrants,
+
+    Call,
+    ShowProcedures,
 }
 
-impl Display for Plan {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Plan {
+    pub fn kind(&self) -> QueryKind {
         match self {
-            Plan::Query { .. } => write!(f, "Query"),
-            Plan::Copy(plan) => match plan.deref() {
-                CopyPlan::IntoTable(copy_plan) => match copy_plan.write_mode {
-                    CopyIntoTableMode::Insert { .. } => write!(f, "Insert"),
-                    _ => write!(f, "Copy"),
-                },
-                _ => write!(f, "Copy"),
+            Plan::Query { .. } => QueryKind::Query,
+            Plan::CopyIntoTable(copy_plan) => match copy_plan.write_mode {
+                CopyIntoTableMode::Insert { .. } => QueryKind::Insert,
+                _ => QueryKind::CopyIntoTable,
             },
-            Plan::Explain { .. } => write!(f, "Explain"),
-            Plan::ExplainAnalyze { .. } => write!(f, "ExplainAnalyze"),
-            Plan::ShowCreateCatalog(_) => write!(f, "ShowCreateCatalog"),
-            Plan::CreateCatalog(_) => write!(f, "CreateCatalog"),
-            Plan::DropCatalog(_) => write!(f, "DropCatalog"),
-            Plan::ShowCreateDatabase(_) => write!(f, "ShowCreateDatabase"),
-            Plan::CreateDatabase(_) => write!(f, "CreateDatabase"),
-            Plan::DropDatabase(_) => write!(f, "DropDatabase"),
-            Plan::UndropDatabase(_) => write!(f, "UndropDatabase"),
-            Plan::UseDatabase(_) => write!(f, "UseDatabase"),
-            Plan::RenameDatabase(_) => write!(f, "RenameDatabase"),
-            Plan::ShowCreateTable(_) => write!(f, "ShowCreateTable"),
-            Plan::DescribeTable(_) => write!(f, "DescribeTable"),
-            Plan::CreateTable(_) => write!(f, "CreateTable"),
-            Plan::DropTable(_) => write!(f, "DropTable"),
-            Plan::UndropTable(_) => write!(f, "UndropTable"),
-            Plan::RenameTable(_) => write!(f, "RenameTable"),
-            Plan::RenameTableColumn(_) => write!(f, "RenameTableColumn"),
-            Plan::AddTableColumn(_) => write!(f, "AddTableColumn"),
-            Plan::ModifyTableColumn(_) => write!(f, "ModifyTableColumn"),
-            Plan::DropTableColumn(_) => write!(f, "DropTableColumn"),
-            Plan::AlterTableClusterKey(_) => write!(f, "AlterTableClusterKey"),
-            Plan::DropTableClusterKey(_) => write!(f, "DropTableClusterKey"),
-            Plan::ReclusterTable(_) => write!(f, "ReclusterTable"),
-            Plan::TruncateTable(_) => write!(f, "TruncateTable"),
-            Plan::OptimizeTable(_) => write!(f, "OptimizeTable"),
-            Plan::VacuumTable(_) => write!(f, "VacuumTable"),
-            Plan::VacuumDropTable(_) => write!(f, "VacuumDropTable"),
-            Plan::AnalyzeTable(_) => write!(f, "AnalyzeTable"),
-            Plan::ExistsTable(_) => write!(f, "ExistsTable"),
-            Plan::CreateView(_) => write!(f, "CreateView"),
-            Plan::AlterView(_) => write!(f, "AlterView"),
-            Plan::DropView(_) => write!(f, "DropView"),
-            Plan::CreateIndex(_) => write!(f, "CreateIndex"),
-            Plan::DropIndex(_) => write!(f, "DropIndex"),
-            Plan::RefreshIndex(_) => write!(f, "RefreshIndex"),
-            Plan::CreateVirtualColumns(_) => write!(f, "CreateVirtualColumns"),
-            Plan::AlterVirtualColumns(_) => write!(f, "AlterVirtualColumns"),
-            Plan::DropVirtualColumns(_) => write!(f, "DropVirtualColumns"),
-            Plan::GenerateVirtualColumns(_) => write!(f, "GenerateVirtualColumns"),
-            Plan::AlterUser(_) => write!(f, "AlterUser"),
-            Plan::CreateUser(_) => write!(f, "CreateUser"),
-            Plan::DropUser(_) => write!(f, "DropUser"),
-            Plan::CreateRole(_) => write!(f, "CreateRole"),
-            Plan::DropRole(_) => write!(f, "DropRole"),
-            Plan::CreateStage(_) => write!(f, "CreateStage"),
-            Plan::DropStage(_) => write!(f, "DropStage"),
-            Plan::CreateFileFormat(_) => write!(f, "CreateFileFormat"),
-            Plan::DropFileFormat(_) => write!(f, "DropFileFormat"),
-            Plan::ShowFileFormats(_) => write!(f, "ShowFileFormats"),
-            Plan::RemoveStage(_) => write!(f, "RemoveStage"),
-            Plan::GrantRole(_) => write!(f, "GrantRole"),
-            Plan::GrantPriv(_) => write!(f, "GrantPriv"),
-            Plan::ShowGrants(_) => write!(f, "ShowGrants"),
-            Plan::ShowRoles(_) => write!(f, "ShowRoles"),
-            Plan::RevokePriv(_) => write!(f, "RevokePriv"),
-            Plan::RevokeRole(_) => write!(f, "RevokeRole"),
-            Plan::CreateUDF(_) => write!(f, "CreateUDF"),
-            Plan::AlterUDF(_) => write!(f, "AlterUDF"),
-            Plan::DropUDF(_) => write!(f, "DropUDF"),
-            Plan::Insert(_) => write!(f, "Insert"),
-            Plan::Replace(_) => write!(f, "Replace"),
-            Plan::Delete(_) => write!(f, "Delete"),
-            Plan::Update(_) => write!(f, "Update"),
-            Plan::Call(_) => write!(f, "Call"),
-            Plan::Presign(_) => write!(f, "Presign"),
-            Plan::SetVariable(_) => write!(f, "SetVariable"),
-            Plan::UnSetVariable(_) => write!(f, "UnSetVariable"),
-            Plan::SetRole(_) => write!(f, "SetRole"),
-            Plan::Kill(_) => write!(f, "Kill"),
-            Plan::CreateShareEndpoint(_) => write!(f, "CreateShareEndpoint"),
-            Plan::ShowShareEndpoint(_) => write!(f, "ShowShareEndpoint"),
-            Plan::DropShareEndpoint(_) => write!(f, "DropShareEndpoint"),
-            Plan::CreateShare(_) => write!(f, "CreateShare"),
-            Plan::DropShare(_) => write!(f, "DropShare"),
-            Plan::GrantShareObject(_) => write!(f, "GrantShareObject"),
-            Plan::RevokeShareObject(_) => write!(f, "RevokeShareObject"),
-            Plan::AlterShareTenants(_) => write!(f, "AlterShareTenants"),
-            Plan::DescShare(_) => write!(f, "DescShare"),
-            Plan::ShowShares(_) => write!(f, "ShowShares"),
-            Plan::ShowObjectGrantPrivileges(_) => write!(f, "ShowObjectGrantPrivileges"),
-            Plan::ShowGrantTenantsOfShare(_) => write!(f, "ShowGrantTenantsOfShare"),
-            Plan::ExplainAst { .. } => write!(f, "ExplainAst"),
-            Plan::ExplainSyntax { .. } => write!(f, "ExplainSyntax"),
-            Plan::RevertTable(..) => write!(f, "RevertTable"),
-            Plan::CreateDatamaskPolicy(..) => {
-                write!(f, "Create Data Mask Policy")
-            }
-            Plan::DropDatamaskPolicy(..) => {
-                write!(f, "Drop Data Mask Policy")
-            }
-            Plan::DescDatamaskPolicy(..) => {
-                write!(f, "Desc Data Mask Policy")
-            }
-            Plan::SetOptions(..) => {
-                write!(f, "SetOptions")
-            }
-            Plan::CreateNetworkPolicy(_) => write!(f, "CreateNetworkPolicy"),
-            Plan::AlterNetworkPolicy(_) => write!(f, "AlterNetworkPolicy"),
-            Plan::DropNetworkPolicy(_) => write!(f, "DropNetworkPolicy"),
-            Plan::DescNetworkPolicy(_) => write!(f, "DescNetworkPolicy"),
-            Plan::ShowNetworkPolicies(_) => write!(f, "ShowNetworkPolicies"),
+            Plan::Explain { .. }
+            | Plan::ExplainAnalyze { .. }
+            | Plan::ExplainAst { .. }
+            | Plan::ExplainSyntax { .. } => QueryKind::Explain,
+            Plan::Insert(_) => QueryKind::Insert,
+            Plan::Replace(_)
+            | Plan::DataMutation { .. }
+            | Plan::OptimizePurge(_)
+            | Plan::OptimizeCompactSegment(_)
+            | Plan::OptimizeCompactBlock { .. } => QueryKind::Update,
+            _ => QueryKind::Other,
         }
     }
 }
 
+impl Display for Plan {
+    fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
+        write!(f, "{}", self.kind())
+    }
+}
+
 impl Plan {
-    /// Notice: This is incomplete and should be only used when you know it must has schema (Plan::Query | Plan::Insert ...).
-    /// If you want to get the real schema from plan use `InterpreterFactory::get_schema()` instead
     pub fn schema(&self) -> DataSchemaRef {
         match self {
             Plan::Query {
@@ -428,74 +484,100 @@ impl Plan {
                 bind_context,
                 ..
             } => bind_context.output_schema(),
-            Plan::Explain { .. } | Plan::ExplainAst { .. } | Plan::ExplainSyntax { .. } => {
+            Plan::Explain { .. }
+            | Plan::ExplainAst { .. }
+            | Plan::ExplainSyntax { .. }
+            | Plan::ExplainAnalyze { .. } => {
                 DataSchemaRefExt::create(vec![DataField::new("explain", DataType::String)])
             }
-            Plan::ExplainAnalyze { .. } => {
-                DataSchemaRefExt::create(vec![DataField::new("explain", DataType::String)])
-            }
+            Plan::DataMutation { schema, .. } => schema.clone(),
             Plan::ShowCreateCatalog(plan) => plan.schema(),
             Plan::ShowCreateDatabase(plan) => plan.schema(),
+            Plan::ShowCreateDictionary(plan) => plan.schema(),
             Plan::ShowCreateTable(plan) => plan.schema(),
             Plan::DescribeTable(plan) => plan.schema(),
             Plan::VacuumTable(plan) => plan.schema(),
             Plan::VacuumDropTable(plan) => plan.schema(),
+            Plan::VacuumTemporaryFiles(plan) => plan.schema(),
             Plan::ExistsTable(plan) => plan.schema(),
+            Plan::DescribeView(plan) => plan.schema(),
             Plan::ShowRoles(plan) => plan.schema(),
-            Plan::ShowGrants(plan) => plan.schema(),
             Plan::ShowFileFormats(plan) => plan.schema(),
-
-            Plan::Insert(plan) => plan.schema(),
             Plan::Replace(plan) => plan.schema(),
-
-            Plan::Call(_) => Arc::new(DataSchema::empty()),
             Plan::Presign(plan) => plan.schema(),
-            Plan::ShowShareEndpoint(plan) => plan.schema(),
-            Plan::DescShare(plan) => plan.schema(),
-            Plan::ShowShares(plan) => plan.schema(),
-            Plan::ShowGrantTenantsOfShare(plan) => plan.schema(),
             Plan::CreateDatamaskPolicy(plan) => plan.schema(),
             Plan::DropDatamaskPolicy(plan) => plan.schema(),
             Plan::DescDatamaskPolicy(plan) => plan.schema(),
-            Plan::CreateNetworkPolicy(plan) => plan.schema(),
-            Plan::AlterNetworkPolicy(plan) => plan.schema(),
-            Plan::DropNetworkPolicy(plan) => plan.schema(),
             Plan::DescNetworkPolicy(plan) => plan.schema(),
             Plan::ShowNetworkPolicies(plan) => plan.schema(),
-            other => {
-                debug_assert!(!other.has_result_set());
-                Arc::new(DataSchema::empty())
-            }
+            Plan::DescPasswordPolicy(plan) => plan.schema(),
+            Plan::CopyIntoTable(plan) => plan.schema(),
+            Plan::CopyIntoLocation(plan) => plan.schema(),
+            Plan::CreateTask(plan) => plan.schema(),
+            Plan::DescribeTask(plan) => plan.schema(),
+            Plan::ShowTasks(plan) => plan.schema(),
+            Plan::ExecuteTask(plan) => plan.schema(),
+            Plan::DescNotification(plan) => plan.schema(),
+            Plan::DescConnection(plan) => plan.schema(),
+            Plan::ShowConnections(plan) => plan.schema(),
+            Plan::ExecuteImmediate(plan) => plan.schema(),
+            Plan::CallProcedure(plan) => plan.schema(),
+            Plan::InsertMultiTable(plan) => plan.schema(),
+            Plan::DescUser(plan) => plan.schema(),
+            Plan::Insert(plan) => plan.schema(),
+            Plan::InspectWarehouse(plan) => plan.schema(),
+            Plan::ShowWarehouses => DataSchemaRefExt::create(vec![
+                DataField::new("warehouse", DataType::String),
+                DataField::new("type", DataType::String),
+                DataField::new("status", DataType::String),
+            ]),
+            Plan::ShowOnlineNodes => DataSchemaRefExt::create(vec![
+                DataField::new("id", DataType::String),
+                DataField::new("type", DataType::String),
+                DataField::new("node_group", DataType::String),
+                DataField::new("warehouse", DataType::String),
+                DataField::new("cluster", DataType::String),
+                DataField::new("version", DataType::String),
+            ]),
+
+            _ => Arc::new(DataSchema::empty()),
         }
     }
 
     pub fn has_result_set(&self) -> bool {
-        matches!(
-            self,
-            Plan::Query { .. }
-                | Plan::Explain { .. }
-                | Plan::ExplainAst { .. }
-                | Plan::ExplainSyntax { .. }
-                | Plan::ExplainAnalyze { .. }
-                | Plan::Call(_)
-                | Plan::ShowCreateDatabase(_)
-                | Plan::ShowCreateTable(_)
-                | Plan::ShowCreateCatalog(_)
-                | Plan::ShowFileFormats(_)
-                | Plan::ShowRoles(_)
-                | Plan::DescShare(_)
-                | Plan::ShowShares(_)
-                | Plan::ShowShareEndpoint(_)
-                | Plan::ShowObjectGrantPrivileges(_)
-                | Plan::ShowGrantTenantsOfShare(_)
-                | Plan::DescribeTable(_)
-                | Plan::ShowGrants(_)
-                | Plan::Presign(_)
-                | Plan::VacuumTable(_)
-                | Plan::VacuumDropTable(_)
-                | Plan::DescDatamaskPolicy(_)
-                | Plan::DescNetworkPolicy(_)
-                | Plan::ShowNetworkPolicies(_)
-        )
+        !self.schema().fields().is_empty()
+    }
+
+    pub fn remove_exchange_for_select(&self) -> Self {
+        if let Plan::Query {
+            s_expr,
+            metadata,
+            bind_context,
+            rewrite_kind,
+            formatted_ast,
+            ignore_result,
+        } = self
+        {
+            if let RelOperator::Exchange(Exchange::Merge) = s_expr.plan.as_ref() {
+                let s_expr = Box::new(s_expr.child(0).unwrap().clone());
+                return Plan::Query {
+                    s_expr,
+                    metadata: metadata.clone(),
+                    bind_context: bind_context.clone(),
+                    rewrite_kind: rewrite_kind.clone(),
+                    formatted_ast: formatted_ast.clone(),
+                    ignore_result: *ignore_result,
+                };
+            }
+        }
+        self.clone()
+    }
+
+    pub fn bind_context(&self) -> Option<BindContext> {
+        if let Plan::Query { bind_context, .. } = self {
+            Some(*bind_context.clone())
+        } else {
+            None
+        }
     }
 }

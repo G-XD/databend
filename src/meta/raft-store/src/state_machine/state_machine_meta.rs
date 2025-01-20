@@ -14,12 +14,13 @@
 
 use std::fmt;
 
-use common_meta_sled_store::sled;
-use common_meta_sled_store::SledBytesError;
-use common_meta_sled_store::SledOrderedSerde;
-use common_meta_types::anyerror::AnyError;
-use common_meta_types::LogId;
-use common_meta_types::StoredMembership;
+use databend_common_meta_sled_store::sled;
+use databend_common_meta_sled_store::SledBytesError;
+use databend_common_meta_sled_store::SledOrderedSerde;
+use databend_common_meta_sled_store::SledSerde;
+use databend_common_meta_types::anyerror::AnyError;
+use databend_common_meta_types::raft_types::LogId;
+use databend_common_meta_types::raft_types::StoredMembership;
 use serde::Deserialize;
 use serde::Serialize;
 use sled::IVec;
@@ -45,7 +46,7 @@ pub enum StateMachineMetaValue {
 }
 
 impl fmt::Display for StateMachineMetaKey {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
             StateMachineMetaKey::LastApplied => {
                 write!(f, "last-applied")
@@ -86,45 +87,10 @@ impl SledOrderedSerde for StateMachineMetaKey {
     }
 }
 
-pub(crate) mod compat_with_07 {
-    use common_meta_sled_store::SledBytesError;
-    use common_meta_sled_store::SledSerde;
-    use common_meta_types::compat07;
-    use openraft::compat::Upgrade;
-
-    use crate::state_machine::StateMachineMetaValue;
-
-    #[derive(Debug, serde::Serialize, serde::Deserialize)]
-    pub enum StateMachineMetaValueCompat {
-        LogId(compat07::LogId),
-        Bool(bool),
-        Membership(compat07::StoredMembership),
-    }
-
-    impl Upgrade<StateMachineMetaValue> for StateMachineMetaValueCompat {
-        #[rustfmt::skip]
-        fn upgrade(self) -> StateMachineMetaValue {
-            match self {
-                Self::LogId(lid)    => StateMachineMetaValue::LogId(lid.upgrade()),
-                Self::Bool(b)       => StateMachineMetaValue::Bool(b),
-                Self::Membership(m) => StateMachineMetaValue::Membership(m.upgrade()),
-            }
-        }
-    }
-
-    impl SledSerde for StateMachineMetaValueCompat {
-        fn de<T: AsRef<[u8]>>(v: T) -> Result<Self, SledBytesError>
-        where Self: Sized {
-            let s = serde_json::from_slice(v.as_ref())?;
-            Ok(s)
-        }
-    }
-
-    impl SledSerde for StateMachineMetaValue {
-        fn de<T: AsRef<[u8]>>(v: T) -> Result<Self, SledBytesError>
-        where Self: Sized {
-            let s: StateMachineMetaValue = serde_json::from_slice(v.as_ref())?;
-            Ok(s)
-        }
+impl SledSerde for StateMachineMetaValue {
+    fn de<T: AsRef<[u8]>>(v: T) -> Result<Self, SledBytesError>
+    where Self: Sized {
+        let s: StateMachineMetaValue = serde_json::from_slice(v.as_ref())?;
+        Ok(s)
     }
 }

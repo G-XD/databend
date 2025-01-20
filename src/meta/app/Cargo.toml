@@ -1,5 +1,5 @@
 [package]
-name = "common-meta-app"
+name = "databend-common-meta-app"
 version = { workspace = true }
 authors = { workspace = true }
 license = { workspace = true }
@@ -14,25 +14,31 @@ test = true
 storage-hdfs = []
 
 [dependencies]
-common-exception = { path = "../../common/exception" }
-common-expression = { path = "../../query/expression" }
-common-io = { path = "../../common/io" }
-common-meta-kvapi = { path = "../kvapi" }
-common-meta-types = { path = "../types" }
-
 anyerror = { workspace = true }
 chrono = { workspace = true }
 chrono-tz = { workspace = true }
-cron = "0.12.0"
-enumflags2 = { version = "0.7.7", features = ["serde"] }
-hex = "0.4.3"
-maplit = "1.0.2"
-num-derive = "0.3.3"
-num-traits = "0.2.15"
+cron = { workspace = true }
+databend-common-ast = { workspace = true }
+databend-common-base = { workspace = true }
+databend-common-exception = { workspace = true }
+databend-common-expression = { workspace = true }
+databend-common-io = { workspace = true }
+databend-common-meta-kvapi = { workspace = true }
+databend-common-meta-types = { workspace = true }
+derive_more = { workspace = true }
+enumflags2 = { workspace = true }
+hex = { workspace = true }
+itertools = { workspace = true }
+maplit = { workspace = true }
+num-derive = { workspace = true }
+num-traits = { workspace = true }
+opendal = { workspace = true }
+paste = { workspace = true }
+prost = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-sha1 = "0.10.5"
-sha2 = "0.10.6"
+sha1 = { workspace = true }
+sha2 = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
@@ -41,7 +47,5 @@ anyhow = { workspace = true }
 [package.metadata.cargo-machete]
 ignored = ["num-traits"]
 
-[build-dependencies]
-common-building = { path = "../../common/building" }
-
-tonic-build = { workspace = true }
+[lints]
+workspace = true

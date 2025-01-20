@@ -13,49 +13,46 @@
 // limitations under the License.
 
 #![allow(clippy::uninlined_format_args)]
+#![allow(clippy::useless_asref)]
 #![feature(type_alias_impl_trait)]
-#![feature(io_error_other)]
 #![feature(iter_order_by)]
 #![feature(let_chains)]
 #![feature(impl_trait_in_assoc_type)]
 #![feature(int_roundings)]
-#![feature(result_option_inspect)]
+#![feature(iterator_try_reduce)]
+#![feature(slice_take)]
+#![allow(clippy::large_enum_variant)]
+#![recursion_limit = "256"]
 
 mod constants;
-mod fuse_lazy_part;
-pub mod fuse_part;
+mod fuse_column;
+mod fuse_part;
 mod fuse_table;
+mod fuse_type;
+
 pub mod io;
 pub mod operations;
 pub mod pruning;
+mod pruning_pipeline;
 pub mod statistics;
 pub mod table_functions;
 
-mod metrics;
-
-use common_catalog::table::NavigationPoint;
-use common_catalog::table::Table;
-use common_catalog::table::TableStatistics;
-pub use common_catalog::table_context::TableContext;
 pub use constants::*;
-pub use fuse_lazy_part::FuseLazyPartInfo;
-pub use fuse_part::FusePartInfo;
-pub use fuse_table::FuseStorageFormat;
+use databend_common_catalog::table::NavigationPoint;
+use databend_common_catalog::table::Table;
+use databend_common_catalog::table::TableStatistics;
+pub use databend_common_catalog::table_context::TableContext;
+pub use fuse_column::FuseTableColumnStatisticsProvider;
+pub use fuse_part::FuseBlockPartInfo;
+pub use fuse_part::FuseLazyPartInfo;
 pub use fuse_table::FuseTable;
-pub use io::MergeIOReadResult;
+pub use fuse_type::FuseStorageFormat;
+pub use fuse_type::FuseTableType;
+pub use io::BlockReadResult;
 pub use pruning::SegmentLocation;
 
 mod sessions {
-    pub use common_catalog::table_context::TableContext;
+    pub use databend_common_catalog::table_context::TableContext;
 }
 
-mod pipelines {
-    pub use common_pipeline_core::Pipeline;
-    pub mod processors {
-        pub use common_pipeline_core::processors::*;
-        pub use common_pipeline_sources::*;
-        pub use common_pipeline_transforms::processors::transforms;
-    }
-}
-
-pub use storages_common_index as index;
+pub use databend_storages_common_index as index;

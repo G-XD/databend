@@ -15,12 +15,12 @@
 use std::fmt;
 use std::fmt::Formatter;
 
-use common_base::rangemap::RangeMerger;
-use common_exception::Result;
+use databend_common_base::rangemap::RangeMerger;
+use databend_common_exception::Result;
 
 struct Array(Vec<std::ops::Range<u64>>);
 impl fmt::Display for Array {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         for range in &self.0 {
             write!(f, "[{},{}] ", range.start, range.end)?;
         }

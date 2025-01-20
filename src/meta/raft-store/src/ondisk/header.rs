@@ -14,9 +14,9 @@
 
 use std::fmt;
 
-use common_meta_sled_store::sled;
-use common_meta_sled_store::SledBytesError;
-use common_meta_sled_store::SledSerde;
+use databend_common_meta_sled_store::sled;
+use databend_common_meta_sled_store::SledBytesError;
+use databend_common_meta_sled_store::SledSerde;
 
 use crate::ondisk::DataVersion;
 use crate::ondisk::DATA_VERSION;
@@ -31,21 +31,30 @@ pub struct Header {
     /// The target version to upgrade to.
     ///
     /// If it is present, the data is upgrading.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub upgrading: Option<DataVersion>,
+
+    /// The second part of the upgrading process:
+    /// new version data is ready, and the old version data is cleaning up.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub cleaning: bool,
 }
 
 impl fmt::Display for Header {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "version: {}, upgrading: {}",
-            self.version,
-            if let Some(upgrading) = self.upgrading {
-                upgrading.to_string()
-            } else {
-                "None".to_string()
-            }
-        )
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{}", self.version)?;
+
+        if let Some(upgrading) = self.upgrading {
+            write!(f, " -> {}", upgrading)?;
+        };
+
+        if self.cleaning {
+            write!(f, " (cleaning)")?;
+        }
+
+        Ok(())
     }
 }
 
@@ -67,6 +76,7 @@ impl Header {
         Self {
             version: DATA_VERSION,
             upgrading: None,
+            cleaning: false,
         }
     }
 }

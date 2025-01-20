@@ -13,19 +13,19 @@
 // limitations under the License.
 
 use anyhow::Error;
-use common_meta_raft_store::key_spaces::RaftStoreEntry;
-use common_meta_types::txn_condition::Target;
-use common_meta_types::txn_op::Request;
-use common_meta_types::Cmd;
-use common_meta_types::Entry;
-use common_meta_types::LogEntry;
-use common_meta_types::Operation;
-use common_meta_types::SeqV;
-use common_meta_types::TxnCondition;
-use common_meta_types::TxnOp;
-use common_meta_types::TxnPutRequest;
-use common_meta_types::TxnRequest;
-use common_meta_types::UpsertKV;
+use databend_common_meta_raft_store::key_spaces::RaftStoreEntry;
+use databend_common_meta_types::raft_types::Entry;
+use databend_common_meta_types::seq_value::SeqV;
+use databend_common_meta_types::txn_condition::Target;
+use databend_common_meta_types::txn_op::Request;
+use databend_common_meta_types::Cmd;
+use databend_common_meta_types::LogEntry;
+use databend_common_meta_types::Operation;
+use databend_common_meta_types::TxnCondition;
+use databend_common_meta_types::TxnOp;
+use databend_common_meta_types::TxnPutRequest;
+use databend_common_meta_types::TxnRequest;
+use databend_common_meta_types::UpsertKV;
 use openraft::EntryPayload;
 
 use crate::process::Process;
@@ -82,6 +82,11 @@ where F: Fn(&str, Vec<u8>) -> Result<Vec<u8>, anyhow::Error>
                 Ok(Some(x))
             }
 
+            RaftStoreEntry::LogEntry(entry) => {
+                let x = RaftStoreEntry::LogEntry(unwrap_or_return!(self.proc_raft_entry(entry)?));
+                Ok(Some(x))
+            }
+
             RaftStoreEntry::GenericKV { key, value } => {
                 let data = (self.process_pb)(&key, value.data)?;
 
@@ -104,6 +109,11 @@ where F: Fn(&str, Vec<u8>) -> Result<Vec<u8>, anyhow::Error>
             RaftStoreEntry::Sequences { .. } => Ok(None),
             RaftStoreEntry::ClientLastResps { .. } => Ok(None),
             RaftStoreEntry::LogMeta { .. } => Ok(None),
+
+            RaftStoreEntry::NodeId(_) => Ok(None),
+            RaftStoreEntry::Vote(_) => Ok(None),
+            RaftStoreEntry::Committed(_) => Ok(None),
+            RaftStoreEntry::Purged(_) => Ok(None),
         }
     }
 
@@ -154,11 +164,7 @@ where F: Fn(&str, Vec<u8>) -> Result<Vec<u8>, anyhow::Error>
                 Ok(Some(LogEntry {
                     txid: log_entry.txid,
                     time_ms: log_entry.time_ms,
-                    cmd: Cmd::Transaction(TxnRequest {
-                        condition,
-                        if_then,
-                        else_then,
-                    }),
+                    cmd: Cmd::Transaction(TxnRequest::new(condition, if_then).with_else(else_then)),
                 }))
             }
         }
@@ -177,6 +183,7 @@ where F: Fn(&str, Vec<u8>) -> Result<Vec<u8>, anyhow::Error>
                 }))
             }
             Operation::Delete => Ok(None),
+            #[allow(deprecated)]
             Operation::AsIs => Ok(None),
         }
     }
@@ -218,6 +225,7 @@ where F: Fn(&str, Vec<u8>) -> Result<Vec<u8>, anyhow::Error>
             value,
             prev_value: p.prev_value,
             expire_at: p.expire_at,
+            ttl_ms: p.ttl_ms,
         };
 
         Ok(pr)

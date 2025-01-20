@@ -13,17 +13,24 @@
 // limitations under the License.
 
 #![allow(clippy::uninlined_format_args)]
-// #![feature(type_alias_impl_trait)]
-
-// #![allow(incomplete_features)]
-// #![feature(return_position_impl_trait_in_trait)]
+#![feature(coroutines)]
+#![feature(impl_trait_in_assoc_type)]
+#![feature(try_blocks)]
+#![allow(clippy::diverging_sub_expression)]
 
 pub mod applier;
-pub(crate) mod compat07;
 pub mod config;
 pub mod key_spaces;
-pub mod log;
+pub mod leveled_store;
+pub(crate) mod marked;
+pub mod mem_meta;
+pub mod mem_state_machine;
 pub mod ondisk;
-pub mod sm_v002;
+pub mod raft_log_v004;
+pub mod sm_v003;
+pub mod snapshot_config;
 pub mod state;
 pub mod state_machine;
+pub mod state_machine_api;
+pub mod state_machine_api_ext;
+pub mod utils;

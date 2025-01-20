@@ -14,12 +14,14 @@
 
 use std::sync::Arc;
 
-use common_exception::ErrorCode;
-use common_exception::Result;
-use common_meta_app::principal::StageType;
-use common_sql::plans::DropStagePlan;
-use common_storages_stage::StageTable;
-use common_users::UserApiProvider;
+use databend_common_exception::Result;
+use databend_common_management::RoleApi;
+use databend_common_meta_app::principal::OwnershipObject;
+use databend_common_meta_app::principal::StageType;
+use databend_common_sql::plans::DropStagePlan;
+use databend_common_storages_stage::StageTable;
+use databend_common_users::RoleCacheManager;
+use databend_common_users::UserApiProvider;
 use log::debug;
 use log::info;
 
@@ -46,7 +48,11 @@ impl Interpreter for DropUserStageInterpreter {
         "DropUserStageInterpreter"
     }
 
-    #[minitrace::trace]
+    fn is_ddl(&self) -> bool {
+        true
+    }
+
+    #[fastrace::trace]
     #[async_backtrace::framed]
     async fn execute2(&self) -> Result<PipelineBuildResult> {
         debug!("ctx.id" = self.ctx.get_id().as_str(); "drop_user_stage_execute");
@@ -55,19 +61,22 @@ impl Interpreter for DropUserStageInterpreter {
         let tenant = self.ctx.get_tenant();
         let user_mgr = UserApiProvider::instance();
 
-        // Check user stage.
-        if plan.name == "~" {
-            return Err(ErrorCode::StagePermissionDenied(
-                "user stage is not allowed to be dropped",
-            ));
-        }
-
         let stage = user_mgr.get_stage(&tenant, &plan.name).await;
         user_mgr
             .drop_stage(&tenant, &plan.name, plan.if_exists)
             .await?;
 
         if let Ok(stage) = stage {
+            // we should do `drop ownership` after actually drop stage,
+            // drop the ownership
+            let role_api = UserApiProvider::instance().role_api(&tenant);
+            let owner_object = OwnershipObject::Stage {
+                name: self.plan.name.clone(),
+            };
+
+            role_api.revoke_ownership(&owner_object).await?;
+            RoleCacheManager::instance().invalidate_cache(&tenant);
+
             if !matches!(&stage.stage_type, StageType::External) {
                 let op = StageTable::get_op(&stage)?;
                 op.remove_all("/").await?;

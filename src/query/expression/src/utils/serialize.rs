@@ -13,11 +13,10 @@
 // limitations under the License.
 
 use std::cmp::Ordering;
+use std::result::Result;
 
-use chrono::Datelike;
-use chrono::NaiveDate;
-use common_exception::ErrorCode;
-use common_exception::Result;
+use jiff::civil::Date;
+use jiff::Unit;
 
 use crate::types::decimal::Decimal;
 use crate::types::decimal::DecimalSize;
@@ -25,25 +24,52 @@ use crate::types::decimal::DecimalSize;
 pub const EPOCH_DAYS_FROM_CE: i32 = 719_163;
 
 #[inline]
-pub fn uniform_date(date: NaiveDate) -> i32 {
-    date.num_days_from_ce() - EPOCH_DAYS_FROM_CE
+pub fn uniform_date(date: Date) -> i32 {
+    date.since((Unit::Day, Date::new(1970, 1, 1).unwrap()))
+        .unwrap()
+        .get_days()
 }
 
+// Used in function, so we don't want to return ErrorCode with backtrace
 pub fn read_decimal_with_size<T: Decimal>(
     buf: &[u8],
     size: DecimalSize,
     exact: bool,
-) -> Result<(T, usize)> {
-    let (n, d, e, n_read) = read_decimal::<T>(buf, size.precision as u32, exact)?;
-    if d as i32 + e > (size.precision - size.scale).into() {
+    rounding_mode: bool,
+) -> Result<(T, usize), String> {
+    // Read one more digit for round
+    let (n, d, e, n_read) =
+        read_decimal::<T>(buf, (size.precision + 1) as u32, size.scale as _, exact)?;
+    if d as i32 + e > (size.precision - size.scale) as i32 {
         return Err(decimal_overflow_error());
     }
     let scale_diff = e + size.scale as i32;
+
     let n = match scale_diff.cmp(&0) {
         Ordering::Less => {
-            // e < 0, than  -e is the actual scale, (-e) > scale means we need to cut more
-            n.checked_div(T::e(-scale_diff as u32))
-                .ok_or_else(decimal_overflow_error)?
+            let scale_diff = -scale_diff as u32;
+            let mut round_val = None;
+            if rounding_mode {
+                // Checking whether numbers need to be added or subtracted to calculate rounding
+                if let Some(r) = n.checked_rem(T::e(scale_diff)) {
+                    if let Some(m) = r.checked_div(T::e(scale_diff - 1)) {
+                        if m >= T::from_i128(5i64) {
+                            round_val = Some(T::one());
+                        } else if m <= T::from_i128(-5i64) {
+                            round_val = Some(T::minus_one());
+                        }
+                    }
+                }
+            }
+            // e < 0, than -e is the actual scale, (-e) > scale means we need to cut more
+            let n = n
+                .checked_div(T::e(scale_diff))
+                .ok_or_else(decimal_overflow_error)?;
+            if let Some(val) = round_val {
+                n.checked_add(val).ok_or_else(decimal_overflow_error)?
+            } else {
+                n
+            }
         }
         Ordering::Greater => n
             .checked_mul(T::e(scale_diff as u32))
@@ -57,7 +83,7 @@ pub fn read_decimal_with_size<T: Decimal>(
 ///   value = n * 10^exponent.
 ///   n has n_digits digits, with no leading or fraction trailing zero.
 ///   Excessive digits in a fraction are discarded (not rounded)
-/// no information is lost except excessive digits cut due to max_digits.
+/// no information is lost except excessive digits cut due to max_digits and max_scales.
 /// e.g '010.010' return (1001, 4 -2, 7)
 /// usage:
 ///   used directly: for example 'select 1.1' should return a decimal
@@ -65,8 +91,9 @@ pub fn read_decimal_with_size<T: Decimal>(
 pub fn read_decimal<T: Decimal>(
     buf: &[u8],
     max_digits: u32,
+    mut max_scales: u32,
     exact: bool,
-) -> Result<(T, u8, i32, usize)> {
+) -> Result<(T, u8, i32, usize), String> {
     if buf.is_empty() {
         return Err(decimal_parse_error("empty"));
     }
@@ -88,12 +115,14 @@ pub fn read_decimal<T: Decimal>(
     };
 
     let mut digits = 0;
+    let mut scales = 0;
     let mut leading_zero = false;
     let mut leading_digits = 0;
     let mut zeros = 0;
+
     let mut has_point = false;
-    let mut has_e = false;
     let mut stop = -1;
+    let mut stop_of_e = -1;
 
     // ignore leading zeros
     while pos < len && buf[pos] == b'0' {
@@ -101,26 +130,78 @@ pub fn read_decimal<T: Decimal>(
         leading_zero = true
     }
 
+    // fetch the e number
+    let mut e_pos = pos;
+    let mut e_sign = 1;
+    let mut e_num = 0;
+    while e_pos < len {
+        match buf[e_pos] {
+            b'e' | b'E' => {
+                e_pos += 1;
+                if e_pos < len {
+                    match buf[e_pos] {
+                        b'+' => {
+                            e_pos += 1;
+                        }
+                        b'-' => {
+                            e_pos += 1;
+                            e_sign = -1;
+                        }
+                        _ => {}
+                    };
+                }
+
+                while e_pos < len {
+                    match buf[e_pos] {
+                        b'0'..=b'9' => {
+                            e_pos += 1;
+                            e_num = e_num * 10 + (buf[e_pos - 1] - b'0') as i32 * e_sign;
+                        }
+                        _ => {
+                            if exact {
+                                return Err(decimal_parse_error("unexpected char"));
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                stop_of_e = e_pos as i32;
+                break;
+            }
+            b'.' | b'-' | b'+' | b'0'..=b'9' => e_pos += 1,
+            _ => {
+                if exact {
+                    return Err(decimal_parse_error("unexpected char"));
+                } else {
+                    stop_of_e = e_pos as i32;
+                    break;
+                }
+            }
+        }
+    }
+
+    // 0.011111e3 --> we need to fetch e_num as 3 to calculate the max_scales scale
+    max_scales = ((max_scales as i32) + e_num).max(0) as u32;
+
     // use 3 separate loops make code more clear and each loop is more tight.
     while pos < len {
         match buf[pos] {
-            b'0'..=b'9' => {
+            v @ b'0'..=b'9' => {
                 digits += 1;
                 if digits > max_digits {
                     return Err(decimal_overflow_error());
+                } else if v == b'0' {
+                    zeros += 1;
                 } else {
-                    let v = buf[pos];
-                    if v == b'0' {
-                        zeros += 1;
-                    } else {
-                        n = n
-                            .checked_mul(T::e(zeros + 1))
-                            .ok_or_else(decimal_overflow_error)?;
-                        n = n
-                            .checked_add(T::from_u64((v - b'0') as u64))
-                            .ok_or_else(decimal_overflow_error)?;
-                        zeros = 0;
-                    }
+                    n = n
+                        .checked_mul(T::e(zeros + 1))
+                        .ok_or_else(decimal_overflow_error)?;
+                    n = n
+                        .checked_add(T::from_i128((v - b'0') as u64))
+                        .ok_or_else(decimal_overflow_error)?;
+                    zeros = 0;
                 }
             }
             b'.' => {
@@ -130,7 +211,7 @@ pub fn read_decimal<T: Decimal>(
                 break;
             }
             b'e' | b'E' => {
-                has_e = true;
+                stop = stop_of_e;
                 pos += 1;
                 break;
             }
@@ -157,7 +238,8 @@ pub fn read_decimal<T: Decimal>(
         while pos < len {
             match buf[pos] {
                 b'0' => {
-                    if digits >= max_digits {
+                    scales += 1;
+                    if digits >= max_digits || scales > max_scales + 1 {
                         // cut and consume excessive digits.
                         pos += 1;
                         continue;
@@ -167,7 +249,8 @@ pub fn read_decimal<T: Decimal>(
                 }
 
                 b'1'..=b'9' => {
-                    if digits >= max_digits {
+                    scales += 1;
+                    if digits >= max_digits || scales > max_scales + 1 {
                         // cut and consume excessive digits.
                         pos += 1;
                         continue;
@@ -177,15 +260,15 @@ pub fn read_decimal<T: Decimal>(
                             .checked_mul(T::e(zeros + 1))
                             .ok_or_else(decimal_overflow_error)?;
                         n = n
-                            .checked_add(T::from_u64((v - b'0') as u64))
+                            .checked_add(T::from_i128((v - b'0') as u64))
                             .ok_or_else(decimal_overflow_error)?;
                         digits += zeros + 1;
                         zeros = 0;
                     }
                 }
+                // already handled
                 b'e' | b'E' => {
-                    has_e = true;
-                    pos += 1;
+                    stop = stop_of_e;
                     break;
                 }
                 _ => {
@@ -212,47 +295,7 @@ pub fn read_decimal<T: Decimal>(
         0i32
     };
 
-    if has_e && stop < 0 {
-        let mut exp = 0i32;
-        if pos == len - 1 {
-            return Err(decimal_parse_error("empty exponent"));
-        }
-
-        let exp_sign = match buf[pos] {
-            b'+' => {
-                pos += 1;
-                1
-            }
-            b'-' => {
-                pos += 1;
-                -1
-            }
-            _ => 1,
-        };
-
-        if pos == len - 1 {
-            return Err(decimal_parse_error("bad exponent"));
-        }
-
-        for (i, v) in buf[pos..].iter().enumerate() {
-            match v {
-                b'0'..=b'9' => {
-                    exp *= 10;
-                    exp += (v - b'0') as i32
-                }
-                c => {
-                    if exact {
-                        return Err(decimal_parse_error(&format!("unexpected char: {c}")));
-                    } else {
-                        stop = (pos + i) as i32;
-                        break;
-                    }
-                }
-            }
-        }
-        exponent += exp * exp_sign;
-    }
-
+    exponent += e_num;
     let n = n.checked_mul(sign).ok_or_else(decimal_overflow_error)?;
     let n_read = if stop > 0 { stop as usize } else { len };
     Ok((n, digits as u8, exponent, n_read))
@@ -261,15 +304,15 @@ pub fn read_decimal<T: Decimal>(
 pub fn read_decimal_from_json<T: Decimal>(
     value: &serde_json::Value,
     size: DecimalSize,
-) -> Result<T> {
+) -> Result<T, String> {
     match value {
         serde_json::Value::Number(n) => {
             if n.is_i64() {
-                Ok(T::from_i64(n.as_i64().unwrap())
+                Ok(T::from_i128(n.as_i64().unwrap())
                     .with_size(size)
                     .ok_or_else(decimal_overflow_error)?)
             } else if n.is_u64() {
-                Ok(T::from_u64(n.as_u64().unwrap())
+                Ok(T::from_i128(n.as_u64().unwrap())
                     .with_size(size)
                     .ok_or_else(decimal_overflow_error)?)
             } else {
@@ -279,17 +322,17 @@ pub fn read_decimal_from_json<T: Decimal>(
             }
         }
         serde_json::Value::String(s) => {
-            let (n, _) = read_decimal_with_size::<T>(s.as_bytes(), size, true)?;
+            let (n, _) = read_decimal_with_size::<T>(s.as_bytes(), size, true, true)?;
             Ok(n)
         }
-        _ => Err(ErrorCode::from("Incorrect json value for decimal")),
+        _ => Err("Incorrect json value for decimal".to_string()),
     }
 }
 
-fn decimal_parse_error(msg: &str) -> ErrorCode {
-    ErrorCode::BadArguments(format!("bad decimal literal: {msg}"))
+fn decimal_parse_error(msg: &str) -> String {
+    format!("bad decimal literal: {msg}")
 }
 
-fn decimal_overflow_error() -> ErrorCode {
-    ErrorCode::Overflow("Decimal overflow")
+fn decimal_overflow_error() -> String {
+    "Decimal overflow".to_string()
 }

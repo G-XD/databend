@@ -13,54 +13,47 @@
 // limitations under the License.
 
 use std::any::Any;
+use std::fmt::Formatter;
 use std::pin::Pin;
-use std::ptr::NonNull;
 use std::sync::Arc;
 
-use common_exception::Result;
-use common_expression::types::string::StringColumnBuilder;
-use common_expression::BlockMetaInfoDowncast;
-use common_expression::Column;
-use common_expression::DataBlock;
-use common_functions::aggregates::StateAddr;
-use common_hashtable::HashtableEntryRefLike;
-use common_hashtable::HashtableLike;
-use common_pipeline_core::processors::port::InputPort;
-use common_pipeline_core::processors::port::OutputPort;
-use common_pipeline_core::processors::processor::Event;
-use common_pipeline_core::processors::processor::ProcessorPtr;
-use common_pipeline_core::processors::Processor;
+use databend_common_exception::Result;
+use databend_common_expression::local_block_meta_serde;
+use databend_common_expression::BlockMetaInfo;
+use databend_common_expression::BlockMetaInfoDowncast;
+use databend_common_expression::BlockMetaInfoPtr;
+use databend_common_expression::DataBlock;
+use databend_common_expression::PayloadFlushState;
+use databend_common_pipeline_core::processors::Event;
+use databend_common_pipeline_core::processors::InputPort;
+use databend_common_pipeline_core::processors::OutputPort;
+use databend_common_pipeline_core::processors::Processor;
+use databend_common_pipeline_core::processors::ProcessorPtr;
+use futures::future::BoxFuture;
 
-use crate::pipelines::processors::transforms::aggregator::aggregate_meta::AggregateMeta;
-use crate::pipelines::processors::transforms::aggregator::aggregate_meta::HashTablePayload;
-use crate::pipelines::processors::transforms::aggregator::estimated_key_size;
-use crate::pipelines::processors::transforms::aggregator::serde::serde_meta::AggregateSerdeMeta;
-use crate::pipelines::processors::transforms::group_by::HashMethodBounds;
-use crate::pipelines::processors::transforms::group_by::KeysColumnBuilder;
-use crate::pipelines::processors::AggregatorParams;
-
-pub struct TransformAggregateSerializer<Method: HashMethodBounds> {
-    method: Method,
+use crate::pipelines::processors::transforms::aggregator::AggregateMeta;
+use crate::pipelines::processors::transforms::aggregator::AggregatePayload;
+use crate::pipelines::processors::transforms::aggregator::AggregateSerdeMeta;
+use crate::pipelines::processors::transforms::aggregator::AggregatorParams;
+pub struct TransformAggregateSerializer {
     params: Arc<AggregatorParams>,
 
     input: Arc<InputPort>,
     output: Arc<OutputPort>,
     output_data: Option<DataBlock>,
-    input_data: Option<SerializeAggregateStream<Method>>,
+    input_data: Option<SerializeAggregateStream>,
 }
 
-impl<Method: HashMethodBounds> TransformAggregateSerializer<Method> {
+impl TransformAggregateSerializer {
     pub fn try_create(
         input: Arc<InputPort>,
         output: Arc<OutputPort>,
-        method: Method,
         params: Arc<AggregatorParams>,
     ) -> Result<ProcessorPtr> {
         Ok(ProcessorPtr::create(Box::new(
             TransformAggregateSerializer {
                 input,
                 output,
-                method,
                 params,
                 input_data: None,
                 output_data: None,
@@ -69,7 +62,7 @@ impl<Method: HashMethodBounds> TransformAggregateSerializer<Method> {
     }
 }
 
-impl<Method: HashMethodBounds> Processor for TransformAggregateSerializer<Method> {
+impl Processor for TransformAggregateSerializer {
     fn name(&self) -> String {
         String::from("TransformAggregateSerializer")
     }
@@ -125,22 +118,21 @@ impl<Method: HashMethodBounds> Processor for TransformAggregateSerializer<Method
     }
 }
 
-impl<Method: HashMethodBounds> TransformAggregateSerializer<Method> {
+impl TransformAggregateSerializer {
     fn transform_input_data(&mut self, mut data_block: DataBlock) -> Result<Event> {
         debug_assert!(data_block.is_empty());
         if let Some(block_meta) = data_block.take_meta() {
-            if let Some(block_meta) = AggregateMeta::<Method, usize>::downcast_from(block_meta) {
+            if let Some(block_meta) = AggregateMeta::downcast_from(block_meta) {
                 match block_meta {
                     AggregateMeta::Spilled(_) => unreachable!(),
-                    AggregateMeta::Spilling(_) => unreachable!(),
                     AggregateMeta::Serialized(_) => unreachable!(),
                     AggregateMeta::BucketSpilled(_) => unreachable!(),
                     AggregateMeta::Partitioned { .. } => unreachable!(),
-                    AggregateMeta::HashTable(payload) => {
+                    AggregateMeta::AggregateSpilling(_) => unreachable!(),
+                    AggregateMeta::AggregatePayload(p) => {
                         self.input_data = Some(SerializeAggregateStream::create(
-                            &self.method,
                             &self.params,
-                            payload,
+                            SerializePayload::AggregatePayload(p),
                         ));
                         return Ok(Event::Sync);
                     }
@@ -152,81 +144,67 @@ impl<Method: HashMethodBounds> TransformAggregateSerializer<Method> {
     }
 }
 
-pub fn serialize_aggregate<Method: HashMethodBounds>(
-    method: &Method,
-    params: &Arc<AggregatorParams>,
-    hashtable: &Method::HashTable<usize>,
-) -> Result<DataBlock> {
-    let keys_len = hashtable.len();
-    let value_size = estimated_key_size(hashtable);
-
-    let funcs = &params.aggregate_functions;
-    let offsets_aggregate_states = &params.offsets_aggregate_states;
-
-    // Builders.
-    let mut state_builders = (0..funcs.len())
-        .map(|_| StringColumnBuilder::with_capacity(keys_len, keys_len * 4))
-        .collect::<Vec<_>>();
-
-    let mut group_key_builder = method.keys_column_builder(keys_len, value_size);
-
-    for group_entity in hashtable.iter() {
-        let place = Into::<StateAddr>::into(*group_entity.get());
-
-        for (idx, func) in funcs.iter().enumerate() {
-            let arg_place = place.next(offsets_aggregate_states[idx]);
-            func.serialize(arg_place, &mut state_builders[idx].data)?;
-            state_builders[idx].commit_row();
-        }
-
-        group_key_builder.append_value(group_entity.key());
-    }
-
-    let mut columns = Vec::with_capacity(state_builders.len() + 1);
-
-    for builder in state_builders.into_iter() {
-        columns.push(Column::String(builder.build()));
-    }
-
-    columns.push(group_key_builder.finish());
-    Ok(DataBlock::new_from_columns(columns))
+pub enum SerializePayload {
+    AggregatePayload(AggregatePayload),
 }
 
-pub struct SerializeAggregateStream<Method: HashMethodBounds> {
-    method: Method,
-    params: Arc<AggregatorParams>,
-    pub payload: Pin<Box<HashTablePayload<Method, usize>>>,
-    iter: <Method::HashTable<usize> as HashtableLike>::Iterator<'static>,
+pub enum FlightSerialized {
+    DataBlock(DataBlock),
+    Future(BoxFuture<'static, Result<DataBlock>>),
+}
+
+unsafe impl Sync for FlightSerialized {}
+
+pub struct FlightSerializedMeta {
+    pub serialized_blocks: Vec<FlightSerialized>,
+}
+
+impl FlightSerializedMeta {
+    pub fn create(blocks: Vec<FlightSerialized>) -> BlockMetaInfoPtr {
+        Box::new(FlightSerializedMeta {
+            serialized_blocks: blocks,
+        })
+    }
+}
+
+impl std::fmt::Debug for FlightSerializedMeta {
+    fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
+        f.debug_struct("FlightSerializedMeta").finish()
+    }
+}
+
+local_block_meta_serde!(FlightSerializedMeta);
+
+#[typetag::serde(name = "exchange_shuffle")]
+impl BlockMetaInfo for FlightSerializedMeta {}
+
+pub struct SerializeAggregateStream {
+    _params: Arc<AggregatorParams>,
+    pub payload: Pin<Box<SerializePayload>>,
+    flush_state: PayloadFlushState,
     end_iter: bool,
+    nums: usize,
 }
 
-unsafe impl<Method: HashMethodBounds> Send for SerializeAggregateStream<Method> {}
+unsafe impl Send for SerializeAggregateStream {}
 
-unsafe impl<Method: HashMethodBounds> Sync for SerializeAggregateStream<Method> {}
+unsafe impl Sync for SerializeAggregateStream {}
 
-impl<Method: HashMethodBounds> SerializeAggregateStream<Method> {
-    pub fn create(
-        method: &Method,
-        params: &Arc<AggregatorParams>,
-        payload: HashTablePayload<Method, usize>,
-    ) -> Self {
-        unsafe {
-            let payload = Box::pin(payload);
-            let point = NonNull::from(&payload.cell.hashtable);
-            let iter = point.as_ref().iter();
+impl SerializeAggregateStream {
+    pub fn create(params: &Arc<AggregatorParams>, payload: SerializePayload) -> Self {
+        let payload = Box::pin(payload);
 
-            SerializeAggregateStream::<Method> {
-                iter,
-                payload,
-                end_iter: false,
-                method: method.clone(),
-                params: params.clone(),
-            }
+        SerializeAggregateStream {
+            payload,
+            flush_state: PayloadFlushState::default(),
+            _params: params.clone(),
+            end_iter: false,
+            nums: 0,
         }
     }
 }
 
-impl<Method: HashMethodBounds> Iterator for SerializeAggregateStream<Method> {
+impl Iterator for SerializeAggregateStream {
     type Item = Result<DataBlock>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -234,73 +212,49 @@ impl<Method: HashMethodBounds> Iterator for SerializeAggregateStream<Method> {
     }
 }
 
-impl<Method: HashMethodBounds> SerializeAggregateStream<Method> {
+impl SerializeAggregateStream {
     fn next_impl(&mut self) -> Result<Option<DataBlock>> {
         if self.end_iter {
             return Ok(None);
         }
 
-        let max_block_rows = std::cmp::min(8192, self.payload.cell.hashtable.len());
-        let max_block_bytes = std::cmp::min(
-            8 * 1024 * 1024 + 1024,
-            self.payload
-                .cell
-                .hashtable
-                .unsize_key_size()
-                .unwrap_or(usize::MAX),
-        );
+        match self.payload.as_ref().get_ref() {
+            SerializePayload::AggregatePayload(p) => {
+                let block = p.payload.aggregate_flush(&mut self.flush_state)?;
 
-        let funcs = &self.params.aggregate_functions;
-        let offsets_aggregate_states = &self.params.offsets_aggregate_states;
+                if block.is_none() {
+                    self.end_iter = true;
+                }
 
-        // Builders.
-        let mut state_builders = (0..funcs.len())
-            .map(|_| StringColumnBuilder::with_capacity(max_block_rows, max_block_rows * 4))
-            .collect::<Vec<_>>();
-
-        let mut group_key_builder = self
-            .method
-            .keys_column_builder(max_block_rows, max_block_bytes);
-
-        #[allow(clippy::while_let_on_iterator)]
-        while let Some(group_entity) = self.iter.next() {
-            let mut bytes = 0;
-            let place = Into::<StateAddr>::into(*group_entity.get());
-
-            for (idx, func) in funcs.iter().enumerate() {
-                let arg_place = place.next(offsets_aggregate_states[idx]);
-                func.serialize(arg_place, &mut state_builders[idx].data)?;
-                state_builders[idx].commit_row();
-                bytes += state_builders[idx].data.len();
-            }
-
-            group_key_builder.append_value(group_entity.key());
-
-            if bytes >= 8 * 1024 * 1024 {
-                return self.finish(state_builders, group_key_builder);
+                match block {
+                    Some(block) => {
+                        self.nums += 1;
+                        Ok(Some(block.add_meta(Some(
+                            AggregateSerdeMeta::create_agg_payload(
+                                p.bucket,
+                                p.max_partition_count,
+                                false,
+                            ),
+                        ))?))
+                    }
+                    None => {
+                        // always return at least one block
+                        if self.nums == 0 {
+                            self.nums += 1;
+                            let block = p.payload.empty_block(Some(1));
+                            Ok(Some(block.add_meta(Some(
+                                AggregateSerdeMeta::create_agg_payload(
+                                    p.bucket,
+                                    p.max_partition_count,
+                                    true,
+                                ),
+                            ))?))
+                        } else {
+                            Ok(None)
+                        }
+                    }
+                }
             }
         }
-
-        self.end_iter = true;
-        self.finish(state_builders, group_key_builder)
-    }
-
-    fn finish(
-        &self,
-        state_builders: Vec<StringColumnBuilder>,
-        group_key_builder: Method::ColumnBuilder<'_>,
-    ) -> Result<Option<DataBlock>> {
-        let mut columns = Vec::with_capacity(state_builders.len() + 1);
-
-        for builder in state_builders.into_iter() {
-            columns.push(Column::String(builder.build()));
-        }
-
-        let bucket = self.payload.bucket;
-        columns.push(group_key_builder.finish());
-        let block = DataBlock::new_from_columns(columns);
-        Ok(Some(
-            block.add_meta(Some(AggregateSerdeMeta::create(bucket)))?,
-        ))
     }
 }

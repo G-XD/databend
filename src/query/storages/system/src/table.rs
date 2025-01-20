@@ -15,25 +15,26 @@
 use std::any::Any;
 use std::sync::Arc;
 
-use common_catalog::plan::DataSourcePlan;
-use common_catalog::plan::PartInfo;
-use common_catalog::plan::PartStatistics;
-use common_catalog::plan::Partitions;
-use common_catalog::plan::PartitionsShuffleKind;
-use common_catalog::plan::PushDownInfo;
-use common_catalog::table::Table;
-use common_catalog::table_context::TableContext;
-use common_exception::Result;
-use common_expression::DataBlock;
-use common_meta_app::schema::TableInfo;
-use common_pipeline_core::processors::port::OutputPort;
-use common_pipeline_core::processors::processor::ProcessorPtr;
-use common_pipeline_core::Pipeline;
-use common_pipeline_sources::AsyncSource;
-use common_pipeline_sources::AsyncSourcer;
-use common_pipeline_sources::EmptySource;
-use common_pipeline_sources::SyncSource;
-use common_pipeline_sources::SyncSourcer;
+use databend_common_catalog::plan::DataSourcePlan;
+use databend_common_catalog::plan::PartInfo;
+use databend_common_catalog::plan::PartStatistics;
+use databend_common_catalog::plan::Partitions;
+use databend_common_catalog::plan::PartitionsShuffleKind;
+use databend_common_catalog::plan::PushDownInfo;
+use databend_common_catalog::table::DistributionLevel;
+use databend_common_catalog::table::Table;
+use databend_common_catalog::table_context::TableContext;
+use databend_common_exception::Result;
+use databend_common_expression::DataBlock;
+use databend_common_meta_app::schema::TableInfo;
+use databend_common_pipeline_core::processors::OutputPort;
+use databend_common_pipeline_core::processors::ProcessorPtr;
+use databend_common_pipeline_core::Pipeline;
+use databend_common_pipeline_sources::AsyncSource;
+use databend_common_pipeline_sources::AsyncSourcer;
+use databend_common_pipeline_sources::EmptySource;
+use databend_common_pipeline_sources::SyncSource;
+use databend_common_pipeline_sources::SyncSourcer;
 
 #[derive(serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct SystemTablePart;
@@ -57,7 +58,8 @@ impl PartInfo for SystemTablePart {
 
 pub trait SyncSystemTable: Send + Sync {
     const NAME: &'static str;
-    const IS_LOCAL: bool = true;
+    const DISTRIBUTION_LEVEL: DistributionLevel = DistributionLevel::Local;
+    const BROADCAST_TRUNCATE: bool = false;
 
     fn get_table_info(&self) -> &TableInfo;
     fn get_full_data(&self, ctx: Arc<dyn TableContext>) -> Result<DataBlock>;
@@ -67,23 +69,29 @@ pub trait SyncSystemTable: Send + Sync {
         _ctx: Arc<dyn TableContext>,
         _push_downs: Option<PushDownInfo>,
     ) -> Result<(PartStatistics, Partitions)> {
-        match Self::IS_LOCAL {
-            true => Ok((
+        match Self::DISTRIBUTION_LEVEL {
+            DistributionLevel::Local => Ok((
                 PartStatistics::default(),
-                Partitions::create_nolazy(PartitionsShuffleKind::Seq, vec![Arc::new(Box::new(
+                Partitions::create(PartitionsShuffleKind::Seq, vec![Arc::new(Box::new(
                     SystemTablePart,
                 ))]),
             )),
-            false => Ok((
+            DistributionLevel::Cluster => Ok((
                 PartStatistics::default(),
-                Partitions::create_nolazy(PartitionsShuffleKind::Broadcast, vec![Arc::new(
+                Partitions::create(PartitionsShuffleKind::BroadcastCluster, vec![Arc::new(
+                    Box::new(SystemTablePart),
+                )]),
+            )),
+            DistributionLevel::Warehouse => Ok((
+                PartStatistics::default(),
+                Partitions::create(PartitionsShuffleKind::BroadcastWarehouse, vec![Arc::new(
                     Box::new(SystemTablePart),
                 )]),
             )),
         }
     }
 
-    fn truncate(&self, _ctx: Arc<dyn TableContext>) -> Result<()> {
+    fn truncate(&self, _ctx: Arc<dyn TableContext>, _pipeline: &mut Pipeline) -> Result<()> {
         Ok(())
     }
 }
@@ -108,8 +116,14 @@ impl<TTable: 'static + SyncSystemTable> Table for SyncOneBlockSystemTable<TTable
         self
     }
 
-    fn is_local(&self) -> bool {
-        TTable::IS_LOCAL
+    fn distribution_level(&self) -> DistributionLevel {
+        // When querying a memory table, we send the partition to one node for execution. The other nodes send empty partitions.
+        // For system tables, they are always non-local, which ensures that system tables can be JOIN or UNION operation with any other table.
+        match TTable::DISTRIBUTION_LEVEL {
+            DistributionLevel::Local => DistributionLevel::Cluster,
+            DistributionLevel::Cluster => DistributionLevel::Cluster,
+            DistributionLevel::Warehouse => DistributionLevel::Warehouse,
+        }
     }
 
     fn get_table_info(&self) -> &TableInfo {
@@ -131,6 +145,7 @@ impl<TTable: 'static + SyncSystemTable> Table for SyncOneBlockSystemTable<TTable
         ctx: Arc<dyn TableContext>,
         plan: &DataSourcePlan,
         pipeline: &mut Pipeline,
+        _put_cache: bool,
     ) -> Result<()> {
         // avoid duplicate read in cluster mode.
         if plan.parts.partitions.is_empty() {
@@ -148,8 +163,12 @@ impl<TTable: 'static + SyncSystemTable> Table for SyncOneBlockSystemTable<TTable
     }
 
     #[async_backtrace::framed]
-    async fn truncate(&self, ctx: Arc<dyn TableContext>, _purge: bool) -> Result<()> {
-        self.inner_table.truncate(ctx)
+    async fn truncate(&self, ctx: Arc<dyn TableContext>, pipeline: &mut Pipeline) -> Result<()> {
+        self.inner_table.truncate(ctx, pipeline)
+    }
+
+    fn broadcast_truncate_to_warehouse(&self) -> bool {
+        TTable::BROADCAST_TRUNCATE
     }
 }
 
@@ -191,7 +210,7 @@ impl<TTable: 'static + SyncSystemTable> SyncSource for SystemTableSyncSource<TTa
 #[async_trait::async_trait]
 pub trait AsyncSystemTable: Send + Sync {
     const NAME: &'static str;
-    const IS_LOCAL: bool = true;
+    const DISTRIBUTION_LEVEL: DistributionLevel = DistributionLevel::Local;
 
     fn get_table_info(&self) -> &TableInfo;
     async fn get_full_data(
@@ -206,16 +225,22 @@ pub trait AsyncSystemTable: Send + Sync {
         _ctx: Arc<dyn TableContext>,
         _push_downs: Option<PushDownInfo>,
     ) -> Result<(PartStatistics, Partitions)> {
-        match Self::IS_LOCAL {
-            true => Ok((
+        match Self::DISTRIBUTION_LEVEL {
+            DistributionLevel::Local => Ok((
                 PartStatistics::default(),
-                Partitions::create_nolazy(PartitionsShuffleKind::Seq, vec![Arc::new(Box::new(
+                Partitions::create(PartitionsShuffleKind::Seq, vec![Arc::new(Box::new(
                     SystemTablePart,
                 ))]),
             )),
-            false => Ok((
+            DistributionLevel::Cluster => Ok((
                 PartStatistics::default(),
-                Partitions::create_nolazy(PartitionsShuffleKind::Broadcast, vec![Arc::new(
+                Partitions::create(PartitionsShuffleKind::BroadcastCluster, vec![Arc::new(
+                    Box::new(SystemTablePart),
+                )]),
+            )),
+            DistributionLevel::Warehouse => Ok((
+                PartStatistics::default(),
+                Partitions::create(PartitionsShuffleKind::BroadcastWarehouse, vec![Arc::new(
                     Box::new(SystemTablePart),
                 )]),
             )),
@@ -243,8 +268,14 @@ impl<TTable: 'static + AsyncSystemTable> Table for AsyncOneBlockSystemTable<TTab
         self
     }
 
-    fn is_local(&self) -> bool {
-        TTable::IS_LOCAL
+    fn distribution_level(&self) -> DistributionLevel {
+        // When querying a memory table, we send the partition to one node for execution. The other nodes send empty partitions.
+        // For system tables, they are always non-local, which ensures that system tables can be JOIN or UNION operation with any other table.
+        match TTable::DISTRIBUTION_LEVEL {
+            DistributionLevel::Local => DistributionLevel::Cluster,
+            DistributionLevel::Cluster => DistributionLevel::Cluster,
+            DistributionLevel::Warehouse => DistributionLevel::Warehouse,
+        }
     }
 
     fn get_table_info(&self) -> &TableInfo {
@@ -266,7 +297,14 @@ impl<TTable: 'static + AsyncSystemTable> Table for AsyncOneBlockSystemTable<TTab
         ctx: Arc<dyn TableContext>,
         plan: &DataSourcePlan,
         pipeline: &mut Pipeline,
+        _put_cache: bool,
     ) -> Result<()> {
+        // avoid duplicate read in cluster mode.
+        if plan.parts.partitions.is_empty() {
+            pipeline.add_source(EmptySource::create, 1)?;
+            return Ok(());
+        }
+
         let inner_table = self.inner_table.clone();
         let push_downs = plan.push_downs.clone();
         pipeline.add_source(
@@ -314,7 +352,6 @@ where Self: AsyncSource
 impl<TTable: 'static + AsyncSystemTable> AsyncSource for SystemTableAsyncSource<TTable> {
     const NAME: &'static str = TTable::NAME;
 
-    #[async_trait::unboxed_simple]
     #[async_backtrace::framed]
     async fn generate(&mut self) -> Result<Option<DataBlock>> {
         if self.finished {
@@ -329,7 +366,7 @@ impl<TTable: 'static + AsyncSystemTable> AsyncSource for SystemTableAsyncSource<
 
         #[cfg(debug_assertions)]
         {
-            use common_expression::types::DataType;
+            use databend_common_expression::types::DataType;
             let table_info = self.inner.get_table_info();
             let data_types: Vec<DataType> = block
                 .columns()

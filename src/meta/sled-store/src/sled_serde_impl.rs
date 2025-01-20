@@ -12,16 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use common_meta_types::Entry;
-use common_meta_types::EntryPayload;
-use common_meta_types::LogId;
-use common_meta_types::Membership;
-use common_meta_types::Node;
-use common_meta_types::SeqNum;
-use common_meta_types::SeqV;
-use common_meta_types::SnapshotMeta;
-use common_meta_types::StoredMembership;
-use common_meta_types::Vote;
+use databend_common_meta_types::raft_types::Entry;
+use databend_common_meta_types::raft_types::EntryPayload;
+use databend_common_meta_types::raft_types::LogId;
+use databend_common_meta_types::raft_types::Membership;
+use databend_common_meta_types::raft_types::SnapshotMeta;
+use databend_common_meta_types::raft_types::StoredMembership;
+use databend_common_meta_types::raft_types::Vote;
+use databend_common_meta_types::seq_value::SeqV;
+use databend_common_meta_types::Node;
+use databend_common_meta_types::SeqNum;
 
 use crate::SledBytesError;
 use crate::SledSerde;
@@ -113,55 +113,5 @@ impl SledSerde for Node {
     where Self: Sized {
         let s = serde_json::from_slice(v.as_ref())?;
         Ok(s)
-    }
-}
-
-pub(crate) mod impl_compat07 {
-    use common_meta_types::compat07;
-
-    use crate::SledBytesError;
-    use crate::SledSerde;
-
-    impl SledSerde for compat07::LogId {
-        fn de<T: AsRef<[u8]>>(v: T) -> Result<Self, SledBytesError>
-        where Self: Sized {
-            let s = serde_json::from_slice(v.as_ref())?;
-            Ok(s)
-        }
-    }
-    impl SledSerde for compat07::Vote {
-        fn de<T: AsRef<[u8]>>(v: T) -> Result<Self, SledBytesError>
-        where Self: Sized {
-            let s = serde_json::from_slice(v.as_ref())?;
-            Ok(s)
-        }
-    }
-    impl SledSerde for compat07::Membership {
-        fn de<T: AsRef<[u8]>>(v: T) -> Result<Self, SledBytesError>
-        where Self: Sized {
-            let s = serde_json::from_slice(v.as_ref())?;
-            Ok(s)
-        }
-    }
-    impl SledSerde for compat07::StoredMembership {
-        fn de<T: AsRef<[u8]>>(v: T) -> Result<Self, SledBytesError>
-        where Self: Sized {
-            let s = serde_json::from_slice(v.as_ref())?;
-            Ok(s)
-        }
-    }
-    impl SledSerde for compat07::Entry {
-        fn de<T: AsRef<[u8]>>(v: T) -> Result<Self, SledBytesError>
-        where Self: Sized {
-            let s = serde_json::from_slice(v.as_ref())?;
-            Ok(s)
-        }
-    }
-    impl SledSerde for compat07::SnapshotMeta {
-        fn de<T: AsRef<[u8]>>(v: T) -> Result<Self, SledBytesError>
-        where Self: Sized {
-            let s = serde_json::from_slice(v.as_ref())?;
-            Ok(s)
-        }
     }
 }

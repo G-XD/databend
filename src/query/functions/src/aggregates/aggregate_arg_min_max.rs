@@ -17,19 +17,19 @@ use std::fmt;
 use std::marker::PhantomData;
 use std::sync::Arc;
 
-use common_arrow::arrow::bitmap::Bitmap;
-use common_exception::ErrorCode;
-use common_exception::Result;
-use common_expression::types::number::*;
-use common_expression::types::*;
-use common_expression::with_number_mapped_type;
-use common_expression::Column;
-use common_expression::ColumnBuilder;
-use common_expression::Scalar;
-use common_io::prelude::*;
-use serde::de::DeserializeOwned;
-use serde::Deserialize;
-use serde::Serialize;
+use borsh::BorshDeserialize;
+use borsh::BorshSerialize;
+use databend_common_exception::ErrorCode;
+use databend_common_exception::Result;
+use databend_common_expression::types::number::*;
+use databend_common_expression::types::Bitmap;
+use databend_common_expression::types::*;
+use databend_common_expression::with_number_mapped_type;
+use databend_common_expression::AggrStateRegistry;
+use databend_common_expression::AggrStateType;
+use databend_common_expression::ColumnBuilder;
+use databend_common_expression::InputColumns;
+use databend_common_expression::Scalar;
 
 use super::aggregate_function_factory::AggregateFunctionDescription;
 use super::aggregate_scalar_state::ChangeIf;
@@ -39,9 +39,13 @@ use super::aggregate_scalar_state::CmpMin;
 use super::aggregate_scalar_state::TYPE_ANY;
 use super::aggregate_scalar_state::TYPE_MAX;
 use super::aggregate_scalar_state::TYPE_MIN;
+use super::borsh_deserialize_state;
+use super::borsh_serialize_state;
 use super::AggregateFunctionRef;
 use super::StateAddr;
 use crate::aggregates::assert_binary_arguments;
+use crate::aggregates::AggrState;
+use crate::aggregates::AggrStateLoc;
 use crate::aggregates::AggregateFunction;
 use crate::with_compare_mapped_type;
 use crate::with_simple_no_number_mapped_type;
@@ -49,9 +53,12 @@ use crate::with_simple_no_number_mapped_type;
 // State for arg_min(arg, val) and arg_max(arg, val)
 // A: ValueType for arg.
 // V: ValueType for val.
-pub trait AggregateArgMinMaxState<A: ValueType, V: ValueType>: Send + Sync + 'static {
+pub trait AggregateArgMinMaxState<A: ValueType, V: ValueType>:
+    BorshSerialize + BorshDeserialize + Send + Sync + 'static
+{
     fn new() -> Self;
-    fn add(&mut self, value: V::ScalarRef<'_>, data: Scalar);
+    fn change(&self, other: &V::ScalarRef<'_>) -> bool;
+    fn update(&mut self, other: V::ScalarRef<'_>, arg: A::ScalarRef<'_>);
     fn add_batch(
         &mut self,
         data_column: &A::Column,
@@ -59,56 +66,48 @@ pub trait AggregateArgMinMaxState<A: ValueType, V: ValueType>: Send + Sync + 'st
         validity: Option<&Bitmap>,
     ) -> Result<()>;
 
+    fn merge_from(&mut self, rhs: Self) -> Result<()>;
     fn merge(&mut self, rhs: &Self) -> Result<()>;
-    fn serialize(&self, writer: &mut Vec<u8>) -> Result<()>;
-    fn deserialize(&mut self, reader: &mut &[u8]) -> Result<()>;
-    fn merge_result(&mut self, column: &mut ColumnBuilder) -> Result<()>;
+    fn merge_result(&self, column: &mut ColumnBuilder) -> Result<()>;
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(BorshSerialize, BorshDeserialize)]
 struct ArgMinMaxState<A, V, C>
 where
     V: ValueType,
-    V::Scalar: Serialize + DeserializeOwned,
+    V::Scalar: BorshSerialize + BorshDeserialize,
+    A: ValueType,
+    A::Scalar: BorshSerialize + BorshDeserialize,
 {
-    #[serde(bound(deserialize = "V::Scalar: DeserializeOwned"))]
-    pub value: Option<V::Scalar>,
-    pub data: Scalar,
-    #[serde(skip)]
-    _a: PhantomData<A>,
-    #[serde(skip)]
+    pub data: Option<(V::Scalar, A::Scalar)>,
+    #[borsh(skip)]
     _c: PhantomData<C>,
 }
 
 impl<A, V, C> AggregateArgMinMaxState<A, V> for ArgMinMaxState<A, V, C>
 where
-    A: ValueType + Send + Sync,
+    A: ValueType,
+    A::Scalar: Send + Sync + BorshSerialize + BorshDeserialize,
     V: ValueType,
-    V::Scalar: Send + Sync + Serialize + DeserializeOwned,
+    V::Scalar: Send + Sync + BorshSerialize + BorshDeserialize,
     C: ChangeIf<V> + Default,
 {
     fn new() -> Self {
         Self {
-            value: None,
-            data: Scalar::Null,
-            _a: PhantomData,
+            data: None,
             _c: PhantomData,
         }
     }
 
-    fn add(&mut self, other: V::ScalarRef<'_>, data: Scalar) {
-        match &self.value {
-            Some(v) => {
-                if C::change_if(V::to_scalar_ref(v), other.clone()) {
-                    self.value = Some(V::to_owned_scalar(other));
-                    self.data = data;
-                }
-            }
-            None => {
-                self.value = Some(V::to_owned_scalar(other));
-                self.data = data;
-            }
+    fn change(&self, other: &V::ScalarRef<'_>) -> bool {
+        match &self.data {
+            Some((val, _)) => C::change_if(&V::to_scalar_ref(val), other),
+            None => true,
         }
+    }
+
+    fn update(&mut self, other: V::ScalarRef<'_>, arg: A::ScalarRef<'_>) {
+        self.data = Some((V::to_owned_scalar(other), A::to_owned_scalar(arg)));
     }
 
     fn add_batch(
@@ -121,87 +120,77 @@ where
         if column_len == 0 {
             return Ok(());
         }
-        let val_col_iter = V::iter_column(val_col);
-
-        if let Some(bit) = validity {
-            if bit.unset_bits() == column_len {
+        let acc = if let Some(bit) = validity {
+            if bit.null_count() == column_len {
                 return Ok(());
             }
-            // V::ScalarRef doesn't derive Default, so take the first value as default.
-            let mut v = unsafe { V::index_column_unchecked(val_col, 0) };
-            let mut has_v = bit.get_bit(0);
-            let mut data_value = if has_v {
-                let arg = unsafe { A::index_column_unchecked(arg_col, 0) };
-                A::upcast_scalar(A::to_owned_scalar(arg))
-            } else {
-                Scalar::Null
-            };
 
-            for ((row, val), valid) in val_col_iter.enumerate().skip(1).zip(bit.iter().skip(1)) {
-                if !valid {
-                    continue;
-                }
-                if !has_v {
-                    has_v = true;
-                    v = val.clone();
-                    let arg = unsafe { A::index_column_unchecked(arg_col, row) };
-                    data_value = A::upcast_scalar(A::to_owned_scalar(arg));
-                } else if C::change_if(v.clone(), val.clone()) {
-                    v = val.clone();
-                    let arg = unsafe { A::index_column_unchecked(arg_col, row) };
-                    data_value = A::upcast_scalar(A::to_owned_scalar(arg));
-                }
-            }
-
-            if has_v {
-                self.add(v, data_value);
-            }
+            V::iter_column(val_col)
+                .enumerate()
+                .zip(bit.iter())
+                .filter_map(|(item, valid)| if valid { Some(item) } else { None })
+                .reduce(|acc, (row, val)| {
+                    if C::change_if(&acc.1, &val) {
+                        (row, val)
+                    } else {
+                        acc
+                    }
+                })
         } else {
-            let v = val_col_iter.enumerate().reduce(|acc, (row, val)| {
-                if C::change_if(acc.1.clone(), val.clone()) {
-                    (row, val)
-                } else {
-                    acc
-                }
-            });
-
-            if let Some((row, val)) = v {
-                let arg = unsafe { A::index_column_unchecked(arg_col, row) };
-                self.add(val, A::upcast_scalar(A::to_owned_scalar(arg)));
-            }
+            V::iter_column(val_col)
+                .enumerate()
+                .reduce(|acc, (row, val)| {
+                    if C::change_if(&acc.1, &val) {
+                        (row, val)
+                    } else {
+                        acc
+                    }
+                })
         };
+
+        if let Some((row, val)) = acc {
+            if self.change(&val) {
+                self.update(val, A::index_column(arg_col, row).unwrap())
+            }
+        }
+        Ok(())
+    }
+
+    fn merge_from(&mut self, rhs: Self) -> Result<()> {
+        if let Some((r_val, r_arg)) = rhs.data {
+            if self.change(&V::to_scalar_ref(&r_val)) {
+                self.data = Some((r_val, r_arg));
+            }
+        }
         Ok(())
     }
 
     fn merge(&mut self, rhs: &Self) -> Result<()> {
-        if let Some(v) = &rhs.value {
-            self.add(V::to_scalar_ref(v), rhs.data.clone());
-        }
-        Ok(())
-    }
-
-    fn serialize(&self, writer: &mut Vec<u8>) -> Result<()> {
-        serialize_into_buf(writer, self)
-    }
-
-    fn deserialize(&mut self, reader: &mut &[u8]) -> Result<()> {
-        *self = deserialize_from_slice(reader)?;
-        Ok(())
-    }
-
-    fn merge_result(&mut self, builder: &mut ColumnBuilder) -> Result<()> {
-        if self.value.is_some() {
-            if let Some(inner) = A::try_downcast_builder(builder) {
-                A::push_item(inner, A::try_downcast_scalar(&self.data.as_ref()).unwrap());
-            } else {
-                builder.push(self.data.as_ref());
+        if let Some((r_val, r_arg)) = &rhs.data {
+            if self.change(&V::to_scalar_ref(r_val)) {
+                self.data = Some((r_val.to_owned(), r_arg.to_owned()));
             }
-        } else if let Some(inner) = A::try_downcast_builder(builder) {
-            A::push_default(inner);
-        } else {
-            builder.push_default();
         }
+        Ok(())
+    }
 
+    fn merge_result(&self, builder: &mut ColumnBuilder) -> Result<()> {
+        match &self.data {
+            Some((_, arg)) => {
+                if let Some(inner) = A::try_downcast_builder(builder) {
+                    A::push_item(inner, A::to_scalar_ref(arg));
+                } else {
+                    builder.push(A::upcast_scalar(arg.clone()).as_ref());
+                }
+            }
+            None => {
+                if let Some(inner) = A::try_downcast_builder(builder) {
+                    A::push_default(inner);
+                } else {
+                    builder.push_default();
+                }
+            }
+        }
         Ok(())
     }
 }
@@ -231,18 +220,18 @@ where
         Ok(self.return_data_type.clone())
     }
 
-    fn init_state(&self, place: StateAddr) {
-        place.write(|| State::new());
+    fn init_state(&self, place: AggrState) {
+        place.write(State::new);
     }
 
-    fn state_layout(&self) -> Layout {
-        Layout::new::<State>()
+    fn register_state(&self, registry: &mut AggrStateRegistry) {
+        registry.register(AggrStateType::Custom(Layout::new::<State>()));
     }
 
     fn accumulate(
         &self,
-        place: StateAddr,
-        columns: &[Column],
+        place: AggrState,
+        columns: InputColumns,
         validity: Option<&Bitmap>,
         _input_rows: usize,
     ) -> Result<()> {
@@ -255,57 +244,56 @@ where
     fn accumulate_keys(
         &self,
         places: &[StateAddr],
-        offset: usize,
-        columns: &[Column],
+        loc: &[AggrStateLoc],
+        columns: InputColumns,
         _input_rows: usize,
     ) -> Result<()> {
         let arg_col = A::try_downcast_column(&columns[0]).unwrap();
         let val_col = V::try_downcast_column(&columns[1]).unwrap();
-        let arg_col_iter = A::iter_column(&arg_col);
         let val_col_iter = V::iter_column(&val_col);
 
         val_col_iter
-            .zip(arg_col_iter)
-            .zip(places.iter())
-            .for_each(|((val, arg), place)| {
-                let addr = place.next(offset);
-                let state = addr.get::<State>();
-                state.add(
-                    val.clone(),
-                    A::upcast_scalar(A::to_owned_scalar(arg.clone())),
-                );
+            .enumerate()
+            .zip(places.iter().cloned())
+            .for_each(|((row, val), addr)| {
+                let state = AggrState::new(addr, loc).get::<State>();
+                if state.change(&val) {
+                    state.update(val, A::index_column(&arg_col, row).unwrap())
+                }
             });
         Ok(())
     }
 
-    fn accumulate_row(&self, place: StateAddr, columns: &[Column], row: usize) -> Result<()> {
+    fn accumulate_row(&self, place: AggrState, columns: InputColumns, row: usize) -> Result<()> {
         let arg_col = A::try_downcast_column(&columns[0]).unwrap();
         let val_col = V::try_downcast_column(&columns[1]).unwrap();
         let state = place.get::<State>();
 
-        let arg = unsafe { A::index_column_unchecked(&arg_col, row) };
         let val = unsafe { V::index_column_unchecked(&val_col, row) };
-        state.add(val, A::upcast_scalar(A::to_owned_scalar(arg.clone())));
+        if state.change(&val) {
+            state.update(val, A::index_column(&arg_col, row).unwrap())
+        }
         Ok(())
     }
 
-    fn serialize(&self, place: StateAddr, writer: &mut Vec<u8>) -> Result<()> {
+    fn serialize(&self, place: AggrState, writer: &mut Vec<u8>) -> Result<()> {
         let state = place.get::<State>();
-        state.serialize(writer)
+        borsh_serialize_state(writer, state)
     }
 
-    fn deserialize(&self, place: StateAddr, reader: &mut &[u8]) -> Result<()> {
+    fn merge(&self, place: AggrState, reader: &mut &[u8]) -> Result<()> {
         let state = place.get::<State>();
-        state.deserialize(reader)
+        let rhs: State = borsh_deserialize_state(reader)?;
+        state.merge_from(rhs)
     }
 
-    fn merge(&self, place: StateAddr, rhs: StateAddr) -> Result<()> {
-        let rhs = rhs.get::<State>();
+    fn merge_states(&self, place: AggrState, rhs: AggrState) -> Result<()> {
         let state = place.get::<State>();
-        state.merge(rhs)
+        let other = rhs.get::<State>();
+        state.merge(other)
     }
 
-    fn merge_result(&self, place: StateAddr, builder: &mut ColumnBuilder) -> Result<()> {
+    fn merge_result(&self, place: AggrState, builder: &mut ColumnBuilder) -> Result<()> {
         let state = place.get::<State>();
         state.merge_result(builder)
     }
@@ -314,7 +302,7 @@ where
         true
     }
 
-    unsafe fn drop_state(&self, place: StateAddr) {
+    unsafe fn drop_state(&self, place: AggrState) {
         let state = place.get::<State>();
         std::ptr::drop_in_place(state);
     }

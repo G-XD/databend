@@ -21,11 +21,43 @@ use enumflags2::BitFlags;
 use crate::principal::UserPrivilegeSet;
 use crate::principal::UserPrivilegeType;
 
+// some statements like `SELECT 1`, `SHOW USERS`, `SHOW ROLES`, `SHOW TABLES` will be
+// rewritten to the queries on the system tables, we need to skip the privilege check on
+// these tables.
+pub const SYSTEM_TABLES_ALLOW_LIST: [&str; 21] = [
+    "catalogs",
+    "columns",
+    "databases",
+    "databases_with_history",
+    "dictionaries",
+    "tables",
+    "views",
+    "tables_with_history",
+    "views_with_history",
+    "password_policies",
+    "streams",
+    "streams_terse",
+    "virtual_columns",
+    "users",
+    "roles",
+    "stages",
+    "one",
+    "processes",
+    "user_functions",
+    "functions",
+    "indexes",
+];
+
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug, Eq, PartialEq, Hash)]
 pub enum GrantObject {
     Global,
     Database(String, String),
+    DatabaseById(String, u64),
     Table(String, String, String),
+    TableById(String, u64, u64),
+    UDF(String),
+    Stage(String),
+    Warehouse(String),
 }
 
 impl GrantObject {
@@ -38,6 +70,12 @@ impl GrantObject {
             (GrantObject::Database(lcat, ldb), GrantObject::Database(rcat, rdb)) => {
                 lcat == rcat && ldb == rdb
             }
+            (GrantObject::DatabaseById(lcat, ldb), GrantObject::DatabaseById(rcat, rdb)) => {
+                lcat == rcat && ldb == rdb
+            }
+            (GrantObject::DatabaseById(lcat, ldb), GrantObject::TableById(rcat, rdb, _)) => {
+                lcat == rcat && ldb == rdb
+            }
             (GrantObject::Database(lcat, ldb), GrantObject::Table(rcat, rdb, _)) => {
                 lcat == rcat && ldb == rdb
             }
@@ -45,16 +83,46 @@ impl GrantObject {
                 GrantObject::Table(lcat, lhs_db, lhs_table),
                 GrantObject::Table(rcat, rhs_db, rhs_table),
             ) => lcat == rcat && (lhs_db == rhs_db) && (lhs_table == rhs_table),
+            (
+                GrantObject::TableById(lcat, lhs_db, lhs_table),
+                GrantObject::TableById(rcat, rhs_db, rhs_table),
+            ) => lcat == rcat && (lhs_db == rhs_db) && (lhs_table == rhs_table),
             (GrantObject::Table(_, _, _), _) => false,
+            (GrantObject::Stage(lstage), GrantObject::Stage(rstage)) => lstage == rstage,
+            (GrantObject::UDF(udf), GrantObject::UDF(rudf)) => udf == rudf,
+            (GrantObject::Warehouse(w), GrantObject::Warehouse(rw)) => w == rw,
+            _ => false,
         }
     }
 
     /// Global, database and table has different available privileges
-    pub fn available_privileges(&self) -> UserPrivilegeSet {
+    pub fn available_privileges(&self, available_ownership: bool) -> UserPrivilegeSet {
         match self {
             GrantObject::Global => UserPrivilegeSet::available_privileges_on_global(),
-            GrantObject::Database(_, _) => UserPrivilegeSet::available_privileges_on_database(),
-            GrantObject::Table(_, _, _) => UserPrivilegeSet::available_privileges_on_table(),
+            GrantObject::Database(_, _) | GrantObject::DatabaseById(_, _) => {
+                UserPrivilegeSet::available_privileges_on_database(available_ownership)
+            }
+            GrantObject::Table(_, _, _) | GrantObject::TableById(_, _, _) => {
+                UserPrivilegeSet::available_privileges_on_table(available_ownership)
+            }
+            GrantObject::UDF(_) => {
+                UserPrivilegeSet::available_privileges_on_udf(available_ownership)
+            }
+            GrantObject::Stage(_) => {
+                UserPrivilegeSet::available_privileges_on_stage(available_ownership)
+            }
+            GrantObject::Warehouse(_) => UserPrivilegeSet::available_privileges_on_warehouse(),
+        }
+    }
+
+    pub fn catalog(&self) -> Option<String> {
+        match self {
+            GrantObject::Global
+            | GrantObject::Stage(_)
+            | GrantObject::UDF(_)
+            | GrantObject::Warehouse(_) => None,
+            GrantObject::Database(cat, _) | GrantObject::DatabaseById(cat, _) => Some(cat.clone()),
+            GrantObject::Table(cat, _, _) | GrantObject::TableById(cat, _, _) => Some(cat.clone()),
         }
     }
 }
@@ -64,9 +132,16 @@ impl fmt::Display for GrantObject {
         match self {
             GrantObject::Global => write!(f, "*.*"),
             GrantObject::Database(ref cat, ref db) => write!(f, "'{}'.'{}'.*", cat, db),
+            GrantObject::DatabaseById(ref cat, ref db) => write!(f, "'{}'.'{}'.*", cat, db),
             GrantObject::Table(ref cat, ref db, ref table) => {
                 write!(f, "'{}'.'{}'.'{}'", cat, db, table)
             }
+            GrantObject::TableById(ref cat, ref db, ref table) => {
+                write!(f, "'{}'.'{}'.'{}'", cat, db, table)
+            }
+            GrantObject::UDF(udf) => write!(f, "UDF {udf}"),
+            GrantObject::Stage(stage) => write!(f, "STAGE {stage}"),
+            GrantObject::Warehouse(w) => write!(f, "WAREHOUSE {w}"),
         }
     }
 }
@@ -90,36 +165,28 @@ impl GrantEntry {
         &self.privileges
     }
 
-    pub fn verify_privilege(
-        &self,
-        object: &GrantObject,
-        privileges: Vec<UserPrivilegeType>,
-    ) -> bool {
+    pub fn verify_privilege(&self, object: &GrantObject, privilege: UserPrivilegeType) -> bool {
         // the verified object should be smaller than the object inside my grant entry.
         if !self.object.contains(object) {
             return false;
         }
 
-        let mut priv_set = UserPrivilegeSet::empty();
-        for privilege in privileges {
-            priv_set.set_privilege(privilege)
-        }
-        self.privileges.contains(BitFlags::from(priv_set))
+        self.privileges.contains(BitFlags::from(privilege))
     }
 
     pub fn matches_entry(&self, object: &GrantObject) -> bool {
         &self.object == object
     }
 
-    fn has_all_available_privileges(&self) -> bool {
-        let all_available_privileges = self.object.available_privileges();
+    pub fn has_all_available_privileges(&self) -> bool {
+        let all_available_privileges = self.object.available_privileges(false);
         self.privileges
             .contains(BitFlags::from(all_available_privileges))
     }
 }
 
 impl fmt::Display for GrantEntry {
-    fn fmt(&self, f: &mut fmt::Formatter) -> std::result::Result<(), fmt::Error> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
         let privileges: UserPrivilegeSet = self.privileges.into();
         let privileges_str = if self.has_all_available_privileges() {
             "ALL".to_string()
@@ -164,14 +231,10 @@ impl UserGrantSet {
         self.roles.remove(role);
     }
 
-    pub fn verify_privilege(
-        &self,
-        object: &GrantObject,
-        privilege: Vec<UserPrivilegeType>,
-    ) -> bool {
+    pub fn verify_privilege(&self, object: &GrantObject, privilege: UserPrivilegeType) -> bool {
         self.entries
             .iter()
-            .any(|e| e.verify_privilege(object, privilege.clone()))
+            .any(|e| e.verify_privilege(object, privilege))
     }
 
     pub fn grant_privileges(&mut self, object: &GrantObject, privileges: UserPrivilegeSet) {
@@ -203,7 +266,11 @@ impl UserGrantSet {
             .map(|e| {
                 if e.matches_entry(object) {
                     let mut e = e.clone();
-                    e.privileges ^= privileges;
+                    e.privileges = e
+                        .privileges
+                        .iter()
+                        .filter(|p| !privileges.contains(*p))
+                        .collect();
                     e
                 } else {
                     e.clone()

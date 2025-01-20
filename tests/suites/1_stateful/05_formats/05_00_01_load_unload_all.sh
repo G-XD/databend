@@ -3,7 +3,7 @@
 CURDIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 . "$CURDIR"/../../../shell_env.sh
 
-echo "drop table if exists test_load_unload" | $MYSQL_CLIENT_CONNECT
+echo "drop table if exists test_load_unload" | $BENDSQL_CLIENT_CONNECT
 
 # todo(youngsofun): add more types
 echo "CREATE TABLE test_load_unload
@@ -16,36 +16,39 @@ echo "CREATE TABLE test_load_unload
     f decimal(4, 2),
     g map(string,int),
     h tuple(string,int)
-);" | $MYSQL_CLIENT_CONNECT
+);" | $BENDSQL_CLIENT_CONNECT
 
 insert_data() {
 	echo "insert into test_load_unload values
 	('a\"b', 1, ['a\"b'], parse_json('{\"k\":\"v\"}'), '2044-05-06T03:25:02.868894-07:00', 010.011, {'k1':10,'k2':20}, ('a', 5)),
 	(null, 2, ['a\'b'], parse_json('[1]'), '2044-05-06T03:25:02.868894-07:00', -010.011, {}, ('b',10))
-	" | $MYSQL_CLIENT_CONNECT
+	" | $BENDSQL_CLIENT_CONNECT
 }
 
 test_format() {
 	echo "---${1}"
-	echo "truncate table test_load_unload" | $MYSQL_CLIENT_CONNECT
+	rm -rf /tmp/test_load_unload
+	mkdir /tmp/test_load_unload
+	echo "drop stage if exists s1" | $BENDSQL_CLIENT_CONNECT
+	echo "create stage s1 url='fs:///tmp/test_load_unload/'" | $BENDSQL_CLIENT_CONNECT
+	echo "truncate table test_load_unload" | $BENDSQL_CLIENT_CONNECT
+
+	# insert
 	insert_data
-	rm -f /tmp/test_load_unload2.txt /tmp/test_load_unload.txt
 
-	curl -s -u root: -XPOST "http://localhost:${QUERY_CLICKHOUSE_HTTP_HANDLER_PORT}" \
-	-d "select * from test_load_unload FORMAT ${1}" > /tmp/test_load_unload.txt
+	# unload1
+	echo "copy into @s1/unload1/ from test_load_unload file_format=(type=${1})" | $BENDSQL_CLIENT_CONNECT
+	mv `ls /tmp/test_load_unload/unload1/*` /tmp/test_load_unload/unload1.txt
+	cat /tmp/test_load_unload/unload1.txt
 
-	cat /tmp/test_load_unload.txt
+	# load unload1
+	echo "truncate table test_load_unload" | $BENDSQL_CLIENT_CONNECT
+	echo "copy into test_load_unload from @s1/unload1.txt file_format=(type=${1}) force=true" | $BENDSQL_CLIENT_CONNECT
 
-	echo "truncate table test_load_unload" | $MYSQL_CLIENT_CONNECT
-
-	curl -sH "insert_sql:insert into test_load_unload file_format = (type = ${1})" \
-	-F "upload=@/tmp/test_load_unload.txt" \
-	-u root: -XPUT "http://localhost:${QUERY_HTTP_HANDLER_PORT}/v1/streaming_load" | grep -c "SUCCESS"
-
-	curl -s -u root: -XPOST "http://localhost:${QUERY_CLICKHOUSE_HTTP_HANDLER_PORT}" \
-	-d "select * from test_load_unload FORMAT ${1}" > /tmp/test_load_unload2.txt
-
-	diff /tmp/test_load_unload2.txt /tmp/test_load_unload.txt
+	# unload2
+	echo "copy into @s1/unload2/ from test_load_unload file_format=(type=${1})" | $BENDSQL_CLIENT_CONNECT
+  mv `ls /tmp/test_load_unload/unload2/*` /tmp/test_load_unload/unload2.txt
+  diff /tmp/test_load_unload/unload1.txt /tmp/test_load_unload/unload2.txt
 }
 
 test_format "CSV"
@@ -53,3 +56,5 @@ test_format "CSV"
 test_format "TSV"
 
 test_format "NDJSON"
+
+echo "drop table if exists test_load_unload" | $BENDSQL_CLIENT_CONNECT

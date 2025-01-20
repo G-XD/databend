@@ -14,9 +14,10 @@
 
 use std::sync::Arc;
 
-use common_catalog::table::NavigationDescriptor;
-use common_exception::Result;
-use common_sql::plans::RevertTablePlan;
+use databend_common_catalog::table::NavigationDescriptor;
+use databend_common_catalog::table::TableExt;
+use databend_common_exception::Result;
+use databend_common_sql::plans::RevertTablePlan;
 
 use crate::interpreters::Interpreter;
 use crate::pipelines::PipelineBuildResult;
@@ -40,14 +41,21 @@ impl Interpreter for RevertTableInterpreter {
         "RevertTableInterpreter"
     }
 
+    fn is_ddl(&self) -> bool {
+        true
+    }
+
     #[async_backtrace::framed]
     async fn execute2(&self) -> Result<PipelineBuildResult> {
         let tenant = self.ctx.get_tenant();
         let catalog = self.ctx.get_catalog(self.plan.catalog.as_str()).await?;
 
         let table = catalog
-            .get_table(tenant.as_str(), &self.plan.database, &self.plan.table)
+            .get_table(&tenant, &self.plan.database, &self.plan.table)
             .await?;
+
+        // check mutability
+        table.check_mutable()?;
 
         let navigation_descriptor = NavigationDescriptor {
             database_name: self.plan.database.clone(),

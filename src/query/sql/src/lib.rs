@@ -13,11 +13,14 @@
 // limitations under the License.
 
 #![allow(clippy::uninlined_format_args)]
+#![allow(non_local_definitions)]
 #![feature(box_patterns)]
+#![feature(iterator_try_reduce)]
 #![feature(let_chains)]
 #![feature(try_blocks)]
 #![feature(extend_one)]
-#![feature(default_free_fn)]
+#![feature(if_let_guard)]
+#![feature(iter_next_chunk)]
 
 pub mod evaluator;
 pub mod executor;

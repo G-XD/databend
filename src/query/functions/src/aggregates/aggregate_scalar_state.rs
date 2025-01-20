@@ -15,16 +15,13 @@
 use std::cmp::Ordering;
 use std::marker::PhantomData;
 
-use common_arrow::arrow::bitmap::Bitmap;
-use common_exception::Result;
-use common_expression::types::DataType;
-use common_expression::types::ValueType;
-use common_expression::ColumnBuilder;
-use common_io::prelude::deserialize_from_slice;
-use common_io::prelude::serialize_into_buf;
-use serde::de::DeserializeOwned;
-use serde::Deserialize;
-use serde::Serialize;
+use borsh::BorshDeserialize;
+use borsh::BorshSerialize;
+use databend_common_exception::Result;
+use databend_common_expression::types::Bitmap;
+use databend_common_expression::types::DataType;
+use databend_common_expression::types::ValueType;
+use databend_common_expression::ColumnBuilder;
 
 // These types can downcast their builders successfully.
 // TODO(@b41sh):  Variant => VariantType can't be used because it will use Scalar::String to compare
@@ -35,6 +32,23 @@ macro_rules! with_simple_no_number_mapped_type {
         match_template::match_template! {
             $t = [
                 String => StringType,
+                Boolean => BooleanType,
+                Timestamp => TimestampType,
+                Null => NullType,
+                EmptyArray => EmptyArrayType,
+                EmptyMap => EmptyMapType,
+                Date => DateType,
+            ],
+            $($tail)*
+        }
+    }
+}
+
+#[macro_export]
+macro_rules! with_simple_no_number_no_string_mapped_type {
+    (| $t:tt | $($tail:tt)*) => {
+        match_template::match_template! {
+            $t = [
                 Boolean => BooleanType,
                 Timestamp => TimestampType,
                 Null => NullType,
@@ -66,7 +80,8 @@ macro_rules! with_compare_mapped_type {
 }
 
 pub trait ChangeIf<T: ValueType>: Send + Sync + 'static {
-    fn change_if(l: T::ScalarRef<'_>, r: T::ScalarRef<'_>) -> bool;
+    fn change_if(l: &T::ScalarRef<'_>, r: &T::ScalarRef<'_>) -> bool;
+    fn change_if_ordering(ordering: Ordering) -> bool;
 }
 
 #[derive(Default)]
@@ -75,13 +90,16 @@ pub struct CmpMin;
 impl<T> ChangeIf<T> for CmpMin
 where
     T: ValueType,
-    for<'a> T::ScalarRef<'a>: PartialOrd,
+    for<'a, 'b> T::ScalarRef<'a>: PartialOrd<T::ScalarRef<'b>>,
 {
     #[inline]
-    fn change_if<'a>(l: T::ScalarRef<'_>, r: T::ScalarRef<'_>) -> bool {
-        let l = T::upcast_gat(l);
-        let r = T::upcast_gat(r);
-        l.partial_cmp(&r).unwrap_or(Ordering::Equal) == Ordering::Greater
+    fn change_if<'a>(l: &T::ScalarRef<'_>, r: &T::ScalarRef<'_>) -> bool {
+        matches!(l.partial_cmp(r), Some(Ordering::Greater))
+    }
+
+    #[inline]
+    fn change_if_ordering(ordering: Ordering) -> bool {
+        ordering == Ordering::Greater
     }
 }
 
@@ -91,13 +109,16 @@ pub struct CmpMax;
 impl<T> ChangeIf<T> for CmpMax
 where
     T: ValueType,
-    for<'a> T::ScalarRef<'a>: PartialOrd,
+    for<'a, 'b> T::ScalarRef<'a>: PartialOrd<T::ScalarRef<'b>>,
 {
     #[inline]
-    fn change_if<'a>(l: T::ScalarRef<'_>, r: T::ScalarRef<'_>) -> bool {
-        let l = T::upcast_gat(l);
-        let r = T::upcast_gat(r);
-        l.partial_cmp(&r).unwrap_or(Ordering::Equal) == std::cmp::Ordering::Less
+    fn change_if<'a>(l: &T::ScalarRef<'_>, r: &T::ScalarRef<'_>) -> bool {
+        matches!(l.partial_cmp(r), Some(Ordering::Less))
+    }
+
+    #[inline]
+    fn change_if_ordering(ordering: Ordering) -> bool {
+        ordering == Ordering::Less
     }
 }
 
@@ -106,37 +127,44 @@ pub struct CmpAny;
 
 impl<T: ValueType> ChangeIf<T> for CmpAny {
     #[inline]
-    fn change_if(_: T::ScalarRef<'_>, _: T::ScalarRef<'_>) -> bool {
+    fn change_if(_: &T::ScalarRef<'_>, _: &T::ScalarRef<'_>) -> bool {
+        false
+    }
+
+    #[inline]
+    fn change_if_ordering(_: Ordering) -> bool {
         false
     }
 }
 
-pub trait ScalarStateFunc<T: ValueType>: Send + Sync + 'static {
+pub trait ScalarStateFunc<T: ValueType>:
+    BorshSerialize + BorshDeserialize + Send + Sync + 'static
+{
     fn new() -> Self;
+    fn mem_size() -> Option<usize> {
+        None
+    }
     fn add(&mut self, other: Option<T::ScalarRef<'_>>);
     fn add_batch(&mut self, column: &T::Column, validity: Option<&Bitmap>) -> Result<()>;
     fn merge(&mut self, rhs: &Self) -> Result<()>;
     fn merge_result(&mut self, builder: &mut ColumnBuilder) -> Result<()>;
-    fn serialize(&self, writer: &mut Vec<u8>) -> Result<()>;
-    fn deserialize(&mut self, reader: &mut &[u8]) -> Result<()>;
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(BorshSerialize, BorshDeserialize)]
 pub struct ScalarState<T, C>
 where
     T: ValueType,
-    T::Scalar: Serialize + DeserializeOwned,
+    T::Scalar: BorshSerialize + BorshDeserialize,
 {
-    #[serde(bound(deserialize = "T::Scalar: DeserializeOwned"))]
     pub value: Option<T::Scalar>,
-    #[serde(skip)]
+    #[borsh(skip)]
     _c: PhantomData<C>,
 }
 
 impl<T, C> Default for ScalarState<T, C>
 where
     T: ValueType,
-    T::Scalar: Serialize + DeserializeOwned,
+    T::Scalar: BorshSerialize + BorshDeserialize,
 {
     fn default() -> Self {
         Self {
@@ -149,7 +177,7 @@ where
 impl<T, C> ScalarStateFunc<T> for ScalarState<T, C>
 where
     T: ValueType,
-    T::Scalar: Serialize + DeserializeOwned + Send + Sync,
+    T::Scalar: BorshSerialize + BorshDeserialize + Send + Sync,
     C: ChangeIf<T> + Default,
 {
     fn new() -> Self {
@@ -160,7 +188,7 @@ where
         if let Some(other) = other {
             match &self.value {
                 Some(v) => {
-                    if C::change_if(T::to_scalar_ref(v), other.clone()) {
+                    if C::change_if(&T::to_scalar_ref(v), &other) {
                         self.value = Some(T::to_owned_scalar(other));
                     }
                 }
@@ -177,40 +205,18 @@ where
             return Ok(());
         }
 
-        let column_iter = T::iter_column(column);
-
         if let Some(validity) = validity {
-            if validity.unset_bits() == column_len {
+            if validity.null_count() == column_len {
                 return Ok(());
             }
 
-            // V::ScalarRef doesn't derive Default, so take the first value as default.
-            let mut v = unsafe { T::index_column_unchecked(column, 0) };
-            let mut has_v = validity.get_bit(0);
-
-            for (data, valid) in column_iter.skip(1).zip(validity.iter().skip(1)) {
-                if !valid {
-                    continue;
-                }
-                if !has_v {
-                    has_v = true;
-                    v = data.clone();
-                } else if C::change_if(v.clone(), data.clone()) {
-                    v = data.clone();
-                }
-            }
-
-            if has_v {
-                self.add(Some(v));
-            }
+            let v = T::iter_column(column)
+                .zip(validity.iter())
+                .filter_map(|(item, valid)| if valid { Some(item) } else { None })
+                .reduce(|l, r| if !C::change_if(&l, &r) { l } else { r });
+            self.add(v);
         } else {
-            let v = column_iter.reduce(|l, r| {
-                if !C::change_if(l.clone(), r.clone()) {
-                    l
-                } else {
-                    r
-                }
-            });
+            let v = T::iter_column(column).reduce(|l, r| if !C::change_if(&l, &r) { l } else { r });
             self.add(v);
         }
         Ok(())
@@ -235,15 +241,6 @@ where
         } else {
             builder.push_default();
         }
-        Ok(())
-    }
-
-    fn serialize(&self, writer: &mut Vec<u8>) -> Result<()> {
-        serialize_into_buf(writer, self)
-    }
-
-    fn deserialize(&mut self, reader: &mut &[u8]) -> Result<()> {
-        self.value = deserialize_from_slice(reader)?;
         Ok(())
     }
 }

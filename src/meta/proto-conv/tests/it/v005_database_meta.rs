@@ -12,12 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::BTreeSet;
-
 use chrono::TimeZone;
 use chrono::Utc;
-use common_meta_app::schema as mt;
-use common_meta_app::share;
+use databend_common_meta_app::schema as mt;
+use fastrace::func_name;
 use maplit::btreemap;
 
 use crate::common;
@@ -31,7 +29,7 @@ use crate::common;
 // * or be removed when an old version is no longer supported. *
 // *************************************************************
 //
-// The message bytes are built from the output of `test_build_pb_buf()`
+// The message bytes are built from the output of `test_pb_from_to()`
 #[test]
 fn test_decode_v5_database_meta() -> anyhow::Result<()> {
     let bytes: Vec<u8> = vec![
@@ -51,11 +49,7 @@ fn test_decode_v5_database_meta() -> anyhow::Result<()> {
         updated_on: Utc.with_ymd_and_hms(2014, 11, 29, 12, 0, 9).unwrap(),
         comment: "foo bar".to_string(),
         drop_on: None,
-        shared_by: BTreeSet::new(),
-        from_share: Some(share::ShareNameIdent {
-            tenant: "tenant".to_string(),
-            share_name: "share".to_string(),
-        }),
+        gc_in_progress: false,
     };
 
     common::test_pb_from_to(func_name!(), want())?;

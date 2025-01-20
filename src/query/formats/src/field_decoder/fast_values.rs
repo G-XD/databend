@@ -17,49 +17,58 @@ use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::io::BufRead;
 use std::io::Cursor;
+use std::ops::Not;
+use std::sync::LazyLock;
 
+use aho_corasick::AhoCorasick;
 use bstr::ByteSlice;
-use common_arrow::arrow::bitmap::MutableBitmap;
-use common_exception::ErrorCode;
-use common_exception::Result;
-use common_expression::serialize::read_decimal_with_size;
-use common_expression::serialize::uniform_date;
-use common_expression::types::array::ArrayColumnBuilder;
-use common_expression::types::date::check_date;
-use common_expression::types::decimal::Decimal;
-use common_expression::types::decimal::DecimalColumnBuilder;
-use common_expression::types::decimal::DecimalSize;
-use common_expression::types::nullable::NullableColumnBuilder;
-use common_expression::types::number::Number;
-use common_expression::types::string::StringColumnBuilder;
-use common_expression::types::timestamp::check_timestamp;
-use common_expression::types::AnyType;
-use common_expression::types::NumberColumnBuilder;
-use common_expression::with_decimal_type;
-use common_expression::with_number_mapped_type;
-use common_expression::ColumnBuilder;
-use common_io::constants::FALSE_BYTES_LOWER;
-use common_io::constants::INF_BYTES_LOWER;
-use common_io::constants::NAN_BYTES_LOWER;
-use common_io::constants::NULL_BYTES_UPPER;
-use common_io::constants::TRUE_BYTES_LOWER;
-use common_io::cursor_ext::BufferReadDateTimeExt;
-use common_io::cursor_ext::BufferReadStringExt;
-use common_io::cursor_ext::DateTimeResType;
-use common_io::cursor_ext::ReadBytesExt;
-use common_io::cursor_ext::ReadCheckPointExt;
-use common_io::cursor_ext::ReadNumberExt;
-use common_io::prelude::FormatSettings;
+use databend_common_column::types::months_days_micros;
+use databend_common_exception::ErrorCode;
+use databend_common_exception::Result;
+use databend_common_exception::ToErrorCode;
+use databend_common_expression::serialize::read_decimal_with_size;
+use databend_common_expression::serialize::uniform_date;
+use databend_common_expression::types::array::ArrayColumnBuilder;
+use databend_common_expression::types::binary::BinaryColumnBuilder;
+use databend_common_expression::types::date::clamp_date;
+use databend_common_expression::types::decimal::Decimal;
+use databend_common_expression::types::decimal::DecimalColumnBuilder;
+use databend_common_expression::types::decimal::DecimalSize;
+use databend_common_expression::types::nullable::NullableColumnBuilder;
+use databend_common_expression::types::number::Number;
+use databend_common_expression::types::string::StringColumnBuilder;
+use databend_common_expression::types::AnyType;
+use databend_common_expression::types::MutableBitmap;
+use databend_common_expression::types::NumberColumnBuilder;
+use databend_common_expression::with_decimal_type;
+use databend_common_expression::with_number_mapped_type;
+use databend_common_expression::ColumnBuilder;
+use databend_common_expression::Scalar;
+use databend_common_io::constants::FALSE_BYTES_LOWER;
+use databend_common_io::constants::NAN_BYTES_LOWER;
+use databend_common_io::constants::NULL_BYTES_UPPER;
+use databend_common_io::constants::TRUE_BYTES_LOWER;
+use databend_common_io::cursor_ext::BufferReadDateTimeExt;
+use databend_common_io::cursor_ext::BufferReadStringExt;
+use databend_common_io::cursor_ext::ReadBytesExt;
+use databend_common_io::cursor_ext::ReadCheckPointExt;
+use databend_common_io::cursor_ext::ReadNumberExt;
+use databend_common_io::geography::geography_from_ewkt_bytes;
+use databend_common_io::parse_bitmap;
+use databend_common_io::parse_bytes_to_ewkb;
+use databend_common_io::prelude::FormatSettings;
+use databend_common_io::Interval;
 use jsonb::parse_value;
 use lexical_core::FromLexical;
-use num::cast::AsPrimitive;
+use num_traits::NumCast;
 
-use crate::CommonSettings;
+use crate::field_decoder::common::read_timestamp;
 use crate::FieldDecoder;
+use crate::InputCommonSettings;
 
 #[derive(Clone)]
 pub struct FastFieldDecoderValues {
-    pub common_settings: CommonSettings,
+    common_settings: InputCommonSettings,
 }
 
 impl FieldDecoder for FastFieldDecoderValues {
@@ -69,26 +78,31 @@ impl FieldDecoder for FastFieldDecoderValues {
 }
 
 impl FastFieldDecoderValues {
-    pub fn create_for_insert(format: FormatSettings) -> Self {
+    pub fn create_for_insert(format: FormatSettings, is_rounding_mode: bool) -> Self {
         FastFieldDecoderValues {
-            common_settings: CommonSettings {
+            common_settings: InputCommonSettings {
                 true_bytes: TRUE_BYTES_LOWER.as_bytes().to_vec(),
                 false_bytes: FALSE_BYTES_LOWER.as_bytes().to_vec(),
-                null_bytes: NULL_BYTES_UPPER.as_bytes().to_vec(),
-                nan_bytes: NAN_BYTES_LOWER.as_bytes().to_vec(),
-                inf_bytes: INF_BYTES_LOWER.as_bytes().to_vec(),
+                null_if: vec![
+                    NULL_BYTES_UPPER.as_bytes().to_vec(),
+                    NAN_BYTES_LOWER.as_bytes().to_vec(),
+                ],
                 timezone: format.timezone,
+                jiff_timezone: format.jiff_timezone,
                 disable_variant_check: false,
+                binary_format: Default::default(),
+                is_rounding_mode,
+                enable_dst_hour_fix: format.enable_dst_hour_fix,
             },
         }
     }
 
-    fn common_settings(&self) -> &CommonSettings {
+    fn common_settings(&self) -> &InputCommonSettings {
         &self.common_settings
     }
 
     fn ignore_field_end<R: AsRef<[u8]>>(&self, reader: &mut Cursor<R>) -> bool {
-        reader.ignore_white_spaces();
+        reader.ignore_white_spaces_or_comments();
         matches!(reader.peek(), None | Some(',') | Some(')') | Some(']'))
     }
 
@@ -135,10 +149,16 @@ impl FastFieldDecoderValues {
             ColumnBuilder::String(c) => self.read_string(c, reader, positions),
             ColumnBuilder::Array(c) => self.read_array(c, reader, positions),
             ColumnBuilder::Map(c) => self.read_map(c, reader, positions),
-            ColumnBuilder::Bitmap(_) => Err(ErrorCode::Unimplemented("not implement")),
+            ColumnBuilder::Bitmap(c) => self.read_bitmap(c, reader, positions),
             ColumnBuilder::Tuple(fields) => self.read_tuple(fields, reader, positions),
             ColumnBuilder::Variant(c) => self.read_variant(c, reader, positions),
-            _ => unimplemented!(),
+            ColumnBuilder::Geometry(c) => self.read_geometry(c, reader, positions),
+            ColumnBuilder::Geography(c) => self.read_geography(c, reader, positions),
+            ColumnBuilder::Binary(_) => Err(ErrorCode::Unimplemented("binary literal")),
+            ColumnBuilder::Interval(c) => self.read_interval(c, reader, positions),
+            ColumnBuilder::EmptyArray { .. } | ColumnBuilder::EmptyMap { .. } => {
+                Err(ErrorCode::Unimplemented("empty array/map literal"))
+            }
         }
     }
 
@@ -186,9 +206,26 @@ impl FastFieldDecoderValues {
     fn read_int<T, R: AsRef<[u8]>>(&self, column: &mut Vec<T>, reader: &mut Cursor<R>) -> Result<()>
     where
         T: Number + From<T::Native>,
-        T::Native: FromLexical,
+        T::Native: FromLexical + NumCast,
     {
-        let v: T::Native = reader.read_int_text()?;
+        let val: Result<T::Native> = reader.read_int_text();
+        let v = match val {
+            Ok(v) => v,
+            Err(_) => {
+                // cast float value to integer value
+                let val: f64 = reader.read_float_text()?;
+                let new_val: Option<T::Native> = if self.common_settings.is_rounding_mode {
+                    num_traits::cast::cast(val.round())
+                } else {
+                    num_traits::cast::cast(val)
+                };
+                if let Some(v) = new_val {
+                    v
+                } else {
+                    return Err(ErrorCode::BadBytes(format!("number {} is overflowed", val)));
+                }
+            }
+        };
         column.push(v.into());
         Ok(())
     }
@@ -213,8 +250,8 @@ impl FastFieldDecoderValues {
         size: DecimalSize,
         reader: &mut Cursor<R>,
     ) -> Result<()> {
-        let buf = reader.remaining_slice();
-        let (n, n_read) = read_decimal_with_size(buf, size, false)?;
+        let buf = Cursor::split(reader).1;
+        let (n, n_read) = read_decimal_with_size(buf, size, false, true)?;
         column.push(n);
         reader.consume(n_read);
         Ok(())
@@ -236,8 +273,28 @@ impl FastFieldDecoderValues {
         reader: &mut Cursor<R>,
         positions: &mut VecDeque<usize>,
     ) -> Result<()> {
-        self.read_string_inner(reader, &mut column.data, positions)?;
+        self.read_string_inner(reader, &mut column.row_buffer, positions)?;
         column.commit_row();
+        Ok(())
+    }
+
+    fn read_interval<R: AsRef<[u8]>>(
+        &self,
+        column: &mut Vec<months_days_micros>,
+        reader: &mut Cursor<R>,
+        positions: &mut VecDeque<usize>,
+    ) -> Result<()> {
+        let mut buf = Vec::new();
+        self.read_string_inner(reader, &mut buf, positions)?;
+        let res =
+            std::str::from_utf8(buf.as_slice()).map_err_to_code(ErrorCode::BadBytes, || {
+                format!(
+                    "UTF-8 Conversion Failed: Unable to convert value {:?} to UTF-8",
+                    buf
+                )
+            })?;
+        let i = Interval::from_string(res)?;
+        column.push(months_days_micros::new(i.months, i.days, i.micros));
         Ok(())
     }
 
@@ -250,10 +307,9 @@ impl FastFieldDecoderValues {
         let mut buf = Vec::new();
         self.read_string_inner(reader, &mut buf, positions)?;
         let mut buffer_readr = Cursor::new(&buf);
-        let date = buffer_readr.read_date_text(&self.common_settings().timezone)?;
+        let date = buffer_readr.read_date_text(&self.common_settings().jiff_timezone)?;
         let days = uniform_date(date);
-        check_date(days as i64)?;
-        column.push(days);
+        column.push(clamp_date(days as i64));
         Ok(())
     }
 
@@ -265,26 +321,7 @@ impl FastFieldDecoderValues {
     ) -> Result<()> {
         let mut buf = Vec::new();
         self.read_string_inner(reader, &mut buf, positions)?;
-        let mut buffer_readr = Cursor::new(&buf);
-        let ts = buffer_readr.read_timestamp_text(&self.common_settings().timezone, false)?;
-        match ts {
-            DateTimeResType::Datetime(ts) => {
-                if !buffer_readr.eof() {
-                    let data = buf.to_str().unwrap_or("not utf8");
-                    let msg = format!(
-                        "fail to deserialize timestamp, unexpected end at pos {} of {}",
-                        buffer_readr.position(),
-                        data
-                    );
-                    return Err(ErrorCode::BadBytes(msg));
-                }
-                let micros = ts.timestamp_micros();
-                check_timestamp(micros)?;
-                column.push(micros.as_());
-            }
-            _ => unreachable!(),
-        }
-        Ok(())
+        read_timestamp(column, &buf, self.common_settings())
     }
 
     fn read_array<R: AsRef<[u8]>>(
@@ -295,7 +332,7 @@ impl FastFieldDecoderValues {
     ) -> Result<()> {
         reader.must_ignore_byte(b'[')?;
         for idx in 0.. {
-            let _ = reader.ignore_white_spaces();
+            let _ = reader.ignore_white_spaces_or_comments();
             if reader.ignore_byte(b']') {
                 break;
             }
@@ -305,7 +342,7 @@ impl FastFieldDecoderValues {
                     return Err(err.into());
                 }
             }
-            let _ = reader.ignore_white_spaces();
+            let _ = reader.ignore_white_spaces_or_comments();
             if let Err(err) = self.read_field(&mut column.builder, reader, positions) {
                 self.pop_inner_values(&mut column.builder, idx);
                 return Err(err);
@@ -327,7 +364,7 @@ impl FastFieldDecoderValues {
         let mut set = HashSet::new();
         let map_builder = column.builder.as_tuple_mut().unwrap();
         for idx in 0.. {
-            let _ = reader.ignore_white_spaces();
+            let _ = reader.ignore_white_spaces_or_comments();
             if reader.ignore_byte(b'}') {
                 break;
             }
@@ -338,7 +375,7 @@ impl FastFieldDecoderValues {
                     return Err(err.into());
                 }
             }
-            let _ = reader.ignore_white_spaces();
+            let _ = reader.ignore_white_spaces_or_comments();
             if let Err(err) = self.read_field(&mut map_builder[KEY], reader, positions) {
                 self.pop_inner_values(&mut map_builder[KEY], idx);
                 self.pop_inner_values(&mut map_builder[VALUE], idx);
@@ -355,13 +392,13 @@ impl FastFieldDecoderValues {
             }
             set.insert(key.clone());
             map_builder[KEY].push(key.as_ref());
-            let _ = reader.ignore_white_spaces();
+            let _ = reader.ignore_white_spaces_or_comments();
             if let Err(err) = reader.must_ignore_byte(b':') {
                 self.pop_inner_values(&mut map_builder[KEY], idx + 1);
                 self.pop_inner_values(&mut map_builder[VALUE], idx);
                 return Err(err.into());
             }
-            let _ = reader.ignore_white_spaces();
+            let _ = reader.ignore_white_spaces_or_comments();
             if let Err(err) = self.read_field(&mut map_builder[VALUE], reader, positions) {
                 self.pop_inner_values(&mut map_builder[KEY], idx + 1);
                 self.pop_inner_values(&mut map_builder[VALUE], idx);
@@ -380,7 +417,7 @@ impl FastFieldDecoderValues {
     ) -> Result<()> {
         reader.must_ignore_byte(b'(')?;
         for idx in 0..fields.len() {
-            let _ = reader.ignore_white_spaces();
+            let _ = reader.ignore_white_spaces_or_comments();
             if idx != 0 {
                 if let Err(err) = reader.must_ignore_byte(b',') {
                     for field in fields.iter_mut().take(idx) {
@@ -389,7 +426,7 @@ impl FastFieldDecoderValues {
                     return Err(err.into());
                 }
             }
-            let _ = reader.ignore_white_spaces();
+            let _ = reader.ignore_white_spaces_or_comments();
             if let Err(err) = self.read_field(&mut fields[idx], reader, positions) {
                 for field in fields.iter_mut().take(idx) {
                     self.pop_inner_values(field, 1);
@@ -406,9 +443,23 @@ impl FastFieldDecoderValues {
         Ok(())
     }
 
+    fn read_bitmap<R: AsRef<[u8]>>(
+        &self,
+        column: &mut BinaryColumnBuilder,
+        reader: &mut Cursor<R>,
+        positions: &mut VecDeque<usize>,
+    ) -> Result<()> {
+        let mut buf = Vec::new();
+        self.read_string_inner(reader, &mut buf, positions)?;
+        let rb = parse_bitmap(&buf)?;
+        rb.serialize_into(&mut column.data).unwrap();
+        column.commit_row();
+        Ok(())
+    }
+
     fn read_variant<R: AsRef<[u8]>>(
         &self,
-        column: &mut StringColumnBuilder,
+        column: &mut BinaryColumnBuilder,
         reader: &mut Cursor<R>,
         positions: &mut VecDeque<usize>,
     ) -> Result<()> {
@@ -421,7 +472,6 @@ impl FastFieldDecoderValues {
             }
             Err(_) => {
                 if self.common_settings().disable_variant_check {
-                    column.put_slice(&buf);
                     column.commit_row();
                 } else {
                     return Err(ErrorCode::BadBytes(format!(
@@ -433,4 +483,229 @@ impl FastFieldDecoderValues {
         }
         Ok(())
     }
+
+    fn read_geometry<R: AsRef<[u8]>>(
+        &self,
+        column: &mut BinaryColumnBuilder,
+        reader: &mut Cursor<R>,
+        positions: &mut VecDeque<usize>,
+    ) -> Result<()> {
+        let mut buf = Vec::new();
+        self.read_string_inner(reader, &mut buf, positions)?;
+        let geom = parse_bytes_to_ewkb(&buf, None)?;
+        column.put_slice(geom.as_bytes());
+        column.commit_row();
+        Ok(())
+    }
+
+    fn read_geography<R: AsRef<[u8]>>(
+        &self,
+        column: &mut BinaryColumnBuilder,
+        reader: &mut Cursor<R>,
+        positions: &mut VecDeque<usize>,
+    ) -> Result<()> {
+        let mut buf = Vec::new();
+        self.read_string_inner(reader, &mut buf, positions)?;
+        let geog = geography_from_ewkt_bytes(&buf)?;
+        column.put_slice(geog.as_bytes());
+        column.commit_row();
+        Ok(())
+    }
+}
+
+pub struct FastValuesDecoder<'a> {
+    field_decoder: &'a FastFieldDecoderValues,
+    reader: Cursor<&'a [u8]>,
+    estimated_rows: usize,
+    positions: VecDeque<usize>,
+}
+
+#[async_trait::async_trait]
+pub trait FastValuesDecodeFallback {
+    async fn parse_fallback(&self, sql: &str) -> Result<Vec<Scalar>>;
+}
+
+// Pre-generate the positions of `(`, `'` and `\`
+static PATTERNS: &[&str] = &["(", "'", "\\"];
+
+static INSERT_TOKEN_FINDER: LazyLock<AhoCorasick> =
+    LazyLock::new(|| AhoCorasick::new(PATTERNS).unwrap());
+
+impl<'a> FastValuesDecoder<'a> {
+    pub fn new(data: &'a str, field_decoder: &'a FastFieldDecoderValues) -> Self {
+        let mut estimated_rows = 0;
+        let mut positions = VecDeque::new();
+        for mat in INSERT_TOKEN_FINDER.find_iter(data) {
+            if mat.pattern() == 0.into() {
+                estimated_rows += 1;
+                continue;
+            }
+            positions.push_back(mat.start());
+        }
+        let reader = Cursor::new(data.as_bytes());
+        FastValuesDecoder {
+            reader,
+            estimated_rows,
+            positions,
+            field_decoder,
+        }
+    }
+
+    pub fn estimated_rows(&self) -> usize {
+        self.estimated_rows
+    }
+
+    pub async fn parse(
+        &mut self,
+        columns: &mut [ColumnBuilder],
+        fallback_fn: &impl FastValuesDecodeFallback,
+    ) -> Result<()> {
+        for row in 0.. {
+            let _ = self.reader.ignore_white_spaces_or_comments();
+            if self.reader.eof() {
+                break;
+            }
+
+            // Not the first row
+            if row != 0 {
+                if self.reader.ignore_byte(b';') {
+                    break;
+                }
+                self.reader.must_ignore_byte(b',')?;
+            }
+
+            self.parse_next_row(columns, fallback_fn).await?;
+        }
+        Ok(())
+    }
+
+    async fn parse_next_row(
+        &mut self,
+        columns: &mut [ColumnBuilder],
+        fallback: &impl FastValuesDecodeFallback,
+    ) -> Result<()> {
+        let _ = self.reader.ignore_white_spaces_or_comments();
+        let col_size = columns.len();
+        let start_pos_of_row = self.reader.checkpoint();
+
+        // Start of the row --- '('
+        if !self.reader.ignore_byte(b'(') {
+            return Err(ErrorCode::BadDataValueType(
+                "Must start with parentheses".to_string(),
+            ));
+        }
+        // Ignore the positions in the previous row.
+        while let Some(pos) = self.positions.front() {
+            if *pos < start_pos_of_row as usize {
+                self.positions.pop_front();
+            } else {
+                break;
+            }
+        }
+
+        for col_idx in 0..col_size {
+            let _ = self.reader.ignore_white_spaces_or_comments();
+            let col_end = if col_idx + 1 == col_size { b')' } else { b',' };
+
+            let col = columns
+                .get_mut(col_idx)
+                .ok_or_else(|| ErrorCode::Internal("ColumnBuilder is None"))?;
+
+            let (need_fallback, pop_count) = self
+                .field_decoder
+                .read_field(col, &mut self.reader, &mut self.positions)
+                .map(|_| {
+                    let _ = self.reader.ignore_white_spaces_or_comments();
+                    let need_fallback = self.reader.ignore_byte(col_end).not();
+                    (need_fallback, col_idx + 1)
+                })
+                .unwrap_or((true, col_idx));
+
+            // ColumnBuilder and expr-parser both will eat the end ')' of the row.
+            if need_fallback {
+                for col in columns.iter_mut().take(pop_count) {
+                    col.pop();
+                }
+                // rollback to start position of the row
+                self.reader.rollback(start_pos_of_row + 1);
+                skip_to_next_row(&mut self.reader, 1)?;
+                let end_pos_of_row = self.reader.position();
+
+                // Parse from expression and append all columns.
+                self.reader.set_position(start_pos_of_row);
+                let row_len = end_pos_of_row - start_pos_of_row;
+                let buf = Cursor::split(&self.reader).1;
+                let buf = &buf[..row_len as usize];
+
+                let sql = std::str::from_utf8(buf).unwrap();
+                let values = fallback.parse_fallback(sql).await?;
+
+                for (col, scalar) in columns.iter_mut().zip(values) {
+                    col.push(scalar.as_ref());
+                }
+                self.reader.set_position(end_pos_of_row);
+                return Ok(());
+            }
+        }
+
+        Ok(())
+    }
+}
+
+// Values |(xxx), (yyy), (zzz)
+pub fn skip_to_next_row<R: AsRef<[u8]>>(reader: &mut Cursor<R>, mut balance: i32) -> Result<()> {
+    let _ = reader.ignore_white_spaces_or_comments();
+
+    let mut quoted = false;
+    let mut escaped = false;
+
+    while balance > 0 {
+        let buffer = Cursor::split(reader).1;
+        if buffer.is_empty() {
+            break;
+        }
+
+        let size = buffer.len();
+
+        let it = buffer
+            .iter()
+            .position(|&c| c == b'(' || c == b')' || c == b'\\' || c == b'\'');
+
+        if let Some(it) = it {
+            let c = buffer[it];
+            reader.consume(it + 1);
+
+            if it == 0 && escaped {
+                escaped = false;
+                continue;
+            }
+            escaped = false;
+
+            match c {
+                b'\\' => {
+                    escaped = true;
+                    continue;
+                }
+                b'\'' => {
+                    quoted ^= true;
+                    continue;
+                }
+                b')' => {
+                    if !quoted {
+                        balance -= 1;
+                    }
+                }
+                b'(' => {
+                    if !quoted {
+                        balance += 1;
+                    }
+                }
+                _ => {}
+            }
+        } else {
+            escaped = false;
+            reader.consume(size);
+        }
+    }
+    Ok(())
 }

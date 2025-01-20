@@ -14,8 +14,8 @@
 
 use std::sync::Arc;
 
-use common_catalog::table_context::TableContext;
-use common_exception::Result;
+use databend_common_catalog::table_context::TableContext;
+use databend_common_exception::Result;
 
 use crate::optimizer::ColumnSet;
 use crate::optimizer::Distribution;
@@ -28,69 +28,39 @@ use crate::optimizer::Statistics;
 use crate::plans::Operator;
 use crate::plans::RelOp;
 use crate::IndexType;
+use crate::ScalarExpr;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct UnionAll {
-    // Pairs of unioned columns
-    pub pairs: Vec<(IndexType, IndexType)>,
+    // We'll cast the output of union to the expected data type by the cast expr at runtime.
+    // Left of union, output idx and the expected data type
+    pub left_outputs: Vec<(IndexType, Option<ScalarExpr>)>,
+    // Right of union, output idx and the expected data type
+    pub right_outputs: Vec<(IndexType, Option<ScalarExpr>)>,
+    // Recursive cte scan names
+    // For example: `with recursive t as (select 1 as x union all select m.x+f.x from t as m, t as f where m.x < 3) select * from t`
+    // The `cte_scan_names` are `m` and `f`
+    pub cte_scan_names: Vec<String>,
+    pub output_indexes: Vec<IndexType>,
 }
 
 impl UnionAll {
     pub fn used_columns(&self) -> Result<ColumnSet> {
         let mut used_columns = ColumnSet::new();
-        for (left, right) in &self.pairs {
-            used_columns.insert(*left);
-            used_columns.insert(*right);
+        for (idx, _) in &self.left_outputs {
+            used_columns.insert(*idx);
+        }
+        for (idx, _) in &self.right_outputs {
+            used_columns.insert(*idx);
         }
         Ok(used_columns)
     }
-}
 
-impl Operator for UnionAll {
-    fn rel_op(&self) -> RelOp {
-        RelOp::UnionAll
-    }
-
-    fn derive_relational_prop(&self, rel_expr: &RelExpr) -> Result<Arc<RelationalProperty>> {
-        let left_prop = rel_expr.derive_relational_prop_child(0)?;
-        let right_prop = rel_expr.derive_relational_prop_child(1)?;
-
-        // Derive output columns
-        let mut output_columns = left_prop.output_columns.clone();
-        output_columns = output_columns
-            .union(&right_prop.output_columns)
-            .cloned()
-            .collect();
-
-        // Derive outer columns
-        let mut outer_columns = left_prop.outer_columns.clone();
-        outer_columns = outer_columns
-            .union(&right_prop.outer_columns)
-            .cloned()
-            .collect();
-
-        // Derive used columns
-        let mut used_columns = self.used_columns()?;
-        used_columns.extend(left_prop.used_columns.clone());
-        used_columns.extend(right_prop.used_columns.clone());
-
-        Ok(Arc::new(RelationalProperty {
-            output_columns,
-            outer_columns,
-            used_columns,
-        }))
-    }
-
-    fn derive_physical_prop(&self, rel_expr: &RelExpr) -> Result<PhysicalProperty> {
-        let left_child = rel_expr.derive_physical_prop_child(0)?;
-        Ok(PhysicalProperty {
-            distribution: left_child.distribution,
-        })
-    }
-
-    fn derive_cardinality(&self, rel_expr: &RelExpr) -> Result<Arc<StatInfo>> {
-        let left_stat_info = rel_expr.derive_cardinality_child(0)?;
-        let right_stat_info = rel_expr.derive_cardinality_child(1)?;
+    pub fn derive_union_stats(
+        &self,
+        left_stat_info: Arc<StatInfo>,
+        right_stat_info: Arc<StatInfo>,
+    ) -> Result<Arc<StatInfo>> {
         let cardinality = left_stat_info.cardinality + right_stat_info.cardinality;
 
         let precise_cardinality =
@@ -112,6 +82,66 @@ impl Operator for UnionAll {
             },
         }))
     }
+}
+
+impl Operator for UnionAll {
+    fn rel_op(&self) -> RelOp {
+        RelOp::UnionAll
+    }
+
+    fn arity(&self) -> usize {
+        2
+    }
+
+    fn derive_relational_prop(&self, rel_expr: &RelExpr) -> Result<Arc<RelationalProperty>> {
+        let left_prop = rel_expr.derive_relational_prop_child(0)?;
+        let right_prop = rel_expr.derive_relational_prop_child(1)?;
+
+        // Derive output columns
+        let output_columns = self.output_indexes.iter().cloned().collect();
+        // Derive outer columns
+        let mut outer_columns = left_prop.outer_columns.clone();
+        outer_columns = outer_columns
+            .union(&right_prop.outer_columns)
+            .cloned()
+            .collect();
+
+        // Derive used columns
+        let mut used_columns = self.used_columns()?;
+        used_columns.extend(left_prop.used_columns.clone());
+        used_columns.extend(right_prop.used_columns.clone());
+
+        Ok(Arc::new(RelationalProperty {
+            output_columns,
+            outer_columns,
+            used_columns,
+            orderings: vec![],
+            partition_orderings: None,
+        }))
+    }
+
+    fn derive_physical_prop(&self, rel_expr: &RelExpr) -> Result<PhysicalProperty> {
+        let left_physical_prop = rel_expr.derive_physical_prop_child(0)?;
+        let right_physical_prop = rel_expr.derive_physical_prop_child(1)?;
+
+        if left_physical_prop.distribution == Distribution::Serial
+            || right_physical_prop.distribution == Distribution::Serial
+        {
+            return Ok(PhysicalProperty {
+                distribution: Distribution::Serial,
+            });
+        }
+
+        Ok(PhysicalProperty {
+            distribution: Distribution::Random,
+        })
+    }
+
+    fn derive_stats(&self, rel_expr: &RelExpr) -> Result<Arc<StatInfo>> {
+        let left_stat_info = rel_expr.derive_cardinality_child(0)?;
+        let right_stat_info = rel_expr.derive_cardinality_child(1)?;
+        self.derive_union_stats(left_stat_info, right_stat_info)
+    }
 
     fn compute_required_prop_child(
         &self,
@@ -120,16 +150,49 @@ impl Operator for UnionAll {
         _child_index: usize,
         required: &RequiredProperty,
     ) -> Result<RequiredProperty> {
-        let mut required = required.clone();
+        let required = required.clone();
         let left_physical_prop = rel_expr.derive_physical_prop_child(0)?;
         let right_physical_prop = rel_expr.derive_physical_prop_child(1)?;
         if left_physical_prop.distribution == Distribution::Serial
             || right_physical_prop.distribution == Distribution::Serial
+            || required.distribution == Distribution::Serial
         {
-            required.distribution = Distribution::Serial;
-        } else if left_physical_prop.distribution == right_physical_prop.distribution {
-            required.distribution = left_physical_prop.distribution;
+            Ok(RequiredProperty {
+                distribution: Distribution::Serial,
+            })
+        } else {
+            Ok(RequiredProperty {
+                distribution: Distribution::Random,
+            })
         }
-        Ok(required)
+    }
+
+    fn compute_required_prop_children(
+        &self,
+        _ctx: Arc<dyn TableContext>,
+        _rel_expr: &RelExpr,
+        _required: &RequiredProperty,
+    ) -> Result<Vec<Vec<RequiredProperty>>> {
+        // (Any, Any)
+        let mut children_required = vec![vec![
+            RequiredProperty {
+                distribution: Distribution::Any,
+            },
+            RequiredProperty {
+                distribution: Distribution::Any,
+            },
+        ]];
+
+        // (Serial, Serial)
+        children_required.push(vec![
+            RequiredProperty {
+                distribution: Distribution::Serial,
+            },
+            RequiredProperty {
+                distribution: Distribution::Serial,
+            },
+        ]);
+
+        Ok(children_required)
     }
 }

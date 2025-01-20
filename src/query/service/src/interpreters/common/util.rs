@@ -14,10 +14,10 @@
 
 use std::sync::Arc;
 
-use common_catalog::table_context::TableContext;
-use common_exception::Result;
-use common_meta_kvapi::kvapi::KVApi;
-use common_users::UserApiProvider;
+use databend_common_catalog::table_context::TableContext;
+use databend_common_exception::Result;
+use databend_common_meta_kvapi::kvapi::KVApi;
+use databend_common_users::UserApiProvider;
 
 /// Checks if a duplicate label exists in the meta store.
 ///
@@ -29,15 +29,21 @@ use common_users::UserApiProvider;
 ///
 /// Returns a `Result` containing a `bool` indicating whether specific duplicate label exists (`true`) or not (`false`).
 pub async fn check_deduplicate_label(ctx: Arc<dyn TableContext>) -> Result<bool> {
-    match ctx.get_settings().get_deduplicate_label()? {
+    match unsafe { ctx.get_settings().get_deduplicate_label()? } {
         None => Ok(false),
         Some(deduplicate_label) => {
-            let kv_store = UserApiProvider::instance().get_meta_store_client();
-            let raw = kv_store.get_kv(&deduplicate_label).await?;
-            match raw {
-                None => Ok(false),
-                Some(_) => Ok(true),
-            }
+            let is_exists = if ctx.txn_mgr().lock().is_active() {
+                ctx.txn_mgr()
+                    .lock()
+                    .contains_deduplicated_label(&deduplicate_label)
+            } else {
+                UserApiProvider::instance()
+                    .get_meta_store_client()
+                    .get_kv(&deduplicate_label)
+                    .await?
+                    .is_some()
+            };
+            Ok(is_exists)
         }
     }
 }

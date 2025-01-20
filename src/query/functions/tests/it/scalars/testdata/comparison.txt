@@ -27,7 +27,16 @@ output         : false
 
 ast            : 1.0=1
 raw expr       : eq(1.0, 1)
-checked expr   : eq<Decimal(4, 1), Decimal(4, 1)>(to_decimal<Decimal(2, 1)>(4, 1)(1.0_d128(2,1)), to_decimal<UInt8>(4, 1)(1_u8))
+checked expr   : eq<Decimal(2, 1), Decimal(3, 0)>(1.0_d128(2,1), to_decimal<UInt8>(3, 0)(1_u8))
+optimized expr : true
+output type    : Boolean
+output domain  : {TRUE}
+output         : true
+
+
+ast            : 2.222>2.11
+raw expr       : gt(2.222, 2.11)
+checked expr   : gt<Decimal(4, 3), Decimal(3, 2)>(2.222_d128(4,3), 2.11_d128(3,2))
 optimized expr : true
 output type    : Boolean
 output domain  : {TRUE}
@@ -101,44 +110,13 @@ error:
   --> SQL:1:10
   |
 1 | (1, 'a') = (1,)
-  |          ^ no overload satisfies `eq(Tuple(UInt8, String), Tuple(UInt8,))`
+  |          ^ no function matches signature `eq(Tuple(UInt8, String), Tuple(UInt8,))`, you might need to add explicit type casts.
 
-has tried possible overloads:
+candidate functions:
   eq(Variant, Variant) :: Boolean                               : unable to unify `Tuple(UInt8, String)` with `Variant`
   eq(Variant NULL, Variant NULL) :: Boolean NULL                : unable to unify `Tuple(UInt8, String)` with `Variant`
   eq(String, String) :: Boolean                                 : unable to unify `Tuple(UInt8, String)` with `String`
-  eq(String NULL, String NULL) :: Boolean NULL                  : unable to unify `Tuple(UInt8, String)` with `String`
-  eq(Date, Date) :: Boolean                                     : unable to unify `Tuple(UInt8, String)` with `Date`
-  eq(Date NULL, Date NULL) :: Boolean NULL                      : unable to unify `Tuple(UInt8, String)` with `Date`
-  eq(Timestamp, Timestamp) :: Boolean                           : unable to unify `Tuple(UInt8, String)` with `Timestamp`
-  eq(Timestamp NULL, Timestamp NULL) :: Boolean NULL            : unable to unify `Tuple(UInt8, String)` with `Timestamp`
-  eq(UInt8, UInt8) :: Boolean                                   : unable to unify `Tuple(UInt8, String)` with `UInt8`
-  eq(UInt8 NULL, UInt8 NULL) :: Boolean NULL                    : unable to unify `Tuple(UInt8, String)` with `UInt8`
-  eq(Int8, Int8) :: Boolean                                     : unable to unify `Tuple(UInt8, String)` with `Int8`
-  eq(Int8 NULL, Int8 NULL) :: Boolean NULL                      : unable to unify `Tuple(UInt8, String)` with `Int8`
-  eq(UInt16, UInt16) :: Boolean                                 : unable to unify `Tuple(UInt8, String)` with `UInt16`
-  eq(UInt16 NULL, UInt16 NULL) :: Boolean NULL                  : unable to unify `Tuple(UInt8, String)` with `UInt16`
-  eq(Int16, Int16) :: Boolean                                   : unable to unify `Tuple(UInt8, String)` with `Int16`
-  eq(Int16 NULL, Int16 NULL) :: Boolean NULL                    : unable to unify `Tuple(UInt8, String)` with `Int16`
-  eq(UInt32, UInt32) :: Boolean                                 : unable to unify `Tuple(UInt8, String)` with `UInt32`
-  eq(UInt32 NULL, UInt32 NULL) :: Boolean NULL                  : unable to unify `Tuple(UInt8, String)` with `UInt32`
-  eq(Int32, Int32) :: Boolean                                   : unable to unify `Tuple(UInt8, String)` with `Int32`
-  eq(Int32 NULL, Int32 NULL) :: Boolean NULL                    : unable to unify `Tuple(UInt8, String)` with `Int32`
-  eq(UInt64, UInt64) :: Boolean                                 : unable to unify `Tuple(UInt8, String)` with `UInt64`
-  eq(UInt64 NULL, UInt64 NULL) :: Boolean NULL                  : unable to unify `Tuple(UInt8, String)` with `UInt64`
-  eq(Int64, Int64) :: Boolean                                   : unable to unify `Tuple(UInt8, String)` with `Int64`
-  eq(Int64 NULL, Int64 NULL) :: Boolean NULL                    : unable to unify `Tuple(UInt8, String)` with `Int64`
-  eq(Float32, Float32) :: Boolean                               : unable to unify `Tuple(UInt8, String)` with `Float32`
-  eq(Float32 NULL, Float32 NULL) :: Boolean NULL                : unable to unify `Tuple(UInt8, String)` with `Float32`
-  eq(Float64, Float64) :: Boolean                               : unable to unify `Tuple(UInt8, String)` with `Float64`
-  eq(Float64 NULL, Float64 NULL) :: Boolean NULL                : unable to unify `Tuple(UInt8, String)` with `Float64`
-  eq(Boolean, Boolean) :: Boolean                               : unable to unify `Tuple(UInt8, String)` with `Boolean`
-  eq(Boolean NULL, Boolean NULL) :: Boolean NULL                : unable to unify `Tuple(UInt8, String)` with `Boolean`
-  eq(Array(Nothing), Array(Nothing)) :: Boolean                 : unable to unify `Tuple(UInt8, String)` with `Array(Nothing)`
-  eq(Array(Nothing) NULL, Array(Nothing) NULL) :: Boolean NULL  : unable to unify `Tuple(UInt8, String)` with `Array(Nothing)`
-  eq(Array(T0), Array(T0)) :: Boolean                           : unable to unify `Tuple(UInt8, String)` with `Array(T0)`
-  eq(Array(T0) NULL, Array(T0) NULL) :: Boolean NULL            : unable to unify `Tuple(UInt8, String)` with `Array(T0)`
-  eq(Tuple(T0, T1), Tuple(T0, T1)) :: Boolean                   : unable to unify `Tuple(UInt8,)` with `Tuple(T0, T1)`
+... and 34 more
 
 
 
@@ -167,6 +145,15 @@ optimized expr : false
 output type    : Boolean
 output domain  : {FALSE}
 output         : false
+
+
+ast            : to_interval('1 hour')=to_interval('3600 seconds')
+raw expr       : eq(to_interval('1 hour'), to_interval('3600 seconds'))
+checked expr   : eq<Interval, Interval>(to_interval<String>("1 hour"), to_interval<String>("3600 seconds"))
+optimized expr : true
+output type    : Boolean
+output domain  : {TRUE}
+output         : true
 
 
 ast            : to_timestamp(-315360000000000)=to_timestamp(-100)
@@ -245,13 +232,13 @@ evaluation:
 | Row 6  | '[1,2,3,["a","b","c"]]'                  | '[1,2,3,["a","b","c"]]'                  | true    |
 +--------+------------------------------------------+------------------------------------------+---------+
 evaluation (internal):
-+--------+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
-| Column | Data                                                                                                                                                                                                                              |
-+--------+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
-| lhs    | StringColumn { data: 0x6e756c6c74727565393232333337323033363835343737353830372d3332373638313233342e353637387b226b223a2276222c2261223a2262227d5b312c322c332c5b2261222c2262222c2263225d5d, offsets: [0, 4, 8, 27, 33, 42, 59, 80] } |
-| rhs    | StringColumn { data: 0x6e756c6c74727565393232333337323033363835343737353830372d3332373638313233342e353637387b226b223a2276222c2261223a2264227d5b312c322c332c5b2261222c2262222c2263225d5d, offsets: [0, 4, 8, 27, 33, 42, 59, 80] } |
-| Output | Boolean([0b_1011111])                                                                                                                                                                                                             |
-+--------+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
++--------+------------------------------------------------------------------------------------------------------------+
+| Column | Data                                                                                                       |
++--------+------------------------------------------------------------------------------------------------------------+
+| lhs    | StringColumn[null, true, 9223372036854775807, -32768, 1234.5678, {"k":"v","a":"b"}, [1,2,3,["a","b","c"]]] |
+| rhs    | StringColumn[null, true, 9223372036854775807, -32768, 1234.5678, {"k":"v","a":"d"}, [1,2,3,["a","b","c"]]] |
+| Output | Boolean([0b_1011111])                                                                                      |
++--------+------------------------------------------------------------------------------------------------------------+
 
 
 ast            : lhs = rhs
@@ -272,13 +259,13 @@ evaluation:
 | Row 6  | '[1,2,3,["a","b","c"]]'                  | '[1,2,3,["a","b","c"]]'                  | true          |
 +--------+------------------------------------------+------------------------------------------+---------------+
 evaluation (internal):
-+--------+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
-| Column | Data                                                                                                                                                                                                                              |
-+--------+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
-| lhs    | StringColumn { data: 0x6e756c6c74727565393232333337323033363835343737353830372d3332373638313233342e353637387b226b223a2276222c2261223a2262227d5b312c322c332c5b2261222c2262222c2263225d5d, offsets: [0, 4, 8, 27, 33, 42, 59, 80] } |
-| rhs    | StringColumn { data: 0x6e756c6c74727565393232333337323033363835343737353830372d3332373638313233342e353637387b226b223a2276222c2261223a2264227d5b312c322c332c5b2261222c2262222c2263225d5d, offsets: [0, 4, 8, 27, 33, 42, 59, 80] } |
-| Output | Boolean([0b_1011111])                                                                                                                                                                                                             |
-+--------+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
++--------+------------------------------------------------------------------------------------------------------------+
+| Column | Data                                                                                                       |
++--------+------------------------------------------------------------------------------------------------------------+
+| lhs    | StringColumn[null, true, 9223372036854775807, -32768, 1234.5678, {"k":"v","a":"b"}, [1,2,3,["a","b","c"]]] |
+| rhs    | StringColumn[null, true, 9223372036854775807, -32768, 1234.5678, {"k":"v","a":"d"}, [1,2,3,["a","b","c"]]] |
+| Output | Boolean([0b_1011111])                                                                                      |
++--------+------------------------------------------------------------------------------------------------------------+
 
 
 ast            : '1'!='2'
@@ -301,7 +288,7 @@ output         : true
 
 ast            : 1.1!=1.1
 raw expr       : noteq(1.1, 1.1)
-checked expr   : noteq<Float32, Float32>(to_float32<Decimal(2, 1)>(1.1_d128(2,1)), to_float32<Decimal(2, 1)>(1.1_d128(2,1)))
+checked expr   : noteq<Decimal(2, 1), Decimal(2, 1)>(1.1_d128(2,1), 1.1_d128(2,1))
 optimized expr : false
 output type    : Boolean
 output domain  : {FALSE}
@@ -366,44 +353,13 @@ error:
   --> SQL:1:10
   |
 1 | (1, 'a') != (1,)
-  |          ^^ no overload satisfies `noteq(Tuple(UInt8, String), Tuple(UInt8,))`
+  |          ^^ no function matches signature `noteq(Tuple(UInt8, String), Tuple(UInt8,))`, you might need to add explicit type casts.
 
-has tried possible overloads:
+candidate functions:
   noteq(Variant, Variant) :: Boolean                               : unable to unify `Tuple(UInt8, String)` with `Variant`
   noteq(Variant NULL, Variant NULL) :: Boolean NULL                : unable to unify `Tuple(UInt8, String)` with `Variant`
   noteq(String, String) :: Boolean                                 : unable to unify `Tuple(UInt8, String)` with `String`
-  noteq(String NULL, String NULL) :: Boolean NULL                  : unable to unify `Tuple(UInt8, String)` with `String`
-  noteq(Date, Date) :: Boolean                                     : unable to unify `Tuple(UInt8, String)` with `Date`
-  noteq(Date NULL, Date NULL) :: Boolean NULL                      : unable to unify `Tuple(UInt8, String)` with `Date`
-  noteq(Timestamp, Timestamp) :: Boolean                           : unable to unify `Tuple(UInt8, String)` with `Timestamp`
-  noteq(Timestamp NULL, Timestamp NULL) :: Boolean NULL            : unable to unify `Tuple(UInt8, String)` with `Timestamp`
-  noteq(UInt8, UInt8) :: Boolean                                   : unable to unify `Tuple(UInt8, String)` with `UInt8`
-  noteq(UInt8 NULL, UInt8 NULL) :: Boolean NULL                    : unable to unify `Tuple(UInt8, String)` with `UInt8`
-  noteq(Int8, Int8) :: Boolean                                     : unable to unify `Tuple(UInt8, String)` with `Int8`
-  noteq(Int8 NULL, Int8 NULL) :: Boolean NULL                      : unable to unify `Tuple(UInt8, String)` with `Int8`
-  noteq(UInt16, UInt16) :: Boolean                                 : unable to unify `Tuple(UInt8, String)` with `UInt16`
-  noteq(UInt16 NULL, UInt16 NULL) :: Boolean NULL                  : unable to unify `Tuple(UInt8, String)` with `UInt16`
-  noteq(Int16, Int16) :: Boolean                                   : unable to unify `Tuple(UInt8, String)` with `Int16`
-  noteq(Int16 NULL, Int16 NULL) :: Boolean NULL                    : unable to unify `Tuple(UInt8, String)` with `Int16`
-  noteq(UInt32, UInt32) :: Boolean                                 : unable to unify `Tuple(UInt8, String)` with `UInt32`
-  noteq(UInt32 NULL, UInt32 NULL) :: Boolean NULL                  : unable to unify `Tuple(UInt8, String)` with `UInt32`
-  noteq(Int32, Int32) :: Boolean                                   : unable to unify `Tuple(UInt8, String)` with `Int32`
-  noteq(Int32 NULL, Int32 NULL) :: Boolean NULL                    : unable to unify `Tuple(UInt8, String)` with `Int32`
-  noteq(UInt64, UInt64) :: Boolean                                 : unable to unify `Tuple(UInt8, String)` with `UInt64`
-  noteq(UInt64 NULL, UInt64 NULL) :: Boolean NULL                  : unable to unify `Tuple(UInt8, String)` with `UInt64`
-  noteq(Int64, Int64) :: Boolean                                   : unable to unify `Tuple(UInt8, String)` with `Int64`
-  noteq(Int64 NULL, Int64 NULL) :: Boolean NULL                    : unable to unify `Tuple(UInt8, String)` with `Int64`
-  noteq(Float32, Float32) :: Boolean                               : unable to unify `Tuple(UInt8, String)` with `Float32`
-  noteq(Float32 NULL, Float32 NULL) :: Boolean NULL                : unable to unify `Tuple(UInt8, String)` with `Float32`
-  noteq(Float64, Float64) :: Boolean                               : unable to unify `Tuple(UInt8, String)` with `Float64`
-  noteq(Float64 NULL, Float64 NULL) :: Boolean NULL                : unable to unify `Tuple(UInt8, String)` with `Float64`
-  noteq(Boolean, Boolean) :: Boolean                               : unable to unify `Tuple(UInt8, String)` with `Boolean`
-  noteq(Boolean NULL, Boolean NULL) :: Boolean NULL                : unable to unify `Tuple(UInt8, String)` with `Boolean`
-  noteq(Array(Nothing), Array(Nothing)) :: Boolean                 : unable to unify `Tuple(UInt8, String)` with `Array(Nothing)`
-  noteq(Array(Nothing) NULL, Array(Nothing) NULL) :: Boolean NULL  : unable to unify `Tuple(UInt8, String)` with `Array(Nothing)`
-  noteq(Array(T0), Array(T0)) :: Boolean                           : unable to unify `Tuple(UInt8, String)` with `Array(T0)`
-  noteq(Array(T0) NULL, Array(T0) NULL) :: Boolean NULL            : unable to unify `Tuple(UInt8, String)` with `Array(T0)`
-  noteq(Tuple(T0, T1), Tuple(T0, T1)) :: Boolean                   : unable to unify `Tuple(UInt8,)` with `Tuple(T0, T1)`
+... and 34 more
 
 
 
@@ -423,6 +379,15 @@ optimized expr : true
 output type    : Boolean
 output domain  : {TRUE}
 output         : true
+
+
+ast            : to_interval('1 hour')!=to_interval('3600 seconds')
+raw expr       : noteq(to_interval('1 hour'), to_interval('3600 seconds'))
+checked expr   : noteq<Interval, Interval>(to_interval<String>("1 hour"), to_interval<String>("3600 seconds"))
+optimized expr : false
+output type    : Boolean
+output domain  : {FALSE}
+output         : false
 
 
 ast            : to_timestamp(-315360000000000)!=to_timestamp(-100)
@@ -458,13 +423,13 @@ evaluation:
 | Row 3  | '[1,2,3,["a","b","c"]]'          | '[1,2,3,["a","b","c"]]'          | false   |
 +--------+----------------------------------+----------------------------------+---------+
 evaluation (internal):
-+--------+-------------------------------------------------------------------------------------------------------------------------------------------------------+
-| Column | Data                                                                                                                                                  |
-+--------+-------------------------------------------------------------------------------------------------------------------------------------------------------+
-| lhs    | StringColumn { data: 0x6e756c6c74727565393232333337323033363835343737353830375b312c322c332c5b2261222c2262222c2263225d5d, offsets: [0, 4, 8, 27, 48] } |
-| rhs    | StringColumn { data: 0x6e756c6c74727565393232333337323033363835343737353830375b312c322c332c5b2261222c2262222c2263225d5d, offsets: [0, 4, 8, 27, 48] } |
-| Output | Boolean([0b____0000])                                                                                                                                 |
-+--------+-------------------------------------------------------------------------------------------------------------------------------------------------------+
++--------+----------------------------------------------------------------------+
+| Column | Data                                                                 |
++--------+----------------------------------------------------------------------+
+| lhs    | StringColumn[null, true, 9223372036854775807, [1,2,3,["a","b","c"]]] |
+| rhs    | StringColumn[null, true, 9223372036854775807, [1,2,3,["a","b","c"]]] |
+| Output | Boolean([0b____0000])                                                |
++--------+----------------------------------------------------------------------+
 
 
 ast            : lhs != rhs
@@ -482,13 +447,13 @@ evaluation:
 | Row 3  | '[1,2,3,["a","b","c"]]'          | '[1,2,3,["a","b","c"]]'          | false         |
 +--------+----------------------------------+----------------------------------+---------------+
 evaluation (internal):
-+--------+-------------------------------------------------------------------------------------------------------------------------------------------------------+
-| Column | Data                                                                                                                                                  |
-+--------+-------------------------------------------------------------------------------------------------------------------------------------------------------+
-| lhs    | StringColumn { data: 0x6e756c6c74727565393232333337323033363835343737353830375b312c322c332c5b2261222c2262222c2263225d5d, offsets: [0, 4, 8, 27, 48] } |
-| rhs    | StringColumn { data: 0x6e756c6c74727565393232333337323033363835343737353830375b312c322c332c5b2261222c2262222c2263225d5d, offsets: [0, 4, 8, 27, 48] } |
-| Output | Boolean([0b____0000])                                                                                                                                 |
-+--------+-------------------------------------------------------------------------------------------------------------------------------------------------------+
++--------+----------------------------------------------------------------------+
+| Column | Data                                                                 |
++--------+----------------------------------------------------------------------+
+| lhs    | StringColumn[null, true, 9223372036854775807, [1,2,3,["a","b","c"]]] |
+| rhs    | StringColumn[null, true, 9223372036854775807, [1,2,3,["a","b","c"]]] |
+| Output | Boolean([0b____0000])                                                |
++--------+----------------------------------------------------------------------+
 
 
 ast            : '1'<'2'
@@ -590,6 +555,15 @@ output domain  : {TRUE}
 output         : true
 
 
+ast            : to_interval('29 days')<to_interval('1 month')
+raw expr       : lt(to_interval('29 days'), to_interval('1 month'))
+checked expr   : lt<Interval, Interval>(to_interval<String>("29 days"), to_interval<String>("1 month"))
+optimized expr : true
+output type    : Boolean
+output domain  : {TRUE}
+output         : true
+
+
 ast            : to_timestamp(-315360000000000)<to_timestamp(-100)
 raw expr       : lt(to_timestamp(minus(315360000000000)), to_timestamp(minus(100)))
 checked expr   : lt<Timestamp, Timestamp>(to_timestamp<Int64>(minus<UInt64>(315360000000000_u64)), to_timestamp<Int64>(to_int64<Int16>(minus<UInt8>(100_u8))))
@@ -626,13 +600,13 @@ evaluation:
 | Row 6  | '[1,2,3,["a","b","c"]]' | '[0,2,3,["a","b","c"]]' | true    |
 +--------+-------------------------+-------------------------+---------+
 evaluation (internal):
-+--------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
-| Column | Data                                                                                                                                                                                                          |
-+--------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
-| lhs    | StringColumn { data: 0x6e756c6c74727565393232333337323033363835343737353830372d3332373638313233342e35363738312e39313265325b312c322c332c5b2261222c2262222c2263225d5d, offsets: [0, 4, 8, 27, 33, 42, 49, 70] } |
-| rhs    | StringColumn { data: 0x6e756c6c74727565393232333337323033363835343737353830302d3333373638313233342e35363738312e39313265325b302c322c332c5b2261222c2262222c2263225d5d, offsets: [0, 4, 8, 27, 33, 42, 49, 70] } |
-| Output | Boolean([0b_1111111])                                                                                                                                                                                         |
-+--------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
++--------+--------------------------------------------------------------------------------------------------+
+| Column | Data                                                                                             |
++--------+--------------------------------------------------------------------------------------------------+
+| lhs    | StringColumn[null, true, 9223372036854775807, -32768, 1234.5678, 1.912e2, [1,2,3,["a","b","c"]]] |
+| rhs    | StringColumn[null, true, 9223372036854775800, -33768, 1234.5678, 1.912e2, [0,2,3,["a","b","c"]]] |
+| Output | Boolean([0b_1111111])                                                                            |
++--------+--------------------------------------------------------------------------------------------------+
 
 
 ast            : lhs < rhs
@@ -653,13 +627,13 @@ evaluation:
 | Row 6  | '[1,2,3,["a","b","c"]]' | '[0,2,3,["a","b","c"]]' | false         |
 +--------+-------------------------+-------------------------+---------------+
 evaluation (internal):
-+--------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
-| Column | Data                                                                                                                                                                                                          |
-+--------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
-| lhs    | StringColumn { data: 0x6e756c6c74727565393232333337323033363835343737353830372d3332373638313233342e35363738312e39313265325b312c322c332c5b2261222c2262222c2263225d5d, offsets: [0, 4, 8, 27, 33, 42, 49, 70] } |
-| rhs    | StringColumn { data: 0x6e756c6c74727565393232333337323033363835343737353830302d3333373638313233342e35363738312e39313265325b302c322c332c5b2261222c2262222c2263225d5d, offsets: [0, 4, 8, 27, 33, 42, 49, 70] } |
-| Output | Boolean([0b_0001000])                                                                                                                                                                                         |
-+--------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
++--------+--------------------------------------------------------------------------------------------------+
+| Column | Data                                                                                             |
++--------+--------------------------------------------------------------------------------------------------+
+| lhs    | StringColumn[null, true, 9223372036854775807, -32768, 1234.5678, 1.912e2, [1,2,3,["a","b","c"]]] |
+| rhs    | StringColumn[null, true, 9223372036854775800, -33768, 1234.5678, 1.912e2, [0,2,3,["a","b","c"]]] |
+| Output | Boolean([0b_0001000])                                                                            |
++--------+--------------------------------------------------------------------------------------------------+
 
 
 ast            : '5'<='2'
@@ -770,6 +744,15 @@ output domain  : {TRUE}
 output         : true
 
 
+ast            : to_interval('29 days')<=to_interval('1 month')
+raw expr       : lte(to_interval('29 days'), to_interval('1 month'))
+checked expr   : lte<Interval, Interval>(to_interval<String>("29 days"), to_interval<String>("1 month"))
+optimized expr : true
+output type    : Boolean
+output domain  : {TRUE}
+output         : true
+
+
 ast            : to_timestamp(-315360000000000)<=to_timestamp(-100)
 raw expr       : lte(to_timestamp(minus(315360000000000)), to_timestamp(minus(100)))
 checked expr   : lte<Timestamp, Timestamp>(to_timestamp<Int64>(minus<UInt64>(315360000000000_u64)), to_timestamp<Int64>(to_int64<Int16>(minus<UInt8>(100_u8))))
@@ -802,13 +785,13 @@ evaluation:
 | Row 2  | '[1,2,3,["a","b","c"]]'                        | '[0,2,3,["a","b","c"]]'                        | false   |
 +--------+------------------------------------------------+------------------------------------------------+---------+
 evaluation (internal):
-+--------+-----------------------------------------------------------------------------------------------------------------------------------------------------+
-| Column | Data                                                                                                                                                |
-+--------+-----------------------------------------------------------------------------------------------------------------------------------------------------+
-| lhs    | StringColumn { data: 0x226461746162656e64227b226b223a2276222c2261223a2262227d5b312c322c332c5b2261222c2262222c2263225d5d, offsets: [0, 10, 27, 48] } |
-| rhs    | StringColumn { data: 0x226461746162656e64227b226b223a2261222c2261223a2264227d5b302c322c332c5b2261222c2262222c2263225d5d, offsets: [0, 10, 27, 48] } |
-| Output | Boolean([0b_____011])                                                                                                                               |
-+--------+-----------------------------------------------------------------------------------------------------------------------------------------------------+
++--------+--------------------------------------------------------------------+
+| Column | Data                                                               |
++--------+--------------------------------------------------------------------+
+| lhs    | StringColumn["databend", {"k":"v","a":"b"}, [1,2,3,["a","b","c"]]] |
+| rhs    | StringColumn["databend", {"k":"a","a":"d"}, [0,2,3,["a","b","c"]]] |
+| Output | Boolean([0b_____011])                                              |
++--------+--------------------------------------------------------------------+
 
 
 ast            : lhs <= rhs
@@ -825,13 +808,13 @@ evaluation:
 | Row 2  | '[1,2,3,["a","b","c"]]'                        | '[0,2,3,["a","b","c"]]'                        | false         |
 +--------+------------------------------------------------+------------------------------------------------+---------------+
 evaluation (internal):
-+--------+-----------------------------------------------------------------------------------------------------------------------------------------------------+
-| Column | Data                                                                                                                                                |
-+--------+-----------------------------------------------------------------------------------------------------------------------------------------------------+
-| lhs    | StringColumn { data: 0x226461746162656e64227b226b223a2276222c2261223a2262227d5b312c322c332c5b2261222c2262222c2263225d5d, offsets: [0, 10, 27, 48] } |
-| rhs    | StringColumn { data: 0x226461746162656e64227b226b223a2261222c2261223a2264227d5b302c322c332c5b2261222c2262222c2263225d5d, offsets: [0, 10, 27, 48] } |
-| Output | Boolean([0b_____001])                                                                                                                               |
-+--------+-----------------------------------------------------------------------------------------------------------------------------------------------------+
++--------+--------------------------------------------------------------------+
+| Column | Data                                                               |
++--------+--------------------------------------------------------------------+
+| lhs    | StringColumn["databend", {"k":"v","a":"b"}, [1,2,3,["a","b","c"]]] |
+| rhs    | StringColumn["databend", {"k":"a","a":"d"}, [0,2,3,["a","b","c"]]] |
+| Output | Boolean([0b_____001])                                              |
++--------+--------------------------------------------------------------------+
 
 
 ast            : '3'>'2'
@@ -933,6 +916,15 @@ output domain  : {FALSE}
 output         : false
 
 
+ast            : to_interval('29 days')>to_interval('1 month')
+raw expr       : gt(to_interval('29 days'), to_interval('1 month'))
+checked expr   : gt<Interval, Interval>(to_interval<String>("29 days"), to_interval<String>("1 month"))
+optimized expr : false
+output type    : Boolean
+output domain  : {FALSE}
+output         : false
+
+
 ast            : to_timestamp(-315360000000000)>to_timestamp(-100)
 raw expr       : gt(to_timestamp(minus(315360000000000)), to_timestamp(minus(100)))
 checked expr   : gt<Timestamp, Timestamp>(to_timestamp<Int64>(minus<UInt64>(315360000000000_u64)), to_timestamp<Int64>(to_int64<Int16>(minus<UInt8>(100_u8))))
@@ -976,13 +968,13 @@ evaluation:
 | Row 4  | '1234.5678'           | '1234.5678'           | false   |
 +--------+-----------------------+-----------------------+---------+
 evaluation (internal):
-+--------+-----------------------------------------------------------------------------------------------------------------------------------------------+
-| Column | Data                                                                                                                                          |
-+--------+-----------------------------------------------------------------------------------------------------------------------------------------------+
-| lhs    | StringColumn { data: 0x6e756c6c74727565393232333337323033363835343737353830372d3332373638313233342e35363738, offsets: [0, 4, 8, 27, 33, 42] } |
-| rhs    | StringColumn { data: 0x6e756c6c74727565393232333337323033363835343737353830362d3332373638313233342e35363738, offsets: [0, 4, 8, 27, 33, 42] } |
-| Output | Boolean([0b___00100])                                                                                                                         |
-+--------+-----------------------------------------------------------------------------------------------------------------------------------------------+
++--------+------------------------------------------------------------------+
+| Column | Data                                                             |
++--------+------------------------------------------------------------------+
+| lhs    | StringColumn[null, true, 9223372036854775807, -32768, 1234.5678] |
+| rhs    | StringColumn[null, true, 9223372036854775806, -32768, 1234.5678] |
+| Output | Boolean([0b___00100])                                            |
++--------+------------------------------------------------------------------+
 
 
 ast            : lhs > rhs
@@ -1001,13 +993,35 @@ evaluation:
 | Row 4  | '1234.5678'           | '1234.5678'           | false         |
 +--------+-----------------------+-----------------------+---------------+
 evaluation (internal):
-+--------+-----------------------------------------------------------------------------------------------------------------------------------------------+
-| Column | Data                                                                                                                                          |
-+--------+-----------------------------------------------------------------------------------------------------------------------------------------------+
-| lhs    | StringColumn { data: 0x6e756c6c74727565393232333337323033363835343737353830372d3332373638313233342e35363738, offsets: [0, 4, 8, 27, 33, 42] } |
-| rhs    | StringColumn { data: 0x6e756c6c74727565393232333337323033363835343737353830362d3332373638313233342e35363738, offsets: [0, 4, 8, 27, 33, 42] } |
-| Output | Boolean([0b___00100])                                                                                                                         |
-+--------+-----------------------------------------------------------------------------------------------------------------------------------------------+
++--------+------------------------------------------------------------------+
+| Column | Data                                                             |
++--------+------------------------------------------------------------------+
+| lhs    | StringColumn[null, true, 9223372036854775807, -32768, 1234.5678] |
+| rhs    | StringColumn[null, true, 9223372036854775806, -32768, 1234.5678] |
+| Output | Boolean([0b___00100])                                            |
++--------+------------------------------------------------------------------+
+
+
+ast            : col > 'efg'
+raw expr       : gt(col::String, 'efg')
+checked expr   : gt<String, String>(col, "efg")
+optimized expr : false
+evaluation:
++--------+-----------------+---------+
+|        | col             | Output  |
++--------+-----------------+---------+
+| Type   | String          | Boolean |
+| Domain | {"bcd"..="efg"} | {FALSE} |
+| Row 0  | 'bcd'           | false   |
+| Row 1  | 'efg'           | false   |
++--------+-----------------+---------+
+evaluation (internal):
++--------+------------------------+
+| Column | Data                   |
++--------+------------------------+
+| col    | StringColumn[bcd, efg] |
+| Output | Boolean([0b______00])  |
++--------+------------------------+
 
 
 ast            : '2'>='1'
@@ -1109,6 +1123,15 @@ output domain  : {FALSE}
 output         : false
 
 
+ast            : to_interval('29 days')>=to_interval('1 month')
+raw expr       : gte(to_interval('29 days'), to_interval('1 month'))
+checked expr   : gte<Interval, Interval>(to_interval<String>("29 days"), to_interval<String>("1 month"))
+optimized expr : false
+output type    : Boolean
+output domain  : {FALSE}
+output         : false
+
+
 ast            : to_timestamp(-315360000000000)>=to_timestamp(-100)
 raw expr       : gte(to_timestamp(minus(315360000000000)), to_timestamp(minus(100)))
 checked expr   : gte<Timestamp, Timestamp>(to_timestamp<Int64>(minus<UInt64>(315360000000000_u64)), to_timestamp<Int64>(to_int64<Int16>(minus<UInt8>(100_u8))))
@@ -1154,13 +1177,13 @@ evaluation:
 | Row 6  | '[1,2,3,["a","b","d"]]'                                   | '[1,2,3,["a","b","c"]]'                                   | true    |
 +--------+-----------------------------------------------------------+-----------------------------------------------------------+---------+
 evaluation (internal):
-+--------+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
-| Column | Data                                                                                                                                                                                                                                                        |
-+--------+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
-| lhs    | StringColumn { data: 0x393232333337323033363835343737353830372d3332373638313233342e35363738312e3931326532225c5c5c226162635c5c5c22227b226b223a2276222c2261223a2262227d5b312c322c332c5b2261222c2262222c2264225d5d, offsets: [0, 19, 25, 34, 41, 54, 71, 92] } |
-| rhs    | StringColumn { data: 0x393232333337323033363835343737353830362d3332373638313233342e35363738312e3931326532225c5c5c226162635c5c5c22227b226b223a2276222c2261223a2264227d5b312c322c332c5b2261222c2262222c2263225d5d, offsets: [0, 19, 25, 34, 41, 54, 71, 92] } |
-| Output | Boolean([0b_1011111])                                                                                                                                                                                                                                       |
-+--------+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
++--------+------------------------------------------------------------------------------------------------------------------------+
+| Column | Data                                                                                                                   |
++--------+------------------------------------------------------------------------------------------------------------------------+
+| lhs    | StringColumn[9223372036854775807, -32768, 1234.5678, 1.912e2, "\\\"abc\\\"", {"k":"v","a":"b"}, [1,2,3,["a","b","d"]]] |
+| rhs    | StringColumn[9223372036854775806, -32768, 1234.5678, 1.912e2, "\\\"abc\\\"", {"k":"v","a":"d"}, [1,2,3,["a","b","c"]]] |
+| Output | Boolean([0b_1011111])                                                                                                  |
++--------+------------------------------------------------------------------------------------------------------------------------+
 
 
 ast            : lhs >= rhs
@@ -1181,13 +1204,13 @@ evaluation:
 | Row 6  | '[1,2,3,["a","b","d"]]'                                   | '[1,2,3,["a","b","c"]]'                                   | true          |
 +--------+-----------------------------------------------------------+-----------------------------------------------------------+---------------+
 evaluation (internal):
-+--------+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
-| Column | Data                                                                                                                                                                                                                                                        |
-+--------+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
-| lhs    | StringColumn { data: 0x393232333337323033363835343737353830372d3332373638313233342e35363738312e3931326532225c5c5c226162635c5c5c22227b226b223a2276222c2261223a2262227d5b312c322c332c5b2261222c2262222c2264225d5d, offsets: [0, 19, 25, 34, 41, 54, 71, 92] } |
-| rhs    | StringColumn { data: 0x393232333337323033363835343737353830362d3332373638313233342e35363738312e3931326532225c5c5c226162635c5c5c22227b226b223a2276222c2261223a2264227d5b312c322c332c5b2261222c2262222c2263225d5d, offsets: [0, 19, 25, 34, 41, 54, 71, 92] } |
-| Output | Boolean([0b_1011111])                                                                                                                                                                                                                                       |
-+--------+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
++--------+------------------------------------------------------------------------------------------------------------------------+
+| Column | Data                                                                                                                   |
++--------+------------------------------------------------------------------------------------------------------------------------+
+| lhs    | StringColumn[9223372036854775807, -32768, 1234.5678, 1.912e2, "\\\"abc\\\"", {"k":"v","a":"b"}, [1,2,3,["a","b","d"]]] |
+| rhs    | StringColumn[9223372036854775806, -32768, 1234.5678, 1.912e2, "\\\"abc\\\"", {"k":"v","a":"d"}, [1,2,3,["a","b","c"]]] |
+| Output | Boolean([0b_1011111])                                                                                                  |
++--------+------------------------------------------------------------------------------------------------------------------------+
 
 
 ast            : '1' like '2'
@@ -1254,12 +1277,12 @@ evaluation:
 | Row 3  | 'abf'           | true          |
 +--------+-----------------+---------------+
 evaluation (internal):
-+--------+------------------------------------------------------------------------------+
-| Column | Data                                                                         |
-+--------+------------------------------------------------------------------------------+
-| lhs    | StringColumn { data: 0x616263616264616265616266, offsets: [0, 3, 6, 9, 12] } |
-| Output | Boolean([0b____1111])                                                        |
-+--------+------------------------------------------------------------------------------+
++--------+----------------------------------+
+| Column | Data                             |
++--------+----------------------------------+
+| lhs    | StringColumn[abc, abd, abe, abf] |
+| Output | Boolean([0b____1111])            |
++--------+----------------------------------+
 
 
 ast            : lhs like 'b%'
@@ -1278,12 +1301,35 @@ evaluation:
 | Row 3  | 'abf'           | false   |
 +--------+-----------------+---------+
 evaluation (internal):
-+--------+------------------------------------------------------------------------------+
-| Column | Data                                                                         |
-+--------+------------------------------------------------------------------------------+
-| lhs    | StringColumn { data: 0x616263616264616265616266, offsets: [0, 3, 6, 9, 12] } |
-| Output | Boolean([0b____0000])                                                        |
-+--------+------------------------------------------------------------------------------+
++--------+----------------------------------+
+| Column | Data                             |
++--------+----------------------------------+
+| lhs    | StringColumn[abc, abd, abe, abf] |
+| Output | Boolean([0b____0000])            |
++--------+----------------------------------+
+
+
+ast            : lhs like 'ab%'
+raw expr       : like(lhs::String, 'ab%')
+checked expr   : like<String, String>(lhs, "ab%")
+evaluation:
++--------+-----------------+---------------+
+|        | lhs             | Output        |
++--------+-----------------+---------------+
+| Type   | String          | Boolean       |
+| Domain | {"abc"..="abf"} | {FALSE, TRUE} |
+| Row 0  | 'abc'           | true          |
+| Row 1  | 'abd'           | true          |
+| Row 2  | 'abe'           | true          |
+| Row 3  | 'abf'           | true          |
++--------+-----------------+---------------+
+evaluation (internal):
++--------+----------------------------------+
+| Column | Data                             |
++--------+----------------------------------+
+| lhs    | StringColumn[abc, abd, abe, abf] |
+| Output | Boolean([0b____1111])            |
++--------+----------------------------------+
 
 
 ast            : lhs like 'c'
@@ -1302,12 +1348,12 @@ evaluation:
 | Row 3  | 'abf'           | false   |
 +--------+-----------------+---------+
 evaluation (internal):
-+--------+------------------------------------------------------------------------------+
-| Column | Data                                                                         |
-+--------+------------------------------------------------------------------------------+
-| lhs    | StringColumn { data: 0x616263616264616265616266, offsets: [0, 3, 6, 9, 12] } |
-| Output | Boolean([0b____0000])                                                        |
-+--------+------------------------------------------------------------------------------+
++--------+----------------------------------+
+| Column | Data                             |
++--------+----------------------------------+
+| lhs    | StringColumn[abc, abd, abe, abf] |
+| Output | Boolean([0b____0000])            |
++--------+----------------------------------+
 
 
 ast            : lhs like rhs
@@ -1325,13 +1371,13 @@ evaluation:
 | Row 3  | 'abf'           | 'a'             | false         |
 +--------+-----------------+-----------------+---------------+
 evaluation (internal):
-+--------+------------------------------------------------------------------------------+
-| Column | Data                                                                         |
-+--------+------------------------------------------------------------------------------+
-| lhs    | StringColumn { data: 0x616263616264616265616266, offsets: [0, 3, 6, 9, 12] } |
-| rhs    | StringColumn { data: 0x61255f625f61626561, offsets: [0, 2, 5, 8, 9] }        |
-| Output | Boolean([0b____0111])                                                        |
-+--------+------------------------------------------------------------------------------+
++--------+----------------------------------+
+| Column | Data                             |
++--------+----------------------------------+
+| lhs    | StringColumn[abc, abd, abe, abf] |
+| rhs    | StringColumn[a%, _b_, abe, a]    |
+| Output | Boolean([0b____0111])            |
++--------+----------------------------------+
 
 
 ast            : parse_json('"hello"') like 'h%'
@@ -1375,12 +1421,12 @@ evaluation:
 | Row 2  | '["abe","abf"]'              | false   |
 +--------+------------------------------+---------+
 evaluation (internal):
-+--------+------------------------------------------------------------------------------------------------------------+
-| Column | Data                                                                                                       |
-+--------+------------------------------------------------------------------------------------------------------------+
-| lhs    | StringColumn { data: 0x22616263227b22616264223a31327d5b22616265222c22616266225d, offsets: [0, 5, 15, 28] } |
-| Output | Boolean([0b_____001])                                                                                      |
-+--------+------------------------------------------------------------------------------------------------------------+
++--------+------------------------------------------------+
+| Column | Data                                           |
++--------+------------------------------------------------+
+| lhs    | StringColumn["abc", {"abd":12}, ["abe","abf"]] |
+| Output | Boolean([0b_____001])                          |
++--------+------------------------------------------------+
 
 
 ast            : parse_json(lhs) like '%ab%'
@@ -1397,12 +1443,12 @@ evaluation:
 | Row 2  | '["abe","abf"]'              | true    |
 +--------+------------------------------+---------+
 evaluation (internal):
-+--------+------------------------------------------------------------------------------------------------------------+
-| Column | Data                                                                                                       |
-+--------+------------------------------------------------------------------------------------------------------------+
-| lhs    | StringColumn { data: 0x22616263227b22616264223a31327d5b22616265222c22616266225d, offsets: [0, 5, 15, 28] } |
-| Output | Boolean([0b_____111])                                                                                      |
-+--------+------------------------------------------------------------------------------------------------------------+
++--------+------------------------------------------------+
+| Column | Data                                           |
++--------+------------------------------------------------+
+| lhs    | StringColumn["abc", {"abd":12}, ["abe","abf"]] |
+| Output | Boolean([0b_____111])                          |
++--------+------------------------------------------------+
 
 
 ast            : lhs regexp rhs
@@ -1422,13 +1468,13 @@ evaluation:
 | Row 5  | ''           | ''           | true          |
 +--------+--------------+--------------+---------------+
 evaluation (internal):
-+--------+--------------------------------------------------------------------------------------------+
-| Column | Data                                                                                       |
-+--------+--------------------------------------------------------------------------------------------+
-| lhs    | StringColumn { data: 0x616263616264616265616266616263, offsets: [0, 3, 6, 9, 12, 15, 15] } |
-| rhs    | StringColumn { data: 0x5e615e6261626561, offsets: [0, 2, 4, 7, 8, 8, 8] }                  |
-| Output | Boolean([0b__101101])                                                                      |
-+--------+--------------------------------------------------------------------------------------------+
++--------+-----------------------------------------+
+| Column | Data                                    |
++--------+-----------------------------------------+
+| lhs    | StringColumn[abc, abd, abe, abf, abc, ] |
+| rhs    | StringColumn[^a, ^b, abe, a, , ]        |
+| Output | Boolean([0b__101101])                   |
++--------+-----------------------------------------+
 
 
 ast            : lhs rlike rhs
@@ -1448,12 +1494,12 @@ evaluation:
 | Row 5  | ''           | ''           | true          |
 +--------+--------------+--------------+---------------+
 evaluation (internal):
-+--------+--------------------------------------------------------------------------------------------+
-| Column | Data                                                                                       |
-+--------+--------------------------------------------------------------------------------------------+
-| lhs    | StringColumn { data: 0x616263616264616265616266616263, offsets: [0, 3, 6, 9, 12, 15, 15] } |
-| rhs    | StringColumn { data: 0x5e615e6261626561, offsets: [0, 2, 4, 7, 8, 8, 8] }                  |
-| Output | Boolean([0b__101101])                                                                      |
-+--------+--------------------------------------------------------------------------------------------+
++--------+-----------------------------------------+
+| Column | Data                                    |
++--------+-----------------------------------------+
+| lhs    | StringColumn[abc, abd, abe, abf, abc, ] |
+| rhs    | StringColumn[^a, ^b, abe, a, , ]        |
+| Output | Boolean([0b__101101])                   |
++--------+-----------------------------------------+
 
 

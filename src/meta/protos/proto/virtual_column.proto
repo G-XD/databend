@@ -1,4 +1,4 @@
-// Copyright 2021 Datafuse Labs.
+// Copyright 2021 Datafuse Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -20,6 +20,8 @@ syntax = "proto3";
 
 package databend_proto;
 
+import "datatype.proto";
+
 // VirtualColumnMeta is a container of virtual columns information.
 message VirtualColumnMeta {
   uint64 ver = 100;
@@ -36,4 +38,7 @@ message VirtualColumnMeta {
 
   // The time virtual column updated.
   optional string updated_on = 4;
+
+  // virtual column data type
+  repeated DataType data_types = 5;
 }

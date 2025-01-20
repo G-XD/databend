@@ -15,39 +15,66 @@
 use std::any::Any;
 use std::sync::Arc;
 
-use common_catalog::catalog::StorageDescription;
-use common_catalog::plan::DataSourcePlan;
-use common_catalog::plan::PartStatistics;
-use common_catalog::plan::Partitions;
-use common_catalog::plan::PartitionsShuffleKind;
-use common_catalog::plan::Projection;
-use common_catalog::plan::PushDownInfo;
-use common_catalog::table::Table;
-use common_catalog::table_context::TableContext;
-use common_exception::Result;
-use common_expression::types::DataType;
-use common_expression::BlockEntry;
-use common_expression::Column;
-use common_expression::DataBlock;
-use common_expression::TableSchemaRef;
-use common_expression::Value;
-use common_meta_app::schema::TableInfo;
-use common_pipeline_core::processors::port::OutputPort;
-use common_pipeline_core::processors::processor::ProcessorPtr;
-use common_pipeline_core::Pipeline;
-use common_pipeline_core::SourcePipeBuilder;
-use common_pipeline_sources::SyncSource;
-use common_pipeline_sources::SyncSourcer;
+use databend_common_catalog::catalog::StorageDescription;
+use databend_common_catalog::plan::DataSourcePlan;
+use databend_common_catalog::plan::PartStatistics;
+use databend_common_catalog::plan::Partitions;
+use databend_common_catalog::plan::PartitionsShuffleKind;
+use databend_common_catalog::plan::Projection;
+use databend_common_catalog::plan::PushDownInfo;
+use databend_common_catalog::table::Table;
+use databend_common_catalog::table_context::TableContext;
+use databend_common_exception::Result;
+use databend_common_expression::types::DataType;
+use databend_common_expression::BlockEntry;
+use databend_common_expression::Column;
+use databend_common_expression::DataBlock;
+use databend_common_expression::RandomOptions;
+use databend_common_expression::TableSchemaRef;
+use databend_common_expression::Value;
+use databend_common_meta_app::schema::TableInfo;
+use databend_common_pipeline_core::processors::OutputPort;
+use databend_common_pipeline_core::processors::ProcessorPtr;
+use databend_common_pipeline_core::Pipeline;
+use databend_common_pipeline_core::SourcePipeBuilder;
+use databend_common_pipeline_sources::SyncSource;
+use databend_common_pipeline_sources::SyncSourcer;
+use databend_storages_common_table_meta::table::OPT_KEY_RANDOM_MAX_ARRAY_LEN;
+use databend_storages_common_table_meta::table::OPT_KEY_RANDOM_MAX_STRING_LEN;
+use databend_storages_common_table_meta::table::OPT_KEY_RANDOM_MIN_STRING_LEN;
+use databend_storages_common_table_meta::table::OPT_KEY_RANDOM_SEED;
 
 use crate::RandomPartInfo;
 
 pub struct RandomTable {
     table_info: TableInfo,
+    random_options: RandomOptions,
 }
 
 impl RandomTable {
     pub fn try_create(table_info: TableInfo) -> Result<Box<dyn Table>> {
-        Ok(Box::new(Self { table_info }))
+        let mut random_options = RandomOptions::default();
+        if let Some(seed_str) = table_info.meta.options.get(OPT_KEY_RANDOM_SEED) {
+            let seed = seed_str.parse::<u64>()?;
+            random_options.seed = Some(seed);
+        }
+
+        if let Some(s) = table_info.meta.options.get(OPT_KEY_RANDOM_MIN_STRING_LEN) {
+            random_options.min_string_len = s.parse::<usize>()?;
+        }
+
+        if let Some(s) = table_info.meta.options.get(OPT_KEY_RANDOM_MAX_STRING_LEN) {
+            random_options.max_string_len = s.parse::<usize>()?;
+        }
+
+        if let Some(s) = table_info.meta.options.get(OPT_KEY_RANDOM_MAX_ARRAY_LEN) {
+            random_options.max_array_len = s.parse::<usize>()?;
+        }
+
+        Ok(Box::new(Self {
+            table_info,
+            random_options,
+        }))
     }
 
     pub fn description() -> StorageDescription {
@@ -76,7 +103,7 @@ impl RandomTable {
                 partitions.push(RandomPartInfo::create(rows));
             }
         }
-        Partitions::create_nolazy(PartitionsShuffleKind::Seq, partitions)
+        Partitions::create(PartitionsShuffleKind::Seq, partitions)
     }
 }
 
@@ -125,10 +152,8 @@ impl Table for RandomTable {
             .iter()
             .map(|f| {
                 let data_type: DataType = f.data_type().into();
-                BlockEntry::new(
-                    data_type.clone(),
-                    Value::Column(Column::random(&data_type, 1)),
-                )
+                let column = Column::random(&data_type, 1, Some(self.random_options.clone()));
+                BlockEntry::new(data_type.clone(), Value::Column(column))
             })
             .collect::<Vec<_>>();
         let block = DataBlock::new(columns, 1);
@@ -155,6 +180,7 @@ impl Table for RandomTable {
         ctx: Arc<dyn TableContext>,
         plan: &DataSourcePlan,
         pipeline: &mut Pipeline,
+        _put_cache: bool,
     ) -> Result<()> {
         let mut output_schema = self.table_info.schema();
         let push_downs = plan.push_downs.clone();
@@ -178,7 +204,27 @@ impl Table for RandomTable {
             let parts = RandomPartInfo::from_part(&plan.parts.partitions[index])?;
             builder.add_source(
                 output.clone(),
-                RandomSource::create(ctx.clone(), output, output_schema.clone(), parts.rows)?,
+                RandomSource::create(
+                    ctx.clone(),
+                    output,
+                    output_schema.clone(),
+                    parts.rows,
+                    self.random_options.clone(),
+                )?,
+            );
+        }
+
+        if plan.parts.is_empty() {
+            let output = OutputPort::create();
+            builder.add_source(
+                output.clone(),
+                RandomSource::create(
+                    ctx.clone(),
+                    output,
+                    output_schema,
+                    0,
+                    self.random_options.clone(),
+                )?,
             );
         }
 
@@ -191,6 +237,7 @@ struct RandomSource {
     schema: TableSchemaRef,
     /// how many rows are needed to generate
     rows: usize,
+    random_options: RandomOptions,
 }
 
 impl RandomSource {
@@ -199,8 +246,13 @@ impl RandomSource {
         output: Arc<OutputPort>,
         schema: TableSchemaRef,
         rows: usize,
+        random_options: RandomOptions,
     ) -> Result<ProcessorPtr> {
-        SyncSourcer::create(ctx, output, RandomSource { schema, rows })
+        SyncSourcer::create(ctx, output, RandomSource {
+            schema,
+            rows,
+            random_options,
+        })
     }
 }
 
@@ -219,7 +271,11 @@ impl SyncSource for RandomSource {
             .iter()
             .map(|f| {
                 let data_type = f.data_type().into();
-                let value = Value::Column(Column::random(&data_type, self.rows));
+                let value = Value::Column(Column::random(
+                    &data_type,
+                    self.rows,
+                    Some(self.random_options.clone()),
+                ));
                 BlockEntry::new(data_type, value)
             })
             .collect();

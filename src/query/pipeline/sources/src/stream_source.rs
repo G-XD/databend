@@ -14,13 +14,13 @@
 
 use std::sync::Arc;
 
-use common_catalog::table_context::TableContext;
-use common_exception::ErrorCode;
-use common_exception::Result;
-use common_expression::DataBlock;
-use common_expression::SendableDataBlockStream;
-use common_pipeline_core::processors::port::OutputPort;
-use common_pipeline_core::processors::processor::ProcessorPtr;
+use databend_common_catalog::table_context::TableContext;
+use databend_common_exception::ErrorCode;
+use databend_common_exception::Result;
+use databend_common_expression::DataBlock;
+use databend_common_expression::SendableDataBlockStream;
+use databend_common_pipeline_core::processors::OutputPort;
+use databend_common_pipeline_core::processors::ProcessorPtr;
 use futures::StreamExt;
 
 use crate::AsyncSource;
@@ -57,7 +57,6 @@ impl<const T: bool> AsyncSource for AsyncStreamSource<T> {
     const NAME: &'static str = "stream source";
     const SKIP_EMPTY_DATA_BLOCK: bool = T;
 
-    #[async_trait::unboxed_simple]
     #[async_backtrace::framed]
     async fn generate(&mut self) -> Result<Option<DataBlock>> {
         match self

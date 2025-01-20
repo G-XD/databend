@@ -16,16 +16,17 @@ use std::time::Duration;
 
 use chrono::TimeZone;
 use chrono::Utc;
-use common_meta_app::background::BackgroundJobIdent;
-use common_meta_app::background::BackgroundJobParams;
-use common_meta_app::background::BackgroundJobState;
-use common_meta_app::background::BackgroundJobStatus;
-use common_meta_app::background::BackgroundJobType;
-use common_meta_app::background::BackgroundTaskState;
-use common_meta_app::background::BackgroundTaskType;
-use common_meta_app::background::CompactionStats;
-use common_meta_app::background::VacuumStats;
-use common_meta_app::schema::TableStatistics;
+use databend_common_meta_app::background::task_creator::BackgroundTaskCreator;
+use databend_common_meta_app::background::BackgroundJobParams;
+use databend_common_meta_app::background::BackgroundJobState;
+use databend_common_meta_app::background::BackgroundJobStatus;
+use databend_common_meta_app::background::BackgroundJobType;
+use databend_common_meta_app::background::BackgroundTaskState;
+use databend_common_meta_app::background::BackgroundTaskType;
+use databend_common_meta_app::background::CompactionStats;
+use databend_common_meta_app::background::VacuumStats;
+use databend_common_meta_app::schema::TableStatistics;
+use fastrace::func_name;
 
 use crate::common;
 
@@ -38,7 +39,7 @@ use crate::common;
 // * or be removed when an old version is no longer supported. *
 // *************************************************************
 //
-// The message bytes are built from the output of `test_build_pb_buf()`
+// The message bytes are built from the output of `test_pb_from_to()`
 #[test]
 fn test_decode_v44_background_task() -> anyhow::Result<()> {
     let bytes = vec![
@@ -47,7 +48,7 @@ fn test_decode_v44_background_task() -> anyhow::Result<()> {
         32, 48, 48, 58, 48, 48, 58, 48, 48, 32, 85, 84, 67, 160, 6, 45, 168, 6, 24,
     ];
 
-    let want = || common_meta_app::background::BackgroundTaskInfo {
+    let want = || databend_common_meta_app::background::BackgroundTaskInfo {
         last_updated: Some(Utc.with_ymd_and_hms(2014, 11, 28, 12, 0, 9).unwrap()),
         task_type: BackgroundTaskType::COMPACTION,
         task_state: BackgroundTaskState::DONE,
@@ -78,7 +79,7 @@ fn test_decode_v40_background_task_case_2() -> anyhow::Result<()> {
         85, 84, 67, 160, 6, 45, 168, 6, 24,
     ];
 
-    let want = || common_meta_app::background::BackgroundTaskInfo {
+    let want = || databend_common_meta_app::background::BackgroundTaskInfo {
         last_updated: Some(Utc.with_ymd_and_hms(2014, 11, 28, 12, 0, 9).unwrap()),
         task_type: BackgroundTaskType::VACUUM,
         task_state: BackgroundTaskState::STARTED,
@@ -106,7 +107,7 @@ fn test_decode_v40_background_task_case_2() -> anyhow::Result<()> {
         }),
         vacuum_stats: Some(VacuumStats {}),
         manual_trigger: None,
-        creator: Some(BackgroundJobIdent {
+        creator: Some(BackgroundTaskCreator {
             tenant: "test1".to_string(),
             name: "compactor_job".to_string(),
         }),
@@ -129,7 +130,7 @@ fn test_decode_v44_background_job() -> anyhow::Result<()> {
         32, 48, 48, 58, 48, 48, 58, 48, 48, 32, 85, 84, 67, 160, 6, 45, 168, 6, 24,
     ];
 
-    let want = || common_meta_app::background::BackgroundJobInfo {
+    let want = || databend_common_meta_app::background::BackgroundJobInfo {
         job_params: Some(BackgroundJobParams {
             job_type: BackgroundJobType::INTERVAL,
             scheduled_job_interval: std::time::Duration::from_secs(100),

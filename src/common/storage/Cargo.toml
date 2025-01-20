@@ -1,5 +1,5 @@
 [package]
-name = "common-storage"
+name = "databend-common-storage"
 version = { workspace = true }
 authors = { workspace = true }
 license = { workspace = true }
@@ -7,30 +7,36 @@ publish = { workspace = true }
 edition = { workspace = true }
 
 [features]
-storage-hdfs = ["common-meta-app/storage-hdfs"]
+storage-hdfs = ["databend-common-meta-app/storage-hdfs"]
 
 [dependencies]
-common-arrow = { path = "../arrow" }
-common-auth = { path = "../auth" }
-common-base = { path = "../base" }
-common-exception = { path = "../exception" }
-common-expression = { path = "../../query/expression" }
-common-meta-app = { path = "../../meta/app" }
-
 anyhow = { workspace = true }
-arrow-schema = "43.0.0"
+arrow-schema = { workspace = true }
 async-backtrace = { workspace = true }
-async-trait = "0.1"
-bytes = "1"
 chrono = { workspace = true }
-flagset = "0.4"
-futures = "0.3"
+dashmap = { workspace = true, features = ["serde"] }
+databend-common-ast = { workspace = true }
+databend-common-auth = { workspace = true }
+databend-common-base = { workspace = true }
+databend-common-exception = { workspace = true }
+databend-common-expression = { workspace = true }
+databend-common-meta-app = { workspace = true }
+databend-common-metrics = { workspace = true }
+databend-common-native = { workspace = true }
+databend-enterprise-storage-encryption = { workspace = true }
+futures = { workspace = true }
+http = { workspace = true }
 log = { workspace = true }
-metrics = "0.20.1"
 opendal = { workspace = true }
-parquet = "43.0.0"
-regex = "1.8.1"
+parquet = { workspace = true }
+prometheus-client = { workspace = true }
+regex = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }
+thiserror = { workspace = true }
+url = { workspace = true }
 
 [dev-dependencies]
+
+[lints]
+workspace = true

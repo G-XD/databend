@@ -12,126 +12,192 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use common_exception::ErrorCode;
-use common_exception::Result;
+use derive_visitor::DriveMut;
+use derive_visitor::VisitorMut;
+use pretty_assertions::assert_eq;
 
+use crate::ast::ExplainKind;
 use crate::ast::Expr;
 use crate::ast::Identifier;
+use crate::ast::Literal;
+use crate::ast::SelectTarget;
 use crate::ast::Statement;
-use crate::error::display_parser_error;
-use crate::input::Dialect;
-use crate::input::Input;
-use crate::parser::expr;
-use crate::parser::expr::subexpr;
+use crate::ast::StatementWithFormat;
+use crate::parser::common::comma_separated_list0;
+use crate::parser::common::comma_separated_list1;
+use crate::parser::common::ident;
+use crate::parser::common::transform_span;
+use crate::parser::common::IResult;
+use crate::parser::error::display_parser_error;
+use crate::parser::expr::expr;
 use crate::parser::expr::values_with_placeholder;
+use crate::parser::input::Dialect;
+use crate::parser::input::Input;
+use crate::parser::input::ParseMode;
+use crate::parser::statement::insert_stmt;
+use crate::parser::statement::replace_stmt;
 use crate::parser::statement::statement;
 use crate::parser::token::Token;
 use crate::parser::token::TokenKind;
 use crate::parser::token::Tokenizer;
-use crate::util::comma_separated_list0;
-use crate::util::comma_separated_list1;
-use crate::util::ident;
-use crate::util::transform_span;
-use crate::Backtrace;
+use crate::parser::Backtrace;
+use crate::ParseError;
+use crate::Range;
+use crate::Result;
 
 pub fn tokenize_sql(sql: &str) -> Result<Vec<Token>> {
     Tokenizer::new(sql).collect::<Result<Vec<_>>>()
 }
 
 /// Parse a SQL string into `Statement`s.
-pub fn parse_sql<'a>(
-    sql_tokens: &'a [Token<'a>],
-    dialect: Dialect,
-) -> Result<(Statement, Option<String>)> {
-    let backtrace = Backtrace::new();
-    match statement(Input(sql_tokens, dialect, &backtrace)) {
-        Ok((rest, stmts)) if rest[0].kind == TokenKind::EOI => Ok((stmts.stmt, stmts.format)),
-        Ok((rest, _)) => Err(ErrorCode::SyntaxException(
-            "unable to parse rest of the sql".to_string(),
-        )
-        .set_span(transform_span(&rest[..1]))),
-        Err(nom::Err::Error(err) | nom::Err::Failure(err)) => {
-            let source = sql_tokens[0].source;
-            Err(ErrorCode::SyntaxException(display_parser_error(
-                err, source,
-            )))
-        }
-        Err(nom::Err::Incomplete(_)) => unreachable!(),
-    }
+#[fastrace::trace]
+pub fn parse_sql(tokens: &[Token], dialect: Dialect) -> Result<(Statement, Option<String>)> {
+    let stmt = run_parser(tokens, dialect, ParseMode::Default, false, statement)?;
+
+    #[cfg(debug_assertions)]
+    assert_reparse(tokens[0].source, stmt.clone());
+
+    Ok((stmt.stmt, stmt.format))
 }
 
 /// Parse udf function into Expr
-pub fn parse_expr<'a>(sql_tokens: &'a [Token<'a>], dialect: Dialect) -> Result<Expr> {
-    let backtrace = Backtrace::new();
-    match expr::expr(Input(sql_tokens, dialect, &backtrace)) {
-        Ok((rest, expr)) if rest[0].kind == TokenKind::EOI => Ok(expr),
-        Ok((rest, _)) => Err(ErrorCode::SyntaxException(
-            "unable to parse rest of the sql".to_string(),
-        )
-        .set_span(transform_span(&rest[..1]))),
-        Err(nom::Err::Error(err) | nom::Err::Failure(err)) => {
-            let source = sql_tokens[0].source;
-            Err(ErrorCode::SyntaxException(display_parser_error(
-                err, source,
-            )))
-        }
-        Err(nom::Err::Incomplete(_)) => unreachable!(),
-    }
+pub fn parse_expr(tokens: &[Token], dialect: Dialect) -> Result<Expr> {
+    run_parser(tokens, dialect, ParseMode::Default, false, expr)
 }
 
-pub fn parse_comma_separated_exprs<'a>(
-    sql_tokens: &'a [Token<'a>],
-    dialect: Dialect,
-) -> Result<Vec<Expr>> {
-    let backtrace = Backtrace::new();
-    let mut comma_separated_exprs_parser = comma_separated_list0(subexpr(0));
-    match comma_separated_exprs_parser(Input(sql_tokens, dialect, &backtrace)) {
-        Ok((_rest, exprs)) => Ok(exprs),
-        Err(nom::Err::Error(err) | nom::Err::Failure(err)) => {
-            let source = sql_tokens[0].source;
-            Err(ErrorCode::SyntaxException(display_parser_error(
-                err, source,
-            )))
-        }
-        Err(nom::Err::Incomplete(_)) => unreachable!(),
-    }
+pub fn parse_comma_separated_exprs(tokens: &[Token], dialect: Dialect) -> Result<Vec<Expr>> {
+    run_parser(tokens, dialect, ParseMode::Default, true, |i| {
+        comma_separated_list0(expr)(i)
+    })
 }
 
-pub fn parse_comma_separated_idents<'a>(
-    sql_tokens: &'a [Token<'a>],
-    dialect: Dialect,
-) -> Result<Vec<Identifier>> {
-    let backtrace = Backtrace::new();
-    let mut comma_separated_idents_parser = comma_separated_list1(ident);
-    match comma_separated_idents_parser(Input(sql_tokens, dialect, &backtrace)) {
-        Ok((_rest, idents)) => Ok(idents),
-        Err(nom::Err::Error(err) | nom::Err::Failure(err)) => {
-            let source = sql_tokens[0].source;
-            Err(ErrorCode::SyntaxException(display_parser_error(
-                err, source,
-            )))
-        }
-        Err(nom::Err::Incomplete(_)) => unreachable!(),
-    }
+pub fn parse_comma_separated_idents(tokens: &[Token], dialect: Dialect) -> Result<Vec<Identifier>> {
+    run_parser(tokens, dialect, ParseMode::Default, true, |i| {
+        comma_separated_list1(ident)(i)
+    })
 }
 
-pub fn parser_values_with_placeholder<'a>(
-    sql_tokens: &'a [Token<'a>],
+pub fn parse_values_with_placeholder(
+    tokens: &[Token],
     dialect: Dialect,
 ) -> Result<Vec<Option<Expr>>> {
+    run_parser(
+        tokens,
+        dialect,
+        ParseMode::Default,
+        false,
+        values_with_placeholder,
+    )
+}
+
+pub fn parse_raw_insert_stmt(tokens: &[Token], dialect: Dialect) -> Result<Statement> {
+    run_parser(
+        tokens,
+        dialect,
+        ParseMode::Default,
+        false,
+        insert_stmt(true),
+    )
+}
+
+pub fn parse_raw_replace_stmt(tokens: &[Token], dialect: Dialect) -> Result<Statement> {
+    run_parser(
+        tokens,
+        dialect,
+        ParseMode::Default,
+        false,
+        replace_stmt(true),
+    )
+}
+
+pub fn run_parser<O>(
+    tokens: &[Token],
+    dialect: Dialect,
+    mode: ParseMode,
+    allow_partial: bool,
+    mut parser: impl FnMut(Input) -> IResult<O>,
+) -> Result<O> {
     let backtrace = Backtrace::new();
-    match values_with_placeholder(Input(sql_tokens, dialect, &backtrace)) {
-        Ok((rest, exprs)) if rest[0].kind == TokenKind::EOI => Ok(exprs),
-        Ok((rest, _)) => Err(ErrorCode::SyntaxException(
-            "unable to parse rest of the sql".to_string(),
-        )
-        .set_span(transform_span(&rest[..1]))),
+    let input = Input {
+        tokens,
+        dialect,
+        mode,
+        backtrace: &backtrace,
+    };
+    match parser(input) {
+        Ok((rest, res)) => {
+            let is_complete = rest[0].kind == TokenKind::EOI;
+            if is_complete || allow_partial {
+                Ok(res)
+            } else {
+                Err(ParseError(
+                    transform_span(&rest[..1]),
+                    "unable to parse rest of the sql".to_string(),
+                ))
+            }
+        }
         Err(nom::Err::Error(err) | nom::Err::Failure(err)) => {
-            let source = sql_tokens[0].source;
-            Err(ErrorCode::SyntaxException(display_parser_error(
-                err, source,
-            )))
+            let source = tokens[0].source;
+            Err(ParseError(None, display_parser_error(err, source)))
         }
         Err(nom::Err::Incomplete(_)) => unreachable!(),
     }
+}
+
+/// Check that the statement can be displayed and reparsed without loss
+#[allow(dead_code)]
+fn assert_reparse(sql: &str, stmt: StatementWithFormat) {
+    let stmt = reset_ast(stmt);
+
+    let new_sql = stmt.to_string();
+    let new_tokens = crate::parser::tokenize_sql(&new_sql).unwrap();
+    let new_stmt = run_parser(
+        &new_tokens,
+        Dialect::PostgreSQL,
+        ParseMode::Default,
+        false,
+        statement,
+    )
+    .map_err(|err| panic!("{} in {}", err.1, new_sql))
+    .unwrap();
+
+    let new_stmt = reset_ast(new_stmt);
+    assert_eq!(stmt, new_stmt, "\nleft:\n{}\nright:\n{}", sql, new_sql);
+}
+
+#[allow(dead_code)]
+fn reset_ast(mut stmt: StatementWithFormat) -> StatementWithFormat {
+    #[derive(VisitorMut)]
+    #[visitor(Range(enter), Literal(enter), ExplainKind(enter), SelectTarget(enter))]
+    struct ResetAST;
+
+    impl ResetAST {
+        fn enter_range(&mut self, range: &mut Range) {
+            range.start = 0;
+            range.end = 0;
+        }
+
+        fn enter_literal(&mut self, literal: &mut Literal) {
+            *literal = Literal::Null;
+        }
+
+        fn enter_explain_kind(&mut self, kind: &mut ExplainKind) {
+            match kind {
+                ExplainKind::Ast(_) => *kind = ExplainKind::Ast("".to_string()),
+                ExplainKind::Syntax(_) => *kind = ExplainKind::Syntax("".to_string()),
+                ExplainKind::Memo(_) => *kind = ExplainKind::Memo("".to_string()),
+                _ => (),
+            }
+        }
+
+        fn enter_select_target(&mut self, target: &mut SelectTarget) {
+            if let SelectTarget::StarColumns { column_filter, .. } = target {
+                *column_filter = None
+            }
+        }
+    }
+
+    stmt.drive_mut(&mut ResetAST);
+
+    stmt
 }

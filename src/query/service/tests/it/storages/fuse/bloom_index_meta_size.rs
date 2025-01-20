@@ -17,43 +17,39 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use chrono::Utc;
-use common_arrow::parquet::metadata::FileMetaData;
-use common_arrow::parquet::metadata::ThriftFileMetaData;
-use common_base::base::tokio;
-use common_cache::Cache;
-use common_expression::types::Int32Type;
-use common_expression::types::NumberDataType;
-use common_expression::types::NumberScalar;
-use common_expression::ColumnId;
-use common_expression::DataBlock;
-use common_expression::FromData;
-use common_expression::Scalar;
-use common_expression::TableDataType;
-use common_expression::TableField;
-use common_expression::TableSchemaRefExt;
-use common_storages_fuse::io::TableMetaLocationGenerator;
-use common_storages_fuse::statistics::gen_columns_statistics;
-use common_storages_fuse::statistics::STATS_STRING_PREFIX_LEN;
-use common_storages_fuse::FuseStorageFormat;
-use databend_query::test_kits::block_writer::BlockWriter;
+use databend_common_base::base::tokio;
+use databend_common_expression::types::Int32Type;
+use databend_common_expression::types::NumberDataType;
+use databend_common_expression::types::NumberScalar;
+use databend_common_expression::ColumnId;
+use databend_common_expression::DataBlock;
+use databend_common_expression::FromData;
+use databend_common_expression::Scalar;
+use databend_common_expression::TableDataType;
+use databend_common_expression::TableField;
+use databend_common_expression::TableSchemaRefExt;
+use databend_common_storages_fuse::io::TableMetaLocationGenerator;
+use databend_common_storages_fuse::statistics::gen_columns_statistics;
+use databend_common_storages_fuse::statistics::STATS_STRING_PREFIX_LEN;
+use databend_common_storages_fuse::FuseStorageFormat;
+use databend_query::test_kits::*;
+use databend_storages_common_cache::CacheAccessor;
+use databend_storages_common_cache::CacheValue;
+use databend_storages_common_cache::InMemoryLruCache;
+use databend_storages_common_table_meta::meta::BlockMeta;
+use databend_storages_common_table_meta::meta::ColumnMeta;
+use databend_storages_common_table_meta::meta::ColumnStatistics;
+use databend_storages_common_table_meta::meta::CompactSegmentInfo;
+use databend_storages_common_table_meta::meta::Compression;
+use databend_storages_common_table_meta::meta::Location;
+use databend_storages_common_table_meta::meta::SegmentInfo;
+use databend_storages_common_table_meta::meta::SingleColumnMeta;
+use databend_storages_common_table_meta::meta::Statistics;
+use databend_storages_common_table_meta::meta::Versioned;
 use opendal::Operator;
-use storages_common_cache::InMemoryCacheBuilder;
-use storages_common_cache::InMemoryItemCacheHolder;
-use storages_common_index::BloomIndexMeta;
-use storages_common_table_meta::meta::BlockMeta;
-use storages_common_table_meta::meta::ColumnMeta;
-use storages_common_table_meta::meta::ColumnStatistics;
-use storages_common_table_meta::meta::CompactSegmentInfo;
-use storages_common_table_meta::meta::Compression;
-use storages_common_table_meta::meta::Location;
-use storages_common_table_meta::meta::SegmentInfo;
-use storages_common_table_meta::meta::SingleColumnMeta;
-use storages_common_table_meta::meta::Statistics;
-use storages_common_table_meta::meta::Versioned;
+use parquet::format::FileMetaData;
 use sysinfo::get_current_pid;
-use sysinfo::ProcessExt;
 use sysinfo::System;
-use sysinfo::SystemExt;
 use uuid::Uuid;
 
 // NOTE:
@@ -65,69 +61,69 @@ use uuid::Uuid;
 //
 // please run the following two cases individually (in different process)
 
-#[tokio::test(flavor = "multi_thread")]
-#[ignore]
-async fn test_index_meta_cache_size_file_meta_data() -> common_exception::Result<()> {
-    let thrift_file_meta = setup().await?;
+// #[tokio::test(flavor = "multi_thread")]
+// #[ignore]
+// async fn test_index_meta_cache_size_file_meta_data() -> databend_common_exception::Result<()> {
+//     let thrift_file_meta = setup().await?;
 
-    let cache_number = 300_000;
+//     let cache_number = 300_000;
 
-    let meta: FileMetaData = FileMetaData::try_from_thrift(thrift_file_meta)?;
+//     let meta: FileMetaData = FileMetaData::try_from_thrift(thrift_file_meta)?;
 
-    let sys = System::new_all();
-    let pid = get_current_pid().unwrap();
-    let process = sys.process(pid).unwrap();
-    let base_memory_usage = process.memory();
-    let scenario = "FileMetaData";
+//     let sys = System::new_all();
+//     let pid = get_current_pid().unwrap();
+//     let process = sys.process(pid).unwrap();
+//     let base_memory_usage = process.memory();
+//     let scenario = "FileMetaData";
 
-    eprintln!(
-        "scenario {}, pid {}, base memory {}",
-        scenario, pid, base_memory_usage
-    );
+//     eprintln!(
+//         "scenario {}, pid {}, base memory {}",
+//         scenario, pid, base_memory_usage
+//     );
 
-    let cache = InMemoryCacheBuilder::new_item_cache::<FileMetaData>(cache_number as u64);
+//     let cache = InMemoryCacheBuilder::new_item_cache::<FileMetaData>(cache_number as u64);
 
-    populate_cache(&cache, meta, cache_number);
-    show_memory_usage(scenario, base_memory_usage, cache_number);
+//     populate_cache(&cache, meta, cache_number);
+//     show_memory_usage(scenario, base_memory_usage, cache_number);
 
-    drop(cache);
+//     drop(cache);
 
-    Ok(())
-}
+//     Ok(())
+// }
 
-#[tokio::test(flavor = "multi_thread")]
-#[ignore]
-async fn test_index_meta_cache_size_bloom_meta() -> common_exception::Result<()> {
-    let thrift_file_meta = setup().await?;
+// #[tokio::test(flavor = "multi_thread")]
+// #[ignore]
+// async fn test_index_meta_cache_size_bloom_meta() -> databend_common_exception::Result<()> {
+//     let thrift_file_meta = setup().await?;
 
-    let cache_number = 300_000;
+//     let cache_number = 300_000;
 
-    let bloom_index_meta = BloomIndexMeta::try_from(thrift_file_meta)?;
+//     let bloom_index_meta = BloomIndexMeta::try_from(thrift_file_meta)?;
 
-    let sys = System::new_all();
-    let pid = get_current_pid().unwrap();
-    let process = sys.process(pid).unwrap();
-    let base_memory_usage = process.memory();
+//     let sys = System::new_all();
+//     let pid = get_current_pid().unwrap();
+//     let process = sys.process(pid).unwrap();
+//     let base_memory_usage = process.memory();
 
-    let scenario = "BloomIndexMeta(mini)";
-    eprintln!(
-        "scenario {}, pid {}, base memory {}",
-        scenario, pid, base_memory_usage
-    );
+//     let scenario = "BloomIndexMeta(mini)";
+//     eprintln!(
+//         "scenario {}, pid {}, base memory {}",
+//         scenario, pid, base_memory_usage
+//     );
 
-    let cache = InMemoryCacheBuilder::new_item_cache::<BloomIndexMeta>(cache_number as u64);
-    populate_cache(&cache, bloom_index_meta, cache_number);
-    show_memory_usage("BloomIndexMeta(Mini)", base_memory_usage, cache_number);
+//     let cache = InMemoryCacheBuilder::new_item_cache::<BloomIndexMeta>(cache_number as u64);
+//     populate_cache(&cache, bloom_index_meta, cache_number);
+//     show_memory_usage("BloomIndexMeta(Mini)", base_memory_usage, cache_number);
 
-    drop(cache);
+//     drop(cache);
 
-    Ok(())
-}
+//     Ok(())
+// }
 
 // cargo test --test it storages::fuse::bloom_index_meta_size::test_random_location_memory_size --no-fail-fast -- --ignored --exact -Z unstable-options --show-output
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
-async fn test_random_location_memory_size() -> common_exception::Result<()> {
+async fn test_random_location_memory_size() -> databend_common_exception::Result<()> {
     // generate random location of Type Location
     let location_gen = TableMetaLocationGenerator::with_prefix("/root".to_string());
 
@@ -160,7 +156,7 @@ async fn test_random_location_memory_size() -> common_exception::Result<()> {
 // cargo test --test it storages::fuse::bloom_index_meta_size::test_segment_info_size --no-fail-fast -- --ignored --exact -Z unstable-options --show-output
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
-async fn test_segment_info_size() -> common_exception::Result<()> {
+async fn test_segment_info_size() -> databend_common_exception::Result<()> {
     let cache_number = 3000;
     let num_block_per_seg = 1000;
 
@@ -180,9 +176,8 @@ async fn test_segment_info_size() -> common_exception::Result<()> {
         scenario, pid, base_memory_usage
     );
 
-    let cache = InMemoryCacheBuilder::new_item_cache::<SegmentInfo>(cache_number as u64);
+    let cache = InMemoryLruCache::with_items_capacity(String::from(""), cache_number);
     {
-        let mut c = cache.write();
         for _ in 0..cache_number {
             let uuid = Uuid::new_v4();
             let block_metas = segment_info
@@ -192,7 +187,10 @@ async fn test_segment_info_size() -> common_exception::Result<()> {
                 .collect::<Vec<_>>();
             let statistics = segment_info.summary.clone();
             let segment_info = SegmentInfo::new(block_metas, statistics);
-            (*c).put(format!("{}", uuid.simple()), Arc::new(segment_info));
+            cache.insert(
+                format!("{}", uuid.simple()),
+                CompactSegmentInfo::try_from(segment_info)?,
+            );
         }
     }
     show_memory_usage("SegmentInfoCache", base_memory_usage, cache_number);
@@ -203,12 +201,12 @@ async fn test_segment_info_size() -> common_exception::Result<()> {
 // cargo test --test it storages::fuse::bloom_index_meta_size::test_segment_raw_bytes_size --no-fail-fast -- --ignored --exact -Z unstable-options --show-output
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
-async fn test_segment_raw_bytes_size() -> common_exception::Result<()> {
+async fn test_segment_raw_bytes_size() -> databend_common_exception::Result<()> {
     let cache_number = 3000;
     let num_block_per_seg = 1000;
 
     let segment_info = build_test_segment_info(num_block_per_seg)?;
-    let segment_info_bytes = segment_info.to_bytes()?;
+    let segment_info_bytes = CompactSegmentInfo::try_from(segment_info)?;
 
     let sys = System::new_all();
     let pid = get_current_pid().unwrap();
@@ -224,17 +222,13 @@ async fn test_segment_raw_bytes_size() -> common_exception::Result<()> {
         scenario, pid, base_memory_usage
     );
 
-    let cache = InMemoryCacheBuilder::new_item_cache::<Vec<u8>>(cache_number as u64);
-    {
-        let mut c = cache.write();
-        for _ in 0..cache_number {
-            let uuid = Uuid::new_v4();
-            (*c).put(
-                format!("{}", uuid.simple()),
-                Arc::new(segment_info_bytes.clone()),
-            );
-        }
+    let cache = InMemoryLruCache::with_items_capacity(String::from(""), cache_number);
+
+    for _ in 0..cache_number {
+        let uuid = Uuid::new_v4();
+        cache.insert(format!("{}", uuid.simple()), segment_info_bytes.clone());
     }
+
     show_memory_usage(
         "SegmentInfoCache(raw bytes Vec<u8>)",
         base_memory_usage,
@@ -247,7 +241,7 @@ async fn test_segment_raw_bytes_size() -> common_exception::Result<()> {
 // cargo test --test it storages::fuse::bloom_index_meta_size::test_segment_raw_repr_bytes_size --no-fail-fast -- --ignored --exact -Z unstable-options --show-output
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
-async fn test_segment_raw_repr_bytes_size() -> common_exception::Result<()> {
+async fn test_segment_raw_repr_bytes_size() -> databend_common_exception::Result<()> {
     let cache_number = 3000;
     let num_block_per_seg = 1000;
 
@@ -269,13 +263,11 @@ async fn test_segment_raw_repr_bytes_size() -> common_exception::Result<()> {
         scenario, pid, base_memory_usage
     );
 
-    let cache = InMemoryCacheBuilder::new_item_cache::<CompactSegmentInfo>(cache_number as u64);
-    {
-        let mut c = cache.write();
-        for _ in 0..cache_number {
-            let uuid = Uuid::new_v4();
-            (*c).put(format!("{}", uuid.simple()), Arc::new(segment_raw.clone()));
-        }
+    let cache = InMemoryLruCache::with_items_capacity(String::from(""), cache_number);
+
+    for _ in 0..cache_number {
+        let uuid = Uuid::new_v4();
+        cache.insert(format!("{}", uuid.simple()), segment_raw.clone());
     }
     show_memory_usage(
         "SegmentInfoCache (compact repr)",
@@ -286,7 +278,9 @@ async fn test_segment_raw_repr_bytes_size() -> common_exception::Result<()> {
     Ok(())
 }
 
-fn build_test_segment_info(num_blocks_per_seg: usize) -> common_exception::Result<SegmentInfo> {
+fn build_test_segment_info(
+    num_blocks_per_seg: usize,
+) -> databend_common_exception::Result<SegmentInfo> {
     let col_meta = ColumnMeta::Parquet(SingleColumnMeta {
         offset: 0,
         len: 0,
@@ -294,8 +288,8 @@ fn build_test_segment_info(num_blocks_per_seg: usize) -> common_exception::Resul
     });
 
     let col_stat = ColumnStatistics::new(
-        Scalar::String(String::from_utf8(vec![b'a'; STATS_STRING_PREFIX_LEN])?.into_bytes()),
-        Scalar::String(String::from_utf8(vec![b'a'; STATS_STRING_PREFIX_LEN])?.into_bytes()),
+        Scalar::String(String::from_utf8(vec![b'a'; STATS_STRING_PREFIX_LEN])?),
+        Scalar::String(String::from_utf8(vec![b'a'; STATS_STRING_PREFIX_LEN])?),
         0,
         0,
         None,
@@ -339,6 +333,7 @@ fn build_test_segment_info(num_blocks_per_seg: usize) -> common_exception::Resul
         location: block_location,
         bloom_filter_index_location: Some(location_gen.block_bloom_index_location(&block_uuid)),
         bloom_filter_index_size: 0,
+        inverted_index_size: None,
         compression: Compression::Lz4,
         create_on: Some(Utc::now()),
     };
@@ -361,19 +356,17 @@ fn build_test_segment_info(num_blocks_per_seg: usize) -> common_exception::Resul
     Ok(SegmentInfo::new(block_metas, statistics))
 }
 
-fn populate_cache<T>(cache: &InMemoryItemCacheHolder<T>, item: T, num_cache: usize)
-where T: Clone {
-    let mut c = cache.write();
+#[allow(dead_code)]
+fn populate_cache<T>(cache: &InMemoryLruCache<T>, item: T, num_cache: usize)
+where T: Clone + Into<CacheValue<T>> {
     for _ in 0..num_cache {
         let uuid = Uuid::new_v4();
-        (*c).put(
-            format!("{}", uuid.simple()),
-            std::sync::Arc::new(item.clone()),
-        );
+        cache.insert(format!("{}", uuid.simple()), item.clone());
     }
 }
 
-async fn setup() -> common_exception::Result<ThriftFileMetaData> {
+#[allow(dead_code)]
+async fn setup() -> databend_common_exception::Result<FileMetaData> {
     let fields = (0..23)
         .map(|_| TableField::new("id", TableDataType::Number(NumberDataType::Int32)))
         .collect::<Vec<_>>();

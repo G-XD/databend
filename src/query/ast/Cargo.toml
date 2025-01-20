@@ -1,41 +1,48 @@
 [package]
-name = "common-ast"
-version = { workspace = true }
+name = "databend-common-ast"
+version = "0.1.3"
+publish = true
+description = "SQL parser for Databend"
 authors = { workspace = true }
 license = { workspace = true }
-publish = { workspace = true }
 edition = { workspace = true }
+repository = "https://github.com/datafuselabs/databend/tree/main/src/query/ast"
 
 [lib]
 doctest = false
 
-[dependencies] # In alphabetical order
-# Workspace dependencies
-common-exception = { path = "../../common/exception" }
-common-io = { path = "../../common/io" }
-common-meta-app = { path = "../../meta/app" }
-
-# Crates.io dependencies
-enum-as-inner = "0.5.1"
+[dependencies]
+derive-visitor = { workspace = true }
+enum-as-inner = { workspace = true }
 ethnum = { workspace = true }
-fast-float = "0.2.0"
-itertools = "0.10.5"
-logos = "0.12.1"
-nom = "7.1.1"
-nom-rule = "0.3.0"
-pratt = "0.4.0"
-pretty = "0.11.3"
-strum = "0.24"
-strum_macros = "0.24"
-url = "2.3.1"
+fast-float2 = { workspace = true }
+fastrace = { workspace = true }
+indent = { workspace = true }
+itertools = { workspace = true }
+logos = { workspace = true }
+nom = { workspace = true }
+nom-rule = { workspace = true }
+ordered-float = { workspace = true }
+percent-encoding = { workspace = true }
+pratt = { workspace = true }
+pretty_assertions = { workspace = true }
+recursive = { workspace = true }
+rspack-codespan-reporting = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+strsim = { workspace = true }
+strum = { workspace = true }
+strum_macros = { workspace = true }
+unindent = { workspace = true }
+url = { workspace = true }
 
 [dev-dependencies]
-common-base = { path = "../../common/base" }
-criterion = "0.4"
-goldenfile = "1.4"
-pretty_assertions = "1.3.0"
-regex = "1.8.1"
+criterion = { workspace = true }
+goldenfile = { workspace = true }
 
 [[bench]]
 name = "bench"
 harness = false
+
+[lints]
+workspace = true

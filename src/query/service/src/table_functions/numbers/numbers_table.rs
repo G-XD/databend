@@ -16,44 +16,43 @@ use std::any::Any;
 use std::mem::size_of;
 use std::sync::Arc;
 
-use chrono::NaiveDateTime;
-use chrono::TimeZone;
-use chrono::Utc;
-use common_catalog::plan::DataSourcePlan;
-use common_catalog::plan::PartInfoPtr;
-use common_catalog::plan::PartStatistics;
-use common_catalog::plan::Partitions;
-use common_catalog::plan::PushDownInfo;
-use common_catalog::table::TableStatistics;
-use common_catalog::table_args::TableArgs;
-use common_exception::Result;
-use common_expression::type_check::check_number;
-use common_expression::types::number::NumberScalar;
-use common_expression::types::number::UInt64Type;
-use common_expression::types::DataType;
-use common_expression::types::NumberDataType;
-use common_expression::utils::FromData;
-use common_expression::DataBlock;
-use common_expression::Expr;
-use common_expression::FunctionContext;
-use common_expression::Scalar;
-use common_expression::TableDataType;
-use common_expression::TableField;
-use common_expression::TableSchemaRefExt;
-use common_functions::BUILTIN_FUNCTIONS;
-use common_meta_app::schema::TableIdent;
-use common_meta_app::schema::TableInfo;
-use common_meta_app::schema::TableMeta;
-use common_pipeline_sources::EmptySource;
-use common_pipeline_sources::SyncSource;
-use common_pipeline_sources::SyncSourcer;
+use chrono::DateTime;
+use databend_common_catalog::plan::DataSourcePlan;
+use databend_common_catalog::plan::PartInfoPtr;
+use databend_common_catalog::plan::PartStatistics;
+use databend_common_catalog::plan::Partitions;
+use databend_common_catalog::plan::PushDownInfo;
+use databend_common_catalog::table::DistributionLevel;
+use databend_common_catalog::table::TableStatistics;
+use databend_common_catalog::table_args::TableArgs;
+use databend_common_exception::Result;
+use databend_common_expression::type_check::check_number;
+use databend_common_expression::types::number::NumberScalar;
+use databend_common_expression::types::number::UInt64Type;
+use databend_common_expression::types::NumberDataType;
+use databend_common_expression::utils::FromData;
+use databend_common_expression::DataBlock;
+use databend_common_expression::Expr;
+use databend_common_expression::FunctionContext;
+use databend_common_expression::Scalar;
+use databend_common_expression::TableDataType;
+use databend_common_expression::TableField;
+use databend_common_expression::TableSchemaRefExt;
+use databend_common_functions::BUILTIN_FUNCTIONS;
+use databend_common_meta_app::schema::TableIdent;
+use databend_common_meta_app::schema::TableInfo;
+use databend_common_meta_app::schema::TableMeta;
+use databend_common_pipeline_core::Pipeline;
+use databend_common_pipeline_core::SourcePipeBuilder;
+use databend_common_pipeline_sources::EmptySource;
+use databend_common_pipeline_sources::SyncSource;
+use databend_common_pipeline_sources::SyncSourcer;
+use databend_storages_common_table_meta::table::ChangeType;
 
 use super::numbers_part::generate_numbers_parts;
 use super::NumbersPartInfo;
-use crate::pipelines::processors::port::OutputPort;
-use crate::pipelines::processors::processor::ProcessorPtr;
-use crate::pipelines::Pipeline;
-use crate::pipelines::SourcePipeBuilder;
+use crate::pipelines::processors::OutputPort;
+use crate::pipelines::processors::ProcessorPtr;
 use crate::sessions::TableContext;
 use crate::storages::Table;
 use crate::table_functions::TableFunction;
@@ -71,18 +70,13 @@ impl NumbersTable {
         table_args: TableArgs,
     ) -> Result<Arc<dyn TableFunction>> {
         let args = table_args.expect_all_positioned(table_func_name, Some(1))?;
-        let total = check_number(
+        let total = check_number::<_, u64>(
             None,
             &FunctionContext::default(),
-            &Expr::<usize>::Cast {
+            &Expr::<usize>::Constant {
                 span: None,
-                is_try: false,
-                expr: Box::new(Expr::Constant {
-                    span: None,
-                    scalar: args[0].clone(),
-                    data_type: args[0].as_ref().infer_data_type(),
-                }),
-                dest_type: DataType::Number(NumberDataType::UInt64),
+                scalar: args[0].clone(),
+                data_type: args[0].as_ref().infer_data_type(),
             },
             &BUILTIN_FUNCTIONS,
         )?;
@@ -105,10 +99,8 @@ impl NumbersTable {
                 engine: engine.to_string(),
                 // Assuming that created_on is unnecessary for function table,
                 // we could make created_on fixed to pass test_shuffle_action_try_into.
-                created_on: Utc
-                    .from_utc_datetime(&NaiveDateTime::from_timestamp_opt(0, 0).unwrap()),
-                updated_on: Utc
-                    .from_utc_datetime(&NaiveDateTime::from_timestamp_opt(0, 0).unwrap()),
+                created_on: DateTime::from_timestamp(0, 0).unwrap(),
+                updated_on: DateTime::from_timestamp(0, 0).unwrap(),
                 ..Default::default()
             },
             ..Default::default()
@@ -120,8 +112,11 @@ impl NumbersTable {
 
 #[async_trait::async_trait]
 impl Table for NumbersTable {
-    fn is_local(&self) -> bool {
-        self.name() == "numbers_local"
+    fn distribution_level(&self) -> DistributionLevel {
+        match self.name() {
+            "numbers_local" => DistributionLevel::Local,
+            _ => DistributionLevel::Cluster,
+        }
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -143,7 +138,7 @@ impl Table for NumbersTable {
         let mut limit = None;
 
         if let Some(extras) = &push_downs {
-            if extras.limit.is_some() && extras.filter.is_none() && extras.order_by.is_empty() {
+            if extras.limit.is_some() && extras.filters.is_none() && extras.order_by.is_empty() {
                 // It is allowed to have an error when we can't get sort columns from the expression. For
                 // example 'select number from numbers(10) order by number+4 limit 10', the column 'number+4'
                 // doesn't exist in the numbers table.
@@ -166,10 +161,13 @@ impl Table for NumbersTable {
             fake_partitions as usize,
         );
 
+        let cluster = ctx.get_cluster();
         let mut worker_num = ctx.get_settings().get_max_threads()?;
-        if worker_num > fake_partitions {
-            worker_num = fake_partitions;
-        }
+
+        worker_num = match worker_num > fake_partitions {
+            true => fake_partitions,
+            false => worker_num * cluster.nodes.len() as u64,
+        };
 
         let parts = generate_numbers_parts(0, worker_num, total);
         Ok((statistics, parts))
@@ -186,6 +184,7 @@ impl Table for NumbersTable {
         ctx: Arc<dyn TableContext>,
         plan: &DataSourcePlan,
         pipeline: &mut Pipeline,
+        _put_cache: bool,
     ) -> Result<()> {
         if plan.parts.partitions.is_empty() {
             pipeline.add_source(EmptySource::create, 1)?;
@@ -212,7 +211,12 @@ impl Table for NumbersTable {
         Ok(())
     }
 
-    fn table_statistics(&self) -> Result<Option<TableStatistics>> {
+    async fn table_statistics(
+        &self,
+        _ctx: Arc<dyn TableContext>,
+        _require_fresh: bool,
+        _change_type: Option<ChangeType>,
+    ) -> Result<Option<TableStatistics>> {
         Ok(Some(TableStatistics {
             num_rows: Some(self.total),
             data_size: Some(self.total * 8),

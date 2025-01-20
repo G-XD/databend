@@ -12,19 +12,25 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::BTreeMap;
 use std::fmt::Display;
 use std::fmt::Formatter;
 
+use derive_visitor::Drive;
+use derive_visitor::DriveMut;
+
 use crate::ast::write_comma_separated_list;
-use crate::ast::write_period_separated_list;
+use crate::ast::write_dot_separated_list;
+use crate::ast::Expr;
 use crate::ast::Hint;
 use crate::ast::Identifier;
 use crate::ast::Query;
+use crate::ast::With;
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Drive, DriveMut)]
 pub struct InsertStmt {
     pub hints: Option<Hint>,
+    // With clause, common table expression
+    pub with: Option<With>,
     pub catalog: Option<Identifier>,
     pub database: Option<Identifier>,
     pub table: Identifier,
@@ -35,6 +41,9 @@ pub struct InsertStmt {
 
 impl Display for InsertStmt {
     fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
+        if let Some(cte) = &self.with {
+            write!(f, "WITH {} ", cte)?;
+        }
         write!(f, "INSERT ")?;
         if let Some(hints) = &self.hints {
             write!(f, "{} ", hints)?;
@@ -44,7 +53,7 @@ impl Display for InsertStmt {
         } else {
             write!(f, "INTO ")?;
         }
-        write_period_separated_list(
+        write_dot_separated_list(
             f,
             self.catalog
                 .iter()
@@ -60,51 +69,29 @@ impl Display for InsertStmt {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Drive, DriveMut)]
 pub enum InsertSource {
-    Streaming {
-        format: String,
-        rest_str: String,
-        start: usize,
-    },
-    StreamingV2 {
-        settings: BTreeMap<String, String>,
-        on_error_mode: Option<String>,
-        start: usize,
-    },
-    Values {
-        rest_str: String,
-    },
-    Select {
-        query: Box<Query>,
-    },
+    Values { rows: Vec<Vec<Expr>> },
+    RawValues { rest_str: String, start: usize },
+    Select { query: Box<Query> },
 }
 
 impl Display for InsertSource {
     fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
         match self {
-            InsertSource::Streaming {
-                format,
-                rest_str,
-                start: _,
-            } => write!(f, "FORMAT {format} {rest_str}"),
-            InsertSource::StreamingV2 {
-                settings,
-                on_error_mode,
-                start: _,
-            } => {
-                write!(f, " FILE_FORMAT = (")?;
-                for (k, v) in settings.iter() {
-                    write!(f, " {} = '{}'", k, v)?;
+            InsertSource::Values { rows } => {
+                write!(f, "VALUES ")?;
+                for (i, row) in rows.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "(")?;
+                    write_comma_separated_list(f, row)?;
+                    write!(f, ")")?;
                 }
-                write!(f, " )")?;
-                write!(
-                    f,
-                    " ON_ERROR = '{}'",
-                    on_error_mode.as_ref().unwrap_or(&"Abort".to_string())
-                )
+                Ok(())
             }
-            InsertSource::Values { rest_str } => write!(f, "VALUES {rest_str}"),
+            InsertSource::RawValues { rest_str, .. } => write!(f, "VALUES {rest_str}"),
             InsertSource::Select { query } => write!(f, "{query}"),
         }
     }

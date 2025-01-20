@@ -15,7 +15,6 @@
 mod mysql_federated;
 mod mysql_handler;
 mod mysql_interactive_worker;
-mod mysql_metrics;
 mod mysql_session;
 #[allow(clippy::unused_io_amount)]
 mod reject_connection;
@@ -27,4 +26,4 @@ pub use self::mysql_handler::MySQLHandler;
 pub use self::mysql_session::MySQLConnection;
 pub use self::tls::MySQLTlsConfig;
 
-const MYSQL_VERSION: &str = "8.0.26";
+const MYSQL_VERSION: &str = "8.0.90";

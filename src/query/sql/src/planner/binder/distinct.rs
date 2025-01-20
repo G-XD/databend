@@ -15,8 +15,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use common_exception::Result;
-use common_exception::Span;
+use databend_common_ast::Span;
+use databend_common_exception::Result;
 
 use crate::binder::Binder;
 use crate::binder::ColumnBinding;
@@ -28,14 +28,16 @@ use crate::plans::BoundColumnRef;
 use crate::plans::EvalScalar;
 use crate::plans::ScalarExpr;
 use crate::plans::ScalarItem;
+use crate::plans::VisitorMut as _;
 use crate::BindContext;
 use crate::IndexType;
+use crate::WindowChecker;
 
 impl Binder {
     pub fn bind_distinct(
         &self,
         span: Span,
-        bind_context: &BindContext,
+        bind_context: &mut BindContext,
         projections: &[ColumnBinding],
         scalar_items: &mut HashMap<IndexType, ScalarItem>,
         child: SExpr,
@@ -43,16 +45,18 @@ impl Binder {
         let scalar_items: Vec<ScalarItem> = scalar_items
             .drain()
             .map(|(_, item)| {
+                let mut scalar = item.scalar;
                 if bind_context.in_grouping {
-                    let group_checker = GroupingChecker::new(bind_context);
-                    let scalar = group_checker.resolve(&item.scalar, None)?;
-                    Ok(ScalarItem {
-                        scalar,
-                        index: item.index,
-                    })
-                } else {
-                    Ok(item)
+                    let mut group_checker = GroupingChecker::new(bind_context);
+                    group_checker.visit(&mut scalar)?;
+                } else if !bind_context.windows.window_functions.is_empty() {
+                    let mut window_checker = WindowChecker::new(bind_context);
+                    window_checker.visit(&mut scalar)?;
                 }
+                Ok(ScalarItem {
+                    scalar,
+                    index: item.index,
+                })
             })
             .collect::<Result<_>>()?;
 
@@ -79,11 +83,8 @@ impl Binder {
         let distinct_plan = Aggregate {
             mode: AggregateMode::Initial,
             group_items,
-            aggregate_functions: vec![],
             from_distinct: true,
-            limit: None,
-            grouping_id_index: 0,
-            grouping_sets: vec![],
+            ..Default::default()
         };
 
         Ok(SExpr::create_unary(

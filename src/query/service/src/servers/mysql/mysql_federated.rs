@@ -14,17 +14,17 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::LazyLock;
 
-use common_expression::types::StringType;
-use common_expression::utils::FromData;
-use common_expression::DataBlock;
-use common_expression::DataSchema;
-use common_expression::DataSchemaRef;
-use common_expression::TableDataType;
-use common_expression::TableField;
-use common_expression::TableSchemaRef;
-use common_expression::TableSchemaRefExt;
-use ctor::ctor;
+use databend_common_expression::types::StringType;
+use databend_common_expression::utils::FromData;
+use databend_common_expression::DataBlock;
+use databend_common_expression::DataSchema;
+use databend_common_expression::DataSchemaRef;
+use databend_common_expression::TableDataType;
+use databend_common_expression::TableField;
+use databend_common_expression::TableSchemaRef;
+use databend_common_expression::TableSchemaRefExt;
 use regex::Regex;
 
 use crate::servers::federated_helper::FederatedHelper;
@@ -43,9 +43,8 @@ impl MySQLFederated {
     // |value|
     fn select_function_block(name: &str, value: &str) -> Option<(TableSchemaRef, DataBlock)> {
         let schema = TableSchemaRefExt::create(vec![TableField::new(name, TableDataType::String)]);
-        let block = DataBlock::new_from_columns(vec![StringType::from_data(vec![
-            value.as_bytes().to_vec(),
-        ])]);
+        let block =
+            DataBlock::new_from_columns(vec![StringType::from_data(vec![value.to_string()])]);
         Some((schema, block))
     }
 
@@ -59,8 +58,8 @@ impl MySQLFederated {
             TableField::new("Value", TableDataType::String),
         ]);
         let block = DataBlock::new_from_columns(vec![
-            StringType::from_data(vec![name.as_bytes().to_vec()]),
-            StringType::from_data(vec![value.as_bytes().to_vec()]),
+            StringType::from_data(vec![name.to_string()]),
+            StringType::from_data(vec![value.to_string()]),
         ]);
         Some((schema, block))
     }
@@ -92,7 +91,7 @@ impl MySQLFederated {
         if vars.len() > 1 {
             vars.remove(0);
             for var in vars {
-                let var = var.trim_end_matches(|c| c == ' ' || c == ',');
+                let var = var.trim_end_matches([' ', ',']);
                 let vars_as: Vec<&str> = var.split(" as ").collect();
                 if vars_as.len() == 2 {
                     // @@cc as yy:
@@ -103,7 +102,7 @@ impl MySQLFederated {
                     // var is 'cc'.
                     let var = vars_as[0];
                     let value = default_map.get(var).unwrap_or(&"0").to_string();
-                    values.push(StringType::from_data(vec![value.as_bytes().to_vec()]));
+                    values.push(StringType::from_data(vec![value]));
                 } else {
                     // @@aa
                     // var is 'aa'
@@ -113,7 +112,7 @@ impl MySQLFederated {
                     ));
 
                     let value = default_map.get(var).unwrap_or(&"0").to_string();
-                    values.push(StringType::from_data(vec![value.as_bytes().to_vec()]));
+                    values.push(StringType::from_data(vec![value]));
                 }
             }
         }
@@ -125,57 +124,63 @@ impl MySQLFederated {
 
     // Check SELECT @@variable, @@variable
     fn federated_select_variable_check(&self, query: &str) -> Option<(TableSchemaRef, DataBlock)> {
-        #[ctor]
-        static SELECT_VARIABLES_LAZY_RULES: Vec<(Regex, LazyBlockFunc)> = vec![
-            (
-                Regex::new("(?i)^(SELECT @@(.*))").unwrap(),
-                MySQLFederated::select_variable_data_block,
-            ),
-            (
-                Regex::new("(?i)^(/\\* mysql-connector-java(.*))").unwrap(),
-                MySQLFederated::select_variable_data_block,
-            ),
-        ];
+        static SELECT_VARIABLES_LAZY_RULES: LazyLock<Vec<(Regex, LazyBlockFunc)>> =
+            LazyLock::new(|| {
+                vec![
+                    (
+                        Regex::new("(?i)^(SELECT @@(.*))").unwrap(),
+                        MySQLFederated::select_variable_data_block,
+                    ),
+                    (
+                        Regex::new("(?i)^(/\\* mysql-connector-java(.*))").unwrap(),
+                        MySQLFederated::select_variable_data_block,
+                    ),
+                ]
+            });
 
         FederatedHelper::lazy_block_match_rule(query, &SELECT_VARIABLES_LAZY_RULES)
     }
 
     // Check SHOW VARIABLES LIKE.
     fn federated_show_variables_check(&self, query: &str) -> Option<(TableSchemaRef, DataBlock)> {
-        #[ctor]
-        static SHOW_VARIABLES_RULES: Vec<(Regex, Option<(TableSchemaRef, DataBlock)>)> = vec![
-            (
-                // sqlalchemy < 1.4.30
-                Regex::new("(?i)^(SHOW VARIABLES LIKE 'sql_mode'(.*))").unwrap(),
-                MySQLFederated::show_variables_block(
-                    "sql_mode",
-                    "ONLY_FULL_GROUP_BY STRICT_TRANS_TABLES NO_ZERO_IN_DATE NO_ZERO_DATE ERROR_FOR_DIVISION_BY_ZERO NO_ENGINE_SUBSTITUTION",
-                ),
-            ),
-            (
-                Regex::new("(?i)^(SHOW VARIABLES LIKE 'lower_case_table_names'(.*))").unwrap(),
-                MySQLFederated::show_variables_block("lower_case_table_names", "0"),
-            ),
-            (
-                Regex::new("(?i)^(show collation where(.*))").unwrap(),
-                MySQLFederated::show_variables_block("", ""),
-            ),
-            (
-                Regex::new("(?i)^(SHOW VARIABLES(.*))").unwrap(),
-                MySQLFederated::show_variables_block("", ""),
-            ),
-        ];
+        #![allow(clippy::type_complexity)]
+        static SHOW_VARIABLES_RULES: LazyLock<Vec<(Regex, Option<(TableSchemaRef, DataBlock)>)>> =
+            LazyLock::new(|| {
+                vec![
+                    (
+                        // sqlalchemy < 1.4.30
+                        Regex::new("(?i)^(SHOW VARIABLES LIKE 'sql_mode'(.*))").unwrap(),
+                        MySQLFederated::show_variables_block(
+                            "sql_mode",
+                            "ONLY_FULL_GROUP_BY STRICT_TRANS_TABLES NO_ZERO_IN_DATE NO_ZERO_DATE ERROR_FOR_DIVISION_BY_ZERO NO_ENGINE_SUBSTITUTION",
+                        ),
+                    ),
+                    (
+                        Regex::new("(?i)^(SHOW VARIABLES LIKE 'lower_case_table_names'(.*))")
+                            .unwrap(),
+                        MySQLFederated::show_variables_block("lower_case_table_names", "0"),
+                    ),
+                    (
+                        Regex::new("(?i)^(show collation where(.*))").unwrap(),
+                        MySQLFederated::show_variables_block("", ""),
+                    ),
+                    (
+                        Regex::new("(?i)^(SHOW VARIABLES(.*))").unwrap(),
+                        MySQLFederated::show_variables_block("", ""),
+                    ),
+                ]
+            });
 
         FederatedHelper::block_match_rule(query, &SHOW_VARIABLES_RULES)
     }
 
     // Check for SET or others query, this is the final check of the federated query.
     fn federated_mixed_check(&self, query: &str) -> Option<(TableSchemaRef, DataBlock)> {
-        #[ctor]
-        static MIXED_RULES: Vec<(Regex, Option<(TableSchemaRef, DataBlock)>)> = vec![
+        #![allow(clippy::type_complexity)]
+        static MIXED_RULES: LazyLock<Vec<(Regex, Option<(TableSchemaRef, DataBlock)>)>> =
+            LazyLock::new(|| {
+                vec![
             // Txn.
-            (Regex::new("(?i)^(ROLLBACK(.*))").unwrap(), None),
-            (Regex::new("(?i)^(COMMIT(.*))").unwrap(), None),
             (Regex::new("(?i)^(START(.*))").unwrap(), None),
             (Regex::new("(?i)^(SET NAMES(.*))").unwrap(), None),
             (Regex::new("(?i)^(SET character_set_results(.*))").unwrap(), None),
@@ -238,7 +243,8 @@ impl MySQLFederated {
             (Regex::new("(?i)^(/\\*!40014 SET(.*) \\*/)$").unwrap(), None),
             (Regex::new("(?i)^(/\\*!40000 SET(.*) \\*/)$").unwrap(), None),
             (Regex::new("(?i)^(/\\*!40000 ALTER(.*) \\*/)$").unwrap(), None),
-        ];
+        ]
+            });
 
         FederatedHelper::block_match_rule(query, &MIXED_RULES)
     }

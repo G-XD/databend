@@ -11,10 +11,18 @@
 "INOUT" = "INOUT"
 "ser" = "ser"
 "Ser" = "Ser"
+"flate" = "flate"
+"Tke" = "Tke"
 
 [files]
 extend-exclude = [
+    "**/Cargo.toml",
     "scripts/benchmark/",
     "benchmark/",
     "tests/",
+    "src/meta",
+    # masked secrets
+    "src/query/config/src/mask.rs",
+    # Forked from upstream
+    "src/common/parquet2"
 ]

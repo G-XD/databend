@@ -12,20 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::io::Cursor;
 use std::sync::Arc;
 
-use common_arrow::arrow::io::parquet::read::infer_schema;
-use common_arrow::arrow::io::parquet::read::{self as pread};
-use common_arrow::parquet::read::read_metadata;
-use common_catalog::table_context::TableContext;
-use common_exception::Result;
-use common_expression::DataBlock;
-use common_expression::DataSchema;
-use common_expression::TableSchema;
-use common_meta_store::MetaStore;
-use common_storage::DataOperator;
+use databend_common_catalog::table_context::TableContext;
+use databend_common_exception::Result;
+use databend_common_expression::DataBlock;
+use databend_common_expression::DataSchema;
+use databend_common_meta_store::MetaStore;
+use databend_common_storage::DataOperator;
 use opendal::Operator;
+use parquet::arrow::arrow_reader::ParquetRecordBatchReader;
 
 use crate::common::gen_result_cache_meta_key;
 use crate::common::ResultCacheValue;
@@ -52,7 +48,7 @@ impl ResultCacheReader {
         tolerate_inconsistent: bool,
     ) -> Self {
         let tenant = ctx.get_tenant();
-        let meta_key = gen_result_cache_meta_key(&tenant, key);
+        let meta_key = gen_result_cache_meta_key(tenant.tenant_name(), key);
         let partitions_shas = ctx.get_partitions_shas();
 
         Self {
@@ -109,35 +105,18 @@ impl ResultCacheReader {
     #[async_backtrace::framed]
     async fn read_result_from_cache(&self, location: &str) -> Result<Vec<DataBlock>> {
         let data = self.operator.read(location).await?;
-        let mut reader = Cursor::new(data);
-        let meta = read_metadata(&mut reader)?;
-        let arrow_schema = infer_schema(&meta)?;
-        let schema = DataSchema::from(&TableSchema::from(&arrow_schema));
-
-        // Read the parquet file into one block.
-        let chunks_iter =
-            pread::FileReader::new(reader, meta.row_groups, arrow_schema, None, None, None);
+        // TODO: improve this part by implement ChunkReader for opendal::Buffer.
+        let chunk_reader = data.to_bytes();
+        let reader = ParquetRecordBatchReader::try_new(chunk_reader, usize::MAX)?;
         let mut blocks = Vec::with_capacity(1);
 
-        for chunk in chunks_iter {
-            let block = DataBlock::from_arrow_chunk(&chunk?, &schema)?;
+        for record_batch in reader {
+            let record_batch = record_batch?;
+            let schema = DataSchema::try_from(record_batch.schema().as_ref())?;
+            let (block, _) = DataBlock::from_record_batch(&schema, &record_batch)?;
             blocks.push(block);
         }
 
         Ok(blocks)
-    }
-
-    #[async_backtrace::framed]
-    pub async fn read_table_schema_and_data(
-        operator: Operator,
-        location: &str,
-    ) -> Result<(TableSchema, Vec<u8>)> {
-        let data = operator.read(location).await?;
-        let mut reader = Cursor::new(data.clone());
-        let meta = read_metadata(&mut reader)?;
-        let arrow_schema = infer_schema(&meta)?;
-        let table_schema = TableSchema::from(&arrow_schema);
-
-        Ok((table_schema, data))
     }
 }

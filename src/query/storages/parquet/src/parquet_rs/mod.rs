@@ -12,14 +12,31 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-mod column_nodes;
-mod convert;
+mod copy_into_table;
 mod parquet_reader;
 mod parquet_table;
-mod projection;
-pub(crate) mod pruning;
+mod partition;
+mod pruning;
+mod source;
 mod statistics;
 
-pub use parquet_reader::ParquetReader;
-pub use parquet_table::ParquetTable;
-pub use pruning::ParquetPartitionPruner;
+mod meta;
+mod schema;
+
+pub use copy_into_table::ParquetTableForCopy;
+pub use meta::read_metadata_async_cached;
+pub use meta::read_metas_in_parallel;
+pub use meta::read_metas_in_parallel_for_copy;
+pub use meta::read_parquet_metas_batch;
+pub use parquet_reader::transform_record_batch;
+pub use parquet_reader::InMemoryRowGroup;
+pub use parquet_reader::ParquetFileReader;
+pub use parquet_reader::ParquetRSFullReader;
+pub use parquet_reader::ParquetRSReaderBuilder;
+pub use parquet_reader::ParquetRSRowGroupReader;
+pub use parquet_table::ParquetRSTable;
+pub use partition::ParquetRSRowGroupPart;
+pub use pruning::ParquetRSPruner;
+pub use source::ParquetSource;
+pub use statistics::collect_row_group_stats;
+pub use statistics::collect_single_row_group_stats;

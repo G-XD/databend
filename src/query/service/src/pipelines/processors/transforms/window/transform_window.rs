@@ -21,29 +21,48 @@ use std::cmp::Ordering;
 use std::collections::VecDeque;
 use std::sync::Arc;
 
-use common_exception::Result;
-use common_expression::arithmetics_type::ResultTypeOfUnary;
-use common_expression::types::Number;
-use common_expression::types::NumberScalar;
-use common_expression::BlockEntry;
-use common_expression::Column;
-use common_expression::ColumnBuilder;
-use common_expression::DataBlock;
-use common_expression::Scalar;
-use common_expression::ScalarRef;
-use common_expression::SortColumnDescription;
-use common_expression::Value;
-use common_pipeline_core::processors::port::InputPort;
-use common_pipeline_core::processors::port::OutputPort;
-use common_pipeline_core::processors::processor::Event;
-use common_pipeline_core::processors::Processor;
-use common_sql::executor::LagLeadDefault;
-use common_sql::plans::WindowFuncFrameUnits;
+use databend_common_exception::Result;
+use databend_common_expression::arithmetics_type::ResultTypeOfUnary;
+use databend_common_expression::types::Number;
+use databend_common_expression::types::NumberScalar;
+use databend_common_expression::BlockEntry;
+use databend_common_expression::Column;
+use databend_common_expression::ColumnBuilder;
+use databend_common_expression::DataBlock;
+use databend_common_expression::Scalar;
+use databend_common_expression::ScalarRef;
+use databend_common_expression::SortColumnDescription;
+use databend_common_expression::Value;
+use databend_common_pipeline_core::processors::Event;
+use databend_common_pipeline_core::processors::InputPort;
+use databend_common_pipeline_core::processors::OutputPort;
+use databend_common_pipeline_core::processors::Processor;
+use databend_common_sql::executor::physical_plans::LagLeadDefault;
+use databend_common_sql::plans::WindowFuncFrameUnits;
 
 use super::frame_bound::FrameBound;
 use super::window_function::WindowFuncAggImpl;
 use super::window_function::WindowFunctionImpl;
 use super::WindowFunctionInfo;
+
+#[derive(Debug, Clone)]
+pub struct WindowSortDesc {
+    pub offset: usize,
+    pub asc: bool,
+    pub nulls_first: bool,
+    // Used for check null frame.
+    pub is_nullable: bool,
+}
+
+impl From<WindowSortDesc> for SortColumnDescription {
+    fn from(value: WindowSortDesc) -> Self {
+        SortColumnDescription {
+            offset: value.offset,
+            asc: value.asc,
+            nulls_first: value.nulls_first,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Default)]
 struct RowPtr {
@@ -77,7 +96,7 @@ pub struct TransformWindow<T: Number> {
 
     partition_indices: Vec<usize>,
     // The second field indicate if the order by column is nullable.
-    order_by: Vec<SortColumnDescription>,
+    order_by: Vec<WindowSortDesc>,
 
     /// A queue of data blocks that we need to process.
     /// If partition is ended, we may free the data block from front of the queue.
@@ -85,7 +104,7 @@ pub struct TransformWindow<T: Number> {
     /// A queue of data blocks that can be output.
     outputs: VecDeque<DataBlock>,
 
-    /// monotonically increasing index of the current block in the queue.
+    /// The monotonically increasing index of the current block in the queue.
     first_block: usize,
     next_output_block: usize,
 
@@ -137,6 +156,8 @@ pub struct TransformWindow<T: Number> {
 
     // If `is_empty_frame`, the window function result of non-NULL rows will be NULL.
     is_empty_frame: bool,
+    // If window function is ranking function
+    is_ranking: bool,
 }
 
 impl<T: Number> TransformWindow<T> {
@@ -217,13 +238,17 @@ impl<T: Number> TransformWindow<T> {
             // STEP 2: Check each partition column to see if it has changed.
             let mut i = 0;
             while i < partition_by_columns {
-                // Should use `prev_frame_start` because the block at `partition_start` may already be popped out of the buffer queue.
-                let start_column =
-                    self.column_at(&self.prev_frame_start, self.partition_indices[i]);
+                // Should use `prev_frame_start` or `peer_group_start` because the block at `partition_start` may already be popped out of the buffer queue.
+                let index = if self.is_ranking {
+                    &self.peer_group_start
+                } else {
+                    &self.prev_frame_start
+                };
+                let start_column = self.column_at(index, self.partition_indices[i]);
                 let compare_column = self.column_at(&self.partition_end, self.partition_indices[i]);
 
                 if unsafe {
-                    start_column.index_unchecked(self.partition_start.row)
+                    start_column.index_unchecked(index.row)
                         != compare_column.index_unchecked(self.partition_end.row)
                 } {
                     break;
@@ -243,7 +268,6 @@ impl<T: Number> TransformWindow<T> {
         assert_eq!(self.partition_end.row, block_rows);
         self.partition_end.block += 1;
         self.partition_end.row = 0;
-
         assert!(!self.partition_ended && self.partition_end == end);
     }
 
@@ -332,11 +356,10 @@ impl<T: Number> TransformWindow<T> {
         self.frame_ended = self.partition_ended;
     }
 
-    // Advance the current row to the next row
-    // if the current row is the last row of the current block, advance the current block and row = 0
+    /// Advance the current row to the next row
+    /// if the current row is the last row of the current block, advance the current block and row = 0
     fn advance_row(&self, mut row: RowPtr) -> RowPtr {
         debug_assert!(row.block >= self.first_block);
-
         if row == self.blocks_end() {
             return row;
         }
@@ -353,6 +376,8 @@ impl<T: Number> TransformWindow<T> {
     fn goback_row(&self, mut row: RowPtr) -> RowPtr {
         if row.row != 0 {
             row.row -= 1;
+        } else if row.block == 0 {
+            row.row = self.block_rows(&row) - 1;
         } else {
             row.block -= 1;
             row.row = self.block_rows(&row) - 1;
@@ -360,6 +385,7 @@ impl<T: Number> TransformWindow<T> {
         row
     }
 
+    /// calculate peer_group_end
     fn advance_peer_group_end(&mut self, mut row: RowPtr) {
         if !self.need_peer {
             return;
@@ -388,6 +414,10 @@ impl<T: Number> TransformWindow<T> {
         if lhs == rhs {
             return true;
         }
+        if lhs.block < self.first_block {
+            return false;
+        }
+
         if self.frame_unit.is_rows() && for_computing_bound {
             // For ROWS frame, the row's peer is only the row itself.
             return false;
@@ -434,11 +464,14 @@ impl<T: Number> TransformWindow<T> {
                 break;
             }
         }
+
         // Release memory that is no longer needed.
-        let first_used_block = self
-            .next_output_block
-            .min(self.prev_frame_start.block)
-            .min(self.current_row.block);
+        let first_used_block = if self.is_ranking {
+            self.next_output_block.min(self.peer_group_start.block)
+        } else {
+            self.next_output_block.min(self.prev_frame_start.block)
+        }
+        .min(self.current_row.block);
 
         if self.first_block < first_used_block {
             self.blocks.drain(..first_used_block - self.first_block);
@@ -486,7 +519,7 @@ impl<T: Number> TransformWindow<T> {
             };
             let cols = agg.arg_columns(data);
             for row in start_row..end_row {
-                agg.accumulate_row(&cols, row)?;
+                agg.accumulate_row(cols, row)?;
             }
         }
 
@@ -529,16 +562,15 @@ impl<T: Number> TransformWindow<T> {
             }
             WindowFunctionImpl::LagLead(ll) => {
                 let value = if self.frame_start == self.frame_end {
-                    let default_value = match ll.default.clone() {
+                    match &ll.default {
                         LagLeadDefault::Null => Scalar::Null,
                         LagLeadDefault::Index(col) => {
                             let block =
                                 &self.blocks[self.current_row.block - self.first_block].block;
-                            let value = &block.get_by_offset(col).value;
+                            let value = &block.get_by_offset(*col).value;
                             value.index(self.current_row.row).unwrap().to_owned()
                         }
-                    };
-                    default_value
+                    }
                 } else {
                     let block = &self
                         .blocks
@@ -563,9 +595,7 @@ impl<T: Number> TransformWindow<T> {
                         n -= 1;
                     }
                     if cur != self.frame_end {
-                        let block = &self.blocks.get(cur.block - self.first_block).unwrap().block;
-                        let col = block.get_by_offset(func.arg).value.as_column().unwrap();
-                        col.index(cur.row).unwrap().to_owned()
+                        self.get_nth_value_by_ignoring_nulls(cur, func.arg, func.ignore_null, true)
                     } else {
                         // No such row
                         Scalar::Null
@@ -574,9 +604,7 @@ impl<T: Number> TransformWindow<T> {
                     // last_value
                     let cur = self.goback_row(self.frame_end);
                     debug_assert!(self.frame_start <= cur);
-                    let block = &self.blocks.get(cur.block - self.first_block).unwrap().block;
-                    let col = block.get_by_offset(func.arg).value.as_column().unwrap();
-                    col.index(cur.row).unwrap().to_owned()
+                    self.get_nth_value_by_ignoring_nulls(cur, func.arg, func.ignore_null, false)
                 };
                 let builder = &mut self.blocks[self.current_row.block - self.first_block].builder;
                 builder.push(value.as_ref());
@@ -638,6 +666,79 @@ impl<T: Number> TransformWindow<T> {
         }
         false
     }
+
+    #[inline]
+    fn get_nth_value_by_ignoring_nulls(
+        &self,
+        mut cur: RowPtr,
+        arg_index: usize,
+        ignore_null: bool,
+        advance: bool,
+    ) -> Scalar {
+        let block = &self.blocks.get(cur.block - self.first_block).unwrap().block;
+        let mut block_entry = block.get_by_offset(arg_index);
+        if !ignore_null {
+            return match &block_entry.value {
+                Value::Scalar(scalar) => scalar.to_owned(),
+                Value::Column(col) => unsafe { col.index_unchecked(cur.row) }.to_owned(),
+            };
+        }
+
+        while (advance && cur < self.frame_end) || (!advance && cur >= self.frame_start) {
+            match &block_entry.value {
+                Value::Scalar(scalar) => {
+                    if scalar != &Scalar::Null {
+                        return scalar.to_owned();
+                    }
+                    // If value is Scalar we can directly skip this block.
+                    if advance {
+                        cur.block += 1;
+                        let block = &self.blocks.get(cur.block - self.first_block).unwrap().block;
+                        block_entry = block.get_by_offset(arg_index);
+                    } else if cur == self.frame_start {
+                        return scalar.to_owned();
+                    } else {
+                        cur.block -= 1;
+                        let block = &self.blocks.get(cur.block - self.first_block).unwrap().block;
+                        block_entry = block.get_by_offset(arg_index);
+                    }
+                }
+                Value::Column(col) => {
+                    let value = col.index(cur.row).unwrap();
+                    if value != ScalarRef::Null {
+                        return value.to_owned();
+                    }
+
+                    cur = if advance {
+                        let advance_cur = self.advance_row(cur);
+                        if advance_cur.block != cur.block {
+                            block_entry = self
+                                .blocks
+                                .get(advance_cur.block - self.first_block)
+                                .unwrap()
+                                .block
+                                .get_by_offset(arg_index);
+                        }
+                        advance_cur
+                    } else if cur == self.frame_start {
+                        return unsafe { col.index_unchecked(cur.row) }.to_owned();
+                    } else {
+                        let back_cur = self.goback_row(cur);
+                        if back_cur.block != cur.block {
+                            block_entry = self
+                                .blocks
+                                .get(back_cur.block - self.first_block)
+                                .unwrap()
+                                .block
+                                .get_by_offset(arg_index);
+                        }
+                        back_cur
+                    };
+                }
+            }
+        }
+        Scalar::Null
+    }
 }
 
 // For ROWS frame
@@ -648,13 +749,19 @@ impl TransformWindow<u64> {
         output: Arc<OutputPort>,
         func: WindowFunctionInfo,
         partition_indices: Vec<usize>,
-        order_by: Vec<SortColumnDescription>,
+        order_by: Vec<WindowSortDesc>,
         bounds: (FrameBound<u64>, FrameBound<u64>),
     ) -> Result<Self> {
         let func = WindowFunctionImpl::try_create(func)?;
         let (start_bound, end_bound) = bounds;
 
         let is_empty_frame = start_bound > end_bound;
+        let is_ranking = matches!(
+            func,
+            WindowFunctionImpl::RowNumber
+                | WindowFunctionImpl::Rank
+                | WindowFunctionImpl::DenseRank
+        );
 
         let rows_start_bound = start_bound.get_inner().unwrap_or_default() as usize;
         let rows_end_bound = end_bound.get_inner().unwrap_or_default() as usize;
@@ -698,6 +805,7 @@ impl TransformWindow<u64> {
             current_dense_rank: 1,
             input_is_finished: false,
             is_empty_frame,
+            is_ranking,
         })
     }
 }
@@ -712,13 +820,19 @@ where T: Number + ResultTypeOfUnary
         output: Arc<OutputPort>,
         func: WindowFunctionInfo,
         partition_indices: Vec<usize>,
-        order_by: Vec<SortColumnDescription>,
+        order_by: Vec<WindowSortDesc>,
         bounds: (FrameBound<T>, FrameBound<T>),
     ) -> Result<Self> {
         let func = WindowFunctionImpl::try_create(func)?;
         let (start_bound, end_bound) = bounds;
 
         let is_empty_frame = start_bound > end_bound;
+        let is_ranking = matches!(
+            func,
+            WindowFunctionImpl::RowNumber
+                | WindowFunctionImpl::Rank
+                | WindowFunctionImpl::DenseRank
+        );
 
         // If the window clause is a specific RANGE window, we should deal with the frame with all NULL values.
         let need_check_null_frame = if order_by.len() == 1 {
@@ -768,6 +882,7 @@ where T: Number + ResultTypeOfUnary
             current_dense_rank: 1,
             input_is_finished: false,
             is_empty_frame,
+            is_ranking,
         })
     }
 
@@ -907,10 +1022,12 @@ where T: Number + ResultTypeOfUnary
     fn add_block(&mut self, data: Option<DataBlock>) -> Result<()> {
         if let Some(data) = data {
             let num_rows = data.num_rows();
-            self.blocks.push_back(WindowBlock {
-                block: data.convert_to_full(),
-                builder: ColumnBuilder::with_capacity(&self.func.return_type()?, num_rows),
-            });
+            if num_rows != 0 {
+                self.blocks.push_back(WindowBlock {
+                    block: data.consume_convert_to_full(),
+                    builder: ColumnBuilder::with_capacity(&self.func.return_type()?, num_rows),
+                });
+            }
         }
 
         // Each loop will do:
@@ -950,6 +1067,8 @@ where T: Number + ResultTypeOfUnary
                 } else if self.is_null_frame {
                     // Only one null frame can exist in one partition, so we don't need to check it again.
                     self.need_check_null_frame = false;
+                } else if self.is_ranking {
+                    self.peer_group_start = self.current_row;
                 }
 
                 // execute only once for each partition.
@@ -975,7 +1094,7 @@ where T: Number + ResultTypeOfUnary
                 if self.is_empty_frame && !self.is_null_frame {
                     // Non-NULL empty frame, no need to advance bounds.
                     self.func.reset();
-                } else {
+                } else if !self.is_ranking {
                     self.advance_frame_start();
                     if !self.frame_started {
                         debug_assert!(!self.input_is_finished);
@@ -1059,7 +1178,7 @@ macro_rules! impl_advance_frame_bound_method {
         paste::paste! {
             impl<T: Number + ResultTypeOfUnary> TransformWindow<T> {
                 fn [<advance_frame_ $bound _range>](&mut self, n: T, is_preceding: bool) {
-                    let SortColumnDescription {
+                    let WindowSortDesc {
                         offset,
                         asc,
                         ..
@@ -1095,7 +1214,7 @@ macro_rules! impl_advance_frame_bound_method {
                 }
 
                 fn [<advance_frame_ $bound _nullable_range>](&mut self, n: T, is_preceding: bool) {
-                    let SortColumnDescription {
+                    let WindowSortDesc {
                         offset: ref_idx,
                         asc,
                         nulls_first,
@@ -1240,29 +1359,71 @@ where T: Number + ResultTypeOfUnary
 mod tests {
     use std::sync::Arc;
 
-    use common_base::base::tokio;
-    use common_exception::Result;
-    use common_expression::block_debug::assert_blocks_eq;
-    use common_expression::types::DataType;
-    use common_expression::types::Int32Type;
-    use common_expression::types::NumberDataType;
-    use common_expression::Column;
-    use common_expression::ColumnBuilder;
-    use common_expression::DataBlock;
-    use common_expression::FromData;
-    use common_functions::aggregates::AggregateFunctionFactory;
-    use common_pipeline_core::processors::connect;
-    use common_pipeline_core::processors::port::InputPort;
-    use common_pipeline_core::processors::port::OutputPort;
-    use common_pipeline_core::processors::processor::Event;
-    use common_pipeline_core::processors::Processor;
-    use common_sql::plans::WindowFuncFrameUnits;
+    use databend_common_base::base::tokio;
+    use databend_common_exception::Result;
+    use databend_common_expression::block_debug::assert_blocks_eq;
+    use databend_common_expression::types::DataType;
+    use databend_common_expression::types::Int32Type;
+    use databend_common_expression::types::NumberDataType;
+    use databend_common_expression::Column;
+    use databend_common_expression::ColumnBuilder;
+    use databend_common_expression::DataBlock;
+    use databend_common_expression::FromData;
+    use databend_common_functions::aggregates::AggregateFunctionFactory;
+    use databend_common_pipeline_core::processors::connect;
+    use databend_common_pipeline_core::processors::Event;
+    use databend_common_pipeline_core::processors::InputPort;
+    use databend_common_pipeline_core::processors::OutputPort;
+    use databend_common_pipeline_core::processors::Processor;
+    use databend_common_sql::plans::WindowFuncFrameUnits;
 
     use super::TransformWindow;
     use super::WindowBlock;
+    use super::WindowSortDesc;
     use crate::pipelines::processors::transforms::window::transform_window::RowPtr;
     use crate::pipelines::processors::transforms::window::FrameBound;
     use crate::pipelines::processors::transforms::window::WindowFunctionInfo;
+
+    fn get_ranking_transform_window(
+        bounds: (FrameBound<u64>, FrameBound<u64>),
+    ) -> Result<TransformWindow<u64>> {
+        let func = WindowFunctionInfo::DenseRank;
+        TransformWindow::try_create_range(
+            InputPort::create(),
+            OutputPort::create(),
+            func,
+            vec![],
+            vec![WindowSortDesc {
+                offset: 0,
+                asc: false,
+                nulls_first: false,
+                is_nullable: false,
+            }],
+            bounds,
+        )
+    }
+
+    fn get_transform_window_without_partition(
+        _unit: WindowFuncFrameUnits,
+        bounds: (FrameBound<u64>, FrameBound<u64>),
+        arg_type: DataType,
+    ) -> Result<TransformWindow<u64>> {
+        let agg = AggregateFunctionFactory::instance().get("sum", vec![], vec![arg_type])?;
+        let func = WindowFunctionInfo::Aggregate(agg, vec![0]);
+        TransformWindow::try_create_rows(
+            InputPort::create(),
+            OutputPort::create(),
+            func,
+            vec![],
+            vec![WindowSortDesc {
+                offset: 0,
+                asc: false,
+                nulls_first: false,
+                is_nullable: false,
+            }],
+            bounds,
+        )
+    }
 
     fn get_transform_window(
         _unit: WindowFuncFrameUnits,
@@ -1420,6 +1581,236 @@ mod tests {
             transform.advance_frame_end();
             assert!(transform.frame_ended);
             assert_eq!(transform.frame_end, RowPtr::new(0, 3));
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_block_release() -> Result<()> {
+        // ranking function release early
+        {
+            let mut transform = get_ranking_transform_window((
+                FrameBound::Preceding(None),
+                FrameBound::CurrentRow,
+            ))?;
+
+            // peer for 3 cross three blocks
+            transform.add_block(Some(DataBlock::new_from_columns(vec![
+                Int32Type::from_data(vec![1, 1, 1, 2, 2, 3, 3, 3]),
+            ])))?;
+
+            transform.check_outputs();
+            assert_eq!(transform.blocks.len(), 1);
+
+            transform.add_block(Some(DataBlock::new_from_columns(vec![
+                Int32Type::from_data(vec![3, 3, 3]),
+            ])))?;
+
+            transform.check_outputs();
+            assert_eq!(transform.blocks.len(), 1);
+
+            transform.add_block(Some(DataBlock::new_from_columns(vec![
+                Int32Type::from_data(vec![3, 4, 4]),
+            ])))?;
+
+            transform.check_outputs();
+            assert_eq!(transform.blocks.len(), 1);
+
+            let output = transform.outputs.pop_front().unwrap();
+
+            assert_blocks_eq(
+                vec![
+                    "+----------+----------+",
+                    "| Column 0 | Column 1 |",
+                    "+----------+----------+",
+                    "| 1        | 1        |",
+                    "| 1        | 1        |",
+                    "| 1        | 1        |",
+                    "| 2        | 2        |",
+                    "| 2        | 2        |",
+                    "| 3        | 3        |",
+                    "| 3        | 3        |",
+                    "| 3        | 3        |",
+                    "+----------+----------+",
+                ],
+                &[output],
+            );
+
+            let output = transform.outputs.pop_front().unwrap();
+
+            assert_blocks_eq(
+                vec![
+                    "+----------+----------+",
+                    "| Column 0 | Column 1 |",
+                    "+----------+----------+",
+                    "| 3        | 3        |",
+                    "| 3        | 3        |",
+                    "| 3        | 3        |",
+                    "+----------+----------+",
+                ],
+                &[output],
+            );
+
+            transform.input_is_finished = true;
+            transform.add_block(None)?;
+            transform.check_outputs();
+            let output = transform.outputs.pop_front().unwrap();
+
+            assert_blocks_eq(
+                vec![
+                    "+----------+----------+",
+                    "| Column 0 | Column 1 |",
+                    "+----------+----------+",
+                    "| 3        | 3        |",
+                    "| 4        | 4        |",
+                    "| 4        | 4        |",
+                    "+----------+----------+",
+                ],
+                &[output],
+            );
+        }
+
+        // ranking function release early
+        {
+            let mut transform = get_ranking_transform_window((
+                FrameBound::Preceding(None),
+                FrameBound::CurrentRow,
+            ))?;
+
+            // peer not cross any blocks
+            transform.add_block(Some(DataBlock::new_from_columns(vec![
+                Int32Type::from_data(vec![1, 1, 1]),
+            ])))?;
+
+            transform.check_outputs();
+            assert_eq!(transform.blocks.len(), 1);
+
+            transform.add_block(Some(DataBlock::new_from_columns(vec![
+                Int32Type::from_data(vec![2, 2, 2]),
+            ])))?;
+
+            transform.check_outputs();
+            assert_eq!(transform.blocks.len(), 1);
+
+            transform.add_block(Some(DataBlock::new_from_columns(vec![
+                Int32Type::from_data(vec![3, 3, 3]),
+            ])))?;
+
+            transform.check_outputs();
+            assert_eq!(transform.blocks.len(), 1);
+
+            let output = transform.outputs.pop_front().unwrap();
+
+            assert_blocks_eq(
+                vec![
+                    "+----------+----------+",
+                    "| Column 0 | Column 1 |",
+                    "+----------+----------+",
+                    "| 1        | 1        |",
+                    "| 1        | 1        |",
+                    "| 1        | 1        |",
+                    "+----------+----------+",
+                ],
+                &[output],
+            );
+
+            let output = transform.outputs.pop_front().unwrap();
+
+            assert_blocks_eq(
+                vec![
+                    "+----------+----------+",
+                    "| Column 0 | Column 1 |",
+                    "+----------+----------+",
+                    "| 2        | 2        |",
+                    "| 2        | 2        |",
+                    "| 2        | 2        |",
+                    "+----------+----------+",
+                ],
+                &[output],
+            );
+
+            transform.input_is_finished = true;
+            transform.add_block(None)?;
+            transform.check_outputs();
+            let output = transform.outputs.pop_front().unwrap();
+
+            assert_blocks_eq(
+                vec![
+                    "+----------+----------+",
+                    "| Column 0 | Column 1 |",
+                    "+----------+----------+",
+                    "| 3        | 3        |",
+                    "| 3        | 3        |",
+                    "| 3        | 3        |",
+                    "+----------+----------+",
+                ],
+                &[output],
+            );
+        }
+
+        // normal agg function
+        {
+            let mut transform = get_transform_window_without_partition(
+                WindowFuncFrameUnits::Rows,
+                (FrameBound::Preceding(None), FrameBound::CurrentRow),
+                DataType::Number(NumberDataType::Int32),
+            )?;
+
+            transform.add_block(Some(DataBlock::new_from_columns(vec![
+                Int32Type::from_data(vec![1, 1, 1, 2, 2, 3, 3, 3]),
+            ])))?;
+
+            transform.check_outputs();
+            assert_eq!(transform.blocks.len(), 1);
+
+            transform.add_block(Some(DataBlock::new_from_columns(vec![
+                Int32Type::from_data(vec![3, 4, 4]),
+            ])))?;
+
+            transform.check_outputs();
+            assert_eq!(transform.blocks.len(), 2);
+
+            let output = transform.outputs.pop_front().unwrap();
+
+            assert_blocks_eq(
+                vec![
+                    "+----------+----------+",
+                    "| Column 0 | Column 1 |",
+                    "+----------+----------+",
+                    "| 1        | 1        |",
+                    "| 1        | 2        |",
+                    "| 1        | 3        |",
+                    "| 2        | 5        |",
+                    "| 2        | 7        |",
+                    "| 3        | 10       |",
+                    "| 3        | 13       |",
+                    "| 3        | 16       |",
+                    "+----------+----------+",
+                ],
+                &[output],
+            );
+
+            transform.input_is_finished = true;
+
+            transform.add_block(None)?;
+
+            transform.check_outputs();
+
+            let output = transform.outputs.pop_front().unwrap();
+
+            assert_blocks_eq(
+                vec![
+                    "+----------+----------+",
+                    "| Column 0 | Column 1 |",
+                    "+----------+----------+",
+                    "| 3        | 19       |",
+                    "| 4        | 23       |",
+                    "| 4        | 27       |",
+                    "+----------+----------+",
+                ],
+                &[output],
+            );
         }
 
         Ok(())

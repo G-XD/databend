@@ -17,28 +17,28 @@ use std::net::IpAddr;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::LazyLock;
 use std::task;
+use std::task::Context;
 use std::task::Poll;
 use std::time::Duration;
 
 use anyerror::AnyError;
-use common_base::base::tokio;
-use common_base::base::tokio::task::JoinHandle;
-use common_exception::ErrorCode;
-use common_exception::Result;
-use hyper::client::connect::dns::Name;
-use hyper::client::HttpConnector;
-use hyper::service::Service;
+use databend_common_base::base::tokio::task::JoinHandle;
+use databend_common_base::runtime;
+use databend_common_exception::ErrorCode;
+use databend_common_exception::Result;
+use hickory_resolver::TokioAsyncResolver;
 use hyper::Uri;
+use hyper_util::client::legacy::connect::dns::Name;
+use hyper_util::client::legacy::connect::HttpConnector;
 use log::info;
-use once_cell::sync::Lazy;
 use serde::Deserialize;
 use serde::Serialize;
 use tonic::transport::Certificate;
 use tonic::transport::Channel;
 use tonic::transport::ClientTlsConfig;
 use tonic::transport::Endpoint;
-use trust_dns_resolver::TokioAsyncResolver;
 
 use crate::RpcClientTlsConfig;
 
@@ -46,8 +46,8 @@ pub struct DNSResolver {
     inner: TokioAsyncResolver,
 }
 
-static INSTANCE: Lazy<Result<Arc<DNSResolver>>> =
-    Lazy::new(|| match TokioAsyncResolver::tokio_from_system_conf() {
+static INSTANCE: LazyLock<Result<Arc<DNSResolver>>> =
+    LazyLock::new(|| match TokioAsyncResolver::tokio_from_system_conf() {
         Err(error) => Result::Err(ErrorCode::DnsParseError(format!(
             "DNS resolver create error: {}",
             error
@@ -63,6 +63,7 @@ impl DNSResolver {
                 error.code(),
                 error.name(),
                 error.message(),
+                String::new(),
                 None,
                 error.backtrace(),
             )),
@@ -82,19 +83,19 @@ impl DNSResolver {
 }
 
 #[derive(Clone)]
-struct DNSService;
+pub struct DNSService;
 
-impl Service<Name> for DNSService {
+impl tower_service::Service<Name> for DNSService {
     type Response = DNSServiceAddrs;
     type Error = ErrorCode;
     type Future = DNSServiceFuture;
 
-    fn poll_ready(&mut self, _cx: &mut task::Context<'_>) -> Poll<Result<()>> {
+    fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<std::result::Result<(), Self::Error>> {
         Poll::Ready(Ok(()))
     }
 
     fn call(&mut self, name: Name) -> Self::Future {
-        let blocking = tokio::spawn(async move {
+        let blocking = runtime::spawn(async move {
             let resolver = DNSResolver::instance()?;
             match resolver.resolve(name.to_string()).await {
                 Err(err) => Err(err),
@@ -108,11 +109,11 @@ impl Service<Name> for DNSService {
     }
 }
 
-struct DNSServiceFuture {
+pub struct DNSServiceFuture {
     inner: JoinHandle<Result<DNSServiceAddrs>>,
 }
 
-struct DNSServiceAddrs {
+pub struct DNSServiceAddrs {
     inner: std::vec::IntoIter<IpAddr>,
 }
 
@@ -153,6 +154,7 @@ impl ConnectionFactory {
         inner_connector.set_nodelay(true);
         inner_connector.set_keepalive(None);
         inner_connector.enforce_http(false);
+        inner_connector.set_connect_timeout(timeout);
 
         // check connection immediately
         match endpoint.connect_with_connector(inner_connector).await {
@@ -167,17 +169,21 @@ impl ConnectionFactory {
     pub fn create_rpc_endpoint(
         addr: impl ToString,
         timeout: Option<Duration>,
-        rpc_client_config: Option<RpcClientTlsConfig>,
+        rpc_client_tls_config: Option<RpcClientTlsConfig>,
     ) -> std::result::Result<Endpoint, GrpcConnectionError> {
-        match format!("http://{}", addr.to_string()).parse::<Uri>() {
+        let u = if rpc_client_tls_config.is_some() {
+            format!("https://{}", addr.to_string())
+        } else {
+            format!("http://{}", addr.to_string())
+        };
+        match u.parse::<Uri>() {
             Err(error) => Err(GrpcConnectionError::InvalidUri {
                 uri: addr.to_string(),
                 source: AnyError::new(&error),
             }),
             Ok(uri) => {
                 let builder = Channel::builder(uri);
-
-                let mut endpoint = if let Some(conf) = rpc_client_config {
+                let mut endpoint = if let Some(conf) = rpc_client_tls_config {
                     info!("tls rpc enabled");
                     let client_tls_config = Self::client_tls_config(&conf).map_err(|e| {
                         GrpcConnectionError::TLSConfigError {

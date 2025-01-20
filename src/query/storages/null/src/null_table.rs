@@ -15,24 +15,24 @@
 use std::any::Any;
 use std::sync::Arc;
 
-use common_catalog::catalog::StorageDescription;
-use common_catalog::plan::DataSourcePlan;
-use common_catalog::plan::PartStatistics;
-use common_catalog::plan::Partitions;
-use common_catalog::plan::PushDownInfo;
-use common_catalog::table::AppendMode;
-use common_catalog::table::Table;
-use common_catalog::table_context::TableContext;
-use common_exception::Result;
-use common_expression::DataBlock;
-use common_expression::DataSchemaRef;
-use common_meta_app::schema::TableInfo;
-use common_pipeline_core::processors::port::OutputPort;
-use common_pipeline_core::processors::processor::ProcessorPtr;
-use common_pipeline_core::Pipeline;
-use common_pipeline_sinks::EmptySink;
-use common_pipeline_sources::SyncSource;
-use common_pipeline_sources::SyncSourcer;
+use databend_common_catalog::catalog::StorageDescription;
+use databend_common_catalog::plan::DataSourcePlan;
+use databend_common_catalog::plan::PartStatistics;
+use databend_common_catalog::plan::Partitions;
+use databend_common_catalog::plan::PushDownInfo;
+use databend_common_catalog::table::DistributionLevel;
+use databend_common_catalog::table::Table;
+use databend_common_catalog::table_context::TableContext;
+use databend_common_exception::Result;
+use databend_common_expression::DataBlock;
+use databend_common_expression::DataSchemaRef;
+use databend_common_meta_app::schema::TableInfo;
+use databend_common_pipeline_core::processors::OutputPort;
+use databend_common_pipeline_core::processors::ProcessorPtr;
+use databend_common_pipeline_core::Pipeline;
+use databend_common_pipeline_sinks::EmptySink;
+use databend_common_pipeline_sources::SyncSource;
+use databend_common_pipeline_sources::SyncSourcer;
 
 pub struct NullTable {
     table_info: TableInfo,
@@ -62,6 +62,11 @@ impl Table for NullTable {
         &self.table_info
     }
 
+    /// Null do not keep data, it's safe to make it non-local.
+    fn distribution_level(&self) -> DistributionLevel {
+        DistributionLevel::Cluster
+    }
+
     #[async_backtrace::framed]
     async fn read_partitions(
         &self,
@@ -77,6 +82,7 @@ impl Table for NullTable {
         ctx: Arc<dyn TableContext>,
         _: &DataSourcePlan,
         pipeline: &mut Pipeline,
+        _put_cache: bool,
     ) -> Result<()> {
         let schema: DataSchemaRef = Arc::new(self.table_info.schema().into());
         pipeline.add_source(
@@ -87,12 +93,7 @@ impl Table for NullTable {
         Ok(())
     }
 
-    fn append_data(
-        &self,
-        _: Arc<dyn TableContext>,
-        pipeline: &mut Pipeline,
-        _: AppendMode,
-    ) -> Result<()> {
+    fn append_data(&self, _: Arc<dyn TableContext>, pipeline: &mut Pipeline) -> Result<()> {
         pipeline.add_sink(|input| Ok(ProcessorPtr::create(EmptySink::create(input))))?;
         Ok(())
     }

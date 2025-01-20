@@ -17,88 +17,32 @@
 use std::fmt::Debug;
 use std::fmt::Display;
 use std::fmt::Formatter;
-use std::sync::Arc;
+use std::marker::PhantomData;
 
-use backtrace::Backtrace;
+use databend_common_ast::span::pretty_print_error;
+use databend_common_ast::Span;
 use thiserror::Error;
 
 use crate::exception_backtrace::capture;
-use crate::span::pretty_print_error;
-use crate::Span;
-
-#[derive(Clone)]
-pub enum ErrorCodeBacktrace {
-    Serialized(Arc<String>),
-    Symbols(Arc<Backtrace>),
-    Address(Arc<Backtrace>),
-}
-
-impl ToString for ErrorCodeBacktrace {
-    fn to_string(&self) -> String {
-        match self {
-            ErrorCodeBacktrace::Serialized(backtrace) => Arc::as_ref(backtrace).clone(),
-            ErrorCodeBacktrace::Symbols(backtrace) => format!("{:?}", backtrace),
-            ErrorCodeBacktrace::Address(backtrace) => {
-                let frames_address = backtrace
-                    .frames()
-                    .iter()
-                    .map(|f| (f.ip() as usize, f.symbol_address() as usize))
-                    .collect::<Vec<_>>();
-                format!("{:?}", frames_address)
-            }
-        }
-    }
-}
-
-impl From<&str> for ErrorCodeBacktrace {
-    fn from(s: &str) -> Self {
-        Self::Serialized(Arc::new(s.to_string()))
-    }
-}
-
-impl From<String> for ErrorCodeBacktrace {
-    fn from(s: String) -> Self {
-        Self::Serialized(Arc::new(s))
-    }
-}
-
-impl From<Arc<String>> for ErrorCodeBacktrace {
-    fn from(s: Arc<String>) -> Self {
-        Self::Serialized(s)
-    }
-}
-
-impl From<Backtrace> for ErrorCodeBacktrace {
-    fn from(bt: Backtrace) -> Self {
-        Self::Symbols(Arc::new(bt))
-    }
-}
-
-impl From<&Backtrace> for ErrorCodeBacktrace {
-    fn from(bt: &Backtrace) -> Self {
-        Self::Serialized(Arc::new(format!("{:?}", bt)))
-    }
-}
-
-impl From<Arc<Backtrace>> for ErrorCodeBacktrace {
-    fn from(bt: Arc<Backtrace>) -> Self {
-        Self::Symbols(bt)
-    }
-}
+use crate::ErrorFrame;
+use crate::StackTrace;
 
 #[derive(Error)]
-pub struct ErrorCode {
-    code: u16,
-    name: String,
-    display_text: String,
-    span: Span,
+pub struct ErrorCode<C = ()> {
+    pub(crate) code: u16,
+    pub(crate) name: String,
+    pub(crate) display_text: String,
+    pub(crate) detail: String,
+    pub(crate) span: Span,
     // cause is only used to contain an `anyhow::Error`.
     // TODO: remove `cause` when we completely get rid of `anyhow::Error`.
-    cause: Option<Box<dyn std::error::Error + Sync + Send>>,
-    backtrace: Option<ErrorCodeBacktrace>,
+    pub(crate) cause: Option<Box<dyn std::error::Error + Sync + Send>>,
+    pub(crate) stacks: Vec<ErrorFrame>,
+    pub(crate) backtrace: StackTrace,
+    pub(crate) _phantom: PhantomData<C>,
 }
 
-impl ErrorCode {
+impl<C> ErrorCode<C> {
     pub fn code(&self) -> u16 {
         self.code
     }
@@ -107,17 +51,35 @@ impl ErrorCode {
         self.name.clone()
     }
 
+    pub fn display_text(&self) -> String {
+        if let Some(cause) = &self.cause {
+            format!("{}\n{:?}", self.display_text, cause)
+        } else {
+            self.display_text.clone()
+        }
+    }
+
     pub fn message(&self) -> String {
-        self.cause
-            .as_ref()
-            .map(|cause| format!("{}\n{:?}", self.display_text, cause))
-            .unwrap_or_else(|| self.display_text.clone())
+        let msg = self.display_text();
+        if self.detail.is_empty() {
+            msg
+        } else {
+            format!("{}\n{}", msg, self.detail)
+        }
+    }
+
+    pub fn detail(&self) -> String {
+        self.detail.clone()
     }
 
     #[must_use]
     pub fn add_message(self, msg: impl AsRef<str>) -> Self {
         Self {
-            display_text: format!("{}\n{}", msg.as_ref(), self.display_text),
+            display_text: if self.display_text.is_empty() {
+                msg.as_ref().to_string()
+            } else {
+                format!("{}\n{}", msg.as_ref(), self.display_text)
+            },
             ..self
         }
     }
@@ -125,7 +87,33 @@ impl ErrorCode {
     #[must_use]
     pub fn add_message_back(self, msg: impl AsRef<str>) -> Self {
         Self {
-            display_text: format!("{}{}", self.display_text, msg.as_ref()),
+            display_text: if self.display_text.is_empty() {
+                msg.as_ref().to_string()
+            } else {
+                format!("{}\n{}", self.display_text, msg.as_ref())
+            },
+            ..self
+        }
+    }
+
+    pub fn add_detail_back(self, msg: impl AsRef<str>) -> Self {
+        Self {
+            detail: if self.detail.is_empty() {
+                msg.as_ref().to_string()
+            } else {
+                format!("{}\n{}", self.detail, msg.as_ref())
+            },
+            ..self
+        }
+    }
+
+    pub fn add_detail(self, msg: impl AsRef<str>) -> Self {
+        Self {
+            detail: if self.detail.is_empty() {
+                msg.as_ref().to_string()
+            } else {
+                format!("{}\n{}", msg.as_ref(), self.detail)
+            },
             ..self
         }
     }
@@ -150,31 +138,28 @@ impl ErrorCode {
         self
     }
 
-    /// Set backtrace info for this error.
-    ///
-    /// Useful when trying to keep original backtrace
-    pub fn set_backtrace(mut self, bt: Option<impl Into<ErrorCodeBacktrace>>) -> Self {
-        if let Some(b) = bt {
-            self.backtrace = Some(b.into());
-        }
-        self
-    }
-
-    pub fn backtrace(&self) -> Option<ErrorCodeBacktrace> {
+    pub fn backtrace(&self) -> StackTrace {
         self.backtrace.clone()
     }
 
     pub fn backtrace_str(&self) -> String {
-        self.backtrace
-            .as_ref()
-            .map_or("".to_string(), |x| x.to_string())
+        format!("{:?}", &self.backtrace)
+    }
+
+    pub fn stacks(&self) -> &[ErrorFrame] {
+        &self.stacks
+    }
+
+    pub fn set_stacks(mut self, stacks: Vec<ErrorFrame>) -> Self {
+        self.stacks = stacks;
+        self
     }
 }
 
-pub type Result<T, E = ErrorCode> = std::result::Result<T, E>;
+pub type Result<T, C = ()> = std::result::Result<T, ErrorCode<C>>;
 
-impl Debug for ErrorCode {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+impl<C> Debug for ErrorCode<C> {
+    fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
         write!(
             f,
             "{}. Code: {}, Text = {}.",
@@ -183,32 +168,18 @@ impl Debug for ErrorCode {
             self.message(),
         )?;
 
-        match self.backtrace.as_ref() {
-            None => write!(
+        match self.backtrace.frames.is_empty() {
+            true => write!(
                 f,
                 "\n\n<Backtrace disabled by default. Please use RUST_BACKTRACE=1 to enable> "
             ),
-            Some(backtrace) => {
-                // TODO: Custom stack frame format for print
-                match backtrace {
-                    ErrorCodeBacktrace::Symbols(backtrace) => write!(f, "\n\n{:?}", backtrace),
-                    ErrorCodeBacktrace::Serialized(backtrace) => write!(f, "\n\n{}", backtrace),
-                    ErrorCodeBacktrace::Address(backtrace) => {
-                        let frames_address = backtrace
-                            .frames()
-                            .iter()
-                            .map(|f| (f.ip() as usize, f.symbol_address() as usize))
-                            .collect::<Vec<_>>();
-                        write!(f, "\n\n{:?}", frames_address)
-                    }
-                }
-            }
+            false => write!(f, "\n\n{:?}", &self.backtrace),
         }
     }
 }
 
-impl Display for ErrorCode {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+impl<C> Display for ErrorCode<C> {
+    fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
         write!(
             f,
             "{}. Code: {}, Text = {}.",
@@ -219,28 +190,37 @@ impl Display for ErrorCode {
     }
 }
 
-impl ErrorCode {
+impl<C> ErrorCode<C> {
     /// All std error will be converted to InternalError
+    #[track_caller]
     pub fn from_std_error<T: std::error::Error>(error: T) -> Self {
         ErrorCode {
             code: 1001,
             name: String::from("FromStdError"),
             display_text: error.to_string(),
+            detail: String::new(),
             span: None,
             cause: None,
             backtrace: capture(),
+            stacks: vec![],
+            _phantom: PhantomData::<C>,
         }
+        .with_context(error.to_string())
     }
 
     pub fn from_string(error: String) -> Self {
         ErrorCode {
             code: 1001,
             name: String::from("Internal"),
-            display_text: error,
+            display_text: error.clone(),
+            detail: String::new(),
             span: None,
             cause: None,
             backtrace: capture(),
+            stacks: vec![],
+            _phantom: PhantomData::<C>,
         }
+        .with_context(error)
     }
 
     pub fn from_string_no_backtrace(error: String) -> Self {
@@ -248,9 +228,12 @@ impl ErrorCode {
             code: 1001,
             name: String::from("Internal"),
             display_text: error,
+            detail: String::new(),
             span: None,
             cause: None,
-            backtrace: None,
+            stacks: vec![],
+            backtrace: StackTrace::no_capture(),
+            _phantom: PhantomData::<C>,
         }
     }
 
@@ -258,28 +241,34 @@ impl ErrorCode {
         code: u16,
         name: impl ToString,
         display_text: String,
+        detail: String,
         cause: Option<Box<dyn std::error::Error + Sync + Send>>,
-        backtrace: Option<ErrorCodeBacktrace>,
-    ) -> ErrorCode {
+        backtrace: StackTrace,
+    ) -> Self {
         ErrorCode {
             code,
-            display_text,
+            display_text: display_text.clone(),
+            detail,
             span: None,
             cause,
             backtrace,
             name: name.to_string(),
+            stacks: vec![],
+            _phantom: PhantomData::<C>,
         }
+        .with_context(display_text)
     }
 }
 
 /// Provides the `map_err_to_code` method for `Result`.
 ///
 /// ```
-/// use common_exception::ErrorCode;
-/// use common_exception::ToErrorCode;
+/// use databend_common_exception::ErrorCode;
+/// use databend_common_exception::ToErrorCode;
 ///
 /// let x: std::result::Result<(), std::fmt::Error> = Err(std::fmt::Error {});
-/// let y: common_exception::Result<()> = x.map_err_to_code(ErrorCode::UnknownException, || 123);
+/// let y: databend_common_exception::Result<()> =
+///     x.map_err_to_code(ErrorCode::UnknownException, || 123);
 ///
 /// assert_eq!(
 ///     "Code: 1067, Text = 123, cause: an error occurred when formatting an argument.",
@@ -317,15 +306,17 @@ where E: Display + Send + Sync + 'static
     }
 }
 
-impl Clone for ErrorCode {
+impl<C> Clone for ErrorCode<C> {
     fn clone(&self) -> Self {
         ErrorCode::create(
             self.code(),
             &self.name,
-            self.message(),
+            self.display_text(),
+            self.detail.clone(),
             None,
             self.backtrace(),
         )
         .set_span(self.span())
+        .set_stacks(self.stacks().to_vec())
     }
 }

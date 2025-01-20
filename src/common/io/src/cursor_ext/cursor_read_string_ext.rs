@@ -34,15 +34,20 @@ pub trait BufferReadStringExt {
 impl<T> BufferReadStringExt for Cursor<T>
 where T: AsRef<[u8]>
 {
-    fn read_quoted_text(&mut self, buf: &mut Vec<u8>, quota: u8) -> Result<()> {
-        self.must_ignore_byte(quota)?;
+    fn read_quoted_text(&mut self, buf: &mut Vec<u8>, quote: u8) -> Result<()> {
+        self.must_ignore_byte(quote)?;
 
         loop {
-            self.keep_read(buf, |b| b != quota && b != b'\\');
-            if self.ignore_byte(quota) {
-                return Ok(());
+            self.keep_read(buf, |b| b != quote && b != b'\\');
+            if self.ignore_byte(quote) {
+                if self.peek_byte() == Some(quote) {
+                    buf.push(quote);
+                    self.consume(1);
+                } else {
+                    return Ok(());
+                }
             } else if self.ignore_byte(b'\\') {
-                let b = self.remaining_slice();
+                let b = Cursor::split(self).1;
                 if b.is_empty() {
                     return Err(std::io::Error::new(
                         ErrorKind::InvalidData,
@@ -73,7 +78,7 @@ where T: AsRef<[u8]>
             ErrorKind::InvalidData,
             format!(
                 "Expected to have terminated string literal after quota {:?}, while consumed buf: {:?}",
-                quota as char, buf
+                quote as char, buf
             ),
         ))
     }
@@ -82,14 +87,11 @@ where T: AsRef<[u8]>
         loop {
             self.keep_read(buf, |f| f != b'\\');
             if self.ignore_byte(b'\\') {
-                let buffer = self.remaining_slice();
+                let buffer = Cursor::split(self).1;
                 let c = buffer[0];
                 match c {
                     b'\'' | b'\"' | b'\\' | b'/' | b'`' => {
                         buf.push(c);
-                        self.consume(1);
-                    }
-                    b'N' => {
                         self.consume(1);
                     }
                     b'x' => {
@@ -134,13 +136,13 @@ where T: AsRef<[u8]>
         // Get next possible end position.
         while let Some(pos) = positions.pop_front() {
             let len = pos - start;
-            buf.extend_from_slice(&self.remaining_slice()[..len]);
+            buf.extend_from_slice(&Cursor::split(self).1[..len]);
             self.consume(len);
 
             if self.ignore_byte(b'\'') {
                 return Ok(());
             } else if self.ignore_byte(b'\\') {
-                let b = self.remaining_slice();
+                let b = Cursor::split(self).1;
                 if b.is_empty() {
                     return Err(std::io::Error::new(
                         ErrorKind::InvalidData,
@@ -202,7 +204,7 @@ fn unescape(c: u8) -> u8 {
         b'a' => b'\x07', // \a in c
         b'b' => b'\x08', // \b in c
         b'v' => b'\x0B', // \v in c
-        b'f' => b'\x0C', // \e in c
+        b'f' => b'\x0C', // \f in c
         b'e' => b'\x1B', // \e in c
         b'n' => b'\n',
         b'r' => b'\r',

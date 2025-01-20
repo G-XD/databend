@@ -14,15 +14,17 @@
 
 use std::sync::Arc;
 
-use common_exception::Result;
-use common_expression::Scalar;
+use databend_common_exception::Result;
+use databend_common_expression::Scalar;
 
+use crate::optimizer::extract::Matcher;
+use crate::optimizer::rule::constant::is_falsy;
+use crate::optimizer::rule::constant::is_true;
 use crate::optimizer::rule::Rule;
 use crate::optimizer::RuleID;
 use crate::optimizer::SExpr;
 use crate::plans::ConstantExpr;
 use crate::plans::Filter;
-use crate::plans::PatternPlan;
 use crate::plans::RelOp;
 use crate::plans::ScalarExpr;
 
@@ -32,39 +34,17 @@ fn normalize_predicates(predicates: Vec<ScalarExpr>) -> Vec<ScalarExpr> {
         .fold(predicates, |acc, f| f(acc))
 }
 
-fn is_true(predicate: &ScalarExpr) -> bool {
-    matches!(
-        predicate,
-        ScalarExpr::ConstantExpr(ConstantExpr {
-            value: Scalar::Boolean(true),
-            ..
-        })
-    )
-}
-
-fn is_falsy(predicate: &ScalarExpr) -> bool {
-    matches!(
-        predicate,
-        ScalarExpr::ConstantExpr(ConstantExpr {
-            value,
-            ..
-        }) if value == &Scalar::Boolean(false) || value == &Scalar::Null
-    )
-}
-
 fn remove_true_predicate(predicates: Vec<ScalarExpr>) -> Vec<ScalarExpr> {
     predicates.into_iter().filter(|p| !is_true(p)).collect()
 }
 
 fn normalize_falsy_predicate(predicates: Vec<ScalarExpr>) -> Vec<ScalarExpr> {
     if predicates.iter().any(is_falsy) {
-        vec![
-            ConstantExpr {
-                span: None,
-                value: Scalar::Boolean(false),
-            }
-            .into(),
-        ]
+        vec![ConstantExpr {
+            span: None,
+            value: Scalar::Boolean(false),
+        }
+        .into()]
     } else {
         predicates
     }
@@ -73,10 +53,10 @@ fn normalize_falsy_predicate(predicates: Vec<ScalarExpr>) -> Vec<ScalarExpr> {
 /// Rule to normalize a Filter, including:
 /// - Remove true predicates
 /// - If there is a NULL or FALSE conjunction, replace the
-/// whole filter with FALSE
+///   whole filter with FALSE
 pub struct RuleNormalizeScalarFilter {
     id: RuleID,
-    patterns: Vec<SExpr>,
+    matchers: Vec<Matcher>,
 }
 
 impl RuleNormalizeScalarFilter {
@@ -86,20 +66,10 @@ impl RuleNormalizeScalarFilter {
             // Filter
             //  \
             //   *
-            patterns: vec![SExpr::create_unary(
-                Arc::new(
-                    PatternPlan {
-                        plan_type: RelOp::Filter,
-                    }
-                    .into(),
-                ),
-                Arc::new(SExpr::create_leaf(Arc::new(
-                    PatternPlan {
-                        plan_type: RelOp::Pattern,
-                    }
-                    .into(),
-                ))),
-            )],
+            matchers: vec![Matcher::MatchOp {
+                op_type: RelOp::Filter,
+                children: vec![Matcher::Leaf],
+            }],
         }
     }
 }
@@ -132,7 +102,7 @@ impl Rule for RuleNormalizeScalarFilter {
         }
     }
 
-    fn patterns(&self) -> &Vec<SExpr> {
-        &self.patterns
+    fn matchers(&self) -> &[Matcher] {
+        &self.matchers
     }
 }

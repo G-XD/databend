@@ -14,23 +14,26 @@
 
 use std::cmp::Ordering;
 
-use common_exception::ErrorCode;
-use common_exception::Result;
-use common_expression::Expr;
-use common_expression::Scalar;
+use databend_common_exception::ErrorCode;
+use databend_common_exception::Result;
+use databend_common_expression::types::NumberScalar;
+use databend_common_expression::Scalar;
 
 use crate::table_functions::TableArgs;
 
 pub fn string_value(value: &Scalar) -> Result<String> {
     match value {
-        Scalar::String(val) => String::from_utf8(val.clone())
-            .map_err(|e| ErrorCode::BadArguments(format!("invalid string. {}", e))),
+        Scalar::String(val) => Ok(val.clone()),
         _ => Err(ErrorCode::BadArguments("invalid string.")),
     }
 }
 
 pub fn string_literal(val: &str) -> Scalar {
-    Scalar::String(val.as_bytes().to_vec())
+    Scalar::String(val.to_string())
+}
+
+pub fn u64_literal(val: u64) -> Scalar {
+    Scalar::Number(NumberScalar::UInt64(val))
 }
 
 pub fn cmp_with_null(v1: &Scalar, v2: &Scalar) -> Ordering {
@@ -42,6 +45,12 @@ pub fn cmp_with_null(v1: &Scalar, v2: &Scalar) -> Ordering {
     }
 }
 
+pub fn parse_sequence_args(table_args: &TableArgs, func_name: &str) -> Result<String> {
+    let args = table_args.expect_all_positioned(func_name, Some(1))?;
+    let sequence = string_value(&args[0])?;
+    Ok(sequence)
+}
+
 pub fn parse_db_tb_args(table_args: &TableArgs, func_name: &str) -> Result<(String, String)> {
     let args = table_args.expect_all_positioned(func_name, Some(2))?;
     let db = string_value(&args[0])?;
@@ -49,35 +58,55 @@ pub fn parse_db_tb_args(table_args: &TableArgs, func_name: &str) -> Result<(Stri
     Ok((db, tbl))
 }
 
-pub fn parse_db_tb_ssid_args(
+pub fn parse_db_tb_opt_args(
     table_args: &TableArgs,
     func_name: &str,
 ) -> Result<(String, String, Option<String>)> {
     let args = table_args.expect_all_positioned(func_name, None)?;
     match args.len() {
         3 => {
-            let db = string_value(&args[0])?;
-            let tbl = string_value(&args[1])?;
-            let snapshot_id = string_value(&args[2])?;
-            Ok((db, tbl, Some(snapshot_id)))
+            let arg1 = string_value(&args[0])?;
+            let arg2 = string_value(&args[1])?;
+            let arg3 = string_value(&args[2])?;
+            Ok((arg1, arg2, Some(arg3)))
         }
         2 => {
-            let db = string_value(&args[0])?;
-            let tbl = string_value(&args[1])?;
-            Ok((db, tbl, None))
+            let arg1 = string_value(&args[0])?;
+            let arg2 = string_value(&args[1])?;
+            Ok((arg1, arg2, None))
         }
         _ => Err(ErrorCode::BadArguments(format!(
-            "expecting <database>, <table_name> and <snapshot_id> (as string literals), but got {:?}",
+            "expecting <database>, <table_name> and <opt_arg> (as string literals), but got {:?}",
             args
         ))),
     }
 }
 
-pub fn unwrap_tuple(expr: &Expr) -> Option<Vec<Expr>> {
-    match expr {
-        Expr::FunctionCall { function, args, .. } if function.signature.name == "tuple" => {
-            Some(args.clone())
+pub fn parse_opt_opt_args(
+    table_args: &TableArgs,
+    func_name: &str,
+) -> Result<(Option<String>, Option<String>)> {
+    let args = table_args.expect_all_positioned(func_name, None)?;
+    match args.len() {
+        2 => {
+            let arg1 = string_value(&args[0])?;
+            let arg2 = string_value(&args[1])?;
+            Ok((Some(arg1), Some(arg2)))
         }
-        _ => None,
+        1 => {
+            let arg1 = string_value(&args[0])?;
+            Ok((Some(arg1), None))
+        }
+        0 => Ok((None, None)),
+        _ => Err(ErrorCode::BadArguments(format!(
+            "expecting <opt_arg1> and <opt_arg2> (as string literals), but got {:?}",
+            args
+        ))),
     }
+}
+
+pub fn parse_db_tb_col_args(table_args: &TableArgs, func_name: &str) -> Result<String> {
+    let args = table_args.expect_all_positioned(func_name, Some(1))?;
+    let db = string_value(&args[0])?;
+    Ok(db)
 }

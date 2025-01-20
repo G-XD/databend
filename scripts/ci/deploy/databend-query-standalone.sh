@@ -10,7 +10,6 @@ BUILD_PROFILE=${BUILD_PROFILE:-debug}
 
 killall databend-query || true
 killall databend-meta || true
-killall open-sharing || true
 sleep 1
 
 for bin in databend-query databend-meta; do
@@ -20,13 +19,16 @@ for bin in databend-query databend-meta; do
 	fi
 done
 
+# Wait for killed process to cleanup resources
+sleep 1
+
 echo 'Start databend-meta...'
-nohup target/${BUILD_PROFILE}/databend-meta --single --log-level=ERROR &
+nohup target/${BUILD_PROFILE}/databend-meta --single --log-level=INFO &
 echo "Waiting on databend-meta 10 seconds..."
-python3 scripts/ci/wait_tcp.py --timeout 10 --port 9191
+python3 scripts/ci/wait_tcp.py --timeout 30 --port 9191
 
 echo 'Start databend-query...'
 nohup target/${BUILD_PROFILE}/databend-query -c scripts/ci/deploy/config/databend-query-node-1.toml --internal-enable-sandbox-tenant &
 
 echo "Waiting on databend-query 10 seconds..."
-python3 scripts/ci/wait_tcp.py --timeout 30 --port 3307
+python3 scripts/ci/wait_tcp.py --timeout 30 --port 8000

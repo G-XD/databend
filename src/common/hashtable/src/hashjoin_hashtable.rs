@@ -17,7 +17,8 @@ use std::marker::PhantomData;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 
-use common_base::mem_allocator::MmapAllocator;
+use databend_common_base::mem_allocator::DefaultAllocator;
+use databend_common_column::bitmap::Bitmap;
 
 use super::traits::HashJoinHashtableLike;
 use super::traits::Keyable;
@@ -49,10 +50,61 @@ pub struct RawEntry<K> {
     pub next: u64,
 }
 
-pub struct HashJoinHashTable<K: Keyable, A: Allocator + Clone = MmapAllocator> {
+/// Hash join early filtering:
+/// For each bucket in the hash table, its type is u64. We use the upper 16 bits to store a tag
+/// for early filtering and the lower 48 bits to store a pointer to the RowEntry.  We construct
+/// the tag during the finalize phase of the hash join, encoding it into the upper 16 bits. During
+/// the probing phase, we can check the tag first. If the key is not found in the tag, we can avoid
+/// reading the RowEntry, which can reduce random memory accesses.
+pub const POINTER_BITS_SIZE: u64 = 48;
+pub const TAG_BITS_SIZE: u64 = 64 - POINTER_BITS_SIZE;
+pub const TAG_BITS_SIZE_MASK: u64 = TAG_BITS_SIZE - 1;
+pub const POINTER_MASK: u64 = (1 << POINTER_BITS_SIZE) - 1;
+pub const TAG_MASK: u64 = !POINTER_MASK;
+
+/// Generate a tag using hash % 16.
+#[inline(always)]
+pub fn tag(hash: u64) -> u64 {
+    1 << (POINTER_BITS_SIZE + (hash & TAG_BITS_SIZE_MASK))
+}
+
+/// Generate a tag and encode it into the upper 16 bits of bucket.
+#[inline(always)]
+pub fn new_header(ptr: u64, hash: u64) -> u64 {
+    ptr | tag(hash)
+}
+
+/// Combine the tags of new_header and old_header.
+#[inline(always)]
+pub fn combine_header(new_header: u64, old_header: u64) -> u64 {
+    new_header | (old_header & TAG_MASK)
+}
+
+/// Remove the tag from the bucket.
+#[inline(always)]
+pub fn remove_header_tag(old_header: u64) -> u64 {
+    old_header & POINTER_MASK
+}
+
+/// Obtain the tag by performing a right shift operation on the bucket,
+/// and then check if the key is in the tag.
+#[inline(always)]
+pub fn early_filtering(header: u64, hash: u64) -> bool {
+    ((header >> POINTER_BITS_SIZE) & (1 << (hash & TAG_BITS_SIZE_MASK))) != 0
+}
+
+/// For SSE4.2, we use CRC32 to calculate the hash, and the hash type is u32.
+#[inline(always)]
+pub fn hash_bits() -> u32 {
+    cfg_if::cfg_if! {
+        if #[cfg(target_feature = "sse4.2")] { 32 } else { 64 }
+    }
+}
+
+pub struct HashJoinHashTable<K: Keyable, A: Allocator + Clone = DefaultAllocator> {
     pub(crate) pointers: Box<[u64], A>,
     pub(crate) atomic_pointers: *mut AtomicU64,
-    pub(crate) hash_mask: usize,
+    pub(crate) hash_shift: usize,
     pub(crate) phantom: PhantomData<K>,
 }
 
@@ -68,7 +120,7 @@ impl<K: Keyable, A: Allocator + Clone + Default> HashJoinHashTable<K, A> {
                 Box::new_zeroed_slice_in(capacity, Default::default()).assume_init()
             },
             atomic_pointers: std::ptr::null_mut(),
-            hash_mask: capacity - 1,
+            hash_shift: (hash_bits() - capacity.trailing_zeros()) as usize,
             phantom: PhantomData,
         };
         hashtable.atomic_pointers = unsafe {
@@ -77,26 +129,28 @@ impl<K: Keyable, A: Allocator + Clone + Default> HashJoinHashTable<K, A> {
         hashtable
     }
 
-    pub fn insert(&mut self, key: K, raw_entry_ptr: *mut RawEntry<K>) {
-        let index = key.hash() as usize & self.hash_mask;
+    pub fn insert(&mut self, key: K, entry_ptr: *mut RawEntry<K>) {
+        let hash = key.hash();
+        let index = (hash >> self.hash_shift) as usize;
+        let new_header = new_header(entry_ptr as u64, hash);
         // # Safety
         // `index` is less than the capacity of hash table.
-        let mut head = unsafe { (*self.atomic_pointers.add(index)).load(Ordering::Relaxed) };
+        let mut old_header = unsafe { (*self.atomic_pointers.add(index)).load(Ordering::Relaxed) };
         loop {
             let res = unsafe {
                 (*self.atomic_pointers.add(index)).compare_exchange_weak(
-                    head,
-                    raw_entry_ptr as u64,
+                    old_header,
+                    combine_header(new_header, old_header),
                     Ordering::SeqCst,
                     Ordering::SeqCst,
                 )
             };
             match res {
                 Ok(_) => break,
-                Err(x) => head = x,
+                Err(x) => old_header = x,
             };
         }
-        unsafe { (*raw_entry_ptr).next = head };
+        unsafe { (*entry_ptr).next = remove_header_tag(old_header) };
     }
 }
 
@@ -107,38 +161,200 @@ where
 {
     type Key = K;
 
-    fn contains(&self, key_ref: &Self::Key) -> bool {
-        let index = key_ref.hash() as usize & self.hash_mask;
-        let mut raw_entry_ptr = self.pointers[index];
+    // Using hashes to probe hash table and converting them in-place to pointers for memory reuse.
+    fn probe(&self, hashes: &mut [u64], bitmap: Option<Bitmap>) -> usize {
+        let mut valids = None;
+        if let Some(bitmap) = bitmap {
+            if bitmap.null_count() == bitmap.len() {
+                hashes.iter_mut().for_each(|hash| {
+                    *hash = 0;
+                });
+                return 0;
+            } else if bitmap.null_count() > 0 {
+                valids = Some(bitmap);
+            }
+        }
+        let mut count = 0;
+        match valids {
+            Some(valids) => {
+                valids
+                    .iter()
+                    .zip(hashes.iter_mut())
+                    .for_each(|(valid, hash)| {
+                        if valid {
+                            let header = self.pointers[(*hash >> self.hash_shift) as usize];
+                            if header != 0 {
+                                *hash = remove_header_tag(header);
+                                count += 1;
+                            } else {
+                                *hash = 0;
+                            }
+                        } else {
+                            *hash = 0;
+                        }
+                    });
+            }
+            None => {
+                hashes.iter_mut().for_each(|hash| {
+                    let header = self.pointers[(*hash >> self.hash_shift) as usize];
+                    if header != 0 {
+                        *hash = remove_header_tag(header);
+                        count += 1;
+                    } else {
+                        *hash = 0;
+                    }
+                });
+            }
+        }
+        count
+    }
+
+    // Perform early filtering probe, store matched indexes in `matched_selection` and store unmatched indexes
+    // in `unmatched_selection`, return the number of matched and unmatched indexes.
+    fn early_filtering_probe(
+        &self,
+        hashes: &mut [u64],
+        bitmap: Option<Bitmap>,
+        matched_selection: &mut [u32],
+        unmatched_selection: &mut [u32],
+    ) -> (usize, usize) {
+        let mut valids = None;
+        if let Some(bitmap) = bitmap {
+            if bitmap.null_count() == bitmap.len() {
+                unmatched_selection
+                    .iter_mut()
+                    .enumerate()
+                    .for_each(|(idx, val)| {
+                        *val = idx as u32;
+                    });
+                return (0, hashes.len());
+            } else if bitmap.null_count() > 0 {
+                valids = Some(bitmap);
+            }
+        }
+        let mut matched_idx = 0;
+        let mut unmatched_idx = 0;
+        match valids {
+            Some(valids) => {
+                valids.iter().zip(hashes.iter_mut().enumerate()).for_each(
+                    |(valid, (idx, hash))| {
+                        if valid {
+                            let header = self.pointers[(*hash >> self.hash_shift) as usize];
+                            if header != 0 && early_filtering(header, *hash) {
+                                *hash = remove_header_tag(header);
+                                unsafe {
+                                    *matched_selection.get_unchecked_mut(matched_idx) = idx as u32
+                                };
+                                matched_idx += 1;
+                            } else {
+                                unsafe {
+                                    *unmatched_selection.get_unchecked_mut(unmatched_idx) =
+                                        idx as u32
+                                };
+                                unmatched_idx += 1;
+                            }
+                        } else {
+                            unsafe {
+                                *unmatched_selection.get_unchecked_mut(unmatched_idx) = idx as u32
+                            };
+                            unmatched_idx += 1;
+                        }
+                    },
+                );
+            }
+            None => {
+                hashes.iter_mut().enumerate().for_each(|(idx, hash)| {
+                    let header = self.pointers[(*hash >> self.hash_shift) as usize];
+                    if header != 0 && early_filtering(header, *hash) {
+                        *hash = remove_header_tag(header);
+                        unsafe { *matched_selection.get_unchecked_mut(matched_idx) = idx as u32 };
+                        matched_idx += 1;
+                    } else {
+                        unsafe {
+                            *unmatched_selection.get_unchecked_mut(unmatched_idx) = idx as u32
+                        };
+                        unmatched_idx += 1;
+                    }
+                });
+            }
+        }
+        (matched_idx, unmatched_idx)
+    }
+
+    // Perform early filtering probe and store matched indexes in `selection`, return the number of matched indexes.
+    fn early_filtering_matched_probe(
+        &self,
+        hashes: &mut [u64],
+        bitmap: Option<Bitmap>,
+        selection: &mut [u32],
+    ) -> usize {
+        let mut valids = None;
+        if let Some(bitmap) = bitmap {
+            if bitmap.null_count() == bitmap.len() {
+                return 0;
+            } else if bitmap.null_count() > 0 {
+                valids = Some(bitmap);
+            }
+        }
+        let mut count = 0;
+        match valids {
+            Some(valids) => {
+                valids.iter().zip(hashes.iter_mut().enumerate()).for_each(
+                    |(valid, (idx, hash))| {
+                        if valid {
+                            let header = self.pointers[(*hash >> self.hash_shift) as usize];
+                            if header != 0 && early_filtering(header, *hash) {
+                                *hash = remove_header_tag(header);
+                                unsafe { *selection.get_unchecked_mut(count) = idx as u32 };
+                                count += 1;
+                            }
+                        }
+                    },
+                );
+            }
+            None => {
+                hashes.iter_mut().enumerate().for_each(|(idx, hash)| {
+                    let header = self.pointers[(*hash >> self.hash_shift) as usize];
+                    if header != 0 && early_filtering(header, *hash) {
+                        *hash = remove_header_tag(header);
+                        unsafe { *selection.get_unchecked_mut(count) = idx as u32 };
+                        count += 1;
+                    }
+                });
+            }
+        }
+        count
+    }
+
+    fn next_contains(&self, key: &Self::Key, mut ptr: u64) -> bool {
         loop {
-            if raw_entry_ptr == 0 {
+            if ptr == 0 {
                 break;
             }
-            let raw_entry = unsafe { &*(raw_entry_ptr as *mut RawEntry<K>) };
-            if key_ref == &raw_entry.key {
+            let raw_entry = unsafe { &*(ptr as *mut RawEntry<K>) };
+            if key == &raw_entry.key {
                 return true;
             }
-            raw_entry_ptr = raw_entry.next;
+            ptr = raw_entry.next;
         }
         false
     }
 
-    fn probe_hash_table(
+    fn next_probe(
         &self,
-        key_ref: &Self::Key,
+        key: &Self::Key,
+        mut ptr: u64,
         vec_ptr: *mut RowPtr,
         mut occupied: usize,
         capacity: usize,
     ) -> (usize, u64) {
-        let index = key_ref.hash() as usize & self.hash_mask;
         let origin = occupied;
-        let mut raw_entry_ptr = self.pointers[index];
         loop {
-            if raw_entry_ptr == 0 || occupied >= capacity {
+            if ptr == 0 || occupied >= capacity {
                 break;
             }
-            let raw_entry = unsafe { &*(raw_entry_ptr as *mut RawEntry<K>) };
-            if key_ref == &raw_entry.key {
+            let raw_entry = unsafe { &*(ptr as *mut RawEntry<K>) };
+            if key == &raw_entry.key {
                 // # Safety
                 // occupied is less than the capacity of vec_ptr.
                 unsafe {
@@ -150,47 +366,26 @@ where
                 };
                 occupied += 1;
             }
-            raw_entry_ptr = raw_entry.next;
+            ptr = raw_entry.next;
         }
         if occupied > origin {
-            (occupied - origin, raw_entry_ptr)
+            (occupied - origin, ptr)
         } else {
             (0, 0)
         }
     }
 
-    fn next_incomplete_ptr(
-        &self,
-        key_ref: &Self::Key,
-        mut incomplete_ptr: u64,
-        vec_ptr: *mut RowPtr,
-        mut occupied: usize,
-        capacity: usize,
-    ) -> (usize, u64) {
-        let origin = occupied;
+    fn next_matched_ptr(&self, key: &Self::Key, mut ptr: u64) -> u64 {
         loop {
-            if incomplete_ptr == 0 || occupied >= capacity {
+            if ptr == 0 {
                 break;
             }
-            let raw_entry = unsafe { &*(incomplete_ptr as *mut RawEntry<K>) };
-            if key_ref == &raw_entry.key {
-                // # Safety
-                // occupied is less than the capacity of vec_ptr.
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        &raw_entry.row_ptr as *const RowPtr,
-                        vec_ptr.add(occupied),
-                        1,
-                    )
-                };
-                occupied += 1;
+            let raw_entry = unsafe { &*(ptr as *mut RawEntry<K>) };
+            if key == &raw_entry.key {
+                return ptr;
             }
-            incomplete_ptr = raw_entry.next;
+            ptr = raw_entry.next;
         }
-        if occupied > origin {
-            (occupied - origin, incomplete_ptr)
-        } else {
-            (0, 0)
-        }
+        0
     }
 }

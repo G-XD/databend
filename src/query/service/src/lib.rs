@@ -12,7 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#![feature(int_roundings)]
+#![allow(internal_features)]
+#![allow(clippy::useless_asref)]
 #![allow(clippy::uninlined_format_args)]
+#![feature(iter_map_windows)]
 #![feature(hash_raw_entry)]
 #![feature(core_intrinsics)]
 #![feature(arbitrary_self_types)]
@@ -21,38 +25,43 @@
 #![feature(trusted_len)]
 #![feature(box_patterns)]
 #![feature(sync_unsafe_cell)]
-#![feature(option_get_or_insert_default)]
-#![feature(result_option_inspect)]
+#![allow(elided_named_lifetimes)]
 #![feature(result_flattening)]
 #![feature(iterator_try_reduce)]
-#![feature(cursor_remaining)]
+#![feature(cursor_split)]
 #![feature(vec_into_raw_parts)]
-#![feature(associated_type_bounds)]
-#![feature(io_error_other)]
-#![feature(hash_drain_filter)]
+#![feature(hash_extract_if)]
+#![allow(clippy::large_enum_variant)]
 #![feature(impl_trait_in_assoc_type)]
 #![feature(iterator_try_collect)]
+#![feature(let_chains)]
+#![feature(try_blocks)]
+#![feature(variant_count)]
+#![feature(duration_constructors)]
+#![allow(clippy::diverging_sub_expression)]
+#![allow(clippy::arc_with_non_send_sync)]
 
 extern crate core;
 
-pub mod api;
 pub mod auth;
 pub mod catalogs;
 pub mod clusters;
 pub mod databases;
 pub mod interpreters;
-pub mod metrics;
+pub mod local;
+pub mod locks;
 pub mod pipelines;
-pub mod procedures;
 pub mod schedulers;
 pub mod servers;
 pub mod sessions;
+pub mod spillers;
 pub mod stream;
 pub mod table_functions;
 pub mod test_kits;
 
+mod builtin;
 mod global_services;
 
-pub use common_sql as sql;
-pub use common_storages_factory as storages;
+pub use databend_common_sql as sql;
+pub use databend_common_storages_factory as storages;
 pub use global_services::GlobalServices;

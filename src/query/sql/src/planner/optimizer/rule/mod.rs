@@ -19,6 +19,7 @@ mod rule;
 mod rule_set;
 mod transform;
 mod transform_result;
+mod utils;
 
 pub use factory::RuleFactory;
 pub use rewrite::agg_index;
@@ -26,6 +27,8 @@ pub use rewrite::try_push_down_filter_join;
 pub use rule::Rule;
 pub use rule::RuleID;
 pub use rule::RulePtr;
+pub use rule::DEFAULT_REWRITE_RULES;
 pub use rule_set::AppliedRules;
 pub use rule_set::RuleSet;
 pub use transform_result::TransformResult;
+pub use utils::constant;

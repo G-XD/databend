@@ -18,7 +18,7 @@ use crate::MetaHandshakeError;
 use crate::MetaNetworkError;
 
 /// Error raised by meta service client.
-#[derive(thiserror::Error, serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(thiserror::Error, Debug, Clone, PartialEq, Eq)]
 pub enum MetaClientError {
     #[error("meta-client dedicated runtime error: {0}")]
     ClientRuntimeError(AnyError),
@@ -27,8 +27,19 @@ pub enum MetaClientError {
     ConfigError(AnyError),
 
     #[error(transparent)]
-    NetworkError(MetaNetworkError),
+    NetworkError(#[from] MetaNetworkError),
 
     #[error(transparent)]
-    HandshakeError(MetaHandshakeError),
+    HandshakeError(#[from] MetaHandshakeError),
+}
+
+impl MetaClientError {
+    pub fn name(&self) -> &'static str {
+        match self {
+            MetaClientError::ClientRuntimeError(_) => "ClientRuntimeError",
+            MetaClientError::ConfigError(_) => "ConfigError",
+            MetaClientError::NetworkError(err) => err.name(),
+            MetaClientError::HandshakeError(_) => "MetaHandshakeError",
+        }
+    }
 }

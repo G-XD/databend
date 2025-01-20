@@ -12,17 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use common_ast::ast::Expr;
-use common_ast::ast::Literal;
-use common_ast::ast::OrderByExpr;
-use common_exception::ErrorCode;
-use common_exception::Result;
+use databend_common_ast::ast::Expr;
+use databend_common_ast::ast::Literal;
+use databend_common_ast::ast::OrderByExpr;
+use databend_common_exception::ErrorCode;
+use databend_common_exception::Result;
 
 use super::ExprContext;
+use crate::binder::aggregate::AggregateRewriter;
 use crate::binder::scalar::ScalarBinder;
 use crate::binder::select::SelectList;
 use crate::binder::window::WindowRewriter;
@@ -30,19 +30,18 @@ use crate::binder::Binder;
 use crate::binder::ColumnBinding;
 use crate::optimizer::SExpr;
 use crate::planner::semantic::GroupingChecker;
-use crate::plans::AggregateFunction;
 use crate::plans::BoundColumnRef;
 use crate::plans::CastExpr;
-use crate::plans::EvalScalar;
 use crate::plans::FunctionCall;
 use crate::plans::LambdaFunc;
 use crate::plans::ScalarExpr;
 use crate::plans::ScalarItem;
 use crate::plans::Sort;
 use crate::plans::SortItem;
+use crate::plans::UDFCall;
+use crate::plans::VisitorMut as _;
 use crate::BindContext;
 use crate::IndexType;
-use crate::WindowChecker;
 
 #[derive(Debug)]
 pub struct OrderItems {
@@ -58,8 +57,7 @@ pub struct OrderItem {
 }
 
 impl Binder {
-    #[async_backtrace::framed]
-    pub async fn analyze_order_items(
+    pub fn analyze_order_items(
         &mut self,
         bind_context: &mut BindContext,
         scalar_items: &mut HashMap<IndexType, ScalarItem>,
@@ -69,20 +67,13 @@ impl Binder {
         distinct: bool,
     ) -> Result<OrderItems> {
         bind_context.set_expr_context(ExprContext::OrderByClause);
-        // null is the largest value in databend, smallest in hive
-        // TODO: rewrite after https://github.com/jorgecarleitao/arrow2/pull/1286 is merged
-        let default_nulls_first = !self
-            .ctx
-            .get_settings()
-            .get_sql_dialect()
-            .unwrap()
-            .is_null_biggest();
+        let default_nulls_first = self.ctx.get_settings().get_nulls_first();
 
         let mut order_items = Vec::with_capacity(order_by.len());
         for order in order_by {
             match &order.expr {
                 Expr::Literal {
-                    lit: Literal::UInt64(index),
+                    value: Literal::UInt64(index),
                     ..
                 } => {
                     let index = *index as usize;
@@ -96,11 +87,15 @@ impl Binder {
 
                     let index = index - 1;
                     let projection = &projections[index];
+
+                    let asc = order.asc.unwrap_or(true);
                     order_items.push(OrderItem {
                         index: projection.index,
                         name: projection.column_name.clone(),
-                        asc: order.asc.unwrap_or(true),
-                        nulls_first: order.nulls_first.unwrap_or(default_nulls_first),
+                        asc,
+                        nulls_first: order
+                            .nulls_first
+                            .unwrap_or_else(|| default_nulls_first(asc)),
                     });
                 }
                 _ => {
@@ -110,10 +105,8 @@ impl Binder {
                         &self.name_resolution_ctx,
                         self.metadata.clone(),
                         aliases,
-                        self.m_cte_bound_ctx.clone(),
-                        self.ctes_map.clone(),
                     );
-                    let (bound_expr, _) = scalar_binder.bind(&order.expr).await?;
+                    let (bound_expr, _) = scalar_binder.bind(&order.expr)?;
 
                     if let Some((idx, (alias, _))) = aliases
                         .iter()
@@ -121,11 +114,14 @@ impl Binder {
                         .find(|(_, (_, scalar))| bound_expr.eq(scalar))
                     {
                         // The order by expression is in the select list.
+                        let asc = order.asc.unwrap_or(true);
                         order_items.push(OrderItem {
                             index: projections[idx].index,
                             name: alias.clone(),
-                            asc: order.asc.unwrap_or(true),
-                            nulls_first: order.nulls_first.unwrap_or(default_nulls_first),
+                            asc,
+                            nulls_first: order
+                                .nulls_first
+                                .unwrap_or_else(|| default_nulls_first(asc)),
                         });
                     } else if distinct {
                         return Err(ErrorCode::SemanticError(
@@ -152,6 +148,10 @@ impl Binder {
                             )
                             .map_err(|e| ErrorCode::SemanticError(e.message()))?;
 
+                        if let ScalarExpr::ConstantExpr(..) = rewrite_scalar {
+                            continue;
+                        }
+
                         let column_binding =
                             if let ScalarExpr::BoundColumnRef(col) = &rewrite_scalar {
                                 col.column.clone()
@@ -159,6 +159,7 @@ impl Binder {
                                 self.create_derived_column_binding(
                                     format!("{:#}", order.expr),
                                     rewrite_scalar.data_type()?,
+                                    Some(rewrite_scalar.clone()),
                                 )
                             };
                         let item = ScalarItem {
@@ -166,11 +167,14 @@ impl Binder {
                             index: column_binding.index,
                         };
                         scalar_items.insert(column_binding.index, item);
+                        let asc = order.asc.unwrap_or(true);
                         order_items.push(OrderItem {
                             index: column_binding.index,
                             name: column_binding.column_name,
-                            asc: order.asc.unwrap_or(true),
-                            nulls_first: order.nulls_first.unwrap_or(default_nulls_first),
+                            asc,
+                            nulls_first: order
+                                .nulls_first
+                                .unwrap_or_else(|| default_nulls_first(asc)),
                         });
                     }
                 }
@@ -179,49 +183,25 @@ impl Binder {
         Ok(OrderItems { items: order_items })
     }
 
-    #[async_backtrace::framed]
-    pub async fn bind_order_by(
+    pub fn bind_order_by(
         &mut self,
         from_context: &BindContext,
         order_by: OrderItems,
         select_list: &SelectList<'_>,
-        scalar_items: &mut HashMap<IndexType, ScalarItem>,
         child: SExpr,
     ) -> Result<SExpr> {
         let mut order_by_items = Vec::with_capacity(order_by.items.len());
-        let mut scalars = vec![];
-
         for order in order_by.items {
             if from_context.in_grouping {
-                let group_checker = GroupingChecker::new(from_context);
+                let mut group_checker = GroupingChecker::new(from_context);
                 // Perform grouping check on original scalar expression if order item is alias.
                 if let Some(scalar_item) = select_list
                     .items
                     .iter()
                     .find(|item| item.alias == order.name)
                 {
-                    group_checker.resolve(&scalar_item.scalar, None)?;
-                }
-            }
-
-            if let Entry::Occupied(entry) = scalar_items.entry(order.index) {
-                let need_eval = !matches!(entry.get().scalar, ScalarExpr::BoundColumnRef(_));
-                if need_eval {
-                    // Remove the entry to avoid bind again in later process (bind_projection).
-                    let (index, item) = entry.remove_entry();
-                    let mut scalar = item.scalar;
-                    let mut need_group_check = false;
-                    if let ScalarExpr::AggregateFunction(_) = scalar {
-                        need_group_check = true;
-                    }
-                    if from_context.in_grouping || need_group_check {
-                        let group_checker = GroupingChecker::new(from_context);
-                        scalar = group_checker.resolve(&scalar, None)?;
-                    } else if !from_context.windows.window_functions.is_empty() {
-                        let window_checker = WindowChecker::new(from_context);
-                        scalar = window_checker.resolve(&scalar)?;
-                    }
-                    scalars.push(ScalarItem { scalar, index });
+                    let mut scalar = scalar_item.scalar.clone();
+                    group_checker.visit(&mut scalar)?;
                 }
             }
 
@@ -234,77 +214,15 @@ impl Binder {
             order_by_items.push(order_by_item);
         }
 
-        let mut new_expr = if !scalars.is_empty() {
-            let eval_scalar = EvalScalar { items: scalars };
-            SExpr::create_unary(Arc::new(eval_scalar.into()), Arc::new(child))
-        } else {
-            child
-        };
-
         let sort_plan = Sort {
             items: order_by_items,
             limit: None,
-            after_exchange: false,
+            after_exchange: None,
             pre_projection: None,
+            window_partition: None,
         };
-        new_expr = SExpr::create_unary(Arc::new(sort_plan.into()), Arc::new(new_expr));
+        let new_expr = SExpr::create_unary(Arc::new(sort_plan.into()), Arc::new(child));
         Ok(new_expr)
-    }
-
-    #[async_backtrace::framed]
-    pub(crate) async fn bind_order_by_for_set_operation(
-        &mut self,
-        bind_context: &mut BindContext,
-        child: SExpr,
-        order_by: &[OrderByExpr],
-    ) -> Result<SExpr> {
-        let mut scalar_binder = ScalarBinder::new(
-            bind_context,
-            self.ctx.clone(),
-            &self.name_resolution_ctx,
-            self.metadata.clone(),
-            &[],
-            self.m_cte_bound_ctx.clone(),
-            self.ctes_map.clone(),
-        );
-        let mut order_by_items = Vec::with_capacity(order_by.len());
-        for order in order_by.iter() {
-            match order.expr {
-                Expr::ColumnRef { .. } => {
-                    let scalar = scalar_binder.bind(&order.expr).await?.0;
-                    match scalar {
-                        ScalarExpr::BoundColumnRef(BoundColumnRef { column, .. }) => {
-                            let order_by_item = SortItem {
-                                index: column.index,
-                                asc: order.asc.unwrap_or(true),
-                                nulls_first: order.nulls_first.unwrap_or(false),
-                            };
-                            order_by_items.push(order_by_item);
-                        }
-                        _ => {
-                            return Err(ErrorCode::Internal("scalar should be BoundColumnRef")
-                                .set_span(order.expr.span()));
-                        }
-                    }
-                }
-                _ => {
-                    return Err(
-                        ErrorCode::SemanticError("can only order by column".to_string())
-                            .set_span(order.expr.span()),
-                    );
-                }
-            }
-        }
-        let sort_plan = Sort {
-            items: order_by_items,
-            limit: None,
-            after_exchange: false,
-            pre_projection: None,
-        };
-        Ok(SExpr::create_unary(
-            Arc::new(sort_plan.into()),
-            Arc::new(child),
-        ))
     }
 
     #[allow(clippy::only_used_in_recursion)]
@@ -321,28 +239,11 @@ impl Binder {
         match replacement_opt {
             Some(replacement) => Ok(replacement),
             None => match original_scalar {
-                ScalarExpr::AggregateFunction(AggregateFunction {
-                    display_name,
-                    func_name,
-                    distinct,
-                    params,
-                    args,
-                    return_type,
-                }) => {
-                    let args = args
-                        .iter()
-                        .map(|arg| {
-                            self.rewrite_scalar_with_replacement(bind_context, arg, replacement_fn)
-                        })
-                        .collect::<Result<Vec<_>>>()?;
-                    Ok(ScalarExpr::AggregateFunction(AggregateFunction {
-                        display_name: display_name.clone(),
-                        func_name: func_name.clone(),
-                        distinct: *distinct,
-                        params: params.clone(),
-                        args,
-                        return_type: return_type.clone(),
-                    }))
+                aggregate @ ScalarExpr::AggregateFunction(_) => {
+                    let mut aggregate = aggregate.clone();
+                    let mut rewriter = AggregateRewriter::new(bind_context, self.metadata.clone());
+                    rewriter.visit(&mut aggregate)?;
+                    Ok(aggregate)
                 }
                 ScalarExpr::LambdaFunction(lambda_func) => {
                     let args = lambda_func
@@ -355,16 +256,17 @@ impl Binder {
                     Ok(ScalarExpr::LambdaFunction(LambdaFunc {
                         span: lambda_func.span,
                         func_name: lambda_func.func_name.clone(),
-                        display_name: lambda_func.display_name.clone(),
                         args,
-                        params: lambda_func.params.clone(),
                         lambda_expr: lambda_func.lambda_expr.clone(),
+                        lambda_display: lambda_func.lambda_display.clone(),
                         return_type: lambda_func.return_type.clone(),
                     }))
                 }
                 window @ ScalarExpr::WindowFunction(_) => {
+                    let mut window = window.clone();
                     let mut rewriter = WindowRewriter::new(bind_context, self.metadata.clone());
-                    rewriter.visit(window)
+                    rewriter.visit(&mut window)?;
+                    Ok(window)
                 }
                 ScalarExpr::FunctionCall(func) => {
                     let arguments = func
@@ -398,6 +300,26 @@ impl Binder {
                         argument,
                         target_type: target_type.clone(),
                     }))
+                }
+                ScalarExpr::UDFCall(udf) => {
+                    let new_args = udf
+                        .arguments
+                        .iter()
+                        .map(|arg| {
+                            self.rewrite_scalar_with_replacement(bind_context, arg, replacement_fn)
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    Ok(UDFCall {
+                        span: udf.span,
+                        name: udf.name.clone(),
+                        handler: udf.handler.clone(),
+                        display_name: udf.display_name.clone(),
+                        udf_type: udf.udf_type.clone(),
+                        arg_types: udf.arg_types.clone(),
+                        return_type: udf.return_type.clone(),
+                        arguments: new_args,
+                    }
+                    .into())
                 }
                 _ => Ok(original_scalar.clone()),
             },

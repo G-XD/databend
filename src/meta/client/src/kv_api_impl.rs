@@ -12,54 +12,52 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use common_meta_kvapi::kvapi;
-use common_meta_kvapi::kvapi::GetKVReply;
-use common_meta_kvapi::kvapi::GetKVReq;
-use common_meta_kvapi::kvapi::ListKVReply;
-use common_meta_kvapi::kvapi::ListKVReq;
-use common_meta_kvapi::kvapi::MGetKVReply;
-use common_meta_kvapi::kvapi::MGetKVReq;
-use common_meta_kvapi::kvapi::UpsertKVReply;
-use common_meta_kvapi::kvapi::UpsertKVReq;
-use common_meta_types::MetaError;
-use common_meta_types::TxnReply;
-use common_meta_types::TxnRequest;
+use databend_common_meta_kvapi::kvapi;
+use databend_common_meta_kvapi::kvapi::KVStream;
+use databend_common_meta_kvapi::kvapi::ListKVReq;
+use databend_common_meta_kvapi::kvapi::MGetKVReq;
+use databend_common_meta_kvapi::kvapi::UpsertKVReply;
+use databend_common_meta_types::MetaError;
+use databend_common_meta_types::TxnReply;
+use databend_common_meta_types::TxnRequest;
+use databend_common_meta_types::UpsertKV;
+use futures::StreamExt;
+use futures::TryStreamExt;
 
 use crate::ClientHandle;
+use crate::Streamed;
 
 #[tonic::async_trait]
 impl kvapi::KVApi for ClientHandle {
     type Error = MetaError;
 
-    async fn upsert_kv(&self, act: UpsertKVReq) -> Result<UpsertKVReply, Self::Error> {
+    #[fastrace::trace]
+    async fn upsert_kv(&self, act: UpsertKV) -> Result<UpsertKVReply, Self::Error> {
         let reply = self.request(act).await?;
         Ok(reply)
     }
 
-    async fn get_kv(&self, key: &str) -> Result<GetKVReply, Self::Error> {
-        let reply = self
-            .request(GetKVReq {
-                key: key.to_string(),
-            })
-            .await?;
-        Ok(reply)
-    }
-
-    async fn mget_kv(&self, keys: &[String]) -> Result<MGetKVReply, Self::Error> {
+    #[fastrace::trace]
+    async fn get_kv_stream(&self, keys: &[String]) -> Result<KVStream<Self::Error>, Self::Error> {
         let keys = keys.to_vec();
-        let reply = self.request(MGetKVReq { keys }).await?;
-        Ok(reply)
+        let strm = self.request(Streamed(MGetKVReq { keys })).await?;
+        let strm = strm.map_err(MetaError::from);
+        Ok(strm.boxed())
     }
 
-    async fn prefix_list_kv(&self, prefix: &str) -> Result<ListKVReply, Self::Error> {
-        let reply = self
-            .request(ListKVReq {
+    #[fastrace::trace]
+    async fn list_kv(&self, prefix: &str) -> Result<KVStream<Self::Error>, Self::Error> {
+        let strm = self
+            .request(Streamed(ListKVReq {
                 prefix: prefix.to_string(),
-            })
+            }))
             .await?;
-        Ok(reply)
+
+        let strm = strm.map_err(MetaError::from);
+        Ok(strm.boxed())
     }
 
+    #[fastrace::trace]
     async fn transaction(&self, txn: TxnRequest) -> Result<TxnReply, Self::Error> {
         let reply = self.request(txn).await?;
         Ok(reply)

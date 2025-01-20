@@ -12,35 +12,35 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use common_arrow::arrow::bitmap::MutableBitmap;
-use common_catalog::table_context::TableContext;
-use common_exception::Result;
-use common_expression::types::DataType;
-use common_expression::types::NumberColumnBuilder;
-use common_expression::types::NumberDataType;
-use common_expression::types::NumberScalar;
-use common_expression::types::UInt64Type;
-use common_expression::types::ValueType;
-use common_expression::BlockEntry;
-use common_expression::Column;
-use common_expression::DataBlock;
-use common_expression::DataField;
-use common_expression::DataSchemaRef;
-use common_expression::DataSchemaRefExt;
-use common_expression::ScalarRef;
-use common_expression::SortColumnDescription;
-use common_expression::Value;
-use common_expression::ValueRef;
-use common_functions::BUILTIN_FUNCTIONS;
-use common_pipeline_transforms::processors::transforms::sort_merge;
-use common_sql::executor::RangeJoin;
+use databend_common_catalog::table_context::TableContext;
+use databend_common_column::bitmap::Bitmap;
+use databend_common_column::bitmap::MutableBitmap;
+use databend_common_exception::Result;
+use databend_common_expression::types::DataType;
+use databend_common_expression::types::NumberColumnBuilder;
+use databend_common_expression::types::NumberDataType;
+use databend_common_expression::types::NumberScalar;
+use databend_common_expression::types::UInt64Type;
+use databend_common_expression::types::ValueType;
+use databend_common_expression::BlockEntry;
+use databend_common_expression::Column;
+use databend_common_expression::DataBlock;
+use databend_common_expression::DataField;
+use databend_common_expression::DataSchemaRef;
+use databend_common_expression::DataSchemaRefExt;
+use databend_common_expression::ScalarRef;
+use databend_common_expression::SortColumnDescription;
+use databend_common_expression::Value;
+use databend_common_functions::BUILTIN_FUNCTIONS;
+use databend_common_pipeline_transforms::processors::sort_merge;
+use databend_common_sql::executor::physical_plans::RangeJoin;
 
-use crate::pipelines::processors::transforms::range_join::ie_join_util::filter_block;
-use crate::pipelines::processors::transforms::range_join::ie_join_util::order_match;
-use crate::pipelines::processors::transforms::range_join::ie_join_util::probe_l1;
+use crate::pipelines::processors::transforms::range_join::filter_block;
+use crate::pipelines::processors::transforms::range_join::order_match;
+use crate::pipelines::processors::transforms::range_join::probe_l1;
 use crate::pipelines::processors::transforms::range_join::RangeJoinState;
 
-pub(crate) struct IEJoinState {
+pub struct IEJoinState {
     l1_data_type: DataType,
     // Sort description for L1
     pub(crate) l1_sort_descriptions: Vec<SortColumnDescription>,
@@ -81,19 +81,16 @@ impl IEJoinState {
                 offset: 0,
                 asc: l1_order,
                 nulls_first: false,
-                is_nullable: l1_data_type.is_nullable(),
             },
             SortColumnDescription {
                 offset: 1,
                 asc: l2_order,
                 nulls_first: false,
-                is_nullable: l2_data_type.is_nullable(),
             },
             SortColumnDescription {
                 offset: 2,
                 asc: false,
                 nulls_first: false,
-                is_nullable: false,
             },
         ];
 
@@ -102,20 +99,17 @@ impl IEJoinState {
                 offset: 1,
                 asc: l2_order,
                 nulls_first: false,
-                is_nullable: l2_data_type.is_nullable(),
             },
             SortColumnDescription {
                 offset: 0,
                 asc: l1_order,
                 nulls_first: false,
-                is_nullable: l1_data_type.is_nullable(),
             },
             // `_tuple_id` column
             SortColumnDescription {
                 offset: 2,
                 asc: false,
                 nulls_first: false,
-                is_nullable: false,
             },
         ];
 
@@ -131,6 +125,10 @@ impl IEJoinState {
     fn intersection(&self, left_block: &DataBlock, right_block: &DataBlock) -> bool {
         let left_len = left_block.num_rows();
         let right_len = right_block.num_rows();
+        if left_len == 0 || right_len == 0 {
+            return false;
+        }
+
         let left_l1_column = left_block.columns()[0]
             .value
             .convert_to_full_column(&self.l1_data_type, left_len);
@@ -203,6 +201,9 @@ impl RangeJoinState {
             block_size,
             ie_join_state.l1_sort_descriptions.clone(),
             left_sorted_blocks,
+            self.ctx.get_settings().get_sort_spilling_batch_bytes()?,
+            self.ctx.get_settings().get_enable_loser_tree_merge_sort()?,
+            false,
         )?;
 
         // Add a column at the end of `left_sorted_blocks`, named `_pos`, which is used to record the position of the block in the original table
@@ -248,6 +249,9 @@ impl RangeJoinState {
             block_size,
             ie_join_state.l2_sort_descriptions.clone(),
             l2_sorted_blocks,
+            self.ctx.get_settings().get_sort_spilling_batch_bytes()?,
+            self.ctx.get_settings().get_enable_loser_tree_merge_sort()?,
+            false,
         )?)?;
 
         // The pos col of l2 sorted blocks is permutation array
@@ -259,14 +263,13 @@ impl RangeJoinState {
             .value
             .try_downcast::<UInt64Type>()
             .unwrap();
-        if let ValueRef::Column(col) = column.as_ref() {
-            for val in UInt64Type::iter_column(&col) {
+        if let Value::Column(col) = &column {
+            for val in UInt64Type::iter_column(col) {
                 p_array.push(val)
             }
         }
         // Initialize bit_array
-        let mut bit_array = MutableBitmap::with_capacity(p_array.len());
-        bit_array.extend_constant(p_array.len(), false);
+        let bit_array = Bitmap::new_constant(false, p_array.len()).make_mut();
 
         let l2 = &merged_blocks.columns()[1].value.convert_to_full_column(
             self.conditions[0]
@@ -315,10 +318,10 @@ impl RangeJoinState {
                     continue;
                 }
             }
+            let idx_val = unsafe { l2.index_unchecked(idx) };
             while off2 < len {
-                let order =
-                    unsafe { l2.index_unchecked(idx) }.cmp(&unsafe { l2.index_unchecked(off2) });
-                if !order_match(&self.conditions[1].operator, order) {
+                let off2_val = unsafe { l2.index_unchecked(off2) };
+                if !order_match(&self.conditions[1].operator, &idx_val, &off2_val) {
                     break;
                 }
                 let p2 = p_array[off2];
@@ -363,13 +366,16 @@ impl RangeJoinState {
             indices.push((0u32, *res as u32, 1usize));
         }
         let mut left_result_block =
-            DataBlock::take_blocks(&[&left_table[left_idx]], &indices, indices.len());
+            DataBlock::take_blocks(&left_table[left_idx..left_idx + 1], &indices, indices.len());
         indices.clear();
         for res in right_buffer.iter() {
             indices.push((0u32, *res as u32, 1usize));
         }
-        let right_result_block =
-            DataBlock::take_blocks(&[&right_table[right_idx]], &indices, indices.len());
+        let right_result_block = DataBlock::take_blocks(
+            &right_table[right_idx..right_idx + 1],
+            &indices,
+            indices.len(),
+        );
         // Merge left_result_block and right_result_block
         for col in right_result_block.columns() {
             left_result_block.add_column(col.clone());

@@ -1,4 +1,4 @@
-// Copyright 2021 Datafuse Labs.
+// Copyright 2021 Datafuse Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,12 +19,12 @@ use std::fmt::Display;
 use std::sync::Arc;
 use std::time::Duration;
 
-use common_base::base::Stoppable;
-use common_meta_client::ClientHandle;
-use common_meta_client::MetaGrpcClient;
-use common_meta_kvapi::kvapi::KVApi;
-use common_meta_kvapi::kvapi::UpsertKVReq;
-use common_meta_types::MetaClientError;
+use databend_common_base::base::Stoppable;
+use databend_common_meta_client::ClientHandle;
+use databend_common_meta_client::MetaGrpcClient;
+use databend_common_meta_kvapi::kvapi::KVApi;
+use databend_common_meta_types::MetaClientError;
+use databend_common_meta_types::UpsertKV;
 use log::info;
 use test_harness::test;
 
@@ -37,7 +37,7 @@ use crate::tests::service::start_metasrv_cluster;
 /// - Shutdown node 1.
 /// - Test upsert kv, expect the client auto choose the running nodes.
 #[test(harness = meta_service_test_harness)]
-#[minitrace::trace]
+#[fastrace::trace]
 async fn test_metasrv_connection_error() -> anyhow::Result<()> {
     info!("--- Start cluster 0,1,2");
     let mut tcs = start_metasrv_cluster(&[0, 1, 2]).await?;
@@ -84,7 +84,7 @@ async fn test_metasrv_connection_error() -> anyhow::Result<()> {
 /// - Shutdown follower node 1.
 /// - Test upsert kv, expect the client to auto choose the running nodes.
 #[test(harness = meta_service_test_harness)]
-#[minitrace::trace]
+#[fastrace::trace]
 async fn test_metasrv_one_client_follower_down() -> anyhow::Result<()> {
     info!("--- Start cluster 0,1,2");
     let mut tcs = start_metasrv_cluster(&[0, 1, 2]).await?;
@@ -117,7 +117,7 @@ async fn test_metasrv_one_client_follower_down() -> anyhow::Result<()> {
 /// - Shutdown leader node 0.
 /// - Test upsert kv, expect the client to auto choose the running nodes.
 #[test(harness = meta_service_test_harness)]
-#[minitrace::trace]
+#[fastrace::trace]
 async fn test_metasrv_one_client_leader_down() -> anyhow::Result<()> {
     info!("--- Start cluster 0,1,2");
     let mut tcs = start_metasrv_cluster(&[0, 1, 2]).await?;
@@ -151,7 +151,6 @@ fn make_client(addresses: Vec<String>) -> Result<Arc<ClientHandle>, MetaClientEr
         "xxx",
         None,
         Some(Duration::from_secs(10)),
-        Duration::from_secs(10),
         None,
     )?;
 
@@ -163,7 +162,7 @@ async fn test_write_read(client: &Arc<ClientHandle>, key: impl Display) -> anyho
     info!("--- test write/read: {}", key);
 
     let k = key.to_string();
-    let res = client.upsert_kv(UpsertKVReq::update(&k, &b(&k))).await?;
+    let res = client.upsert_kv(UpsertKV::update(&k, &b(&k))).await?;
 
     info!("--- upsert {} res: {:?}", k, res);
 

@@ -19,23 +19,31 @@ use std::fmt;
 use std::fmt::Display;
 use std::fmt::Formatter;
 use std::ops::Deref;
+use std::ops::Range;
 use std::sync::Arc;
+use std::time::Duration;
 
+use anyerror::func_name;
 use chrono::DateTime;
 use chrono::Utc;
-use common_exception::Result;
-use common_expression::FieldIndex;
-use common_expression::TableField;
-use common_expression::TableSchema;
-use common_meta_types::MatchSeq;
-use common_meta_types::MetaId;
+use databend_common_exception::ErrorCode;
+use databend_common_exception::Result;
+use databend_common_expression::FieldIndex;
+use databend_common_expression::TableField;
+use databend_common_expression::TableSchema;
+use databend_common_meta_types::MatchSeq;
+use databend_common_meta_types::MetaId;
 use maplit::hashmap;
 
-use crate::schema::database::DatabaseNameIdent;
-use crate::share::ShareNameIdent;
-use crate::share::ShareSpec;
-use crate::share::ShareTableInfoMap;
+use super::CatalogInfo;
+use super::CreateOption;
+use super::DatabaseId;
+use super::MarkedDeletedIndexMeta;
+use crate::schema::database_name_ident::DatabaseNameIdent;
+use crate::schema::table_niv::TableNIV;
 use crate::storage::StorageParams;
+use crate::tenant::Tenant;
+use crate::tenant::ToTenant;
 
 /// Globally unique identifier of a version of TableMeta.
 #[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, Eq, PartialEq, Default)]
@@ -60,29 +68,33 @@ impl TableIdent {
 }
 
 impl Display for TableIdent {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         write!(f, "table_id:{}, ver:{}", self.table_id, self.seq)
     }
 }
 
-#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, Eq, PartialEq, Default)]
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub struct TableNameIdent {
-    pub tenant: String,
+    pub tenant: Tenant,
     pub db_name: String,
     pub table_name: String,
 }
 
 impl TableNameIdent {
     pub fn new(
-        tenant: impl Into<String>,
-        db_name: impl Into<String>,
-        table_name: impl Into<String>,
+        tenant: impl ToTenant,
+        db_name: impl ToString,
+        table_name: impl ToString,
     ) -> TableNameIdent {
         TableNameIdent {
-            tenant: tenant.into(),
-            db_name: db_name.into(),
-            table_name: table_name.into(),
+            tenant: tenant.to_tenant(),
+            db_name: db_name.to_string(),
+            table_name: table_name.to_string(),
         }
+    }
+
+    pub fn tenant(&self) -> &Tenant {
+        &self.tenant
     }
 
     pub fn table_name(&self) -> String {
@@ -90,77 +102,88 @@ impl TableNameIdent {
     }
 
     pub fn db_name_ident(&self) -> DatabaseNameIdent {
-        DatabaseNameIdent {
-            tenant: self.tenant.clone(),
-            db_name: self.db_name.clone(),
-        }
+        DatabaseNameIdent::new(&self.tenant, &self.db_name)
     }
 }
 
 impl Display for TableNameIdent {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         write!(
             f,
             "'{}'.'{}'.'{}'",
-            self.tenant, self.db_name, self.table_name
+            self.tenant.tenant_name(),
+            self.db_name,
+            self.table_name
         )
     }
 }
 
-#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, Eq, PartialEq, Default)]
+#[derive(Clone, Debug, Eq, PartialEq, Default)]
 pub struct DBIdTableName {
     pub db_id: u64,
     pub table_name: String,
 }
 
+impl DBIdTableName {
+    pub fn new(db_id: u64, table_name: impl ToString) -> Self {
+        DBIdTableName {
+            db_id,
+            table_name: table_name.to_string(),
+        }
+    }
+    pub fn display(&self) -> impl Display {
+        format!("{}.'{}'", self.db_id, self.table_name)
+    }
+}
+
 impl Display for DBIdTableName {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         write!(f, "{}.'{}'", self.db_id, self.table_name)
     }
 }
 
-#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, Eq, PartialEq, Default)]
+#[derive(Clone, Debug, Eq, PartialEq, Default)]
 pub struct TableId {
     pub table_id: u64,
 }
 
+impl TableId {
+    pub fn new(table_id: u64) -> Self {
+        TableId { table_id }
+    }
+}
+
 impl Display for TableId {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         write!(f, "TableId{{{}}}", self.table_id)
     }
 }
 
-#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, Eq, PartialEq, Default)]
-pub struct TableIdListKey {
-    pub db_id: u64,
+/// The meta-service key for storing table id history ever used by a table name
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+pub struct TableIdHistoryIdent {
+    pub database_id: u64,
     pub table_name: String,
 }
 
-impl Display for TableIdListKey {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        write!(f, "{}.'{}'", self.db_id, self.table_name)
+impl Display for TableIdHistoryIdent {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+        write!(f, "{}.'{}'", self.database_id, self.table_name)
     }
 }
 
+// serde is required by [`TableInfo`]
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug, Eq, PartialEq, Default)]
 pub enum DatabaseType {
     #[default]
     NormalDB,
-    ShareDB(ShareNameIdent),
 }
 
 impl Display for DatabaseType {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         match self {
             DatabaseType::NormalDB => {
                 write!(f, "normal database")
-            }
-            DatabaseType::ShareDB(share_ident) => {
-                write!(
-                    f,
-                    "share database: {}-{}",
-                    share_ident.tenant, share_ident.share_name
-                )
             }
         }
     }
@@ -168,6 +191,9 @@ impl Display for DatabaseType {
 
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug, Eq, PartialEq, Default)]
 pub struct TableInfo {
+    /// For a temp table,
+    /// `ident.seq` is always 0.
+    /// `id.table_id` is set as value of `TempTblId`.
     pub ident: TableIdent,
 
     /// For a table it is `db_name.table_name`.
@@ -185,10 +211,25 @@ pub struct TableInfo {
     /// `name`, `id` or `version` is not included in the table structure definition.
     pub meta: TableMeta,
 
-    pub tenant: String,
+    /// The corresponding catalog info of this table.
+    pub catalog_info: Arc<CatalogInfo>,
 
     // table belong to which type of database.
     pub db_type: DatabaseType,
+}
+
+impl TableInfo {
+    pub fn database_name(&self) -> Result<&str> {
+        if self.engine() != "FUSE" {
+            return Err(ErrorCode::Internal(format!(
+                "Invalid engine: {}",
+                self.engine()
+            )));
+        }
+        let database_name = self.desc.split('.').next().unwrap();
+        let database_name = &database_name[1..database_name.len() - 1];
+        Ok(database_name)
+    }
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug, Eq, PartialEq, Default)]
@@ -215,18 +256,17 @@ pub struct TableStatistics {
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug, Eq, PartialEq)]
 pub struct TableMeta {
     pub schema: Arc<TableSchema>,
-    pub catalog: String,
     pub engine: String,
     pub engine_options: BTreeMap<String, String>,
     pub storage_params: Option<StorageParams>,
     pub part_prefix: String,
     pub options: BTreeMap<String, String>,
-    // The default cluster key.
-    pub default_cluster_key: Option<String>,
-    // All cluster keys that have been defined.
-    pub cluster_keys: Vec<String>,
-    // The sequence number of default_cluster_key in cluster_keys.
-    pub default_cluster_key_id: Option<u32>,
+    pub cluster_key: Option<String>,
+    /// A sequential number that uniquely identifies changes to the cluster key.
+    /// This value increments by 1 each time the cluster key is created or modified,
+    /// ensuring a unique identifier for each version of the cluster key.
+    /// It remains unchanged when the cluster key is dropped.
+    pub cluster_key_seq: u32,
     pub created_on: DateTime<Utc>,
     pub updated_on: DateTime<Utc>,
     pub comment: String,
@@ -238,25 +278,33 @@ pub struct TableMeta {
     // shared by share_id
     pub shared_by: BTreeSet<u64>,
     pub column_mask_policy: Option<BTreeMap<String, String>>,
+    pub indexes: BTreeMap<String, TableIndex>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, Eq, PartialEq)]
+pub struct TableIndex {
+    pub name: String,
+    pub column_ids: Vec<u32>,
+    // if true, index will create after data written to databend,
+    // no need execute refresh index manually.
+    pub sync_creation: bool,
+    // if the index columns or options change,
+    // the index data needs to be regenerated,
+    // version is used to identify each change.
+    pub version: String,
+    // index options specify the index configs, like tokenizer.
+    pub options: BTreeMap<String, String>,
 }
 
 impl TableMeta {
-    pub fn add_columns(&mut self, fields: &[TableField], field_comments: &[String]) -> Result<()> {
-        let mut new_schema = self.schema.as_ref().to_owned();
-        new_schema.add_columns(fields)?;
-        self.schema = Arc::new(new_schema);
-        field_comments.iter().for_each(|c| {
-            self.field_comments.push(c.to_owned());
-        });
-        Ok(())
-    }
-
     pub fn add_column(
         &mut self,
         field: &TableField,
         comment: &str,
         index: FieldIndex,
     ) -> Result<()> {
+        self.fill_field_comments();
+
         let mut new_schema = self.schema.as_ref().to_owned();
         new_schema.add_column(field, index)?;
         self.schema = Arc::new(new_schema);
@@ -265,11 +313,22 @@ impl TableMeta {
     }
 
     pub fn drop_column(&mut self, column: &str) -> Result<()> {
+        self.fill_field_comments();
+
         let mut new_schema = self.schema.as_ref().to_owned();
         let index = new_schema.drop_column(column)?;
         self.field_comments.remove(index);
         self.schema = Arc::new(new_schema);
         Ok(())
+    }
+
+    /// To fix the field comments panic.
+    pub fn fill_field_comments(&mut self) {
+        let num_fields = self.schema.num_fields();
+        // If the field comments is confused, fill it with empty string.
+        if self.field_comments.len() < num_fields {
+            self.field_comments = vec!["".to_string(); num_fields];
+        }
     }
 }
 
@@ -287,6 +346,7 @@ impl TableInfo {
         }
     }
 
+    /// Deprecated: use `new_full()`. This method sets default values for some fields.
     pub fn new(db_name: &str, table_name: &str, ident: TableIdent, meta: TableMeta) -> TableInfo {
         TableInfo {
             ident,
@@ -294,6 +354,24 @@ impl TableInfo {
             name: table_name.to_string(),
             meta,
             ..Default::default()
+        }
+    }
+
+    pub fn new_full(
+        db_name: &str,
+        table_name: &str,
+        ident: TableIdent,
+        meta: TableMeta,
+        catalog_info: Arc<CatalogInfo>,
+        db_type: DatabaseType,
+    ) -> TableInfo {
+        TableInfo {
+            ident,
+            desc: format!("'{}'.'{}'", db_name, table_name),
+            name: table_name.to_string(),
+            meta,
+            catalog_info,
+            db_type,
         }
     }
 
@@ -305,8 +383,12 @@ impl TableInfo {
         &self.meta.options
     }
 
+    pub fn options_mut(&mut self) -> &mut BTreeMap<String, String> {
+        &mut self.meta.options
+    }
+
     pub fn catalog(&self) -> &str {
-        &self.meta.catalog
+        &self.catalog_info.name_ident.catalog_name
     }
 
     pub fn engine(&self) -> &str {
@@ -326,21 +408,26 @@ impl TableInfo {
         self.meta.schema = schema;
         self
     }
+
+    pub fn cluster_key(&self) -> Option<(u32, String)> {
+        self.meta
+            .cluster_key
+            .clone()
+            .map(|k| (self.meta.cluster_key_seq, k))
+    }
 }
 
 impl Default for TableMeta {
     fn default() -> Self {
         TableMeta {
             schema: Arc::new(TableSchema::empty()),
-            catalog: "default".to_string(),
-            engine: "".to_string(),
+            engine: "FUSE".to_string(),
             engine_options: BTreeMap::new(),
             storage_params: None,
             part_prefix: "".to_string(),
             options: BTreeMap::new(),
-            default_cluster_key: None,
-            cluster_keys: vec![],
-            default_cluster_key_id: None,
+            cluster_key: None,
+            cluster_key_seq: 0,
             created_on: Utc::now(),
             updated_on: Utc::now(),
             comment: "".to_string(),
@@ -349,34 +436,22 @@ impl Default for TableMeta {
             statistics: Default::default(),
             shared_by: BTreeSet::new(),
             column_mask_policy: None,
+            indexes: BTreeMap::new(),
         }
     }
 }
 
-impl TableMeta {
-    pub fn push_cluster_key(mut self, cluster_key: String) -> Self {
-        self.cluster_keys.push(cluster_key.clone());
-        self.default_cluster_key = Some(cluster_key);
-        self.default_cluster_key_id = Some(self.cluster_keys.len() as u32 - 1);
-        self
-    }
-
-    pub fn cluster_key(&self) -> Option<(u32, String)> {
-        self.default_cluster_key_id
-            .zip(self.default_cluster_key.clone())
-    }
-}
-
 impl Display for TableMeta {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         write!(
             f,
-            "Engine: {}={:?}, Schema: {:?}, Options: {:?}, FieldComments: {:?} CreatedOn: {:?} DropOn: {:?}",
+            "Engine: {}={:?}, Schema: {:?}, Options: {:?}, FieldComments: {:?} Indexes: {:?} CreatedOn: {:?} DropOn: {:?}",
             self.engine,
             self.engine_options,
             self.schema,
             self.options,
             self.field_comments,
+            self.indexes,
             self.created_on,
             self.drop_on,
         )
@@ -384,7 +459,7 @@ impl Display for TableMeta {
 }
 
 impl Display for TableInfo {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         write!(
             f,
             "DB.Table: {}, Table: {}-{}, Engine: {}",
@@ -402,6 +477,12 @@ pub struct TableIdList {
 impl TableIdList {
     pub fn new() -> TableIdList {
         TableIdList::default()
+    }
+
+    pub fn new_with_ids(ids: impl IntoIterator<Item = u64>) -> TableIdList {
+        TableIdList {
+            id_list: ids.into_iter().collect(),
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -424,26 +505,34 @@ impl TableIdList {
         self.id_list.pop()
     }
 
-    pub fn last(&mut self) -> Option<&u64> {
+    pub fn last(&self) -> Option<&u64> {
         self.id_list.last()
     }
 }
 
 impl Display for TableIdList {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         write!(f, "DB.Table id list: {:?}", self.id_list)
     }
 }
 
-#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CreateTableReq {
-    pub if_not_exists: bool,
+    pub create_option: CreateOption,
     pub name_ident: TableNameIdent,
     pub table_meta: TableMeta,
+
+    /// Set it to true if a dropped table needs to be created,
+    ///
+    /// since [CreateOption] is used by various scenarios, we use
+    /// this dedicated flag to mark this behavior.
+    ///
+    /// currently used in atomic CTAS.
+    pub as_dropped: bool,
 }
 
 impl CreateTableReq {
-    pub fn tenant(&self) -> &str {
+    pub fn tenant(&self) -> &Tenant {
         &self.name_ident.tenant
     }
     pub fn db_name(&self) -> &str {
@@ -455,29 +544,67 @@ impl CreateTableReq {
 }
 
 impl Display for CreateTableReq {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "create_table(if_not_exists={}):{}/{}-{}={}",
-            self.if_not_exists,
-            self.tenant(),
-            self.db_name(),
-            self.table_name(),
-            self.table_meta
-        )
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+        match self.create_option {
+            CreateOption::Create => write!(
+                f,
+                "create_table:{}/{}-{}={}",
+                self.tenant().tenant_name(),
+                self.db_name(),
+                self.table_name(),
+                self.table_meta
+            ),
+            CreateOption::CreateIfNotExists => write!(
+                f,
+                "create_table_if_not_exists:{}/{}-{}={}",
+                self.tenant().tenant_name(),
+                self.db_name(),
+                self.table_name(),
+                self.table_meta
+            ),
+            CreateOption::CreateOrReplace => write!(
+                f,
+                "create_or_replace_table:{}/{}-{}={}",
+                self.tenant().tenant_name(),
+                self.db_name(),
+                self.table_name(),
+                self.table_meta
+            ),
+        }
     }
 }
 
-#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CreateTableReply {
     pub table_id: u64,
+    pub table_id_seq: Option<u64>,
+    pub db_id: u64,
     pub new_table: bool,
+    // (db id, removed table id)
+    pub spec_vec: Option<(u64, u64)>,
+    pub prev_table_id: Option<u64>,
+    pub orphan_table_name: Option<String>,
 }
 
-#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
+/// Drop table by id.
+///
+/// Dropping a table requires just `table_id`, but when dropping a table, it also needs to update
+/// the count of tables belonging to a tenant, which require tenant information.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DropTableByIdReq {
     pub if_exists: bool,
+
+    pub tenant: Tenant,
+
     pub tb_id: MetaId,
+
+    pub table_name: String,
+
+    pub db_id: MetaId,
+
+    pub engine: String,
+
+    pub session_id: String,
 }
 
 impl DropTableByIdReq {
@@ -487,7 +614,7 @@ impl DropTableByIdReq {
 }
 
 impl Display for DropTableByIdReq {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         write!(
             f,
             "drop_table_by_id(if_exists={}):{}",
@@ -497,18 +624,50 @@ impl Display for DropTableByIdReq {
     }
 }
 
-#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
-pub struct DropTableReply {
-    pub spec_vec: Option<(Vec<ShareSpec>, Vec<ShareTableInfoMap>)>,
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct DropTableReply {}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CommitTableMetaReq {
+    pub name_ident: TableNameIdent,
+    pub db_id: MetaId,
+    pub table_id: MetaId,
+    pub prev_table_id: Option<MetaId>,
+    pub orphan_table_name: Option<String>,
 }
 
-#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
+impl CommitTableMetaReq {
+    pub fn table_id(&self) -> MetaId {
+        self.table_id
+    }
+}
+
+impl Display for CommitTableMetaReq {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+        write!(f, "commit_table_meta:{}", self.table_id(),)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CommitTableMetaReply {}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UndropTableReq {
     pub name_ident: TableNameIdent,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UndropTableByIdReq {
+    pub name_ident: TableNameIdent,
+    pub db_id: MetaId,
+    pub table_id: MetaId,
+    pub table_id_seq: u64,
+    // Indicates whether to forcefully replace an existing table with the same name, if it exists.
+    pub force_replace: bool,
+}
+
 impl UndropTableReq {
-    pub fn tenant(&self) -> &str {
+    pub fn tenant(&self) -> &Tenant {
         &self.name_ident.tenant
     }
     pub fn db_name(&self) -> &str {
@@ -520,21 +679,18 @@ impl UndropTableReq {
 }
 
 impl Display for UndropTableReq {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         write!(
             f,
             "undrop_table:{}/{}-{}",
-            self.tenant(),
+            self.tenant().tenant_name(),
             self.db_name(),
             self.table_name()
         )
     }
 }
 
-#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
-pub struct UndropTableReply {}
-
-#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RenameTableReq {
     pub if_exists: bool,
     pub name_ident: TableNameIdent,
@@ -543,7 +699,7 @@ pub struct RenameTableReq {
 }
 
 impl RenameTableReq {
-    pub fn tenant(&self) -> &str {
+    pub fn tenant(&self) -> &Tenant {
         &self.name_ident.tenant
     }
     pub fn db_name(&self) -> &str {
@@ -555,11 +711,11 @@ impl RenameTableReq {
 }
 
 impl Display for RenameTableReq {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         write!(
             f,
             "rename_table:{}/{}-{}=>{}-{}",
-            self.tenant(),
+            self.tenant().tenant_name(),
             self.db_name(),
             self.table_name(),
             self.new_db_name,
@@ -568,12 +724,12 @@ impl Display for RenameTableReq {
     }
 }
 
-#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RenameTableReply {
     pub table_id: u64,
 }
 
-#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UpsertTableOptionReq {
     pub table_id: u64,
     pub seq: MatchSeq,
@@ -586,13 +742,51 @@ pub struct UpsertTableOptionReq {
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct UpdateStreamMetaReq {
+    pub stream_id: u64,
+    pub seq: MatchSeq,
+    pub options: BTreeMap<String, String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UpdateTableMetaReq {
     pub table_id: u64,
     pub seq: MatchSeq,
     pub new_table_meta: TableMeta,
-    pub copied_files: Option<UpsertTableCopiedFileReq>,
-    pub deduplicated_label: Option<String>,
 }
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UpdateTempTableReq {
+    pub table_id: u64,
+    pub desc: String,
+    pub new_table_meta: TableMeta,
+    pub copied_files: BTreeMap<String, TableCopiedFileInfo>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct UpdateMultiTableMetaReq {
+    pub update_table_metas: Vec<(UpdateTableMetaReq, TableInfo)>,
+    pub copied_files: Vec<(u64, UpsertTableCopiedFileReq)>,
+    pub update_stream_metas: Vec<UpdateStreamMetaReq>,
+    pub deduplicated_labels: Vec<String>,
+    pub update_temp_tables: Vec<UpdateTempTableReq>,
+}
+
+impl UpdateMultiTableMetaReq {
+    pub fn is_empty(&self) -> bool {
+        self.update_table_metas.is_empty()
+            && self.copied_files.is_empty()
+            && self.update_stream_metas.is_empty()
+            && self.deduplicated_labels.is_empty()
+            && self.update_temp_tables.is_empty()
+    }
+}
+
+/// The result of updating multiple table meta
+///
+/// If update fails due to table version mismatch, the `Err` will contain the (table id, seq , table meta)s that fail to update.
+pub type UpdateMultiTableMetaResult =
+    std::result::Result<UpdateTableMetaReply, Vec<(u64, u64, TableMeta)>>;
 
 impl UpsertTableOptionReq {
     pub fn new(
@@ -609,7 +803,7 @@ impl UpsertTableOptionReq {
 }
 
 impl Display for UpsertTableOptionReq {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         write!(
             f,
             "upsert-table-options: table-id:{}({:?}) = {:?}",
@@ -618,7 +812,7 @@ impl Display for UpsertTableOptionReq {
     }
 }
 
-#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SetTableColumnMaskPolicyAction {
     // new mask name, old mask name(if any)
     Set(String, Option<String>),
@@ -626,31 +820,79 @@ pub enum SetTableColumnMaskPolicyAction {
     Unset(String),
 }
 
-#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SetTableColumnMaskPolicyReq {
-    pub tenant: String,
+    pub tenant: Tenant,
     pub table_id: u64,
     pub seq: MatchSeq,
     pub column: String,
     pub action: SetTableColumnMaskPolicyAction,
 }
 
-#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
-pub struct SetTableColumnMaskPolicyReply {
-    pub share_table_info: Option<Vec<ShareTableInfoMap>>,
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SetTableColumnMaskPolicyReply {}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UpsertTableOptionReply {}
+
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct UpdateTableMetaReply {}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CreateTableIndexReq {
+    pub create_option: CreateOption,
+    pub tenant: Tenant,
+    pub table_id: u64,
+    pub name: String,
+    pub column_ids: Vec<u32>,
+    pub sync_creation: bool,
+    pub options: BTreeMap<String, String>,
 }
 
-#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
-pub struct UpsertTableOptionReply {
-    pub share_table_info: Option<Vec<ShareTableInfoMap>>,
+impl Display for CreateTableIndexReq {
+    fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
+        let typ = match self.create_option {
+            CreateOption::Create => "create_table_index",
+            CreateOption::CreateIfNotExists => "create_table_index_if_not_exists",
+            CreateOption::CreateOrReplace => "create_or_replace_table_index",
+        };
+
+        write!(
+            f,
+            "{}: {} ColumnIds: {:?}, SyncCreation: {:?}, Options: {:?}",
+            typ, self.name, self.column_ids, self.sync_creation, self.options,
+        )
+    }
 }
 
-#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
-pub struct UpdateTableMetaReply {
-    pub share_table_info: Option<Vec<ShareTableInfoMap>>,
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DropTableIndexReq {
+    pub tenant: Tenant,
+    pub if_exists: bool,
+    pub table_id: u64,
+    pub name: String,
 }
 
-#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
+impl Display for DropTableIndexReq {
+    fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
+        write!(
+            f,
+            "drop_table_index(if_exists={}):{}/{}",
+            self.if_exists, self.table_id, self.name,
+        )
+    }
+}
+
+/// Maps table_id to a vector of (index_name, index_version, marked_deleted_index_meta) pairs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GetMarkedDeletedTableIndexesReply {
+    pub table_indexes: HashMap<u64, Vec<(IndexName, IndexVersion, MarkedDeletedIndexMeta)>>,
+}
+
+pub type IndexName = String;
+pub type IndexVersion = String;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GetTableReq {
     pub inner: TableNameIdent,
 }
@@ -664,153 +906,219 @@ impl Deref for GetTableReq {
 }
 
 impl From<(&str, &str, &str)> for GetTableReq {
+    /// For testing only
     fn from(db_table: (&str, &str, &str)) -> Self {
-        Self::new(db_table.0, db_table.1, db_table.2)
+        let tenant = Tenant::new_or_err(db_table.0, func_name!()).unwrap();
+        Self::new(&tenant, db_table.1, db_table.2)
     }
 }
 
 impl GetTableReq {
-    pub fn new(
-        tenant: impl Into<String>,
-        db_name: impl Into<String>,
-        table_name: impl Into<String>,
-    ) -> GetTableReq {
+    pub fn new(tenant: &Tenant, db_name: impl ToString, table_name: impl ToString) -> GetTableReq {
         GetTableReq {
-            inner: TableNameIdent::new(tenant, db_name, table_name),
+            inner: TableNameIdent::new(tenant.clone(), db_name, table_name),
         }
     }
 }
 
-#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ListTableReq {
-    pub inner: DatabaseNameIdent,
-}
-
-impl Deref for ListTableReq {
-    type Target = DatabaseNameIdent;
-
-    fn deref(&self) -> &Self::Target {
-        &self.inner
-    }
+    pub tenant: Tenant,
+    pub database_id: DatabaseId,
 }
 
 impl ListTableReq {
-    pub fn new(tenant: impl Into<String>, db_name: impl Into<String>) -> ListTableReq {
+    pub fn new(tenant: &Tenant, database_id: DatabaseId) -> ListTableReq {
         ListTableReq {
-            inner: DatabaseNameIdent {
-                tenant: tenant.into(),
-                db_name: db_name.into(),
-            },
+            tenant: tenant.clone(),
+            database_id,
         }
     }
 }
 
-#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
-pub enum TableInfoFilter {
-    // if datatime is some, filter only dropped tables which drop time before that,
-    // else filter all dropped tables
-    Dropped(Option<DateTime<Utc>>),
-    // filter all dropped tables, including all tables in dropped database and dropped tables in exist dbs,
-    // in this case, `ListTableReq`.db_name will be ignored
-    // return Tables in two cases:
-    //  1) if database drop before date time, then all table in this db will be return;
-    //  2) else, return all the tables drop before data time.
-    AllDroppedTables(Option<DateTime<Utc>>),
-    // return all tables, ignore drop on time.
-    All,
-}
-
-#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ListDroppedTableReq {
-    pub inner: DatabaseNameIdent,
-    pub filter: TableInfoFilter,
+    pub tenant: Tenant,
+
+    /// If `database_name` is None, choose all tables in all databases.
+    /// Otherwise, choose only tables in this database.
+    pub database_name: Option<String>,
+
+    /// The time range in which the database/table will be returned.
+    /// choose only tables/databases dropped before this boundary time.
+    /// It can include non-dropped tables/databases with `None..Some()`
+    pub drop_time_range: Range<Option<DateTime<Utc>>>,
+
+    pub limit: Option<usize>,
 }
 
-#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
-pub enum DroppedId {
-    // db id, db name
-    Db(u64, String),
-    // db id, table id, table name
-    Table(u64, u64, String),
-}
+impl ListDroppedTableReq {
+    pub fn new(tenant: &Tenant) -> ListDroppedTableReq {
+        let rng_start = Some(DateTime::<Utc>::MIN_UTC);
+        let rng_end = Some(DateTime::<Utc>::MAX_UTC);
+        ListDroppedTableReq {
+            tenant: tenant.clone(),
+            database_name: None,
+            drop_time_range: rng_start..rng_end,
+            limit: None,
+        }
+    }
 
-#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
-pub struct ListDroppedTableResp {
-    pub drop_table_infos: Vec<Arc<TableInfo>>,
-    pub drop_ids: Vec<DroppedId>,
-}
+    pub fn with_db(self, db_name: impl ToString) -> Self {
+        Self {
+            database_name: Some(db_name.to_string()),
+            ..self
+        }
+    }
 
-#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
-pub struct GcDroppedTableReq {
-    pub tenant: String,
-    pub drop_ids: Vec<DroppedId>,
-}
+    pub fn with_retention_boundary(self, d: DateTime<Utc>) -> Self {
+        let rng_start = Some(DateTime::<Utc>::MIN_UTC);
+        let rng_end = Some(d);
+        Self {
+            drop_time_range: rng_start..rng_end,
+            ..self
+        }
+    }
 
-#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
-pub struct GcDroppedTableResp {}
+    pub fn with_limit(self, limit: usize) -> Self {
+        Self {
+            limit: Some(limit),
+            ..self
+        }
+    }
 
-#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, Eq, PartialEq, Default)]
-pub struct CountTablesKey {
-    pub tenant: String,
-}
+    pub fn new4(
+        tenant: &Tenant,
+        database_name: Option<impl ToString>,
+        retention_boundary: Option<DateTime<Utc>>,
+        limit: Option<usize>,
+    ) -> ListDroppedTableReq {
+        let rng_start = Some(DateTime::<Utc>::MIN_UTC);
+        let rng_end = if let Some(b) = retention_boundary {
+            Some(b)
+        } else {
+            Some(DateTime::<Utc>::MAX_UTC)
+        };
+        ListDroppedTableReq {
+            tenant: tenant.clone(),
+            database_name: database_name.map(|s| s.to_string()),
+            drop_time_range: rng_start..rng_end,
+            limit,
+        }
+    }
 
-impl Display for CountTablesKey {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "'{}'", self.tenant)
+    pub fn database_name(&self) -> Option<&str> {
+        self.database_name.as_deref()
     }
 }
 
-/// count tables for a tenant
-#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
-pub struct CountTablesReq {
-    pub tenant: String,
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DroppedId {
+    Db { db_id: u64, db_name: String },
+    Table { name: DBIdTableName, id: TableId },
 }
 
-#[derive(Debug)]
-pub struct CountTablesReply {
-    pub count: u64,
+impl From<TableNIV> for DroppedId {
+    fn from(value: TableNIV) -> Self {
+        let (name, id, _) = value.unpack();
+        Self::Table { name, id }
+    }
 }
 
-#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, Default, Eq, PartialEq)]
+impl DroppedId {
+    pub fn new_table_name_id(name: DBIdTableName, id: TableId) -> DroppedId {
+        DroppedId::Table { name, id }
+    }
+
+    pub fn new_table(db_id: u64, table_id: u64, table_name: impl ToString) -> DroppedId {
+        DroppedId::Table {
+            name: DBIdTableName::new(db_id, table_name),
+            id: TableId::new(table_id),
+        }
+    }
+
+    /// Build a string contains essential information for comparison.
+    ///
+    /// Only used for testing.
+    pub fn cmp_key(&self) -> String {
+        match self {
+            DroppedId::Db { db_id, db_name, .. } => format!("db:{}-{}", db_id, db_name),
+            DroppedId::Table { name, id } => format!("table:{:?}-{:?}", name, id),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ListDroppedTableResp {
+    /// The **database_name, (name, id, value)** of a table to vacuum.
+    pub vacuum_tables: Vec<(DatabaseNameIdent, TableNIV)>,
+    pub drop_ids: Vec<DroppedId>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GcDroppedTableReq {
+    pub tenant: Tenant,
+    pub drop_ids: Vec<DroppedId>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct TableIdToName {
     pub table_id: u64,
 }
 
-#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, Eq, PartialEq, Default)]
+impl Display for TableIdToName {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+        write!(f, "TableIdToName{{{}}}", self.table_id)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Default)]
 pub struct TableCopiedFileNameIdent {
     pub table_id: u64,
     pub file: String,
 }
 
-#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, Eq, PartialEq, Default)]
+impl fmt::Display for TableCopiedFileNameIdent {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(
+            f,
+            "TableCopiedFileNameIdent{{table_id:{}, file:{}}}",
+            self.table_id, self.file
+        )
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Default)]
 pub struct TableCopiedFileInfo {
     pub etag: Option<String>,
     pub content_length: u64,
     pub last_modified: Option<DateTime<Utc>>,
 }
 
-#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GetTableCopiedFileReq {
     pub table_id: u64,
     pub files: Vec<String>,
 }
 
-#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GetTableCopiedFileReply {
     pub file_info: BTreeMap<String, TableCopiedFileInfo>,
 }
 
-#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UpsertTableCopiedFileReq {
     pub file_info: BTreeMap<String, TableCopiedFileInfo>,
-    pub expire_at: Option<u64>,
-    pub fail_if_duplicated: bool,
+    /// If not None, specifies the time-to-live for the keys.
+    pub ttl: Option<Duration>,
+    /// If there is already existing key, ignore inserting
+    pub insert_if_not_exists: bool,
 }
 
-#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UpsertTableCopiedFileReply {}
 
-#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TruncateTableReq {
     pub table_id: u64,
     /// Specify the max number copied file to delete in every sub-transaction.
@@ -819,247 +1127,190 @@ pub struct TruncateTableReq {
     pub batch_size: Option<u64>,
 }
 
-#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TruncateTableReply {}
 
-#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
-pub struct TableCopiedFileLockKey {
-    pub table_id: u64,
-}
-
-#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EmptyProto {}
 
-#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
-pub struct TableLockKey {
-    pub table_id: u64,
-    pub revision: u64,
-}
-
-#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
-pub struct ListTableLockRevReq {
-    pub table_id: u64,
-}
-
-#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
-pub struct CreateTableLockRevReq {
-    pub table_id: u64,
-    pub expire_at: u64,
-}
-
-#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
-pub struct CreateTableLockRevReply {
-    pub revision: u64,
-}
-
-#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
-pub struct ExtendTableLockRevReq {
-    pub table_id: u64,
-    pub expire_at: u64,
-    pub revision: u64,
-}
-
-#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
-pub struct DeleteTableLockRevReq {
-    pub table_id: u64,
-    pub revision: u64,
-}
-
 mod kvapi_key_impl {
-    use common_meta_kvapi::kvapi;
+    use databend_common_meta_kvapi::kvapi;
+    use databend_common_meta_kvapi::kvapi::Key;
+    use databend_common_meta_kvapi::kvapi::KeyBuilder;
+    use databend_common_meta_kvapi::kvapi::KeyError;
+    use databend_common_meta_kvapi::kvapi::KeyParser;
 
-    use crate::schema::CountTablesKey;
     use crate::schema::DBIdTableName;
-    use crate::schema::TableCopiedFileLockKey;
+    use crate::schema::DatabaseId;
+    use crate::schema::TableCopiedFileInfo;
     use crate::schema::TableCopiedFileNameIdent;
     use crate::schema::TableId;
-    use crate::schema::TableIdListKey;
+    use crate::schema::TableIdHistoryIdent;
+    use crate::schema::TableIdList;
     use crate::schema::TableIdToName;
-    use crate::schema::TableLockKey;
-    use crate::schema::PREFIX_TABLE;
-    use crate::schema::PREFIX_TABLE_BY_ID;
-    use crate::schema::PREFIX_TABLE_COPIED_FILES;
-    use crate::schema::PREFIX_TABLE_COPIED_FILES_LOCK;
-    use crate::schema::PREFIX_TABLE_COUNT;
-    use crate::schema::PREFIX_TABLE_ID_LIST;
-    use crate::schema::PREFIX_TABLE_ID_TO_NAME;
-    use crate::schema::PREFIX_TABLE_LOCK;
+    use crate::schema::TableMeta;
+
+    impl kvapi::KeyCodec for DBIdTableName {
+        fn encode_key(&self, b: KeyBuilder) -> KeyBuilder {
+            b.push_u64(self.db_id).push_str(&self.table_name)
+        }
+
+        fn decode_key(p: &mut KeyParser) -> Result<Self, KeyError> {
+            let db_id = p.next_u64()?;
+            let table_name = p.next_str()?;
+            Ok(Self { db_id, table_name })
+        }
+    }
 
     /// "__fd_table/<db_id>/<tb_name>"
     impl kvapi::Key for DBIdTableName {
-        const PREFIX: &'static str = PREFIX_TABLE;
+        const PREFIX: &'static str = "__fd_table";
 
-        fn to_string_key(&self) -> String {
-            kvapi::KeyBuilder::new_prefixed(Self::PREFIX)
-                .push_u64(self.db_id)
-                .push_str(&self.table_name)
-                .done()
+        type ValueType = TableId;
+
+        fn parent(&self) -> Option<String> {
+            Some(DatabaseId::new(self.db_id).to_string_key())
+        }
+    }
+
+    impl kvapi::KeyCodec for TableIdToName {
+        fn encode_key(&self, b: KeyBuilder) -> KeyBuilder {
+            b.push_u64(self.table_id)
         }
 
-        fn from_str_key(s: &str) -> Result<Self, kvapi::KeyError> {
-            let mut p = kvapi::KeyParser::new_prefixed(s, Self::PREFIX)?;
-
-            let db_id = p.next_u64()?;
-            let table_name = p.next_str()?;
-            p.done()?;
-
-            Ok(DBIdTableName { db_id, table_name })
+        fn decode_key(p: &mut KeyParser) -> Result<Self, KeyError> {
+            let table_id = p.next_u64()?;
+            Ok(Self { table_id })
         }
     }
 
     /// "__fd_table_id_to_name/<table_id> -> DBIdTableName"
     impl kvapi::Key for TableIdToName {
-        const PREFIX: &'static str = PREFIX_TABLE_ID_TO_NAME;
+        const PREFIX: &'static str = "__fd_table_id_to_name";
 
-        fn to_string_key(&self) -> String {
-            kvapi::KeyBuilder::new_prefixed(Self::PREFIX)
-                .push_u64(self.table_id)
-                .done()
+        type ValueType = DBIdTableName;
+
+        fn parent(&self) -> Option<String> {
+            Some(TableId::new(self.table_id).to_string_key())
+        }
+    }
+
+    impl kvapi::KeyCodec for TableId {
+        fn encode_key(&self, b: KeyBuilder) -> KeyBuilder {
+            b.push_u64(self.table_id)
         }
 
-        fn from_str_key(s: &str) -> Result<Self, kvapi::KeyError> {
-            let mut p = kvapi::KeyParser::new_prefixed(s, Self::PREFIX)?;
-
+        fn decode_key(p: &mut KeyParser) -> Result<Self, KeyError> {
             let table_id = p.next_u64()?;
-            p.done()?;
-
-            Ok(TableIdToName { table_id })
+            Ok(Self { table_id })
         }
     }
 
     /// "__fd_table_by_id/<tb_id> -> TableMeta"
     impl kvapi::Key for TableId {
-        const PREFIX: &'static str = PREFIX_TABLE_BY_ID;
+        const PREFIX: &'static str = "__fd_table_by_id";
 
-        fn to_string_key(&self) -> String {
-            kvapi::KeyBuilder::new_prefixed(Self::PREFIX)
-                .push_u64(self.table_id)
-                .done()
+        type ValueType = TableMeta;
+
+        fn parent(&self) -> Option<String> {
+            None
+        }
+    }
+
+    impl kvapi::KeyCodec for TableIdHistoryIdent {
+        fn encode_key(&self, b: KeyBuilder) -> KeyBuilder {
+            b.push_u64(self.database_id).push_str(&self.table_name)
         }
 
-        fn from_str_key(s: &str) -> Result<Self, kvapi::KeyError> {
-            let mut p = kvapi::KeyParser::new_prefixed(s, Self::PREFIX)?;
-
-            let table_id = p.next_u64()?;
-            p.done()?;
-
-            Ok(TableId { table_id })
+        fn decode_key(b: &mut KeyParser) -> Result<Self, kvapi::KeyError> {
+            let db_id = b.next_u64()?;
+            let table_name = b.next_str()?;
+            Ok(Self {
+                database_id: db_id,
+                table_name,
+            })
         }
     }
 
     /// "_fd_table_id_list/<db_id>/<tb_name> -> id_list"
-    impl kvapi::Key for TableIdListKey {
-        const PREFIX: &'static str = PREFIX_TABLE_ID_LIST;
+    impl kvapi::Key for TableIdHistoryIdent {
+        const PREFIX: &'static str = "__fd_table_id_list";
 
-        fn to_string_key(&self) -> String {
-            kvapi::KeyBuilder::new_prefixed(Self::PREFIX)
-                .push_u64(self.db_id)
-                .push_str(&self.table_name)
-                .done()
-        }
+        type ValueType = TableIdList;
 
-        fn from_str_key(s: &str) -> Result<Self, kvapi::KeyError> {
-            let mut p = kvapi::KeyParser::new_prefixed(s, Self::PREFIX)?;
-
-            let db_id = p.next_u64()?;
-            let table_name = p.next_str()?;
-            p.done()?;
-
-            Ok(TableIdListKey { db_id, table_name })
+        fn parent(&self) -> Option<String> {
+            Some(DatabaseId::new(self.database_id).to_string_key())
         }
     }
 
-    /// "__fd_table_count/<tenant>" -> <table_count>
-    impl kvapi::Key for CountTablesKey {
-        const PREFIX: &'static str = PREFIX_TABLE_COUNT;
-
-        fn to_string_key(&self) -> String {
-            kvapi::KeyBuilder::new_prefixed(Self::PREFIX)
-                .push_raw(&self.tenant)
-                .done()
+    impl kvapi::KeyCodec for TableCopiedFileNameIdent {
+        fn encode_key(&self, b: KeyBuilder) -> KeyBuilder {
+            // TODO: file is not escaped!!!
+            //       There already are non escaped data stored on disk.
+            //       We can not change it anymore.
+            b.push_u64(self.table_id).push_raw(&self.file)
         }
 
-        fn from_str_key(s: &str) -> Result<Self, kvapi::KeyError> {
-            let mut p = kvapi::KeyParser::new_prefixed(s, Self::PREFIX)?;
-
-            let tenant = p.next_str()?;
-            p.done()?;
-
-            Ok(CountTablesKey { tenant })
+        fn decode_key(p: &mut KeyParser) -> Result<Self, kvapi::KeyError> {
+            let table_id = p.next_u64()?;
+            let file = p.tail_raw()?.to_string();
+            Ok(Self { table_id, file })
         }
     }
 
     // __fd_table_copied_files/table_id/file_name -> TableCopiedFileInfo
     impl kvapi::Key for TableCopiedFileNameIdent {
-        const PREFIX: &'static str = PREFIX_TABLE_COPIED_FILES;
+        const PREFIX: &'static str = "__fd_table_copied_files";
 
-        fn to_string_key(&self) -> String {
-            // TODO: file is not escaped!!!
-            //       There already are non escaped data stored on disk.
-            //       We can not change it anymore.
-            kvapi::KeyBuilder::new_prefixed(Self::PREFIX)
-                .push_u64(self.table_id)
-                .push_raw(&self.file)
-                .done()
-        }
+        type ValueType = TableCopiedFileInfo;
 
-        fn from_str_key(s: &str) -> Result<Self, kvapi::KeyError> {
-            let mut p = kvapi::KeyParser::new_prefixed(s, Self::PREFIX)?;
-
-            let table_id = p.next_u64()?;
-            let file = p.tail_raw()?.to_string();
-
-            Ok(TableCopiedFileNameIdent { table_id, file })
+        fn parent(&self) -> Option<String> {
+            Some(TableId::new(self.table_id).to_string_key())
         }
     }
 
-    /// __fd_table_copied_file_lock/table_id -> ""
-    impl kvapi::Key for TableCopiedFileLockKey {
-        const PREFIX: &'static str = PREFIX_TABLE_COPIED_FILES_LOCK;
-
-        fn to_string_key(&self) -> String {
-            kvapi::KeyBuilder::new_prefixed(Self::PREFIX)
-                .push_u64(self.table_id)
-                .done()
-        }
-
-        fn from_str_key(s: &str) -> Result<Self, kvapi::KeyError> {
-            let mut p = kvapi::KeyParser::new_prefixed(s, Self::PREFIX)?;
-
-            let table_id = p.next_u64()?;
-            p.done()?;
-
-            Ok(TableCopiedFileLockKey { table_id })
+    impl kvapi::Value for TableId {
+        type KeyType = DBIdTableName;
+        fn dependency_keys(&self, _key: &Self::KeyType) -> impl IntoIterator<Item = String> {
+            [self.to_string_key()]
         }
     }
 
-    /// __fd_table_lock/table_id/revision -> ""
-    impl kvapi::Key for TableLockKey {
-        const PREFIX: &'static str = PREFIX_TABLE_LOCK;
-
-        fn to_string_key(&self) -> String {
-            kvapi::KeyBuilder::new_prefixed(Self::PREFIX)
-                .push_u64(self.table_id)
-                .push_u64(self.revision)
-                .done()
+    impl kvapi::Value for DBIdTableName {
+        type KeyType = TableIdToName;
+        fn dependency_keys(&self, _key: &Self::KeyType) -> impl IntoIterator<Item = String> {
+            []
         }
+    }
 
-        fn from_str_key(s: &str) -> Result<Self, kvapi::KeyError> {
-            let mut p = kvapi::KeyParser::new_prefixed(s, Self::PREFIX)?;
+    impl kvapi::Value for TableMeta {
+        type KeyType = TableId;
+        fn dependency_keys(&self, _key: &Self::KeyType) -> impl IntoIterator<Item = String> {
+            []
+        }
+    }
 
-            let table_id = p.next_u64()?;
-            let revision = p.next_u64()?;
-            p.done()?;
+    impl kvapi::Value for TableIdList {
+        type KeyType = TableIdHistoryIdent;
+        fn dependency_keys(&self, _key: &Self::KeyType) -> impl IntoIterator<Item = String> {
+            self.id_list
+                .iter()
+                .map(|id| TableId::new(*id).to_string_key())
+        }
+    }
 
-            Ok(TableLockKey { table_id, revision })
+    impl kvapi::Value for TableCopiedFileInfo {
+        type KeyType = TableCopiedFileNameIdent;
+        fn dependency_keys(&self, _key: &Self::KeyType) -> impl IntoIterator<Item = String> {
+            []
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use common_meta_kvapi::kvapi;
-    use common_meta_kvapi::kvapi::Key;
+    use databend_common_meta_kvapi::kvapi;
+    use databend_common_meta_kvapi::kvapi::Key;
 
     use crate::schema::TableCopiedFileNameIdent;
 

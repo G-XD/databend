@@ -12,24 +12,26 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#![allow(internal_features)]
 #![allow(clippy::uninlined_format_args)]
-#![deny(unused_crate_dependencies)]
+#![allow(clippy::large_enum_variant)]
+#![allow(clippy::useless_asref)]
+#![allow(clippy::diverging_sub_expression)]
+#![feature(try_blocks)]
+#![feature(impl_trait_in_assoc_type)]
+#![feature(let_chains)]
+#![feature(core_intrinsics)]
+#![feature(int_roundings)]
+#![feature(box_patterns)]
+// FIXME: Remove this once the deprecated code is removed
+#![allow(deprecated)]
 
-mod parquet2;
 mod parquet_part;
-mod parquet_reader;
 mod parquet_rs;
-mod processors;
+mod read_settings;
 mod utils;
 
-pub use parquet2::Parquet2Reader;
-pub use parquet2::Parquet2Table;
+pub use parquet_part::ParquetFilesPart;
 pub use parquet_part::ParquetPart;
-pub use parquet_part::ParquetRowGroupPart;
-pub use parquet_part::ParquetSmallFilesPart;
-pub use parquet_reader::BlockIterator;
-pub use parquet_reader::ParquetPartData;
-pub use parquet_reader::ParquetReader;
-pub use parquet_rs::ParquetPartitionPruner;
-pub use parquet_rs::ParquetReader as ParquetRSReader;
-pub use parquet_rs::ParquetTable;
+pub use parquet_rs::*;
+pub use read_settings::ReadSettings;

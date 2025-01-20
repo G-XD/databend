@@ -14,20 +14,22 @@
 
 use std::cmp::max;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::fmt::Display;
 use std::fmt::Formatter;
 use std::sync::Arc;
 
-use common_catalog::table_context::TableContext;
-use common_exception::Result;
-use common_expression::types::F64;
+use databend_common_catalog::table_context::TableContext;
+use databend_common_exception::Result;
+use databend_common_expression::types::F64;
+use databend_common_storage::Datum;
+use databend_common_storage::Histogram;
+use databend_common_storage::DEFAULT_HISTOGRAM_BUCKETS;
 
 use crate::optimizer::histogram_from_ndv;
 use crate::optimizer::ColumnSet;
 use crate::optimizer::ColumnStat;
-use crate::optimizer::Datum;
 use crate::optimizer::Distribution;
-use crate::optimizer::Histogram;
 use crate::optimizer::NewStatistic;
 use crate::optimizer::PhysicalProperty;
 use crate::optimizer::RelExpr;
@@ -36,7 +38,6 @@ use crate::optimizer::RequiredProperty;
 use crate::optimizer::StatInfo;
 use crate::optimizer::Statistics;
 use crate::optimizer::UniformSampleSet;
-use crate::optimizer::DEFAULT_HISTOGRAM_BUCKETS;
 use crate::plans::Operator;
 use crate::plans::RelOp;
 use crate::plans::ScalarExpr;
@@ -44,6 +45,7 @@ use crate::IndexType;
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum JoinType {
+    Cross,
     Inner,
     Left,
     Right,
@@ -52,7 +54,6 @@ pub enum JoinType {
     RightSemi,
     LeftAnti,
     RightAnti,
-    Cross,
     /// Mark Join is a special case of join that is used to process Any subquery and correlated Exists subquery.
     /// Left Mark Join use subquery as probe side, it's blocked at `mark_join_blocks`
     LeftMark,
@@ -81,7 +82,14 @@ impl JoinType {
     }
 
     pub fn is_outer_join(&self) -> bool {
-        matches!(self, JoinType::Left | JoinType::Right | JoinType::Full)
+        matches!(
+            self,
+            JoinType::Left
+                | JoinType::Right
+                | JoinType::Full
+                | JoinType::LeftSingle
+                | JoinType::RightSingle
+        )
     }
 
     pub fn is_mark_join(&self) -> bool {
@@ -90,7 +98,7 @@ impl JoinType {
 }
 
 impl Display for JoinType {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
         match self {
             JoinType::Inner => {
                 write!(f, "INNER")
@@ -135,33 +143,77 @@ impl Display for JoinType {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct HashJoinBuildCacheInfo {
+    pub cache_idx: usize,
+    pub columns: Vec<usize>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct JoinEquiCondition {
+    pub left: ScalarExpr,
+    pub right: ScalarExpr,
+    // Used for "is (not) distinct from".
+    pub is_null_equal: bool,
+}
+
+impl JoinEquiCondition {
+    pub fn new(left: ScalarExpr, right: ScalarExpr, is_null_equal: bool) -> Self {
+        Self {
+            left,
+            right,
+            is_null_equal,
+        }
+    }
+
+    pub fn new_conditions(
+        left: Vec<ScalarExpr>,
+        right: Vec<ScalarExpr>,
+        is_null_equal: Vec<usize>,
+    ) -> Vec<JoinEquiCondition> {
+        left.into_iter()
+            .zip(right)
+            .enumerate()
+            .map(|(index, (l, r))| JoinEquiCondition::new(l, r, is_null_equal.contains(&index)))
+            .collect()
+    }
+}
+
 /// Join operator. We will choose hash join by default.
 /// In the case that using hash join, the right child
 /// is always the build side, and the left child is always
 /// the probe side.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Join {
-    pub left_conditions: Vec<ScalarExpr>,
-    pub right_conditions: Vec<ScalarExpr>,
+    pub equi_conditions: Vec<JoinEquiCondition>,
     pub non_equi_conditions: Vec<ScalarExpr>,
     pub join_type: JoinType,
     // marker_index is for MarkJoin only.
     pub marker_index: Option<IndexType>,
     pub from_correlated_subquery: bool,
-    // It means that join has a corresponding runtime filter
-    pub contain_runtime_filter: bool,
+    // if we execute distributed merge into, we need to hold the
+    // hash table to get not match data from source.
+    pub need_hold_hash_table: bool,
+    pub is_lateral: bool,
+    // When left/right single join converted to inner join, record the original join type
+    // and do some special processing during runtime.
+    pub single_to_inner: Option<JoinType>,
+    // Cache info for ExpressionScan.
+    pub build_side_cache_info: Option<HashJoinBuildCacheInfo>,
 }
 
 impl Default for Join {
     fn default() -> Self {
         Self {
-            left_conditions: Default::default(),
-            right_conditions: Default::default(),
+            equi_conditions: Default::default(),
             non_equi_conditions: Default::default(),
             join_type: JoinType::Cross,
             marker_index: Default::default(),
             from_correlated_subquery: Default::default(),
-            contain_runtime_filter: false,
+            need_hold_hash_table: false,
+            is_lateral: false,
+            single_to_inner: None,
+            build_side_cache_info: None,
         }
     }
 }
@@ -169,13 +221,21 @@ impl Default for Join {
 impl Join {
     pub fn used_columns(&self) -> Result<ColumnSet> {
         let mut used_columns = ColumnSet::new();
-        for cond in self
-            .left_conditions
-            .iter()
-            .chain(self.right_conditions.iter())
-            .chain(self.non_equi_conditions.iter())
-        {
-            used_columns = used_columns.union(&cond.used_columns()).cloned().collect();
+        for condition in self.equi_conditions.iter() {
+            used_columns = used_columns
+                .union(&condition.left.used_columns())
+                .cloned()
+                .collect();
+            used_columns = used_columns
+                .union(&condition.right.used_columns())
+                .cloned()
+                .collect();
+        }
+        for condition in self.non_equi_conditions.iter() {
+            used_columns = used_columns
+                .union(&condition.used_columns())
+                .cloned()
+                .collect();
         }
         Ok(used_columns)
     }
@@ -191,11 +251,9 @@ impl Join {
         let mut join_card_updated = false;
         let mut left_column_index = 0;
         let mut right_column_index = 0;
-        for (left_condition, right_condition) in self
-            .left_conditions
-            .iter()
-            .zip(self.right_conditions.iter())
-        {
+        for condition in self.equi_conditions.iter() {
+            let left_condition = &condition.left;
+            let right_condition = &condition.right;
             if join_card == 0 as f64 {
                 break;
             }
@@ -291,11 +349,11 @@ impl Join {
                 _ => continue,
             }
         }
-
         if join_card_updated {
             for (idx, left) in left_statistics.column_stats.iter_mut() {
                 if *idx == left_column_index {
                     if left.histogram.is_some() {
+                        // Todo: find a better way to update accuracy histogram
                         left.histogram = if left.ndv as u64 <= 2 {
                             None
                         } else {
@@ -310,7 +368,7 @@ impl Join {
                                 Some((left.min.clone(), left.max.clone())),
                                 DEFAULT_HISTOGRAM_BUCKETS,
                             )?)
-                        }
+                        };
                     }
                     continue;
                 }
@@ -320,6 +378,7 @@ impl Join {
             for (idx, right) in right_statistics.column_stats.iter_mut() {
                 if *idx == right_column_index {
                     if right.histogram.is_some() {
+                        // Todo: find a better way to update accuracy histogram
                         right.histogram = if right.ndv as u64 <= 2 {
                             None
                         } else {
@@ -334,90 +393,27 @@ impl Join {
                                 Some((right.min.clone(), right.max.clone())),
                                 DEFAULT_HISTOGRAM_BUCKETS,
                             )?)
-                        }
+                        };
                     }
                     continue;
                 }
                 right.histogram = None;
             }
         }
-
         Ok(join_card)
     }
-}
 
-impl Operator for Join {
-    fn rel_op(&self) -> RelOp {
-        RelOp::Join
-    }
-
-    fn derive_relational_prop(&self, rel_expr: &RelExpr) -> Result<Arc<RelationalProperty>> {
-        let left_prop = rel_expr.derive_relational_prop_child(0)?;
-        let right_prop = rel_expr.derive_relational_prop_child(1)?;
-        // Derive output columns
-        let mut output_columns = left_prop.output_columns.clone();
-        if let Some(mark_index) = self.marker_index {
-            output_columns.insert(mark_index);
-        }
-        output_columns = output_columns
-            .union(&right_prop.output_columns)
-            .cloned()
-            .collect();
-
-        // Derive outer columns
-        let mut outer_columns = left_prop.outer_columns.clone();
-        outer_columns = outer_columns
-            .union(&right_prop.outer_columns)
-            .cloned()
-            .collect();
-        for cond in self
-            .left_conditions
+    pub fn has_null_equi_condition(&self) -> bool {
+        self.equi_conditions
             .iter()
-            .chain(self.right_conditions.iter())
-        {
-            let used_columns = cond.used_columns();
-            let outer = used_columns.difference(&output_columns).cloned().collect();
-            outer_columns = outer_columns.union(&outer).cloned().collect();
-        }
-        outer_columns = outer_columns.difference(&output_columns).cloned().collect();
-
-        // Derive used columns
-        let mut used_columns = self.used_columns()?;
-        used_columns.extend(left_prop.used_columns.clone());
-        used_columns.extend(right_prop.used_columns.clone());
-
-        Ok(Arc::new(RelationalProperty {
-            output_columns,
-            outer_columns,
-            used_columns,
-        }))
+            .any(|condition| condition.is_null_equal)
     }
 
-    fn derive_physical_prop(&self, rel_expr: &RelExpr) -> Result<PhysicalProperty> {
-        let probe_prop = rel_expr.derive_physical_prop_child(0)?;
-        let build_prop = rel_expr.derive_physical_prop_child(1)?;
-
-        match (&probe_prop.distribution, &build_prop.distribution) {
-            // If the distribution of probe side is Random, we will pass through
-            // the distribution of build side.
-            (Distribution::Random, _) => Ok(PhysicalProperty {
-                distribution: build_prop.distribution.clone(),
-            }),
-            // If both sides are broadcast, which means broadcast join is enabled, to make sure the current join is broadcast, should return Random.
-            // Then required proper is broadcast, and the join will be broadcast.
-            (Distribution::Broadcast, Distribution::Broadcast) => Ok(PhysicalProperty {
-                distribution: Distribution::Random,
-            }),
-            // Otherwise pass through probe side.
-            _ => Ok(PhysicalProperty {
-                distribution: probe_prop.distribution.clone(),
-            }),
-        }
-    }
-
-    fn derive_cardinality(&self, rel_expr: &RelExpr) -> Result<Arc<StatInfo>> {
-        let left_stat_info = rel_expr.derive_cardinality_child(0)?;
-        let right_stat_info = rel_expr.derive_cardinality_child(1)?;
+    pub fn derive_join_stats(
+        &self,
+        left_stat_info: Arc<StatInfo>,
+        right_stat_info: Arc<StatInfo>,
+    ) -> Result<Arc<StatInfo>> {
         let (mut left_cardinality, mut left_statistics) = (
             left_stat_info.cardinality,
             left_stat_info.statistics.clone(),
@@ -443,13 +439,10 @@ impl Operator for Join {
                     + f64::max(right_cardinality, inner_join_cardinality)
                     - inner_join_cardinality
             }
-            JoinType::LeftSemi | JoinType::LeftAnti | JoinType::LeftMark | JoinType::LeftSingle => {
-                left_cardinality
-            }
-            JoinType::RightSemi
-            | JoinType::RightAnti
-            | JoinType::RightMark
-            | JoinType::RightSingle => right_cardinality,
+            JoinType::LeftSemi => f64::min(left_cardinality, inner_join_cardinality),
+            JoinType::RightSemi => f64::min(right_cardinality, inner_join_cardinality),
+            JoinType::LeftSingle | JoinType::RightMark | JoinType::LeftAnti => left_cardinality,
+            JoinType::RightSingle | JoinType::LeftMark | JoinType::RightAnti => right_cardinality,
         };
         // Derive column statistics
         let column_stats = if cardinality == 0.0 {
@@ -468,6 +461,108 @@ impl Operator for Join {
             },
         }))
     }
+}
+
+impl Operator for Join {
+    fn rel_op(&self) -> RelOp {
+        RelOp::Join
+    }
+
+    fn arity(&self) -> usize {
+        2
+    }
+
+    fn derive_relational_prop(&self, rel_expr: &RelExpr) -> Result<Arc<RelationalProperty>> {
+        let left_prop = rel_expr.derive_relational_prop_child(0)?;
+        let right_prop = rel_expr.derive_relational_prop_child(1)?;
+        // Derive output columns
+        let mut output_columns = left_prop.output_columns.clone();
+        if let Some(mark_index) = self.marker_index {
+            output_columns.insert(mark_index);
+        }
+        output_columns = output_columns
+            .union(&right_prop.output_columns)
+            .cloned()
+            .collect();
+
+        // Derive outer columns
+        let mut outer_columns = left_prop.outer_columns.clone();
+        outer_columns = outer_columns
+            .union(&right_prop.outer_columns)
+            .cloned()
+            .collect();
+
+        for condition in self.equi_conditions.iter() {
+            let left_used_columns = condition.left.used_columns();
+            let right_used_columns = condition.right.used_columns();
+            let used_columns: HashSet<usize> = left_used_columns
+                .union(&right_used_columns)
+                .cloned()
+                .collect();
+            let outer = used_columns.difference(&output_columns).cloned().collect();
+            outer_columns = outer_columns.union(&outer).cloned().collect();
+        }
+        outer_columns = outer_columns.difference(&output_columns).cloned().collect();
+
+        // Derive used columns
+        let mut used_columns = self.used_columns()?;
+        used_columns.extend(left_prop.used_columns.clone());
+        used_columns.extend(right_prop.used_columns.clone());
+
+        Ok(Arc::new(RelationalProperty {
+            output_columns,
+            outer_columns,
+            used_columns,
+            orderings: vec![],
+            partition_orderings: None,
+        }))
+    }
+
+    fn derive_physical_prop(&self, rel_expr: &RelExpr) -> Result<PhysicalProperty> {
+        let probe_prop = rel_expr.derive_physical_prop_child(0)?;
+        let build_prop = rel_expr.derive_physical_prop_child(1)?;
+
+        if probe_prop.distribution == Distribution::Serial
+            || build_prop.distribution == Distribution::Serial
+        {
+            return Ok(PhysicalProperty {
+                distribution: Distribution::Serial,
+            });
+        }
+
+        if !matches!(self.join_type, JoinType::Inner) {
+            return Ok(PhysicalProperty {
+                distribution: Distribution::Random,
+            });
+        }
+
+        match (&probe_prop.distribution, &build_prop.distribution) {
+            // If any side of the join is Broadcast, pass through the other side.
+            (_, Distribution::Broadcast) => Ok(PhysicalProperty {
+                distribution: probe_prop.distribution.clone(),
+            }),
+
+            // If both sides of the join are Hash, pass through the probe side.
+            // Although the build side is also Hash, it is more efficient to
+            // utilize the distribution on the probe side.
+            // As soon as we support subset property, we can pass through both sides.
+            (Distribution::Hash(_), Distribution::Hash(_)) => Ok(PhysicalProperty {
+                distribution: probe_prop.distribution.clone(),
+            }),
+
+            // Otherwise use random distribution.
+            _ => Ok(PhysicalProperty {
+                distribution: Distribution::Random,
+            }),
+        }
+    }
+
+    fn derive_stats(&self, rel_expr: &RelExpr) -> Result<Arc<StatInfo>> {
+        let left_stat_info = rel_expr.derive_cardinality_child(0)?;
+        let right_stat_info = rel_expr.derive_cardinality_child(1)?;
+        let stat_info = self.derive_join_stats(left_stat_info, right_stat_info)?;
+        Ok(stat_info)
+    }
 
     fn compute_required_prop_child(
         &self,
@@ -481,40 +576,129 @@ impl Operator for Join {
         let probe_physical_prop = rel_expr.derive_physical_prop_child(0)?;
         let build_physical_prop = rel_expr.derive_physical_prop_child(1)?;
 
-        // if join/probe side is Serial or join key is empty, we use Serial distribution
+        // if join/probe side is Serial or this is a non-equi join, we use Serial distribution
         if probe_physical_prop.distribution == Distribution::Serial
             || build_physical_prop.distribution == Distribution::Serial
+            || (self.equi_conditions.is_empty() && !self.non_equi_conditions.is_empty())
         {
             // TODO(leiysky): we can enforce redistribution here
             required.distribution = Distribution::Serial;
             return Ok(required);
-        } else if ctx.get_settings().get_prefer_broadcast_join()?
-            && !matches!(
-                self.join_type,
-                JoinType::Right
-                    | JoinType::Full
-                    | JoinType::RightAnti
-                    | JoinType::RightSemi
-                    | JoinType::RightMark
-            )
-        {
+        }
+
+        // Try to use broadcast join
+        if !matches!(
+            self.join_type,
+            JoinType::Right
+                | JoinType::Full
+                | JoinType::RightAnti
+                | JoinType::RightSemi
+                | JoinType::LeftMark
+        ) {
+            let settings = ctx.get_settings();
             let left_stat_info = rel_expr.derive_cardinality_child(0)?;
             let right_stat_info = rel_expr.derive_cardinality_child(1)?;
             // The broadcast join is cheaper than the hash join when one input is at least (n − 1)× larger than the other
             // where n is the number of servers in the cluster.
-            let broadcast_join_threshold = (ctx.get_cluster().nodes.len() - 1) as f64;
-            if right_stat_info.cardinality * broadcast_join_threshold < left_stat_info.cardinality {
-                required.distribution = Distribution::Broadcast;
+            let broadcast_join_threshold = if settings.get_prefer_broadcast_join()? {
+                (ctx.get_cluster().nodes.len() - 1) as f64
+            } else {
+                // Use a very large value to prevent broadcast join.
+                1000.0
+            };
+            if !settings.get_enforce_shuffle_join()?
+                && (right_stat_info.cardinality * broadcast_join_threshold
+                    < left_stat_info.cardinality
+                    || settings.get_enforce_broadcast_join()?)
+            {
+                if child_index == 1 {
+                    required.distribution = Distribution::Broadcast;
+                } else {
+                    required.distribution = Distribution::Any;
+                }
                 return Ok(required);
             }
         }
+
+        // Otherwise, use hash shuffle
         if child_index == 0 {
-            required.distribution = Distribution::Hash(self.left_conditions.clone());
+            let left_conditions = self
+                .equi_conditions
+                .iter()
+                .map(|condition| condition.left.clone())
+                .collect();
+            required.distribution = Distribution::Hash(left_conditions);
         } else {
-            required.distribution = Distribution::Hash(self.right_conditions.clone());
+            let right_conditions = self
+                .equi_conditions
+                .iter()
+                .map(|condition| condition.right.clone())
+                .collect();
+            required.distribution = Distribution::Hash(right_conditions);
         }
 
         Ok(required)
+    }
+
+    fn compute_required_prop_children(
+        &self,
+        ctx: Arc<dyn TableContext>,
+        _rel_expr: &RelExpr,
+        _required: &RequiredProperty,
+    ) -> Result<Vec<Vec<RequiredProperty>>> {
+        let mut children_required = vec![];
+
+        let settings = ctx.get_settings();
+        if self.join_type != JoinType::Cross && !settings.get_enforce_broadcast_join()? {
+            // (Hash, Hash)
+            children_required.extend(self.equi_conditions.iter().map(|condition| {
+                vec![
+                    RequiredProperty {
+                        distribution: Distribution::Hash(vec![condition.left.clone()]),
+                    },
+                    RequiredProperty {
+                        distribution: Distribution::Hash(vec![condition.right.clone()]),
+                    },
+                ]
+            }));
+        }
+
+        if !matches!(
+            self.join_type,
+            JoinType::Right
+                | JoinType::Full
+                | JoinType::RightAnti
+                | JoinType::RightSemi
+                | JoinType::LeftMark
+                | JoinType::RightSingle
+        ) && !settings.get_enforce_shuffle_join()?
+        {
+            // (Any, Broadcast)
+            let left_distribution = Distribution::Any;
+            let right_distribution = Distribution::Broadcast;
+            children_required.push(vec![
+                RequiredProperty {
+                    distribution: left_distribution,
+                },
+                RequiredProperty {
+                    distribution: right_distribution,
+                },
+            ]);
+        }
+
+        if children_required.is_empty() {
+            // (Serial, Serial)
+            children_required.push(vec![
+                RequiredProperty {
+                    distribution: Distribution::Serial,
+                },
+                RequiredProperty {
+                    distribution: Distribution::Serial,
+                },
+            ]);
+        }
+
+        Ok(children_required)
     }
 }
 
@@ -525,22 +709,14 @@ fn evaluate_by_histogram(
 ) -> Result<f64> {
     let mut card = 0.0;
     let mut all_ndv = 0.0;
-    for (left_idx, left_bucket) in left_hist.buckets.iter().enumerate() {
-        if left_idx == 0 {
-            continue;
-        }
+    for left_bucket in left_hist.buckets.iter() {
         let mut has_intersection = false;
         let left_num_rows = left_bucket.num_values();
         let left_ndv = left_bucket.num_distinct();
-        let left_bucket_min = left_hist.buckets[left_idx - 1].upper_bound().to_double()?;
+        let left_bucket_min = left_bucket.lower_bound().to_double()?;
         let left_bucket_max = left_bucket.upper_bound().to_double()?;
-        for (right_idx, right_bucket) in right_hist.buckets.iter().enumerate() {
-            if right_idx == 0 {
-                continue;
-            }
-            let right_bucket_min = right_hist.buckets[right_idx - 1]
-                .upper_bound()
-                .to_double()?;
+        for right_bucket in right_hist.buckets.iter() {
+            let right_bucket_min = right_bucket.lower_bound().to_double()?;
             let right_bucket_max = right_bucket.upper_bound().to_double()?;
             if left_bucket_min < right_bucket_max && left_bucket_max > right_bucket_min {
                 has_intersection = true;
@@ -548,9 +724,9 @@ fn evaluate_by_histogram(
                 let right_ndv = right_bucket.num_distinct();
 
                 // There are four cases for interleaving
-                // 1. left bucket contains right bucket
-                // ---left_min---right_min---right_max---left_max---
                 if right_bucket_min >= left_bucket_min && right_bucket_max <= left_bucket_max {
+                    // 1. left bucket contains right bucket
+                    // ---left_min---right_min---right_max---left_max---
                     let percentage =
                         (right_bucket_max - right_bucket_min) / (left_bucket_max - left_bucket_min);
 

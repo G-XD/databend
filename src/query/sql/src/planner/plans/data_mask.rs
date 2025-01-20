@@ -15,19 +15,22 @@
 use std::sync::Arc;
 
 use chrono::Utc;
-use common_ast::ast::DataMaskPolicy;
-use common_expression::types::DataType;
-use common_expression::DataField;
-use common_expression::DataSchema;
-use common_expression::DataSchemaRef;
-use common_meta_app::data_mask::CreateDatamaskReq;
-use common_meta_app::data_mask::DatamaskNameIdent;
-use common_meta_app::data_mask::DropDatamaskReq;
+use databend_common_ast::ast::DataMaskPolicy;
+use databend_common_expression::types::DataType;
+use databend_common_expression::DataField;
+use databend_common_expression::DataSchema;
+use databend_common_expression::DataSchemaRef;
+use databend_common_meta_app::data_mask::CreateDatamaskReq;
+use databend_common_meta_app::data_mask::DataMaskNameIdent;
+use databend_common_meta_app::data_mask::DatamaskMeta;
+use databend_common_meta_app::data_mask::DropDatamaskReq;
+use databend_common_meta_app::schema::CreateOption;
+use databend_common_meta_app::tenant::Tenant;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct CreateDatamaskPolicyPlan {
-    pub if_not_exists: bool,
-    pub tenant: String,
+    pub create_option: CreateOption,
+    pub tenant: Tenant,
     pub name: String,
     pub policy: DataMaskPolicy,
 }
@@ -41,21 +44,21 @@ impl CreateDatamaskPolicyPlan {
 impl From<CreateDatamaskPolicyPlan> for CreateDatamaskReq {
     fn from(p: CreateDatamaskPolicyPlan) -> Self {
         CreateDatamaskReq {
-            if_not_exists: p.if_not_exists,
-            name: DatamaskNameIdent {
-                tenant: p.tenant.clone(),
-                name: p.name.clone(),
+            create_option: p.create_option,
+            name: DataMaskNameIdent::new(p.tenant.clone(), &p.name),
+            data_mask_meta: DatamaskMeta {
+                args: p
+                    .policy
+                    .args
+                    .iter()
+                    .map(|arg| (arg.arg_name.to_string(), arg.arg_type.to_string()))
+                    .collect(),
+                return_type: p.policy.return_type.to_string(),
+                body: p.policy.body.to_string(),
+                comment: p.policy.comment,
+                create_on: Utc::now(),
+                update_on: None,
             },
-            args: p
-                .policy
-                .args
-                .iter()
-                .map(|arg| (arg.arg_name.to_string(), arg.arg_type.to_string()))
-                .collect(),
-            return_type: p.policy.return_type.to_string(),
-            body: p.policy.body.to_string(),
-            comment: p.policy.comment,
-            create_on: Utc::now(),
         }
     }
 }
@@ -63,7 +66,7 @@ impl From<CreateDatamaskPolicyPlan> for CreateDatamaskReq {
 #[derive(Clone, Debug, PartialEq)]
 pub struct DropDatamaskPolicyPlan {
     pub if_exists: bool,
-    pub tenant: String,
+    pub tenant: Tenant,
     pub name: String,
 }
 
@@ -77,10 +80,7 @@ impl From<DropDatamaskPolicyPlan> for DropDatamaskReq {
     fn from(p: DropDatamaskPolicyPlan) -> Self {
         DropDatamaskReq {
             if_exists: p.if_exists,
-            name: DatamaskNameIdent {
-                tenant: p.tenant.clone(),
-                name: p.name,
-            },
+            name: DataMaskNameIdent::new(&p.tenant, &p.name),
         }
     }
 }

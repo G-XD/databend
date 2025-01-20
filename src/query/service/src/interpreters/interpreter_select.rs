@@ -14,29 +14,37 @@
 
 use std::sync::Arc;
 
-use common_catalog::table::Table;
-use common_exception::ErrorCode;
-use common_exception::Result;
-use common_expression::infer_table_schema;
-use common_expression::DataSchemaRef;
-use common_expression::TableSchemaRef;
-use common_meta_store::MetaStore;
-use common_pipeline_core::pipe::Pipe;
-use common_pipeline_core::pipe::PipeItem;
-use common_pipeline_core::processors::port::InputPort;
-use common_pipeline_core::processors::port::OutputPort;
-use common_pipeline_core::Pipeline;
-use common_pipeline_transforms::processors::transforms::TransformDummy;
-use common_sql::executor::PhysicalPlan;
-use common_sql::parse_result_scan_args;
-use common_sql::ColumnBinding;
-use common_sql::MetadataRef;
-use common_storages_result_cache::gen_result_cache_key;
-use common_storages_result_cache::ResultCacheReader;
-use common_storages_result_cache::WriteResultCacheSink;
-use common_users::UserApiProvider;
+use databend_common_base::runtime::GlobalIORuntime;
+use databend_common_catalog::table::Table;
+use databend_common_exception::ErrorCode;
+use databend_common_exception::Result;
+use databend_common_expression::infer_table_schema;
+use databend_common_expression::DataField;
+use databend_common_expression::DataSchemaRef;
+use databend_common_expression::DataSchemaRefExt;
+use databend_common_expression::TableSchemaRef;
+use databend_common_meta_app::schema::UpdateMultiTableMetaReq;
+use databend_common_meta_store::MetaStore;
+use databend_common_pipeline_core::processors::InputPort;
+use databend_common_pipeline_core::processors::OutputPort;
+use databend_common_pipeline_core::ExecutionInfo;
+use databend_common_pipeline_core::Pipe;
+use databend_common_pipeline_core::PipeItem;
+use databend_common_pipeline_core::Pipeline;
+use databend_common_pipeline_transforms::processors::TransformDummy;
+use databend_common_sql::executor::physical_plans::FragmentKind;
+use databend_common_sql::executor::PhysicalPlan;
+use databend_common_sql::parse_result_scan_args;
+use databend_common_sql::ColumnBinding;
+use databend_common_sql::MetadataRef;
+use databend_common_storages_result_cache::gen_result_cache_key;
+use databend_common_storages_result_cache::ResultCacheReader;
+use databend_common_storages_result_cache::WriteResultCacheSink;
+use databend_common_users::UserApiProvider;
 use log::error;
+use log::info;
 
+use crate::interpreters::common::query_build_update_stream_req;
 use crate::interpreters::Interpreter;
 use crate::pipelines::PipelineBuildResult;
 use crate::schedulers::build_query_pipeline;
@@ -46,7 +54,7 @@ use crate::sql::executor::PhysicalPlanBuilder;
 use crate::sql::optimizer::SExpr;
 use crate::sql::BindContext;
 
-/// Interpret SQL query with ne&w SQL planner
+/// Interpret SQL query with new SQL planner
 pub struct SelectInterpreter {
     ctx: Arc<QueryContext>,
     s_expr: SExpr,
@@ -83,24 +91,75 @@ impl SelectInterpreter {
         self.bind_context.columns.clone()
     }
 
+    pub fn get_result_schema(&self) -> DataSchemaRef {
+        // Building data schema from bind_context columns
+        // TODO(leiyskey): Extract the following logic as new API of BindContext.
+        let fields = self
+            .bind_context
+            .columns
+            .iter()
+            .map(|column_binding| {
+                DataField::new(
+                    &column_binding.column_name,
+                    *column_binding.data_type.clone(),
+                )
+            })
+            .collect();
+        DataSchemaRefExt::create(fields)
+    }
+
     #[inline]
     #[async_backtrace::framed]
     pub async fn build_physical_plan(&self) -> Result<PhysicalPlan> {
         let mut builder = PhysicalPlanBuilder::new(self.metadata.clone(), self.ctx.clone(), false);
         self.ctx.set_status_info("building physical plan");
-        builder.build(&self.s_expr).await
+        builder
+            .build(&self.s_expr, self.bind_context.column_set())
+            .await
     }
 
     #[async_backtrace::framed]
-    pub async fn build_pipeline(&self, physical_plan: PhysicalPlan) -> Result<PipelineBuildResult> {
-        build_query_pipeline(
+    pub async fn build_pipeline(
+        &self,
+        mut physical_plan: PhysicalPlan,
+    ) -> Result<PipelineBuildResult> {
+        if let PhysicalPlan::Exchange(exchange) = &mut physical_plan {
+            if exchange.kind == FragmentKind::Merge && self.ignore_result {
+                exchange.ignore_exchange = self.ignore_result;
+            }
+        }
+
+        let mut build_res = build_query_pipeline(
             &self.ctx,
             &self.bind_context.columns,
             &physical_plan,
             self.ignore_result,
-            false,
         )
-        .await
+        .await?;
+
+        // consume stream
+        let update_stream_metas = query_build_update_stream_req(&self.ctx).await?;
+
+        let catalog = self.ctx.get_default_catalog()?;
+        build_res
+            .main_pipeline
+            .set_on_finished(move |info: &ExecutionInfo| match &info.res {
+                Ok(_) => GlobalIORuntime::instance().block_on(async move {
+                    match update_stream_metas {
+                        Some(streams) => {
+                            let r = UpdateMultiTableMetaReq {
+                                update_table_metas: streams.update_table_metas,
+                                ..Default::default()
+                            };
+                            info!("Updating the stream meta to consume data");
+                            catalog.update_multi_table_meta(r).await.map(|_| ())
+                        }
+                        None => Ok(()),
+                    }
+                }),
+                Err(error_code) => Err(error_code.clone()),
+            });
+        Ok(build_res)
     }
 
     /// Add pipelines for writing query result cache.
@@ -124,7 +183,7 @@ impl SelectInterpreter {
         //              └─────────┘    └─────────┘    └─────────┘
 
         // 1. Duplicate the pipes.
-        pipeline.duplicate(false)?;
+        pipeline.duplicate(false, 2)?;
         // 2. Reorder the pipes.
         let output_len = pipeline.output_len();
         debug_assert!(output_len % 2 == 0);
@@ -189,6 +248,18 @@ impl SelectInterpreter {
         }
         Ok(None)
     }
+
+    fn attach_tables_to_ctx(&self) {
+        let metadata = self.metadata.read();
+        for table in metadata.tables() {
+            self.ctx.attach_table(
+                table.catalog(),
+                table.database(),
+                table.name(),
+                table.table(),
+            )
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -197,20 +268,32 @@ impl Interpreter for SelectInterpreter {
         "SelectInterpreterV2"
     }
 
-    fn schema(&self) -> DataSchemaRef {
-        self.bind_context.output_schema()
+    fn is_ddl(&self) -> bool {
+        false
     }
 
     /// This method will create a new pipeline
     /// The QueryPipelineBuilder will use the optimized plan to generate a Pipeline
-    #[minitrace::trace(name = "select_interpreter_execute")]
+    #[fastrace::trace]
     #[async_backtrace::framed]
     async fn execute2(&self) -> Result<PipelineBuildResult> {
+        self.attach_tables_to_ctx();
+
         self.ctx.set_status_info("preparing plan");
 
         // 0. Need to build physical plan first to get the partitions.
         let physical_plan = self.build_physical_plan().await?;
-        if self.ctx.get_settings().get_enable_query_result_cache()? && self.ctx.get_cacheable() {
+
+        let query_plan = physical_plan
+            .format(self.metadata.clone(), Default::default())?
+            .format_pretty()?;
+
+        info!("Query physical plan: \n{}", query_plan);
+
+        if self.ctx.get_settings().get_enable_query_result_cache()?
+            && self.ctx.get_cacheable()
+            && self.formatted_ast.is_some()
+        {
             let key = gen_result_cache_key(self.formatted_ast.as_ref().unwrap());
             // 1. Try to get result from cache.
             let kv_store = UserApiProvider::instance().get_meta_store_client();
@@ -256,7 +339,7 @@ impl Interpreter for SelectInterpreter {
                 Ok(None) => {
                     let mut build_res = self.build_pipeline(physical_plan).await?;
                     // 2.2 If not found result in cache, add pipelines to write the result to cache.
-                    let schema = infer_table_schema(&self.schema())?;
+                    let schema = infer_table_schema(&self.bind_context.output_schema())?;
                     self.add_result_cache(&key, schema, &mut build_res.main_pipeline, kv_store)?;
                     return Ok(build_res);
                 }

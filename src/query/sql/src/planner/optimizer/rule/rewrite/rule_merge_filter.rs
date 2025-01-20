@@ -14,20 +14,20 @@
 
 use std::sync::Arc;
 
-use common_exception::Result;
+use databend_common_exception::Result;
 
+use crate::optimizer::extract::Matcher;
 use crate::optimizer::rule::Rule;
 use crate::optimizer::rule::RuleID;
 use crate::optimizer::rule::TransformResult;
 use crate::optimizer::SExpr;
 use crate::plans::Filter;
-use crate::plans::PatternPlan;
 use crate::plans::RelOp;
 
 // Merge two adjacent `Filter`s into one
 pub struct RuleMergeFilter {
     id: RuleID,
-    patterns: Vec<SExpr>,
+    matchers: Vec<Matcher>,
 }
 
 impl RuleMergeFilter {
@@ -39,28 +39,13 @@ impl RuleMergeFilter {
             //  Filter
             //  \
             //   *
-            patterns: vec![SExpr::create_unary(
-                Arc::new(
-                    PatternPlan {
-                        plan_type: RelOp::Filter,
-                    }
-                    .into(),
-                ),
-                Arc::new(SExpr::create_unary(
-                    Arc::new(
-                        PatternPlan {
-                            plan_type: RelOp::Filter,
-                        }
-                        .into(),
-                    ),
-                    Arc::new(SExpr::create_leaf(Arc::new(
-                        PatternPlan {
-                            plan_type: RelOp::Pattern,
-                        }
-                        .into(),
-                    ))),
-                )),
-            )],
+            matchers: vec![Matcher::MatchOp {
+                op_type: RelOp::Filter,
+                children: vec![Matcher::MatchOp {
+                    op_type: RelOp::Filter,
+                    children: vec![Matcher::Leaf],
+                }],
+            }],
         }
     }
 }
@@ -77,12 +62,9 @@ impl Rule for RuleMergeFilter {
         let predicates = up_filter
             .predicates
             .into_iter()
-            .chain(down_filter.predicates.into_iter())
+            .chain(down_filter.predicates)
             .collect();
-        let merged = Filter {
-            predicates,
-            is_having: false,
-        };
+        let merged = Filter { predicates };
 
         let new_expr = SExpr::create_unary(
             Arc::new(merged.into()),
@@ -92,7 +74,7 @@ impl Rule for RuleMergeFilter {
         Ok(())
     }
 
-    fn patterns(&self) -> &Vec<SExpr> {
-        &self.patterns
+    fn matchers(&self) -> &[Matcher] {
+        &self.matchers
     }
 }

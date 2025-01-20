@@ -16,20 +16,34 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use common_ast::ast::Identifier;
-use common_ast::ast::Indirection;
-use common_ast::ast::QualifiedName;
-use common_ast::ast::SelectTarget;
-use common_ast::parser::parse_expr;
-use common_ast::parser::tokenize_sql;
-use common_ast::Dialect;
-use common_exception::ErrorCode;
-use common_exception::Result;
-use common_exception::Span;
+use databend_common_ast::ast::ColumnFilter;
+use databend_common_ast::ast::ColumnID;
+use databend_common_ast::ast::ColumnRef;
+use databend_common_ast::ast::Expr;
+use databend_common_ast::ast::FunctionCall;
+use databend_common_ast::ast::Identifier;
+use databend_common_ast::ast::Indirection;
+use databend_common_ast::ast::Literal;
+use databend_common_ast::ast::SelectTarget;
+use databend_common_ast::parser::parse_expr;
+use databend_common_ast::parser::tokenize_sql;
+use databend_common_ast::Span;
+use databend_common_exception::ErrorCode;
+use databend_common_exception::Result;
+use databend_common_expression::Column;
+use databend_common_expression::ConstantFolder;
+use databend_common_expression::Scalar;
+use databend_common_functions::BUILTIN_FUNCTIONS;
+use derive_visitor::DriveMut;
+use derive_visitor::VisitorMut;
+use itertools::Itertools;
 
 use super::AggregateInfo;
+use crate::binder::aggregate::find_replaced_aggregate_function;
 use crate::binder::select::SelectItem;
 use crate::binder::select::SelectList;
+use crate::binder::window::find_replaced_window_function;
+use crate::binder::window::WindowInfo;
 use crate::binder::ExprContext;
 use crate::binder::Visibility;
 use crate::optimizer::SExpr;
@@ -46,30 +60,66 @@ use crate::plans::ScalarExpr;
 use crate::plans::ScalarItem;
 use crate::plans::SubqueryExpr;
 use crate::plans::SubqueryType;
+use crate::plans::VisitorMut as _;
 use crate::IndexType;
+use crate::TypeChecker;
 use crate::WindowChecker;
+
+#[derive(VisitorMut)]
+#[visitor(Identifier(enter))]
+struct RemoveIdentifierQuote;
+
+impl RemoveIdentifierQuote {
+    fn enter_identifier(&mut self, ident: &mut Identifier) {
+        if !ident.is_hole() && !ident.is_variable() {
+            ident.quote = None;
+            ident.name = ident.name.to_lowercase();
+        }
+    }
+}
 
 impl Binder {
     pub fn analyze_projection(
         &mut self,
         agg_info: &AggregateInfo,
+        window_info: &WindowInfo,
         select_list: &SelectList,
     ) -> Result<(HashMap<IndexType, ScalarItem>, Vec<ColumnBinding>)> {
         let mut columns = Vec::with_capacity(select_list.items.len());
         let mut scalars = HashMap::new();
         for item in select_list.items.iter() {
             // This item is a grouping sets item, its data type should be nullable.
-            let is_grouping_sets_item = agg_info.grouping_id_column.is_some()
+            let is_grouping_sets_item = agg_info.grouping_sets.is_some()
                 && agg_info.group_items_map.contains_key(&item.scalar);
-            let mut column_binding = if let ScalarExpr::BoundColumnRef(ref column_ref) = item.scalar
-            {
-                let mut column_binding = column_ref.column.clone();
-                // We should apply alias for the ColumnBinding, since it comes from table
-                column_binding.column_name = item.alias.clone();
-                column_binding
-            } else {
-                self.create_derived_column_binding(item.alias.clone(), item.scalar.data_type()?)
+
+            let mut column_binding = match &item.scalar {
+                ScalarExpr::BoundColumnRef(column_ref) => {
+                    let mut column_binding = column_ref.column.clone();
+                    // We should apply alias for the ColumnBinding, since it comes from table
+                    column_binding.column_name = item.alias.clone();
+                    column_binding
+                }
+                ScalarExpr::AggregateFunction(agg) => {
+                    // Replace to bound column to reduce duplicate derived column bindings.
+                    debug_assert!(!is_grouping_sets_item);
+                    find_replaced_aggregate_function(
+                        agg_info,
+                        &agg.display_name,
+                        &agg.return_type,
+                        &item.alias,
+                    )
+                    .unwrap()
+                }
+                ScalarExpr::WindowFunction(win) => {
+                    find_replaced_window_function(window_info, win, &item.alias).unwrap()
+                }
+                _ => self.create_derived_column_binding(
+                    item.alias.clone(),
+                    item.scalar.data_type()?,
+                    Some(item.scalar.clone()),
+                ),
             };
+
             if is_grouping_sets_item {
                 column_binding.data_type = Box::new(column_binding.data_type.wrap_nullable());
             }
@@ -96,6 +146,7 @@ impl Binder {
                         projection_index: Some(column_binding.index),
                         data_type,
                         outer_columns,
+                        contain_agg: None,
                     })
                 } else {
                     item.scalar.clone()
@@ -125,15 +176,17 @@ impl Binder {
             .iter()
             .map(|(_, item)| {
                 if bind_context.in_grouping {
-                    let grouping_checker = GroupingChecker::new(bind_context);
-                    let scalar = grouping_checker.resolve(&item.scalar, None)?;
+                    let mut scalar = item.scalar.clone();
+                    let mut grouping_checker = GroupingChecker::new(bind_context);
+                    grouping_checker.visit(&mut scalar)?;
                     Ok(ScalarItem {
                         scalar,
                         index: item.index,
                     })
                 } else {
-                    let window_checker = WindowChecker::new(bind_context);
-                    let scalar = window_checker.resolve(&item.scalar)?;
+                    let mut scalar = item.scalar.clone();
+                    let mut window_checker = WindowChecker::new(bind_context);
+                    window_checker.visit(&mut scalar)?;
                     Ok(ScalarItem {
                         scalar,
                         index: item.index,
@@ -170,8 +223,7 @@ impl Binder {
     /// For scalar expressions and aggregate expressions, we will register new columns for
     /// them in `Metadata`. And notice that, the semantic of aggregate expressions won't be checked
     /// in this function.
-    #[async_backtrace::framed]
-    pub async fn normalize_select_list<'a>(
+    pub fn normalize_select_list<'a>(
         &mut self,
         input_context: &mut BindContext,
         select_list: &'a [SelectTarget],
@@ -181,79 +233,29 @@ impl Binder {
         let mut output = SelectList::default();
         let mut prev_aliases = Vec::new();
 
-        fn push_alias(
-            binder: &Binder,
-            prev_aliases: &mut Vec<(String, ScalarExpr)>,
-            alias: String,
-            scalar: ScalarExpr,
-        ) {
-            if !prev_aliases.iter().any(|(name, pre_scalar)| {
-                name == &alias && binder.judge_equal_scalars(pre_scalar, &scalar)
-            }) {
-                prev_aliases.push((alias, scalar));
-            }
-        }
-
         for select_target in select_list {
             match select_target {
-                SelectTarget::QualifiedName {
+                SelectTarget::StarColumns {
                     qualified: names,
-                    exclude,
+                    column_filter,
                 } => {
-                    // Handle qualified name as select target
-                    let mut exclude_cols: HashSet<String> = HashSet::new();
-                    if let Some(cols) = exclude {
-                        let is_unquoted_ident_case_sensitive =
-                            self.name_resolution_ctx.unquoted_ident_case_sensitive;
-                        for col in cols {
-                            let name = is_unquoted_ident_case_sensitive
-                                .then(|| col.name().to_owned())
-                                .unwrap_or_else(|| col.name().to_lowercase());
-                            exclude_cols.insert(name);
-                        }
-                        if exclude_cols.len() < cols.len() {
-                            // * except (id, id)
-                            return Err(ErrorCode::SemanticError("duplicate column name"));
-                        }
+                    if names.len() > 3 || names.is_empty() {
+                        return Err(ErrorCode::SemanticError("Unsupported indirection type"));
                     }
+
                     let span = match names.last() {
                         Some(Indirection::Star(span)) => *span,
                         _ => None,
                     };
-                    match names.len() {
-                        1 | 2 => {
-                            self.resolve_qualified_name_without_database_name(
-                                span,
-                                input_context,
-                                names,
-                                exclude_cols,
-                                select_target,
-                                &mut output,
-                            )
-                            .await?
-                        }
-                        3 => {
-                            self.resolve_qualified_name_with_database_name(
-                                span,
-                                input_context,
-                                names,
-                                exclude_cols,
-                                select_target,
-                                &mut output,
-                            )
-                            .await?
-                        }
-                        _ => return Err(ErrorCode::SemanticError("Unsupported indirection type")),
-                    };
 
-                    if let Some(last) = output.items.last() {
-                        push_alias(
-                            self,
-                            &mut prev_aliases,
-                            last.alias.clone(),
-                            last.scalar.clone(),
-                        );
-                    }
+                    self.resolve_star_columns(
+                        span,
+                        input_context,
+                        select_target,
+                        names.as_slice(),
+                        column_filter,
+                        &mut output,
+                    )?;
                 }
                 SelectTarget::AliasedExpr { expr, alias } => {
                     let mut scalar_binder = ScalarBinder::new(
@@ -262,24 +264,34 @@ impl Binder {
                         &self.name_resolution_ctx,
                         self.metadata.clone(),
                         &prev_aliases,
-                        self.m_cte_bound_ctx.clone(),
-                        self.ctes_map.clone(),
                     );
-                    scalar_binder.allow_pushdown();
-                    let (bound_expr, _) = scalar_binder.bind(expr).await?;
+                    let (bound_expr, _) = scalar_binder.bind(expr)?;
 
                     // If alias is not specified, we will generate a name for the scalar expression.
-                    let expr_name = match alias {
-                        Some(alias) => normalize_identifier(alias, &self.name_resolution_ctx).name,
-                        None => format!("{:#}", expr).to_lowercase(),
+                    let expr_name = match (expr.as_ref(), alias) {
+                        (
+                            Expr::ColumnRef {
+                                column:
+                                    ColumnRef {
+                                        column: ColumnID::Name(column),
+                                        ..
+                                    },
+                                ..
+                            },
+                            None,
+                        ) => normalize_identifier(column, &self.name_resolution_ctx).name,
+                        (_, Some(alias)) => {
+                            normalize_identifier(alias, &self.name_resolution_ctx).name
+                        }
+                        _ => {
+                            let mut expr = expr.clone();
+                            let mut remove_quote_visitor = RemoveIdentifierQuote;
+                            expr.drive_mut(&mut remove_quote_visitor);
+                            format!("{:#}", expr)
+                        }
                     };
 
-                    push_alias(
-                        self,
-                        &mut prev_aliases,
-                        expr_name.clone(),
-                        bound_expr.clone(),
-                    );
+                    prev_aliases.push((expr_name.clone(), bound_expr.clone()));
 
                     output.items.push(SelectItem {
                         select_target,
@@ -292,8 +304,7 @@ impl Binder {
         Ok(output)
     }
 
-    #[async_backtrace::framed]
-    async fn build_select_item<'a>(
+    fn build_select_item<'a>(
         &self,
         span: Span,
         input_context: &BindContext,
@@ -309,13 +320,11 @@ impl Binder {
                     &self.name_resolution_ctx,
                     self.metadata.clone(),
                     &[],
-                    self.m_cte_bound_ctx.clone(),
-                    self.ctes_map.clone(),
                 );
                 let sql_tokens = tokenize_sql(virtual_computed_expr.as_str())?;
-                let expr = parse_expr(&sql_tokens, Dialect::PostgreSQL)?;
+                let expr = parse_expr(&sql_tokens, self.dialect)?;
 
-                let (scalar, _) = scalar_binder.bind(&expr).await?;
+                let (scalar, _) = scalar_binder.bind(&expr)?;
                 scalar
             }
             None => ScalarExpr::BoundColumnRef(BoundColumnRef {
@@ -331,234 +340,221 @@ impl Binder {
         })
     }
 
-    #[async_backtrace::framed]
-    async fn resolve_qualified_name_without_database_name<'a>(
+    fn resolve_star_columns<'a>(
         &self,
         span: Span,
         input_context: &BindContext,
-        names: &QualifiedName,
-        exclude_cols: HashSet<String>,
         select_target: &'a SelectTarget,
+        names: &[Indirection],
+        column_filter: &Option<ColumnFilter>,
         output: &mut SelectList<'a>,
     ) -> Result<()> {
-        let mut match_table = false;
-        let empty_exclude = exclude_cols.is_empty();
-        let table_name = match &names[0] {
-            Indirection::Star(_) => None,
-            Indirection::Identifier(table_name) => Some(table_name),
-        };
-        let star = table_name.is_none();
-        if !empty_exclude {
-            precheck_exclude_cols(input_context, &exclude_cols, None, table_name)?;
+        let excludes = column_filter.as_ref().and_then(|c| c.get_excludes());
+        let mut to_exclude_columns = HashSet::new();
+        if let Some(excludes) = excludes {
+            for ex in excludes.iter() {
+                let exclude = normalize_identifier(ex, &self.name_resolution_ctx).name;
+                if to_exclude_columns.contains(&exclude) {
+                    return Err(ErrorCode::SemanticError(format!(
+                        "Duplicate entry `{exclude}` in EXCLUDE list"
+                    )));
+                }
+                to_exclude_columns.insert(exclude);
+            }
         }
+
+        let mut excluded_columns = HashSet::new();
+
+        let lambda = column_filter.as_ref().and_then(|c| c.get_lambda());
+
+        let mut database = None;
+        let mut table = None;
+        if names.len() == 2 {
+            if let Indirection::Identifier(ident) = &names[0] {
+                table = Some(normalize_identifier(ident, &self.name_resolution_ctx).name);
+            }
+        } else if names.len() == 3 {
+            if let Indirection::Identifier(ident) = &names[0] {
+                database = Some(normalize_identifier(ident, &self.name_resolution_ctx).name);
+            }
+            if let Indirection::Identifier(ident) = &names[1] {
+                table = Some(normalize_identifier(ident, &self.name_resolution_ctx).name);
+            }
+        }
+
+        let mut match_database = false;
+        let mut match_table = false;
+        let star = table.is_none();
+        let mut column_ids = Vec::new();
+        let mut column_names = Vec::new();
+
+        let mut adds = 0;
+
         for column_binding in input_context.all_column_bindings() {
             if column_binding.visibility != Visibility::Visible {
                 continue;
             }
-            let push_item =
-                empty_exclude || exclude_cols.get(&column_binding.column_name).is_none();
-            if star {
-                if column_binding.column_name.starts_with('_')
-                    && column_binding.database_name == Some("system".to_string())
-                {
-                    return Err(ErrorCode::SemanticError(
-                        "can not select * from csv/ndjson file",
-                    ));
+
+            match (&database, &column_binding.database_name) {
+                (Some(t1), Some(t2)) if t1 != t2 => {
+                    continue;
                 }
-                // Expands wildcard star, for example we have a table `t(a INT, b INT)`:
-                // The query `SELECT * FROM t` will be expanded into `SELECT t.a, t.b FROM t`
-                if push_item {
-                    let item = self
-                        .build_select_item(
-                            span,
-                            input_context,
-                            select_target,
-                            column_binding.clone(),
-                        )
-                        .await?;
-                    output.items.push(item);
+                (Some(_), None) => continue,
+                _ => {}
+            }
+
+            match_database = true;
+
+            match (&table, &column_binding.table_name) {
+                (Some(t1), Some(t2)) if !compare_table_name(t1, t2, &self.name_resolution_ctx) => {
+                    continue;
                 }
-            } else if let Some(name) = &column_binding.table_name {
-                if push_item
-                    && compare_table_name(
-                        name,
-                        &table_name.unwrap().name,
-                        &self.name_resolution_ctx,
-                    )
-                {
-                    if column_binding.column_name.starts_with('_')
-                        && column_binding.database_name == Some("system".to_string())
-                    {
-                        return Err(ErrorCode::SemanticError(
-                            "can not select * from csv/ndjson file",
-                        ));
-                    }
-                    match_table = true;
-                    let item = self
-                        .build_select_item(
-                            span,
-                            input_context,
-                            select_target,
-                            column_binding.clone(),
-                        )
-                        .await?;
-                    output.items.push(item);
-                }
+                (Some(_), None) => continue,
+                _ => {}
+            }
+
+            match_table = true;
+
+            if to_exclude_columns.contains(&column_binding.column_name) {
+                excluded_columns.insert(column_binding.column_name.clone());
+                continue;
+            }
+
+            // TODO: yangxiufeng refactor it with InVisible
+            if star
+                && column_binding.column_name.starts_with("_$")
+                && column_binding.database_name == Some("system".to_string())
+                && column_binding.table_name == Some("stage".to_string())
+            {
+                return Err(ErrorCode::SemanticError(
+                    "select * from file only support Parquet format",
+                ));
+            }
+
+            if lambda.is_some() {
+                column_ids.push(column_binding.index);
+                column_names.push(column_binding.column_name.clone())
+            } else {
+                let item = self.build_select_item(
+                    span,
+                    input_context,
+                    select_target,
+                    column_binding.clone(),
+                )?;
+                output.items.push(item);
+                adds += 1;
             }
         }
-        if !star && !match_table {
-            return Err(ErrorCode::UnknownTable(format!(
-                "Unknown table '{}'",
-                table_name.unwrap().name
-            ))
-            .set_span(span));
+
+        for exclude in to_exclude_columns {
+            if !excluded_columns.contains(&exclude) {
+                return Err(ErrorCode::SemanticError(format!(
+                    "Column `{exclude}` in EXCLUDE list not found in FROM clause"
+                )));
+            }
         }
-        Ok(())
-    }
 
-    #[async_backtrace::framed]
-    async fn resolve_qualified_name_with_database_name<'a>(
-        &self,
-        span: Span,
-        input_context: &BindContext,
-        names: &QualifiedName,
-        exclude_cols: HashSet<String>,
-        select_target: &'a SelectTarget,
-        output: &mut SelectList<'a>,
-    ) -> Result<()> {
-        let mut match_table = false;
-        let empty_exclude = exclude_cols.is_empty();
-        // db.table.*
-        let db_name = &names[0];
-        let tab_name = &names[1];
+        if let Some(database) = database {
+            if !match_database {
+                return Err(ErrorCode::UnknownDatabase(format!(
+                    "Unknown database `{}` from bind context",
+                    database,
+                ))
+                .set_span(span));
+            }
+        }
 
-        match (db_name, tab_name) {
-            (Indirection::Identifier(db_name), Indirection::Identifier(table_name)) => {
-                if !empty_exclude {
-                    precheck_exclude_cols(
-                        input_context,
-                        &exclude_cols,
-                        Some(db_name),
-                        Some(table_name),
-                    )?;
-                }
-                for column_binding in input_context.all_column_bindings() {
-                    if column_binding.visibility != Visibility::Visible {
-                        continue;
+        if let Some(table) = &table {
+            if !match_table {
+                return Err(ErrorCode::UnknownTable(format!(
+                    "Unknown table `{}` from bind context",
+                    table,
+                ))
+                .set_span(span));
+            }
+        }
+
+        // apply lambda expression
+        if lambda.is_some() {
+            let input_array = Expr::Array {
+                span,
+                exprs: column_names
+                    .into_iter()
+                    .map(|x| Expr::Literal {
+                        span,
+                        value: Literal::String(x),
+                    })
+                    .collect_vec(),
+            };
+
+            let expr = Expr::FunctionCall {
+                span,
+                func: FunctionCall {
+                    name: Identifier::from_name(span, "array_apply"),
+                    args: vec![input_array],
+                    lambda: lambda.cloned(),
+                    distinct: false,
+                    params: vec![],
+                    window: None,
+                },
+            };
+
+            let mut temp_ctx = BindContext::new();
+            let mut type_checker = TypeChecker::try_create(
+                &mut temp_ctx,
+                self.ctx.clone(),
+                &self.name_resolution_ctx,
+                self.metadata.clone(),
+                &[],
+                true,
+            )?;
+            let (scalar, _) = *type_checker.resolve(&expr)?;
+            let expr = scalar.as_expr()?;
+            let (new_expr, _) =
+                ConstantFolder::fold(&expr, &self.ctx.get_function_context()?, &BUILTIN_FUNCTIONS);
+
+            match new_expr {
+                databend_common_expression::Expr::Constant {
+                    scalar: Scalar::Array(Column::Boolean(bitmap)),
+                    ..
+                } => {
+                    let mut new_column_idx = Vec::new();
+                    for (index, val) in bitmap.iter().enumerate() {
+                        if val {
+                            new_column_idx.push(column_ids[index]);
+                        }
                     }
-                    let match_table_with_db =
-                        match (&column_binding.database_name, &column_binding.table_name) {
-                            (Some(d_name), Some(t_name)) => {
-                                d_name == &db_name.name
-                                    && compare_table_name(
-                                        t_name,
-                                        &table_name.name,
-                                        &self.name_resolution_ctx,
-                                    )
-                            }
-                            _ => false,
-                        };
-                    if match_table_with_db
-                        && (exclude_cols.is_empty()
-                            || exclude_cols.get(&column_binding.column_name).is_none())
+
+                    adds += new_column_idx.len();
+
+                    for column_binding in input_context
+                        .all_column_bindings()
+                        .iter()
+                        .filter(|x| new_column_idx.contains(&x.index))
                     {
-                        match_table = true;
-                        let item = self
-                            .build_select_item(
-                                span,
-                                input_context,
-                                select_target,
-                                column_binding.clone(),
-                            )
-                            .await?;
+                        let item = self.build_select_item(
+                            span,
+                            input_context,
+                            select_target,
+                            column_binding.clone(),
+                        )?;
                         output.items.push(item);
                     }
                 }
-                if !match_table {
-                    return Err(ErrorCode::UnknownTable(format!(
-                        "Unknown table '{}'.'{}'",
-                        db_name.name.clone(),
-                        table_name.name.clone()
+                _ => {
+                    return Err(ErrorCode::SemanticError(format!(
+                        "Column lambda expression must be constant folded: {:?}",
+                        new_expr
                     ))
                     .set_span(span));
                 }
             }
-            _ => {
-                return Err(ErrorCode::SemanticError("Unsupported indirection type"));
-            }
         }
+
+        if adds == 0 {
+            return Err(ErrorCode::SemanticError("SELECT with no columns"));
+        }
+
         Ok(())
     }
-}
-
-// Pre-check exclude_col is legal
-fn precheck_exclude_cols(
-    input_context: &BindContext,
-    exclude_cols: &HashSet<String>,
-    db_name: Option<&Identifier>,
-    table_name: Option<&Identifier>,
-) -> Result<()> {
-    let all_columns_bind = input_context.all_column_bindings();
-    let mut qualified_cols_name: HashSet<String> = HashSet::new();
-
-    fn fill_qualified_cols(
-        qualified_cols_name: &mut HashSet<String>,
-        column_bind: &ColumnBinding,
-    ) -> Result<()> {
-        let col_name = column_bind.column_name.clone();
-        if qualified_cols_name.contains(col_name.as_str()) {
-            return Err(ErrorCode::SemanticError(format!(
-                "ambiguous column name '{col_name}'"
-            )));
-        } else {
-            qualified_cols_name.insert(col_name);
-        }
-        Ok(())
-    }
-
-    match (db_name, table_name) {
-        (None, None) => {
-            for column_bind in all_columns_bind {
-                if column_bind.visibility != Visibility::Visible {
-                    continue;
-                }
-                fill_qualified_cols(&mut qualified_cols_name, column_bind)?;
-            }
-        }
-        (None, Some(table_name)) => {
-            for column_bind in all_columns_bind {
-                if column_bind.visibility != Visibility::Visible {
-                    continue;
-                }
-                if column_bind.table_name == Some(table_name.name.clone()) {
-                    fill_qualified_cols(&mut qualified_cols_name, column_bind)?;
-                }
-            }
-        }
-        (Some(db_name), Some(table_name)) => {
-            for column_bind in all_columns_bind {
-                if column_bind.visibility != Visibility::Visible {
-                    continue;
-                }
-                if column_bind.table_name == Some(table_name.name.clone())
-                    && column_bind.database_name == Some(db_name.name.clone())
-                {
-                    fill_qualified_cols(&mut qualified_cols_name, column_bind)?;
-                }
-            }
-        }
-        (Some(_), None) => {}
-    }
-
-    for exclude_col in exclude_cols {
-        if qualified_cols_name.get(exclude_col).is_none() {
-            return Err(ErrorCode::SemanticError(format!(
-                "column '{exclude_col}' doesn't exist"
-            )));
-        }
-    }
-    if exclude_cols.len() == qualified_cols_name.len() {
-        return Err(ErrorCode::SemanticError("SELECT with no columns"));
-    }
-    Ok(())
 }

@@ -14,8 +14,8 @@
 
 use std::io::Write;
 
-use common_expression::types::*;
-use common_expression::FromData;
+use databend_common_expression::types::*;
+use databend_common_expression::FromData;
 use goldenfile::Mint;
 
 use super::run_ast;
@@ -27,6 +27,7 @@ fn test_array() {
 
     test_create(file);
     test_length(file);
+    test_range(file);
     test_get(file);
     test_slice(file);
     test_contains(file);
@@ -51,6 +52,7 @@ fn test_array() {
     test_array_kurtosis(file);
     test_array_skewness(file);
     test_array_sort(file);
+    test_arrays_zip(file);
 }
 
 fn test_create(file: &mut impl Write) {
@@ -72,6 +74,13 @@ fn test_length(file: &mut impl Write) {
     run_ast(file, "length([1, 2, 3])", &[]);
     run_ast(file, "length([true, false])", &[]);
     run_ast(file, "length(['a', 'b', 'c', 'd'])", &[]);
+    run_ast(file, "array_size(['a', 'b', 'c', 'd'])", &[]);
+    run_ast(file, "array_length(['a', 'b', 'c', 'd'])", &[]);
+}
+
+fn test_range(file: &mut impl Write) {
+    run_ast(file, "range(10, 20)", &[]);
+    run_ast(file, "range(10, 500000011)", &[]);
 }
 
 fn test_get(file: &mut impl Write) {
@@ -150,6 +159,10 @@ fn test_contains(file: &mut impl Write) {
     let columns = [
         ("int8_col", Int8Type::from_data(vec![1i8, 2, 7, 8])),
         (
+            "string_col",
+            StringType::from_data(vec![r#"1"#, r#"2"#, r#"5"#, r#"1234"#]),
+        ),
+        (
             "nullable_col",
             Int64Type::from_data_with_validity(vec![9i64, 10, 11, 12], vec![
                 true, true, false, false,
@@ -158,6 +171,20 @@ fn test_contains(file: &mut impl Write) {
     ];
 
     run_ast(file, "int8_col not in (1, 2, 3, 4, 5, null)", &columns);
+    run_ast(
+        file,
+        "contains(['5000', '6000', '7000'], string_col)",
+        &columns,
+    );
+
+    run_ast(file, "contains(['1', '5'], string_col)", &columns);
+
+    run_ast(
+        file,
+        "contains(['15000', '6000', '7000'], string_col)",
+        &columns,
+    );
+
     run_ast(file, "contains([1,2,null], nullable_col)", &columns);
     run_ast(
         file,
@@ -202,6 +229,16 @@ fn test_array_prepend(file: &mut impl Write) {
     run_ast(file, "array_prepend(1, [])", &[]);
     run_ast(file, "array_prepend(1, [2, 3, NULL, 4])", &[]);
     run_ast(file, "array_prepend('a', ['b', NULL, NULL, 'c', 'd'])", &[]);
+    run_ast(
+        file,
+        "array_prepend(NULL, CAST([2, 3] AS Array(INT8 NULL) NULL))",
+        &[],
+    );
+    run_ast(
+        file,
+        "array_prepend(1, CAST([2, 3] AS Array(INT8 NULL) NULL))",
+        &[],
+    );
     run_ast(file, "array_prepend(a, [b, c])", &[
         ("a", Int16Type::from_data(vec![0i16, 1, 2])),
         ("b", Int16Type::from_data(vec![3i16, 4, 5])),
@@ -213,6 +250,16 @@ fn test_array_append(file: &mut impl Write) {
     run_ast(file, "array_append([], 1)", &[]);
     run_ast(file, "array_append([2, 3, NULL, 4], 5)", &[]);
     run_ast(file, "array_append(['b', NULL, NULL, 'c', 'd'], 'e')", &[]);
+    run_ast(
+        file,
+        "array_append(CAST([1, 2] AS Array(INT8 NULL) NULL), NULL)",
+        &[],
+    );
+    run_ast(
+        file,
+        "array_append(CAST([1, 2] AS Array(INT8 NULL) NULL), 3)",
+        &[],
+    );
     run_ast(file, "array_append([b, c], a)", &[
         ("a", Int16Type::from_data(vec![0i16, 1, 2])),
         ("b", Int16Type::from_data(vec![3i16, 4, 5])),
@@ -230,7 +277,7 @@ fn test_array_indexof(file: &mut impl Write) {
     run_ast(file, "array_indexof([1,2,3,'s'], 's')", &[]);
     run_ast(
         file,
-        "array_indexof([1::VARIANT,'x'::VARIANT,null::VARIANT,'x'::VARIANT], 'x'::VARIANT)",
+        "array_indexof([1::VARIANT,2::VARIANT,3::VARIANT,4::VARIANT], 2::VARIANT)",
         &[],
     );
 
@@ -641,6 +688,9 @@ fn test_array_sort(file: &mut impl Write) {
     run_ast(file, "array_sort_asc_null_first([])", &[]);
     run_ast(file, "array_sort_desc_null_first([])", &[]);
     run_ast(file, "array_sort_asc_null_first(NULL)", &[]);
+    run_ast(file, "array_sort_asc_null_first([NULL, NULL, NULL])", &[]);
+    run_ast(file, "array_sort_desc_null_first([[], [], []])", &[]);
+    run_ast(file, "array_sort_asc_null_first([{}, {}, {}])", &[]);
     run_ast(
         file,
         "array_sort_asc_null_first([8, 20, 1, 2, 3, 4, 5, 6, 7])",
@@ -681,4 +731,11 @@ fn test_array_sort(file: &mut impl Write) {
         "array_sort_desc_null_last([1.2, NULL, 3.4, 5.6, '2.2', NULL])",
         &[],
     );
+}
+
+fn test_arrays_zip(file: &mut impl Write) {
+    run_ast(file, "arrays_zip(NULL, NULL)", &[]);
+    run_ast(file, "arrays_zip(1, 2, 'a')", &[]);
+    run_ast(file, "arrays_zip([1,2,3], ['a','b','c'], 10)", &[]);
+    run_ast(file, "arrays_zip([1,2,3], ['a','b'], 10)", &[]);
 }

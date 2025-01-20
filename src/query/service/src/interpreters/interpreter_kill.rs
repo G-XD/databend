@@ -12,38 +12,104 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
-use common_exception::ErrorCode;
-use common_exception::Result;
-use common_sql::plans::KillPlan;
+use databend_common_catalog::table_context::TableContext;
+use databend_common_exception::ErrorCode;
+use databend_common_exception::Result;
+use databend_common_sql::plans::KillPlan;
 
+use crate::clusters::ClusterHelper;
+use crate::clusters::FlightParams;
 use crate::interpreters::Interpreter;
 use crate::pipelines::PipelineBuildResult;
+use crate::servers::flight::v1::actions::KILL_QUERY;
+use crate::sessions::QueriesQueueManager;
 use crate::sessions::QueryContext;
 
 pub struct KillInterpreter {
     ctx: Arc<QueryContext>,
     plan: KillPlan,
+    proxy_to_warehouse: bool,
 }
 
 impl KillInterpreter {
     pub fn try_create(ctx: Arc<QueryContext>, plan: KillPlan) -> Result<Self> {
-        Ok(KillInterpreter { ctx, plan })
+        Ok(KillInterpreter {
+            ctx,
+            plan,
+            proxy_to_warehouse: true,
+        })
+    }
+
+    pub fn from_flight(ctx: Arc<QueryContext>, plan: KillPlan) -> Result<Self> {
+        Ok(KillInterpreter {
+            ctx,
+            plan,
+            proxy_to_warehouse: false,
+        })
+    }
+
+    #[async_backtrace::framed]
+    async fn kill_warehouse_query(&self) -> Result<PipelineBuildResult> {
+        let settings = self.ctx.get_settings();
+        let warehouse = self.ctx.get_warehouse_cluster().await?;
+
+        let flight_params = FlightParams {
+            timeout: settings.get_flight_client_timeout()?,
+            retry_times: settings.get_flight_max_retry_times()?,
+            retry_interval: settings.get_flight_retry_interval()?,
+        };
+
+        let mut message = HashMap::with_capacity(warehouse.nodes.len());
+
+        for node_info in &warehouse.nodes {
+            if node_info.id != warehouse.local_id {
+                message.insert(node_info.id.clone(), self.plan.clone());
+            }
+        }
+
+        let res = warehouse
+            .do_action::<_, bool>(KILL_QUERY, message, flight_params)
+            .await?;
+
+        match res.values().any(|x| *x) {
+            true => Ok(PipelineBuildResult::create()),
+            false => Err(ErrorCode::UnknownSession(format!(
+                "Not found session id {}",
+                self.plan.id
+            ))),
+        }
     }
 
     #[async_backtrace::framed]
     async fn execute_kill(&self, session_id: &String) -> Result<PipelineBuildResult> {
         match self.ctx.get_session_by_id(session_id) {
-            None => Err(ErrorCode::UnknownSession(format!(
-                "Not found session id {}",
-                session_id
-            ))),
+            None => match self.proxy_to_warehouse {
+                true => self.kill_warehouse_query().await,
+                false => Err(ErrorCode::UnknownSession(format!(
+                    "Not found session id {}",
+                    session_id
+                ))),
+            },
             Some(kill_session) if self.plan.kill_connection => {
+                if let Some(query_id) = kill_session.get_current_query_id() {
+                    if QueriesQueueManager::instance().remove(query_id) {
+                        return Ok(PipelineBuildResult::create());
+                    }
+                }
+
                 kill_session.force_kill_session();
                 Ok(PipelineBuildResult::create())
             }
             Some(kill_session) => {
+                if let Some(query_id) = kill_session.get_current_query_id() {
+                    if QueriesQueueManager::instance().remove(query_id) {
+                        return Ok(PipelineBuildResult::create());
+                    }
+                }
+
                 kill_session.force_kill_query(ErrorCode::AbortedQuery(
                     "Aborted query, because the server is shutting down or the query was killed",
                 ));
@@ -59,7 +125,12 @@ impl Interpreter for KillInterpreter {
         "KillInterpreter"
     }
 
+    fn is_ddl(&self) -> bool {
+        false
+    }
+
     #[async_backtrace::framed]
+    #[fastrace::trace]
     async fn execute2(&self) -> Result<PipelineBuildResult> {
         let id = &self.plan.id;
         // If press Ctrl + C, MySQL Client will create a new session and send query

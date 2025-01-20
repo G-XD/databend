@@ -16,23 +16,30 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use common_config::GlobalConfig;
-use common_exception::ErrorCode;
-use common_exception::Result;
-use common_io::prelude::FormatSettings;
-use common_meta_app::principal::GrantObject;
-use common_meta_app::principal::RoleInfo;
-use common_meta_app::principal::UserInfo;
-use common_meta_app::principal::UserPrivilegeType;
-use common_settings::ChangeValue;
-use common_settings::Settings;
-use common_users::RoleCacheManager;
-use common_users::BUILTIN_ROLE_PUBLIC;
+use databend_common_base::runtime::drop_guard;
+use databend_common_catalog::cluster_info::Cluster;
+use databend_common_config::GlobalConfig;
+use databend_common_exception::ErrorCode;
+use databend_common_exception::Result;
+use databend_common_expression::Scalar;
+use databend_common_io::prelude::FormatSettings;
+use databend_common_meta_app::principal::GrantObject;
+use databend_common_meta_app::principal::OwnershipObject;
+use databend_common_meta_app::principal::RoleInfo;
+use databend_common_meta_app::principal::UserInfo;
+use databend_common_meta_app::principal::UserPrivilegeType;
+use databend_common_meta_app::tenant::Tenant;
+use databend_common_pipeline_core::PlanProfile;
+use databend_common_settings::Settings;
+use databend_common_users::GrantObjectVisibilityChecker;
+use databend_storages_common_session::TempTblMgrRef;
+use databend_storages_common_session::TxnManagerRef;
 use log::debug;
 use parking_lot::RwLock;
 
 use crate::clusters::ClusterDiscovery;
-use crate::servers::http::v1::HttpQueryManager;
+use crate::sessions::session_privilege_mgr::SessionPrivilegeManager;
+use crate::sessions::session_privilege_mgr::SessionPrivilegeManagerImpl;
 use crate::sessions::QueryContext;
 use crate::sessions::QueryContextShared;
 use crate::sessions::SessionContext;
@@ -43,7 +50,7 @@ use crate::sessions::SessionType;
 pub struct Session {
     pub(in crate::sessions) id: String,
     pub(in crate::sessions) typ: RwLock<SessionType>,
-    pub(in crate::sessions) session_ctx: Arc<SessionContext>,
+    pub(in crate::sessions) session_ctx: Box<SessionContext>,
     status: Arc<RwLock<SessionStatus>>,
     pub(in crate::sessions) mysql_connection_id: Option<u32>,
     format_settings: FormatSettings,
@@ -53,25 +60,43 @@ impl Session {
     pub fn try_create(
         id: String,
         typ: SessionType,
-        session_ctx: Arc<SessionContext>,
+        session_ctx: Box<SessionContext>,
         mysql_connection_id: Option<u32>,
-    ) -> Result<Arc<Session>> {
-        let status = Arc::new(Default::default());
-        Ok(Arc::new(Session {
+    ) -> Result<Session> {
+        let status = Default::default();
+        Ok(Session {
             id,
             typ: RwLock::new(typ),
             status,
             session_ctx,
             mysql_connection_id,
             format_settings: FormatSettings::default(),
-        }))
+        })
     }
 
-    pub fn get_mysql_conn_id(self: &Arc<Self>) -> Option<u32> {
+    pub fn to_fastrace_properties(&self) -> Vec<(String, String)> {
+        let mut properties = vec![
+            ("session_id".to_string(), self.id.clone()),
+            ("session_database".to_string(), self.get_current_database()),
+            (
+                "session_tenant".to_string(),
+                self.get_current_tenant().tenant_name().to_string(),
+            ),
+        ];
+        if let Some(query_id) = self.get_current_query_id() {
+            properties.push(("query_id".to_string(), query_id));
+        }
+        if let Some(connection_id) = self.get_mysql_conn_id() {
+            properties.push(("connection_id".to_string(), connection_id.to_string()));
+        }
+        properties
+    }
+
+    pub fn get_mysql_conn_id(&self) -> Option<u32> {
         self.mysql_connection_id
     }
 
-    pub fn get_id(self: &Arc<Self>) -> String {
+    pub fn get_id(&self) -> String {
         self.id.clone()
     }
 
@@ -85,38 +110,34 @@ impl Session {
         *lock = typ;
     }
 
-    pub fn is_aborting(self: &Arc<Self>) -> bool {
+    pub fn is_aborting(&self) -> bool {
         self.session_ctx.get_abort()
     }
 
-    pub fn quit(self: &Arc<Self>) {
-        let session_ctx = self.session_ctx.clone();
+    pub fn quit(&self) {
+        let session_ctx = self.session_ctx.as_ref();
+
         if session_ctx.get_current_query_id().is_some() {
             if let Some(shutdown_fun) = session_ctx.take_io_shutdown_tx() {
                 shutdown_fun();
             }
         }
-
-        let http_queries_manager = HttpQueryManager::instance();
-        http_queries_manager.kill_session(&self.id);
     }
 
-    pub fn kill(self: &Arc<Self>) {
+    pub fn kill(&self) {
         self.session_ctx.set_abort(true);
         self.quit();
     }
 
-    pub fn force_kill_session(self: &Arc<Self>) {
+    pub fn force_kill_session(&self) {
         self.force_kill_query(ErrorCode::AbortedQuery(
             "Aborted query, because the server is shutting down or the query was killed",
         ));
         self.kill(/* shutdown io stream */);
     }
 
-    pub fn force_kill_query(self: &Arc<Self>, cause: ErrorCode) {
-        let session_ctx = self.session_ctx.clone();
-
-        if let Some(context_shared) = session_ctx.get_query_context_shared() {
+    pub fn force_kill_query<C>(&self, cause: ErrorCode<C>) {
+        if let Some(context_shared) = self.session_ctx.get_query_context_shared() {
             context_shared.kill(cause);
         }
     }
@@ -127,8 +148,15 @@ impl Session {
     #[async_backtrace::framed]
     pub async fn create_query_context(self: &Arc<Self>) -> Result<Arc<QueryContext>> {
         let config = GlobalConfig::instance();
-        let session = self.clone();
         let cluster = ClusterDiscovery::instance().discover(&config).await?;
+        self.create_query_context_with_cluster(cluster)
+    }
+
+    pub fn create_query_context_with_cluster(
+        self: &Arc<Self>,
+        cluster: Arc<Cluster>,
+    ) -> Result<Arc<QueryContext>> {
+        let session = self.clone();
         let shared = QueryContextShared::try_create(session, cluster)?;
 
         self.session_ctx
@@ -149,232 +177,254 @@ impl Session {
         self.session_ctx.get_current_query_id()
     }
 
-    pub fn attach<F>(self: &Arc<Self>, host: Option<SocketAddr>, io_shutdown: F)
+    pub fn attach<F>(&self, host: Option<SocketAddr>, io_shutdown: F)
     where F: FnOnce() + Send + Sync + 'static {
-        self.session_ctx.set_client_host(host);
+        self.session_ctx
+            .set_client_host(host.map(|host| host.ip().to_string()));
         self.session_ctx.set_io_shutdown_tx(io_shutdown);
     }
 
-    pub fn set_current_database(self: &Arc<Self>, database_name: String) {
+    pub fn set_client_host(&self, host: Option<String>) {
+        self.session_ctx.set_client_host(host);
+    }
+
+    pub fn set_current_database(&self, database_name: String) {
         self.session_ctx.set_current_database(database_name);
     }
 
-    pub fn get_current_database(self: &Arc<Self>) -> String {
+    pub fn get_current_database(&self) -> String {
         self.session_ctx.get_current_database()
     }
 
-    pub fn get_current_catalog(self: &Arc<Self>) -> String {
+    pub fn get_current_catalog(&self) -> String {
         self.session_ctx.get_current_catalog()
     }
 
-    pub fn get_current_tenant(self: &Arc<Self>) -> String {
+    pub fn set_current_catalog(&self, catalog_name: String) {
+        self.session_ctx.set_current_catalog(catalog_name)
+    }
+
+    pub fn get_current_tenant(&self) -> Tenant {
         self.session_ctx.get_current_tenant()
     }
 
-    pub fn set_current_tenant(self: &Arc<Self>, tenant: String) {
+    pub fn set_current_tenant(&mut self, tenant: Tenant) {
         self.session_ctx.set_current_tenant(tenant);
     }
 
-    pub fn get_current_user(self: &Arc<Self>) -> Result<UserInfo> {
-        self.session_ctx
-            .get_current_user()
-            .ok_or_else(|| ErrorCode::AuthenticateFailure("unauthenticated"))
+    pub fn get_current_user(&self) -> Result<UserInfo> {
+        self.privilege_mgr().get_current_user()
+    }
+
+    pub fn privilege_mgr(&self) -> SessionPrivilegeManagerImpl<'_> {
+        SessionPrivilegeManagerImpl::new(self.session_ctx.as_ref())
     }
 
     // set_authed_user() is called after authentication is passed in various protocol handlers, like
-    // HTTP handler, clickhouse query handler, mysql query handler. auth_role represents the role
-    // granted by external authenticator, it will over write the current user's granted roles, and
+    // HTTP handler, clickhouse query handler, mysql query handler. restricted_role represents the role
+    // granted by external authenticator, it will overwrite the current user's granted roles, and
     // becomes the CURRENT ROLE if not set X-DATABEND-ROLE.
     #[async_backtrace::framed]
     pub async fn set_authed_user(
-        self: &Arc<Self>,
+        &self,
         user: UserInfo,
-        auth_role: Option<String>,
+        restricted_role: Option<String>,
     ) -> Result<()> {
-        self.session_ctx.set_current_user(user);
-        self.session_ctx.set_auth_role(auth_role);
-        self.ensure_current_role().await?;
-        Ok(())
-    }
-
-    // ensure_current_role() is called after authentication and before any privilege checks
-    #[async_backtrace::framed]
-    async fn ensure_current_role(self: &Arc<Self>) -> Result<()> {
-        let tenant = self.get_current_tenant();
-        let public_role = RoleCacheManager::instance()
-            .find_role(&tenant, BUILTIN_ROLE_PUBLIC)
-            .await?
-            .unwrap_or_else(|| RoleInfo::new(BUILTIN_ROLE_PUBLIC));
-
-        // if CURRENT ROLE is not set, take current session's AUTH ROLE
-        let mut current_role_name = self.get_current_role().map(|r| r.name);
-        if current_role_name.is_none() {
-            current_role_name = self.session_ctx.get_auth_role();
-        }
-
-        // if CURRENT ROLE and AUTH ROLE are not set, take current user's DEFAULT ROLE
-        if current_role_name.is_none() {
-            current_role_name = self
-                .session_ctx
-                .get_current_user()
-                .map(|u| u.option.default_role().cloned())
-                .unwrap_or(None)
-        };
-
-        // if CURRENT ROLE, AUTH ROLE and DEFAULT ROLE are not set, take PUBLIC role
-        let current_role_name =
-            current_role_name.unwrap_or_else(|| BUILTIN_ROLE_PUBLIC.to_string());
-
-        // I can not use the CURRENT ROLE, reset to PUBLIC role
-        let role = self
-            .validate_available_role(&current_role_name)
+        self.privilege_mgr()
+            .set_authed_user(user, restricted_role)
             .await
-            .or_else(|e| {
-                if e.code() == ErrorCode::INVALID_ROLE {
-                    Ok(public_role)
-                } else {
-                    Err(e)
-                }
-            })?;
-        self.session_ctx.set_current_role(Some(role));
-        Ok(())
     }
 
     #[async_backtrace::framed]
-    pub async fn validate_available_role(self: &Arc<Self>, role_name: &str) -> Result<RoleInfo> {
-        let available_roles = self.get_all_available_roles().await?;
-        let role = available_roles.iter().find(|r| r.name == role_name);
-        match role {
-            Some(role) => Ok(role.clone()),
-            None => {
-                let available_role_names = available_roles
-                    .iter()
-                    .map(|r| r.name.clone())
-                    .collect::<Vec<_>>()
-                    .join(",");
-                Err(ErrorCode::InvalidRole(format!(
-                    "Invalid role {} for current session, available: {}",
-                    role_name, available_role_names,
-                )))
-            }
-        }
+    pub async fn validate_available_role(&self, role_name: &str) -> Result<RoleInfo> {
+        self.privilege_mgr()
+            .validate_available_role(role_name)
+            .await
     }
 
     // Only the available role can be set as current role. The current role can be set by the SET
-    // ROLE statement, or by the X-DATABEND-ROLE header in HTTP protocol (not implemented yet).
+    // ROLE statement, or by the `session.role` field in the HTTP query request body.
     #[async_backtrace::framed]
-    pub async fn set_current_role_checked(self: &Arc<Self>, role_name: &str) -> Result<()> {
-        let role = self.validate_available_role(role_name).await?;
-        self.session_ctx.set_current_role(Some(role));
-        Ok(())
+    pub async fn set_current_role_checked(&self, role_name: &str) -> Result<()> {
+        self.privilege_mgr()
+            .set_current_role(Some(role_name.to_string()))
+            .await
     }
 
-    pub fn get_current_role(self: &Arc<Self>) -> Option<RoleInfo> {
-        self.session_ctx.get_current_role()
+    #[async_backtrace::framed]
+    pub async fn set_secondary_roles_checked(&self, role_names: Option<Vec<String>>) -> Result<()> {
+        self.privilege_mgr().set_secondary_roles(role_names).await
     }
 
-    pub fn unset_current_role(self: &Arc<Self>) {
-        self.session_ctx.set_current_role(None)
+    pub fn get_current_role(&self) -> Option<RoleInfo> {
+        self.privilege_mgr().get_current_role()
     }
 
-    // Returns all the roles the current session has. If the user have been granted auth_role,
+    pub fn get_secondary_roles(&self) -> Option<Vec<String>> {
+        self.privilege_mgr().get_secondary_roles()
+    }
+
+    #[async_backtrace::framed]
+    pub async fn unset_current_role(&self) -> Result<()> {
+        self.privilege_mgr()
+            .set_current_role(Some("public".to_string()))
+            .await
+    }
+
+    // Returns all the roles the current session has. If the user have been granted restricted_role,
     // the other roles will be ignored.
     // On executing SET ROLE, the role have to be one of the available roles.
     #[async_backtrace::framed]
-    pub async fn get_all_available_roles(self: &Arc<Self>) -> Result<Vec<RoleInfo>> {
-        let roles = match self.session_ctx.get_auth_role() {
-            Some(auth_role) => vec![auth_role],
-            None => {
-                let current_user = self.get_current_user()?;
-                current_user.grants.roles()
-            }
-        };
+    pub async fn get_all_available_roles(&self) -> Result<Vec<RoleInfo>> {
+        self.privilege_mgr().get_all_available_roles().await
+    }
 
-        let tenant = self.get_current_tenant();
-        let mut related_roles = RoleCacheManager::instance()
-            .find_related_roles(&tenant, &roles)
-            .await?;
-        related_roles.sort_by(|a, b| a.name.cmp(&b.name));
-        Ok(related_roles)
+    #[async_backtrace::framed]
+    pub async fn get_all_effective_roles(&self) -> Result<Vec<RoleInfo>> {
+        self.privilege_mgr().get_all_effective_roles().await
+    }
+
+    #[async_backtrace::framed]
+    pub async fn set_current_warehouse(&self, w: Option<String>) -> Result<()> {
+        self.privilege_mgr().set_current_warehouse(w).await
+    }
+
+    #[async_backtrace::framed]
+    pub async fn get_current_warehouse(&self) -> Option<String> {
+        self.session_ctx.get_current_warehouse()
     }
 
     #[async_backtrace::framed]
     pub async fn validate_privilege(
-        self: &Arc<Self>,
+        &self,
         object: &GrantObject,
-        privilege: Vec<UserPrivilegeType>,
+        privilege: UserPrivilegeType,
+        check_current_role_only: bool,
     ) -> Result<()> {
         if matches!(self.get_type(), SessionType::Local) {
             return Ok(());
         }
-
-        // 1. check user's privilege set
-        let current_user = self.get_current_user()?;
-        let user_verified = current_user
-            .grants
-            .verify_privilege(object, privilege.clone());
-        if user_verified {
-            return Ok(());
-        }
-
-        // 2. check the user's roles' privilege set
-        self.ensure_current_role().await?;
-        let available_roles = self.get_all_available_roles().await?;
-        let role_verified = available_roles
-            .iter()
-            .any(|r| r.grants.verify_privilege(object, privilege.clone()));
-        if role_verified {
-            return Ok(());
-        }
-        let roles_name = available_roles
-            .iter()
-            .map(|r| r.name.clone())
-            .collect::<Vec<_>>()
-            .join(",");
-
-        Err(ErrorCode::PermissionDenied(format!(
-            "Permission denied, privilege {:?} is required on {} for user {} with roles [{}]",
-            privilege.clone(),
-            object,
-            &current_user.identity(),
-            roles_name,
-        )))
+        self.privilege_mgr()
+            .validate_privilege(object, privilege, check_current_role_only)
+            .await
     }
 
-    pub fn get_settings(self: &Arc<Self>) -> Arc<Settings> {
+    #[async_backtrace::framed]
+    pub async fn has_ownership(
+        &self,
+        object: &OwnershipObject,
+        check_current_role_only: bool,
+    ) -> Result<bool> {
+        if matches!(self.get_type(), SessionType::Local) {
+            return Ok(true);
+        }
+        self.privilege_mgr()
+            .has_ownership(object, check_current_role_only)
+            .await
+    }
+
+    #[async_backtrace::framed]
+    pub async fn get_visibility_checker(
+        &self,
+        ignore_ownership: bool,
+    ) -> Result<GrantObjectVisibilityChecker> {
+        self.privilege_mgr()
+            .get_visibility_checker(ignore_ownership)
+            .await
+    }
+
+    pub fn get_settings(&self) -> Arc<Settings> {
         self.session_ctx.get_settings()
     }
 
-    pub fn get_changed_settings(&self) -> HashMap<String, ChangeValue> {
-        self.session_ctx.get_changed_settings()
-    }
-
-    pub fn apply_changed_settings(&self, changes: HashMap<String, ChangeValue>) -> Result<()> {
-        self.session_ctx.apply_changed_settings(changes)
-    }
-
-    pub fn get_memory_usage(self: &Arc<Self>) -> usize {
+    pub fn get_memory_usage(&self) -> usize {
         // TODO(winter): use thread memory tracker
         0
     }
 
-    pub fn get_status(self: &Arc<Self>) -> Arc<RwLock<SessionStatus>> {
+    pub fn get_status(&self) -> Arc<RwLock<SessionStatus>> {
         self.status.clone()
     }
 
-    pub fn get_query_result_cache_key(self: &Arc<Self>, query_id: &str) -> Option<String> {
+    pub fn get_query_result_cache_key(&self, query_id: &str) -> Option<String> {
         self.session_ctx.get_query_result_cache_key(query_id)
     }
 
-    pub fn update_query_ids_results(self: &Arc<Self>, query_id: String, result_cache_key: String) {
+    pub fn update_query_ids_results(&self, query_id: String, result_cache_key: String) {
         self.session_ctx
             .update_query_ids_results(query_id, Some(result_cache_key))
+    }
+
+    pub fn txn_mgr(&self) -> TxnManagerRef {
+        self.session_ctx.txn_mgr()
+    }
+    pub fn set_txn_mgr(&self, txn_mgr: TxnManagerRef) {
+        self.session_ctx.set_txn_mgr(txn_mgr)
+    }
+
+    pub fn temp_tbl_mgr(&self) -> TempTblMgrRef {
+        self.session_ctx.temp_tbl_mgr()
+    }
+    pub fn set_temp_tbl_mgr(&self, temp_tbl_mgr: TempTblMgrRef) {
+        self.session_ctx.set_temp_tbl_mgr(temp_tbl_mgr)
+    }
+
+    pub fn set_query_priority(&self, priority: u8) {
+        if let Some(context_shared) = self.session_ctx.get_query_context_shared() {
+            context_shared.set_priority(priority);
+        }
+    }
+
+    pub fn get_query_profiles(&self) -> Vec<PlanProfile> {
+        match self.session_ctx.get_query_context_shared() {
+            None => vec![],
+            Some(x) => x.get_query_profiles(),
+        }
+    }
+
+    pub fn get_all_variables(&self) -> HashMap<String, Scalar> {
+        self.session_ctx.get_all_variables()
+    }
+
+    pub fn set_all_variables(&self, variables: HashMap<String, Scalar>) {
+        self.session_ctx.set_all_variables(variables)
+    }
+
+    pub fn get_client_session_id(&self) -> Option<String> {
+        self.session_ctx.get_client_session_id()
+    }
+
+    pub fn set_client_session_id(&mut self, id: String) {
+        self.session_ctx.set_client_session_id(id)
+    }
+    pub fn get_temp_table_prefix(&self) -> Result<String> {
+        let typ = self.typ.read().clone();
+        let session_id = match typ {
+            SessionType::MySQL => self.id.clone(),
+            SessionType::HTTPQuery => {
+                if let Some(id) = self.get_client_session_id() {
+                    id
+                } else {
+                    return Err(ErrorCode::BadArguments(
+                        "can not use temp table in http handler if cookie is not enabled",
+                    ));
+                }
+            }
+            t => {
+                return Err(ErrorCode::BadArguments(format!(
+                    "can not use temp table in session type {t}"
+                )));
+            }
+        };
+        Ok(format!("{}/{session_id}", self.get_current_user()?.name))
     }
 }
 
 impl Drop for Session {
     fn drop(&mut self) {
-        debug!("Drop session {}", self.id.clone());
-        SessionManager::instance().destroy_session(&self.id.clone());
+        drop_guard(move || {
+            debug!("Drop session {}", self.id.clone());
+            SessionManager::instance().destroy_session(&self.id.clone());
+        })
     }
 }

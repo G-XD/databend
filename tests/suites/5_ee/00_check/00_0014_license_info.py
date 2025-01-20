@@ -22,7 +22,7 @@ mydb = mysql.connector.connect(
 
 
 def get_license():
-    return os.getenv("DATABEND_ENTERPRISE_LICENSE")
+    return os.getenv("QUERY_DATABEND_ENTERPRISE_LICENSE")
 
 
 if __name__ == "__main__":
@@ -48,15 +48,16 @@ if __name__ == "__main__":
         organization = license[0][2]
         issue_at = license[0][3]
         expire_at = license[0][4]
-        now = datetime.utcnow()
+        features = license[0][6]
+        now = datetime.now()
 
         if now < issue_at or now > expire_at:
             print(
                 f"License is invalid: issuer: {issuer}, type: {type_}, "
-                f"org: {organization}, issue_at: {issue_at}, expire_at: {expire_at}"
+                f"org: {organization}, issue_at: {issue_at}, expire_at: {expire_at}, features: {features}"
             )
             sys.exit(1)
-
+        print(features)
         mycursor = mydb.cursor()
         mycursor.execute(
             "select count(*) from system.processes where type = 'FlightSQL';"

@@ -15,33 +15,31 @@
 use std::ops::Deref;
 use std::sync::Arc;
 
-use common_catalog::table_context::TableContext;
+use databend_common_exception::Result;
 
-use crate::optimizer::PhysicalProperty;
 use crate::optimizer::RelExpr;
 use crate::optimizer::RelationalProperty;
-use crate::optimizer::RequiredProperty;
 use crate::optimizer::StatInfo;
 use crate::plans::Operator;
 use crate::plans::RelOp;
-use crate::IndexType;
-use crate::ScalarExpr;
-
-/// An item of set-returning function.
-/// Contains definition of srf and its output columns.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct SrfItem {
-    pub scalar: ScalarExpr,
-    pub index: IndexType,
-}
+use crate::plans::ScalarItem;
 
 /// `ProjectSet` is a plan that evaluate a series of
 /// set-returning functions, zip the result together,
 /// and return the joined result with input relation.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ProjectSet {
-    pub srfs: Vec<SrfItem>,
-    pub unused_columns: Option<Vec<IndexType>>,
+    pub srfs: Vec<ScalarItem>,
+}
+
+impl ProjectSet {
+    pub fn derive_project_set_stats(&self, input_stat: &mut StatInfo) -> Result<Arc<StatInfo>> {
+        // ProjectSet is set-returning functions, precise_cardinality set None
+        input_stat.statistics.precise_cardinality = None;
+        // We assume that the SRF function will expand by at least x3 per row.
+        input_stat.cardinality *= 3.0;
+        Ok(Arc::new(input_stat.clone()))
+    }
 }
 
 impl Operator for ProjectSet {
@@ -52,35 +50,43 @@ impl Operator for ProjectSet {
     fn derive_relational_prop(
         &self,
         rel_expr: &RelExpr,
-    ) -> common_exception::Result<Arc<RelationalProperty>> {
-        let mut child_prop = rel_expr.derive_relational_prop_child(0)?.as_ref().clone();
+    ) -> databend_common_exception::Result<Arc<RelationalProperty>> {
+        let child_prop = rel_expr.derive_relational_prop_child(0)?.as_ref().clone();
+
+        // Derive output columns
+        let mut output_columns = child_prop.output_columns.clone();
         for srf in &self.srfs {
-            child_prop.output_columns.insert(srf.index);
+            output_columns.insert(srf.index);
         }
-        Ok(Arc::new(child_prop))
+
+        // Derive used columns
+        let mut used_columns = child_prop.used_columns.clone();
+        for srf in &self.srfs {
+            used_columns.extend(srf.scalar.used_columns());
+        }
+
+        // Derive outer columns
+        let mut outer_columns = child_prop.outer_columns.clone();
+        for srf in &self.srfs {
+            outer_columns.extend(
+                srf.scalar
+                    .used_columns()
+                    .difference(&child_prop.output_columns)
+                    .cloned(),
+            );
+        }
+
+        Ok(Arc::new(RelationalProperty {
+            output_columns,
+            outer_columns,
+            used_columns,
+            orderings: vec![],
+            partition_orderings: None,
+        }))
     }
 
-    fn derive_physical_prop(
-        &self,
-        rel_expr: &RelExpr,
-    ) -> common_exception::Result<PhysicalProperty> {
-        rel_expr.derive_physical_prop_child(0)
-    }
-
-    fn derive_cardinality(&self, rel_expr: &RelExpr) -> common_exception::Result<Arc<StatInfo>> {
+    fn derive_stats(&self, rel_expr: &RelExpr) -> databend_common_exception::Result<Arc<StatInfo>> {
         let mut input_stat = rel_expr.derive_cardinality_child(0)?.deref().clone();
-        // ProjectSet is set-returning functions, precise_cardinality set None
-        input_stat.statistics.precise_cardinality = None;
-        Ok(Arc::new(input_stat))
-    }
-
-    fn compute_required_prop_child(
-        &self,
-        _ctx: Arc<dyn TableContext>,
-        _rel_expr: &RelExpr,
-        _child_index: usize,
-        required: &RequiredProperty,
-    ) -> common_exception::Result<RequiredProperty> {
-        Ok(required.clone())
+        self.derive_project_set_stats(&mut input_stat)
     }
 }

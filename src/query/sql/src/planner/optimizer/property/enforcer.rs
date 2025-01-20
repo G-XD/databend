@@ -14,101 +14,133 @@
 
 use std::sync::Arc;
 
-use common_catalog::table_context::TableContext;
-use common_exception::Result;
+use databend_common_catalog::table_context::TableContext;
+use databend_common_exception::ErrorCode;
+use databend_common_exception::Result;
+use databend_common_expression::type_check::common_super_type;
+use databend_common_functions::BUILTIN_FUNCTIONS;
 
+use crate::binder::wrap_cast;
 use crate::optimizer::property::Distribution;
+use crate::optimizer::PhysicalProperty;
 use crate::optimizer::RelExpr;
 use crate::optimizer::RequiredProperty;
 use crate::optimizer::SExpr;
 use crate::plans::Exchange;
 use crate::plans::RelOperator;
 
+/// Enforcer is a trait that can enforce the physical property
+pub trait Enforcer: std::fmt::Debug + Send + Sync {
+    /// Check if necessary to enforce the physical property
+    fn check_enforce(&self, input_prop: &PhysicalProperty) -> bool;
+
+    /// Enforce the physical property
+    fn enforce(&self) -> Result<RelOperator>;
+}
+
+#[derive(Debug)]
+pub struct DistributionEnforcer(Distribution);
+
+impl DistributionEnforcer {
+    pub fn into_inner(self) -> Distribution {
+        self.0
+    }
+}
+
+impl From<Distribution> for DistributionEnforcer {
+    fn from(distribution: Distribution) -> Self {
+        DistributionEnforcer(distribution)
+    }
+}
+
+impl Enforcer for DistributionEnforcer {
+    fn check_enforce(&self, input_prop: &PhysicalProperty) -> bool {
+        !self.0.satisfied_by(&input_prop.distribution)
+    }
+
+    fn enforce(&self) -> Result<RelOperator> {
+        match self.0 {
+            Distribution::Serial => Ok(Exchange::Merge.into()),
+            Distribution::Broadcast => Ok(Exchange::Broadcast.into()),
+            Distribution::Hash(ref hash_keys) => Ok(Exchange::Hash(hash_keys.clone()).into()),
+            Distribution::Random | Distribution::Any => Err(ErrorCode::Internal(
+                "Cannot enforce random or any distribution",
+            )),
+        }
+    }
+}
+
 /// Require and enforce physical property from a physical `SExpr`
+#[recursive::recursive]
 pub fn require_property(
     ctx: Arc<dyn TableContext>,
     required: &RequiredProperty,
     s_expr: &SExpr,
 ) -> Result<SExpr> {
-    // First, we will require the child SExpr with input `RequiredProperty`
-    let optimized_children = s_expr
+    // First, we will require the child SExpr with input `RequiredProperty`.
+    let children = s_expr
         .children()
-        .iter()
         .map(|child| Ok(Arc::new(require_property(ctx.clone(), required, child)?)))
         .collect::<Result<Vec<_>>>()?;
-    let optimized_expr = SExpr::create(
-        Arc::new(s_expr.plan().clone()),
-        optimized_children,
-        None,
-        None,
-        None,
-    );
+    let s_expr = SExpr::create(Arc::new(s_expr.plan().clone()), children, None, None, None);
+    let rel_expr = RelExpr::with_s_expr(&s_expr);
 
-    let rel_expr = RelExpr::with_s_expr(&optimized_expr);
     let mut children = Vec::with_capacity(s_expr.arity());
-    for index in 0..optimized_expr.arity() {
-        let required = rel_expr.compute_required_prop_child(ctx.clone(), index, required)?;
-        let physical = rel_expr.derive_physical_prop_child(index)?;
-        if let RelOperator::Join(_) = s_expr.plan.as_ref() {
-            if index == 0 && required.distribution == Distribution::Broadcast {
-                // If the child is join probe side and join type is broadcast join
-                // We should wrap the child with Random exchange to make it partition to all nodes
-                if optimized_expr
-                    .child(0)?
-                    .children()
-                    .iter()
-                    .any(|v| check_partition(v.as_ref()))
-                {
-                    children.push(Arc::new(optimized_expr.child(index)?.clone()));
-                    continue;
-                }
-                let enforced_child =
-                    enforce_property(optimized_expr.child(index)?, &RequiredProperty {
-                        distribution: Distribution::Any,
-                    })?;
-                children.push(Arc::new(enforced_child));
-                continue;
-            } else if index == 1 && required.distribution == Distribution::Broadcast {
-                // If the child is join build side and join type is broadcast join
-                // We should wrap the child with Broadcast exchange to make it available to all nodes.
-                let enforced_child = enforce_property(optimized_expr.child(index)?, &required)?;
-                children.push(Arc::new(enforced_child));
-            }
-        }
-        if let RelOperator::UnionAll(_) = s_expr.plan.as_ref() {
-            // Wrap the child with Random exchange to make it partition to all nodes
-            // Check if exists `Merge` in child, if not exits, wrap it with `Exchange`
-            if optimized_expr
-                .children()
-                .iter()
-                .all(|child| !check_merge(child))
-            {
-                let enforced_child =
-                    enforce_property(optimized_expr.child(index)?, &RequiredProperty {
-                        distribution: Distribution::Any,
-                    })?;
-                children.push(Arc::new(enforced_child));
-                continue;
-            }
-        }
+    let mut required_properties = Vec::with_capacity(s_expr.arity());
+    let mut physical_properties = Vec::with_capacity(s_expr.arity());
+    for index in 0..s_expr.arity() {
+        required_properties.push(rel_expr.compute_required_prop_child(
+            ctx.clone(),
+            index,
+            required,
+        )?);
+        physical_properties.push(rel_expr.derive_physical_prop_child(index)?);
+    }
 
-        if required.satisfied_by(&physical) {
-            children.push(Arc::new(optimized_expr.child(index)?.clone()));
+    let plan = s_expr.plan.as_ref().clone();
+    if let RelOperator::Join(_) = &plan {
+        let (probe_required_property, build_required_property) =
+            required_properties.split_at_mut(1);
+        if let Distribution::Hash(probe_keys) = &mut probe_required_property[0].distribution
+            && let Distribution::Hash(build_keys) = &mut build_required_property[0].distribution
+        {
+            for (probe_key, build_key) in probe_keys.iter_mut().zip(build_keys.iter_mut()) {
+                let probe_key_data_type = probe_key.data_type()?;
+                let build_key_data_type = build_key.data_type()?;
+                let conmon_data_type = common_super_type(
+                    probe_key_data_type.clone(),
+                    build_key_data_type.clone(),
+                    &BUILTIN_FUNCTIONS.default_cast_rules,
+                )
+                .ok_or_else(|| {
+                    ErrorCode::IllegalDataType(format!(
+                        "Cannot find common type for probe key {:?} and build key {:?}",
+                        &probe_key, &build_key
+                    ))
+                })?;
+                for (key, data_type) in [
+                    (probe_key, probe_key_data_type),
+                    (build_key, build_key_data_type),
+                ] {
+                    if data_type != conmon_data_type {
+                        *key = wrap_cast(key, &conmon_data_type);
+                    }
+                }
+            }
+        }
+    }
+
+    for index in 0..s_expr.arity() {
+        if required_properties[index].satisfied_by(&physical_properties[index]) {
+            children.push(Arc::new(s_expr.child(index)?.clone()));
             continue;
         }
-
         // Enforce required property on the child.
-        let enforced_child = enforce_property(optimized_expr.child(index)?, &required)?;
+        let enforced_child = enforce_property(s_expr.child(index)?, &required_properties[index])?;
         children.push(Arc::new(enforced_child));
     }
 
-    Ok(SExpr::create(
-        Arc::new(optimized_expr.plan().clone()),
-        children,
-        None,
-        None,
-        None,
-    ))
+    Ok(SExpr::create(Arc::new(plan), children, None, None, None))
 }
 
 /// Try to enforce physical property from a physical `SExpr`
@@ -119,11 +151,6 @@ fn enforce_property(s_expr: &SExpr, required: &RequiredProperty) -> Result<SExpr
 
 pub fn enforce_distribution(distribution: &Distribution, s_expr: &SExpr) -> Result<SExpr> {
     match distribution {
-        Distribution::Random | Distribution::Any => Ok(SExpr::create_unary(
-            Arc::new(Exchange::Random.into()),
-            Arc::new(s_expr.clone()),
-        )),
-
         Distribution::Serial => Ok(SExpr::create_unary(
             Arc::new(Exchange::Merge.into()),
             Arc::new(s_expr.clone()),
@@ -138,37 +165,9 @@ pub fn enforce_distribution(distribution: &Distribution, s_expr: &SExpr) -> Resu
             Arc::new(Exchange::Hash(hash_keys.clone()).into()),
             Arc::new(s_expr.clone()),
         )),
-    }
-}
 
-fn check_merge(s_expr: &SExpr) -> bool {
-    // Todo: support cluster for materialized cte
-    if let RelOperator::CteScan(_) = s_expr.plan.as_ref() {
-        return true;
+        Distribution::Random | Distribution::Any => Err(ErrorCode::Internal(
+            "Cannot enforce random or any distribution",
+        )),
     }
-    if let RelOperator::Exchange(op) = s_expr.plan.as_ref() {
-        if op == &Exchange::Merge {
-            return true;
-        }
-    }
-    for child in s_expr.children() {
-        if check_merge(child) {
-            return true;
-        }
-    }
-    false
-}
-
-fn check_partition(s_expr: &SExpr) -> bool {
-    if let RelOperator::Exchange(op) = s_expr.plan.as_ref() {
-        if matches!(op, Exchange::Random | Exchange::Hash(_)) {
-            return true;
-        }
-    }
-    for child in s_expr.children() {
-        if check_partition(child) {
-            return true;
-        }
-    }
-    false
 }

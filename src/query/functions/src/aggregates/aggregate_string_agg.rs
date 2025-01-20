@@ -16,34 +16,38 @@ use std::alloc::Layout;
 use std::fmt;
 use std::sync::Arc;
 
-use common_arrow::arrow::bitmap::Bitmap;
-use common_exception::ErrorCode;
-use common_exception::Result;
-use common_expression::types::DataType;
-use common_expression::types::StringType;
-use common_expression::types::ValueType;
-use common_expression::Column;
-use common_expression::ColumnBuilder;
-use common_expression::Scalar;
-use common_io::prelude::deserialize_from_slice;
-use common_io::prelude::serialize_into_buf;
-use serde::Deserialize;
-use serde::Serialize;
+use borsh::BorshDeserialize;
+use borsh::BorshSerialize;
+use databend_common_exception::ErrorCode;
+use databend_common_exception::Result;
+use databend_common_expression::types::Bitmap;
+use databend_common_expression::types::DataType;
+use databend_common_expression::types::StringType;
+use databend_common_expression::types::ValueType;
+use databend_common_expression::AggrStateRegistry;
+use databend_common_expression::AggrStateType;
+use databend_common_expression::ColumnBuilder;
+use databend_common_expression::InputColumns;
+use databend_common_expression::Scalar;
 
 use super::aggregate_function_factory::AggregateFunctionDescription;
+use super::borsh_deserialize_state;
+use super::borsh_serialize_state;
 use super::StateAddr;
 use crate::aggregates::assert_variadic_arguments;
+use crate::aggregates::AggrState;
+use crate::aggregates::AggrStateLoc;
 use crate::aggregates::AggregateFunction;
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(BorshSerialize, BorshDeserialize, Debug)]
 pub struct StringAggState {
-    values: Vec<u8>,
+    values: String,
 }
 
 #[derive(Clone)]
 pub struct AggregateStringAggFunction {
     display_name: String,
-    delimiter: Vec<u8>,
+    delimiter: String,
 }
 
 impl AggregateFunction for AggregateStringAggFunction {
@@ -55,18 +59,20 @@ impl AggregateFunction for AggregateStringAggFunction {
         Ok(DataType::String)
     }
 
-    fn init_state(&self, place: StateAddr) {
-        place.write(|| StringAggState { values: Vec::new() });
+    fn init_state(&self, place: AggrState) {
+        place.write(|| StringAggState {
+            values: String::new(),
+        });
     }
 
-    fn state_layout(&self) -> Layout {
-        Layout::new::<StringAggState>()
+    fn register_state(&self, registry: &mut AggrStateRegistry) {
+        registry.register(AggrStateType::Custom(Layout::new::<StringAggState>()));
     }
 
     fn accumulate(
         &self,
-        place: StateAddr,
-        columns: &[Column],
+        place: AggrState,
+        columns: InputColumns,
         validity: Option<&Bitmap>,
         _input_rows: usize,
     ) -> Result<()> {
@@ -76,15 +82,15 @@ impl AggregateFunction for AggregateStringAggFunction {
             Some(validity) => {
                 column.iter().zip(validity.iter()).for_each(|(v, b)| {
                     if b {
-                        state.values.extend_from_slice(v);
-                        state.values.extend_from_slice(self.delimiter.as_slice());
+                        state.values.push_str(v);
+                        state.values.push_str(&self.delimiter);
                     }
                 });
             }
             None => {
                 column.iter().for_each(|v| {
-                    state.values.extend_from_slice(v);
-                    state.values.extend_from_slice(self.delimiter.as_slice());
+                    state.values.push_str(v);
+                    state.values.push_str(&self.delimiter);
                 });
             }
         }
@@ -94,59 +100,60 @@ impl AggregateFunction for AggregateStringAggFunction {
     fn accumulate_keys(
         &self,
         places: &[StateAddr],
-        offset: usize,
-        columns: &[Column],
+        loc: &[AggrStateLoc],
+        columns: InputColumns,
         _input_rows: usize,
     ) -> Result<()> {
         let column = StringType::try_downcast_column(&columns[0]).unwrap();
         let column_iter = StringType::iter_column(&column);
         column_iter.zip(places.iter()).for_each(|(v, place)| {
-            let addr = place.next(offset);
-            let state = addr.get::<StringAggState>();
-            state.values.extend_from_slice(v);
-            state.values.extend_from_slice(self.delimiter.as_slice());
+            let state = AggrState::new(*place, loc).get::<StringAggState>();
+            state.values.push_str(v);
+            state.values.push_str(&self.delimiter);
         });
         Ok(())
     }
 
-    fn accumulate_row(&self, place: StateAddr, columns: &[Column], row: usize) -> Result<()> {
+    fn accumulate_row(&self, place: AggrState, columns: InputColumns, row: usize) -> Result<()> {
         let column = StringType::try_downcast_column(&columns[0]).unwrap();
         let v = StringType::index_column(&column, row);
         if let Some(v) = v {
             let state = place.get::<StringAggState>();
-            state.values.extend_from_slice(v);
-            state.values.extend_from_slice(self.delimiter.as_slice());
+            state.values.push_str(v);
+            state.values.push_str(&self.delimiter);
         }
         Ok(())
     }
 
-    fn serialize(&self, place: StateAddr, writer: &mut Vec<u8>) -> Result<()> {
+    fn serialize(&self, place: AggrState, writer: &mut Vec<u8>) -> Result<()> {
         let state = place.get::<StringAggState>();
-        serialize_into_buf(writer, state)?;
+        borsh_serialize_state(writer, state)?;
         Ok(())
     }
 
-    fn deserialize(&self, place: StateAddr, reader: &mut &[u8]) -> Result<()> {
+    fn merge(&self, place: AggrState, reader: &mut &[u8]) -> Result<()> {
         let state = place.get::<StringAggState>();
-        state.values = deserialize_from_slice(reader)?;
+        let rhs: StringAggState = borsh_deserialize_state(reader)?;
+        state.values.push_str(&rhs.values);
         Ok(())
     }
 
-    fn merge(&self, place: StateAddr, rhs: StateAddr) -> Result<()> {
-        let rhs = rhs.get::<StringAggState>();
+    fn merge_states(&self, place: AggrState, rhs: AggrState) -> Result<()> {
         let state = place.get::<StringAggState>();
-        state.values.extend_from_slice(rhs.values.as_slice());
+        let other = rhs.get::<StringAggState>();
+        state.values.push_str(&other.values);
         Ok(())
     }
 
-    fn merge_result(&self, place: StateAddr, builder: &mut ColumnBuilder) -> Result<()> {
+    fn merge_result(&self, place: AggrState, builder: &mut ColumnBuilder) -> Result<()> {
         let state = place.get::<StringAggState>();
         let builder = StringType::try_downcast_builder(builder).unwrap();
         if !state.values.is_empty() {
             let len = state.values.len() - self.delimiter.len();
-            builder.put_slice(&state.values.as_slice()[..len]);
+            builder.put_and_commit(&state.values[..len]);
+        } else {
+            builder.put_and_commit("");
         }
-        builder.commit_row();
         Ok(())
     }
 
@@ -154,7 +161,7 @@ impl AggregateFunction for AggregateStringAggFunction {
         true
     }
 
-    unsafe fn drop_state(&self, place: StateAddr) {
+    unsafe fn drop_state(&self, place: AggrState) {
         let state = place.get::<StringAggState>();
         std::ptr::drop_in_place(state);
     }
@@ -167,7 +174,7 @@ impl fmt::Display for AggregateStringAggFunction {
 }
 
 impl AggregateStringAggFunction {
-    fn try_create(display_name: &str, delimiter: Vec<u8>) -> Result<Arc<dyn AggregateFunction>> {
+    fn try_create(display_name: &str, delimiter: String) -> Result<Arc<dyn AggregateFunction>> {
         let func = AggregateStringAggFunction {
             display_name: display_name.to_string(),
             delimiter,
@@ -192,7 +199,7 @@ pub fn try_create_aggregate_string_agg_function(
     let delimiter = if params.len() == 1 {
         params[0].as_string().unwrap().clone()
     } else {
-        vec![]
+        String::new()
     };
     AggregateStringAggFunction::try_create(display_name, delimiter)
 }

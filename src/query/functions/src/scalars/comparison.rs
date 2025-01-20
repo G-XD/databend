@@ -16,41 +16,44 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use common_arrow::arrow::bitmap::MutableBitmap;
-use common_expression::types::boolean::BooleanDomain;
-use common_expression::types::string::StringDomain;
-use common_expression::types::AnyType;
-use common_expression::types::ArgType;
-use common_expression::types::ArrayType;
-use common_expression::types::BooleanType;
-use common_expression::types::DataType;
-use common_expression::types::DateType;
-use common_expression::types::EmptyArrayType;
-use common_expression::types::GenericType;
-use common_expression::types::NumberClass;
-use common_expression::types::NumberType;
-use common_expression::types::StringType;
-use common_expression::types::TimestampType;
-use common_expression::types::ValueType;
-use common_expression::types::VariantType;
-use common_expression::types::ALL_NUMBER_CLASSES;
-use common_expression::values::Value;
-use common_expression::with_number_mapped_type;
-use common_expression::Column;
-use common_expression::EvalContext;
-use common_expression::Function;
-use common_expression::FunctionDomain;
-use common_expression::FunctionEval;
-use common_expression::FunctionRegistry;
-use common_expression::FunctionSignature;
-use common_expression::ScalarRef;
-use common_expression::SimpleDomainCmp;
-use common_expression::ValueRef;
-use memchr::memchr;
-use memchr::memmem;
-use regex::bytes::Regex;
+use databend_common_expression::generate_like_pattern;
+use databend_common_expression::types::boolean::BooleanDomain;
+use databend_common_expression::types::string::StringDomain;
+use databend_common_expression::types::AnyType;
+use databend_common_expression::types::ArgType;
+use databend_common_expression::types::ArrayType;
+use databend_common_expression::types::Bitmap;
+use databend_common_expression::types::BooleanType;
+use databend_common_expression::types::DataType;
+use databend_common_expression::types::DateType;
+use databend_common_expression::types::EmptyArrayType;
+use databend_common_expression::types::GenericType;
+use databend_common_expression::types::IntervalType;
+use databend_common_expression::types::MutableBitmap;
+use databend_common_expression::types::NumberClass;
+use databend_common_expression::types::NumberType;
+use databend_common_expression::types::StringColumn;
+use databend_common_expression::types::StringType;
+use databend_common_expression::types::TimestampType;
+use databend_common_expression::types::ValueType;
+use databend_common_expression::types::VariantType;
+use databend_common_expression::types::ALL_NUMBER_CLASSES;
+use databend_common_expression::values::Value;
+use databend_common_expression::with_number_mapped_type;
+use databend_common_expression::Column;
+use databend_common_expression::EvalContext;
+use databend_common_expression::Function;
+use databend_common_expression::FunctionDomain;
+use databend_common_expression::FunctionEval;
+use databend_common_expression::FunctionRegistry;
+use databend_common_expression::FunctionSignature;
+use databend_common_expression::LikePattern;
+use databend_common_expression::Scalar;
+use databend_common_expression::ScalarRef;
+use databend_common_expression::SimpleDomainCmp;
+use databend_functions_scalar_decimal::register_decimal_compare_op;
+use regex::Regex;
 
-use crate::scalars::decimal::register_decimal_compare_op;
 use crate::scalars::string_multi_args::regexp;
 
 pub fn register(registry: &mut FunctionRegistry) {
@@ -63,6 +66,7 @@ pub fn register(registry: &mut FunctionRegistry) {
     register_array_cmp(registry);
     register_tuple_cmp(registry);
     register_like(registry);
+    register_interval_cmp(registry);
 }
 
 pub const ALL_COMP_FUNC_NAMES: &[&str] = &["eq", "noteq", "lt", "lte", "gt", "gte", "contains"];
@@ -78,42 +82,42 @@ const ALL_FALSE_DOMAIN: BooleanDomain = BooleanDomain {
 };
 
 fn register_variant_cmp(registry: &mut FunctionRegistry) {
-    registry.register_2_arg::<VariantType, VariantType, BooleanType, _, _>(
+    registry.register_comparison_2_arg::<VariantType, VariantType, _, _>(
         "eq",
         |_, _, _| FunctionDomain::Full,
         |lhs, rhs, _| {
             jsonb::compare(lhs, rhs).expect("unable to parse jsonb value") == Ordering::Equal
         },
     );
-    registry.register_2_arg::<VariantType, VariantType, BooleanType, _, _>(
+    registry.register_comparison_2_arg::<VariantType, VariantType, _, _>(
         "noteq",
         |_, _, _| FunctionDomain::Full,
         |lhs, rhs, _| {
             jsonb::compare(lhs, rhs).expect("unable to parse jsonb value") != Ordering::Equal
         },
     );
-    registry.register_2_arg::<VariantType, VariantType, BooleanType, _, _>(
+    registry.register_comparison_2_arg::<VariantType, VariantType, _, _>(
         "gt",
         |_, _, _| FunctionDomain::Full,
         |lhs, rhs, _| {
             jsonb::compare(lhs, rhs).expect("unable to parse jsonb value") == Ordering::Greater
         },
     );
-    registry.register_2_arg::<VariantType, VariantType, BooleanType, _, _>(
+    registry.register_comparison_2_arg::<VariantType, VariantType, _, _>(
         "gte",
         |_, _, _| FunctionDomain::Full,
         |lhs, rhs, _| {
             jsonb::compare(lhs, rhs).expect("unable to parse jsonb value") != Ordering::Less
         },
     );
-    registry.register_2_arg::<VariantType, VariantType, BooleanType, _, _>(
+    registry.register_comparison_2_arg::<VariantType, VariantType, _, _>(
         "lt",
         |_, _, _| FunctionDomain::Full,
         |lhs, rhs, _| {
             jsonb::compare(lhs, rhs).expect("unable to parse jsonb value") == Ordering::Less
         },
     );
-    registry.register_2_arg::<VariantType, VariantType, BooleanType, _, _>(
+    registry.register_comparison_2_arg::<VariantType, VariantType, _, _>(
         "lte",
         |_, _, _| FunctionDomain::Full,
         |lhs, rhs, _| {
@@ -124,32 +128,32 @@ fn register_variant_cmp(registry: &mut FunctionRegistry) {
 
 macro_rules! register_simple_domain_type_cmp {
     ($registry:ident, $T:ty) => {
-        $registry.register_2_arg::<$T, $T, BooleanType, _, _>(
+        $registry.register_comparison_2_arg::<$T, $T, _, _>(
             "eq",
             |_, d1, d2| d1.domain_eq(d2),
             |lhs, rhs, _| lhs == rhs,
         );
-        $registry.register_2_arg::<$T, $T, BooleanType, _, _>(
+        $registry.register_comparison_2_arg::<$T, $T, _, _>(
             "noteq",
             |_, d1, d2| d1.domain_noteq(d2),
             |lhs, rhs, _| lhs != rhs,
         );
-        $registry.register_2_arg::<$T, $T, BooleanType, _, _>(
+        $registry.register_comparison_2_arg::<$T, $T, _, _>(
             "gt",
             |_, d1, d2| d1.domain_gt(d2),
             |lhs, rhs, _| lhs > rhs,
         );
-        $registry.register_2_arg::<$T, $T, BooleanType, _, _>(
+        $registry.register_comparison_2_arg::<$T, $T, _, _>(
             "gte",
             |_, d1, d2| d1.domain_gte(d2),
             |lhs, rhs, _| lhs >= rhs,
         );
-        $registry.register_2_arg::<$T, $T, BooleanType, _, _>(
+        $registry.register_comparison_2_arg::<$T, $T, _, _>(
             "lt",
             |_, d1, d2| d1.domain_lt(d2),
             |lhs, rhs, _| lhs < rhs,
         );
-        $registry.register_2_arg::<$T, $T, BooleanType, _, _>(
+        $registry.register_comparison_2_arg::<$T, $T, _, _>(
             "lte",
             |_, d1, d2| d1.domain_lte(d2),
             |lhs, rhs, _| lhs <= rhs,
@@ -158,7 +162,62 @@ macro_rules! register_simple_domain_type_cmp {
 }
 
 fn register_string_cmp(registry: &mut FunctionRegistry) {
-    register_simple_domain_type_cmp!(registry, StringType);
+    registry.register_passthrough_nullable_2_arg::<StringType, StringType, BooleanType, _, _>(
+        "eq",
+        |_, d1, d2| d1.domain_eq(d2),
+        vectorize_string_cmp(|cmp| cmp == Ordering::Equal),
+    );
+    registry.register_passthrough_nullable_2_arg::<StringType, StringType, BooleanType, _, _>(
+        "noteq",
+        |_, d1, d2| d1.domain_noteq(d2),
+        vectorize_string_cmp(|cmp| cmp != Ordering::Equal),
+    );
+    registry.register_passthrough_nullable_2_arg::<StringType, StringType, BooleanType, _, _>(
+        "gt",
+        |_, d1, d2| d1.domain_gt(d2),
+        vectorize_string_cmp(|cmp| cmp == Ordering::Greater),
+    );
+    registry.register_passthrough_nullable_2_arg::<StringType, StringType, BooleanType, _, _>(
+        "gte",
+        |_, d1, d2| d1.domain_gte(d2),
+        vectorize_string_cmp(|cmp| cmp != Ordering::Less),
+    );
+    registry.register_passthrough_nullable_2_arg::<StringType, StringType, BooleanType, _, _>(
+        "lt",
+        |_, d1, d2| d1.domain_lt(d2),
+        vectorize_string_cmp(|cmp| cmp == Ordering::Less),
+    );
+    registry.register_passthrough_nullable_2_arg::<StringType, StringType, BooleanType, _, _>(
+        "lte",
+        |_, d1, d2| d1.domain_lte(d2),
+        vectorize_string_cmp(|cmp| cmp != Ordering::Greater),
+    );
+}
+
+fn vectorize_string_cmp(
+    func: impl Fn(Ordering) -> bool + Copy,
+) -> impl Fn(Value<StringType>, Value<StringType>, &mut EvalContext) -> Value<BooleanType> + Copy {
+    move |arg1, arg2, ctx| match (arg1, arg2) {
+        (Value::Scalar(arg1), Value::Scalar(arg2)) => Value::Scalar(func(arg1.cmp(&arg2))),
+        (Value::Column(arg1), Value::Scalar(arg2)) => {
+            let col = Bitmap::collect_bool(ctx.num_rows, |i| {
+                func(StringColumn::compare_str(&arg1, i, &arg2))
+            });
+            Value::Column(col)
+        }
+        (Value::Scalar(arg1), Value::Column(arg2)) => {
+            let col = Bitmap::collect_bool(ctx.num_rows, |i| {
+                func(StringColumn::compare_str(&arg2, i, &arg1).reverse())
+            });
+            Value::Column(col)
+        }
+        (Value::Column(arg1), Value::Column(arg2)) => {
+            let col = Bitmap::collect_bool(ctx.num_rows, |i| {
+                func(StringColumn::compare(&arg1, i, &arg2, i))
+            });
+            Value::Column(col)
+        }
+    }
 }
 
 fn register_date_cmp(registry: &mut FunctionRegistry) {
@@ -169,8 +228,12 @@ fn register_timestamp_cmp(registry: &mut FunctionRegistry) {
     register_simple_domain_type_cmp!(registry, TimestampType);
 }
 
+fn register_interval_cmp(registry: &mut FunctionRegistry) {
+    register_simple_domain_type_cmp!(registry, IntervalType);
+}
+
 fn register_boolean_cmp(registry: &mut FunctionRegistry) {
-    registry.register_2_arg::<BooleanType, BooleanType, BooleanType, _, _>(
+    registry.register_comparison_2_arg::<BooleanType, BooleanType, _, _>(
         "eq",
         |_, d1, d2| match (d1.has_true, d1.has_false, d2.has_true, d2.has_false) {
             (true, false, true, false) => FunctionDomain::Domain(ALL_TRUE_DOMAIN),
@@ -181,7 +244,7 @@ fn register_boolean_cmp(registry: &mut FunctionRegistry) {
         },
         |lhs, rhs, _| lhs == rhs,
     );
-    registry.register_2_arg::<BooleanType, BooleanType, BooleanType, _, _>(
+    registry.register_comparison_2_arg::<BooleanType, BooleanType, _, _>(
         "noteq",
         |_, d1, d2| match (d1.has_true, d1.has_false, d2.has_true, d2.has_false) {
             (true, false, true, false) => FunctionDomain::Domain(ALL_FALSE_DOMAIN),
@@ -192,7 +255,7 @@ fn register_boolean_cmp(registry: &mut FunctionRegistry) {
         },
         |lhs, rhs, _| lhs != rhs,
     );
-    registry.register_2_arg::<BooleanType, BooleanType, BooleanType, _, _>(
+    registry.register_comparison_2_arg::<BooleanType, BooleanType, _, _>(
         "gt",
         |_, d1, d2| match (d1.has_true, d1.has_false, d2.has_true, d2.has_false) {
             (true, false, false, true) => FunctionDomain::Domain(ALL_TRUE_DOMAIN),
@@ -201,7 +264,7 @@ fn register_boolean_cmp(registry: &mut FunctionRegistry) {
         },
         |lhs, rhs, _| lhs & !rhs,
     );
-    registry.register_2_arg::<BooleanType, BooleanType, BooleanType, _, _>(
+    registry.register_comparison_2_arg::<BooleanType, BooleanType, _, _>(
         "gte",
         |_, d1, d2| match (d1.has_true, d1.has_false, d2.has_true, d2.has_false) {
             (true, false, _, _) => FunctionDomain::Domain(ALL_TRUE_DOMAIN),
@@ -209,9 +272,9 @@ fn register_boolean_cmp(registry: &mut FunctionRegistry) {
             (false, true, true, false) => FunctionDomain::Domain(ALL_FALSE_DOMAIN),
             _ => FunctionDomain::Full,
         },
-        |lhs, rhs, _| (lhs & !rhs) || (lhs & rhs),
+        |lhs, rhs, _| lhs | !rhs,
     );
-    registry.register_2_arg::<BooleanType, BooleanType, BooleanType, _, _>(
+    registry.register_comparison_2_arg::<BooleanType, BooleanType, _, _>(
         "lt",
         |_, d1, d2| match (d1.has_true, d1.has_false, d2.has_true, d2.has_false) {
             (false, true, true, false) => FunctionDomain::Domain(ALL_TRUE_DOMAIN),
@@ -220,7 +283,7 @@ fn register_boolean_cmp(registry: &mut FunctionRegistry) {
         },
         |lhs, rhs, _| !lhs & rhs,
     );
-    registry.register_2_arg::<BooleanType, BooleanType, BooleanType, _, _>(
+    registry.register_comparison_2_arg::<BooleanType, BooleanType, _, _>(
         "lte",
         |_, d1, d2| match (d1.has_true, d1.has_false, d2.has_true, d2.has_false) {
             (false, true, _, _) => FunctionDomain::Domain(ALL_TRUE_DOMAIN),
@@ -228,7 +291,7 @@ fn register_boolean_cmp(registry: &mut FunctionRegistry) {
             (true, false, false, true) => FunctionDomain::Domain(ALL_FALSE_DOMAIN),
             _ => FunctionDomain::Full,
         },
-        |lhs, rhs, _| (!lhs & rhs) || (lhs & rhs),
+        |lhs, rhs, _| !lhs | rhs,
     );
 }
 
@@ -348,25 +411,25 @@ fn register_tuple_cmp(registry: &mut FunctionRegistry) {
                     calc_domain: Box::new(move |_, _| FunctionDomain::Full),
                     eval: Box::new(move |args, _| {
                         let len = args.iter().find_map(|arg| match arg {
-                            ValueRef::Column(col) => Some(col.len()),
+                            Value::Column(col) => Some(col.len()),
                             _ => None,
                         });
 
-                        let lhs_fields: Vec<ValueRef<AnyType>> = match &args[0] {
-                            ValueRef::Scalar(ScalarRef::Tuple(fields)) => {
-                                fields.iter().cloned().map(ValueRef::Scalar).collect()
+                        let lhs_fields: Vec<Value<AnyType>> = match &args[0] {
+                            Value::Scalar(Scalar::Tuple(fields)) => {
+                                fields.iter().cloned().map(Value::Scalar).collect()
                             }
-                            ValueRef::Column(Column::Tuple(fields)) => {
-                                fields.iter().cloned().map(ValueRef::Column).collect()
+                            Value::Column(Column::Tuple(fields)) => {
+                                fields.iter().cloned().map(Value::Column).collect()
                             }
                             _ => unreachable!(),
                         };
-                        let rhs_fields: Vec<ValueRef<AnyType>> = match &args[1] {
-                            ValueRef::Scalar(ScalarRef::Tuple(fields)) => {
-                                fields.iter().cloned().map(ValueRef::Scalar).collect()
+                        let rhs_fields: Vec<Value<AnyType>> = match &args[1] {
+                            Value::Scalar(Scalar::Tuple(fields)) => {
+                                fields.iter().cloned().map(Value::Scalar).collect()
                             }
-                            ValueRef::Column(Column::Tuple(fields)) => {
-                                fields.iter().cloned().map(ValueRef::Column).collect()
+                            Value::Column(Column::Tuple(fields)) => {
+                                fields.iter().cloned().map(Value::Column).collect()
                             }
                             _ => unreachable!(),
                         };
@@ -403,10 +466,18 @@ fn register_tuple_cmp(registry: &mut FunctionRegistry) {
     }
 
     register_tuple_cmp_op(registry, "eq", true, |lhs, rhs| {
-        if lhs != rhs { Some(false) } else { None }
+        if lhs != rhs {
+            Some(false)
+        } else {
+            None
+        }
     });
     register_tuple_cmp_op(registry, "noteq", false, |lhs, rhs| {
-        if lhs != rhs { Some(true) } else { None }
+        if lhs != rhs {
+            Some(true)
+        } else {
+            None
+        }
     });
     register_tuple_cmp_op(registry, "gt", false, |lhs, rhs| {
         match lhs.partial_cmp(&rhs) {
@@ -444,50 +515,19 @@ fn register_like(registry: &mut FunctionRegistry) {
     registry.register_passthrough_nullable_2_arg::<VariantType, StringType, BooleanType, _, _>(
         "like",
         |_, _, _| FunctionDomain::Full,
-        variant_vectorize_like(|val, pat, _, pattern_type| {
-            match &pattern_type {
-                PatternType::OrdinalStr => {
-                    if let Some(s) = jsonb::as_str(val) {
-                        s.as_bytes() == pat
-                    } else {
-                        false
-                    }
+        variant_vectorize_like(|val, pattern_type| match pattern_type {
+            LikePattern::OrdinalStr(_)
+            | LikePattern::StartOfPercent(_)
+            | LikePattern::EndOfPercent(_)
+            | LikePattern::Constant(_) => {
+                if let Some(s) = jsonb::as_str(val) {
+                    pattern_type.compare(s.as_bytes())
+                } else {
+                    false
                 }
-                PatternType::EndOfPercent => {
-                    // fast path, can use starts_with
-                    if let Some(s) = jsonb::as_str(val) {
-                        let v = s.as_bytes();
-                        v.starts_with(&pat[..pat.len() - 1])
-                    } else {
-                        false
-                    }
-                }
-                PatternType::StartOfPercent => {
-                    // fast path, can use ends_with
-                    if let Some(s) = jsonb::as_str(val) {
-                        let v = s.as_bytes();
-                        v.ends_with(&pat[1..])
-                    } else {
-                        false
-                    }
-                }
-                PatternType::SurroundByPercent => {
-                    jsonb::traverse_check_string(val, |v| {
-                        if pat.len() > 2 {
-                            memmem::find(v, &pat[1..pat.len() - 1]).is_some()
-                        } else {
-                            // true for empty '%%' pattern, which follows pg/mysql way
-                            true
-                        }
-                    })
-                }
-                PatternType::SimplePattern(simple_pattern) => {
-                    jsonb::traverse_check_string(val, |v| {
-                        simple_like(v, simple_pattern.0, simple_pattern.1, &simple_pattern.2)
-                    })
-                }
-                PatternType::ComplexPattern => jsonb::traverse_check_string(val, |v| like(v, pat)),
             }
+
+            _ => jsonb::traverse_check_string(val, |v| pattern_type.compare(v)),
         }),
     );
 
@@ -495,70 +535,34 @@ fn register_like(registry: &mut FunctionRegistry) {
         "like",
         |_, lhs, rhs| {
             if rhs.max.as_ref() == Some(&rhs.min) {
-                let pattern_type = check_pattern_type(&rhs.min, false);
-                if pattern_type == PatternType::EndOfPercent
-                    || pattern_type == PatternType::OrdinalStr
-                {
-                    let (min, max) = if pattern_type == PatternType::EndOfPercent {
-                        let min = rhs.min[..rhs.min.len() - 1].to_vec();
-                        let mut max = min.clone();
+                let pattern_type = generate_like_pattern(rhs.min.as_bytes(), 1);
 
-                        let l = max.len();
-                        if max[l - 1] != u8::MAX {
-                            max[l - 1] += 1;
-                        } else {
-                            return FunctionDomain::Full;
-                        }
-                        (min, max)
-                    } else {
-                        (rhs.min.clone(), rhs.min.clone())
-                    };
+                if matches!(pattern_type, LikePattern::OrdinalStr(_)) {
+                    return lhs.domain_eq(rhs);
+                }
 
+                if matches!(pattern_type, LikePattern::EndOfPercent(_)) {
+                    let mut pat_str = rhs.min.clone();
+                    // remove the last char '%'
+                    pat_str.pop();
+                    let pat_len = pat_str.chars().count();
                     let other = StringDomain {
-                        min,
-                        max: Some(max),
+                        min: pat_str.clone(),
+                        max: Some(pat_str),
                     };
-                    let gte = lhs.domain_gte(&other);
-                    let lt = lhs.domain_lt(&other);
-
-                    if let (FunctionDomain::Domain(lhs), FunctionDomain::Domain(rhs)) = (lt, gte) {
-                        return FunctionDomain::Domain(BooleanDomain {
-                            has_false: lhs.has_false || rhs.has_false,
-                            has_true: lhs.has_true && rhs.has_true,
-                        });
-                    }
+                    let lhs = StringDomain {
+                        min: lhs.min.chars().take(pat_len).collect(),
+                        max: lhs
+                            .max
+                            .as_ref()
+                            .map(|max| max.chars().take(pat_len).collect()),
+                    };
+                    return lhs.domain_eq(&other);
                 }
             }
             FunctionDomain::Full
         },
-        vectorize_like(|str, pat, _, pattern_type| {
-            match &pattern_type {
-                PatternType::OrdinalStr => str == pat,
-                PatternType::EndOfPercent => {
-                    // fast path, can use starts_with
-                    let starts_with = &pat[..pat.len() - 1];
-                    str.starts_with(starts_with)
-                }
-                PatternType::StartOfPercent => {
-                    // fast path, can use ends_with
-                    str.ends_with(&pat[1..])
-                }
-
-                PatternType::SurroundByPercent => {
-                    if pat.len() > 2 {
-                        memmem::find(str, &pat[1..pat.len() - 1]).is_some()
-                    } else {
-                        // true for empty '%%' pattern, which follows pg/mysql way
-                        true
-                    }
-                }
-
-                PatternType::SimplePattern(simple_pattern) => {
-                    simple_like(str, simple_pattern.0, simple_pattern.1, &simple_pattern.2)
-                }
-                PatternType::ComplexPattern => like(str, pat),
-            }
-        }),
+        vectorize_like(|str, pattern_type| pattern_type.compare(str)),
     );
 
     registry.register_passthrough_nullable_2_arg::<StringType, StringType, BooleanType, _, _>(
@@ -572,7 +576,7 @@ fn register_like(registry: &mut FunctionRegistry) {
                 match regexp::build_regexp_from_pattern("regexp", pat, None) {
                     Ok(re) => {
                         builder.push(re.is_match(str));
-                        map.insert(pat.to_vec(), re);
+                        map.insert(pat.to_string(), re);
                     }
                     Err(e) => {
                         ctx.set_error(builder.len(), e);
@@ -585,48 +589,45 @@ fn register_like(registry: &mut FunctionRegistry) {
 }
 
 fn vectorize_like(
-    func: impl Fn(&[u8], &[u8], &mut EvalContext, &PatternType) -> bool + Copy,
-) -> impl Fn(ValueRef<StringType>, ValueRef<StringType>, &mut EvalContext) -> Value<BooleanType> + Copy
-{
-    move |arg1, arg2, ctx| match (arg1, arg2) {
-        (ValueRef::Scalar(arg1), ValueRef::Scalar(arg2)) => {
-            let pattern_type = check_pattern_type(arg2, false);
-            Value::Scalar(func(arg1, arg2, ctx, &pattern_type))
+    func: impl Fn(&[u8], &LikePattern) -> bool + Copy,
+) -> impl Fn(Value<StringType>, Value<StringType>, &mut EvalContext) -> Value<BooleanType> + Copy {
+    move |arg1, arg2, _ctx| match (arg1, arg2) {
+        (Value::Scalar(arg1), Value::Scalar(arg2)) => {
+            let pattern_type = generate_like_pattern(arg2.as_bytes(), 1);
+            Value::Scalar(func(arg1.as_bytes(), &pattern_type))
         }
-        (ValueRef::Column(arg1), ValueRef::Scalar(arg2)) => {
+        (Value::Column(arg1), Value::Scalar(arg2)) => {
             let arg1_iter = StringType::iter_column(&arg1);
-
-            let pattern_type = check_pattern_type(arg2, false);
-            // faster path for memmem to have a single instance of Finder
-            if pattern_type == PatternType::SurroundByPercent && arg2.len() > 2 {
-                let finder = memmem::Finder::new(&arg2[1..arg2.len() - 1]);
-                let it = arg1_iter.map(|arg1| finder.find(arg1).is_some());
-                let bitmap = BooleanType::column_from_iter(it, &[]);
-                return Value::Column(bitmap);
-            }
-
             let mut builder = MutableBitmap::with_capacity(arg1.len());
-            for arg1 in arg1_iter {
-                builder.push(func(arg1, arg2, ctx, &pattern_type));
+            let pattern_type = generate_like_pattern(arg2.as_bytes(), arg1.total_bytes_len());
+            if let LikePattern::SurroundByPercent(searcher) = pattern_type {
+                for arg1 in arg1_iter {
+                    builder.push(searcher.search(arg1.as_bytes()).is_some());
+                }
+            } else {
+                for arg1 in arg1_iter {
+                    builder.push(func(arg1.as_bytes(), &pattern_type));
+                }
             }
+
             Value::Column(builder.into())
         }
-        (ValueRef::Scalar(arg1), ValueRef::Column(arg2)) => {
+        (Value::Scalar(arg1), Value::Column(arg2)) => {
             let arg2_iter = StringType::iter_column(&arg2);
             let mut builder = MutableBitmap::with_capacity(arg2.len());
             for arg2 in arg2_iter {
-                let pattern_type = check_pattern_type(arg2, false);
-                builder.push(func(arg1, arg2, ctx, &pattern_type));
+                let pattern_type = generate_like_pattern(arg2.as_bytes(), 1);
+                builder.push(func(arg1.as_bytes(), &pattern_type));
             }
             Value::Column(builder.into())
         }
-        (ValueRef::Column(arg1), ValueRef::Column(arg2)) => {
+        (Value::Column(arg1), Value::Column(arg2)) => {
             let arg1_iter = StringType::iter_column(&arg1);
             let arg2_iter = StringType::iter_column(&arg2);
             let mut builder = MutableBitmap::with_capacity(arg2.len());
             for (arg1, arg2) in arg1_iter.zip(arg2_iter) {
-                let pattern_type = check_pattern_type(arg2, false);
-                builder.push(func(arg1, arg2, ctx, &pattern_type));
+                let pattern_type = generate_like_pattern(arg2.as_bytes(), 1);
+                builder.push(func(arg1.as_bytes(), &pattern_type));
             }
             Value::Column(builder.into())
         }
@@ -634,48 +635,39 @@ fn vectorize_like(
 }
 
 fn variant_vectorize_like(
-    func: impl Fn(&[u8], &[u8], &mut EvalContext, &PatternType) -> bool + Copy,
-) -> impl Fn(ValueRef<VariantType>, ValueRef<StringType>, &mut EvalContext) -> Value<BooleanType> + Copy
-{
-    move |arg1, arg2, ctx| match (arg1, arg2) {
-        (ValueRef::Scalar(arg1), ValueRef::Scalar(arg2)) => {
-            let pattern_type = check_pattern_type(arg2, false);
-            Value::Scalar(func(arg1, arg2, ctx, &pattern_type))
+    func: impl Fn(&[u8], &LikePattern) -> bool + Copy,
+) -> impl Fn(Value<VariantType>, Value<StringType>, &mut EvalContext) -> Value<BooleanType> + Copy {
+    move |arg1, arg2, _ctx| match (arg1, arg2) {
+        (Value::Scalar(arg1), Value::Scalar(arg2)) => {
+            let pattern_type = generate_like_pattern(arg2.as_bytes(), 1);
+            Value::Scalar(func(&arg1, &pattern_type))
         }
-        (ValueRef::Column(arg1), ValueRef::Scalar(arg2)) => {
+        (Value::Column(arg1), Value::Scalar(arg2)) => {
             let arg1_iter = VariantType::iter_column(&arg1);
 
-            let pattern_type = check_pattern_type(arg2, false);
-            // faster path for memmem to have a single instance of Finder
-            if pattern_type == PatternType::SurroundByPercent && arg2.len() > 2 {
-                let finder = memmem::Finder::new(&arg2[1..arg2.len() - 1]);
-                let it = arg1_iter.map(|arg1| finder.find(arg1).is_some());
-                let bitmap = BooleanType::column_from_iter(it, &[]);
-                return Value::Column(bitmap);
-            }
-
+            let pattern_type = generate_like_pattern(arg2.as_bytes(), arg1.total_bytes_len());
             let mut builder = MutableBitmap::with_capacity(arg1.len());
             for arg1 in arg1_iter {
-                builder.push(func(arg1, arg2, ctx, &pattern_type));
+                builder.push(func(arg1, &pattern_type));
             }
             Value::Column(builder.into())
         }
-        (ValueRef::Scalar(arg1), ValueRef::Column(arg2)) => {
-            let arg2_iter = VariantType::iter_column(&arg2);
+        (Value::Scalar(arg1), Value::Column(arg2)) => {
+            let arg2_iter = StringType::iter_column(&arg2);
             let mut builder = MutableBitmap::with_capacity(arg2.len());
             for arg2 in arg2_iter {
-                let pattern_type = check_pattern_type(arg2, false);
-                builder.push(func(arg1, arg2, ctx, &pattern_type));
+                let pattern_type = generate_like_pattern(arg2.as_bytes(), 1);
+                builder.push(func(&arg1, &pattern_type));
             }
             Value::Column(builder.into())
         }
-        (ValueRef::Column(arg1), ValueRef::Column(arg2)) => {
+        (Value::Column(arg1), Value::Column(arg2)) => {
             let arg1_iter = VariantType::iter_column(&arg1);
-            let arg2_iter = VariantType::iter_column(&arg2);
+            let arg2_iter = StringType::iter_column(&arg2);
             let mut builder = MutableBitmap::with_capacity(arg2.len());
             for (arg1, arg2) in arg1_iter.zip(arg2_iter) {
-                let pattern_type = check_pattern_type(arg2, false);
-                builder.push(func(arg1, arg2, ctx, &pattern_type));
+                let pattern_type = generate_like_pattern(arg2.as_bytes(), 1);
+                builder.push(func(arg1, &pattern_type));
             }
             Value::Column(builder.into())
         }
@@ -684,41 +676,40 @@ fn variant_vectorize_like(
 
 fn vectorize_regexp(
     func: impl Fn(
-        &[u8],
-        &[u8],
-        &mut MutableBitmap,
-        &mut EvalContext,
-        &mut HashMap<Vec<u8>, Regex>,
-        &mut HashMap<Vec<u8>, String>,
-    ) + Copy,
-) -> impl Fn(ValueRef<StringType>, ValueRef<StringType>, &mut EvalContext) -> Value<BooleanType> + Copy
-{
+            &str,
+            &str,
+            &mut MutableBitmap,
+            &mut EvalContext,
+            &mut HashMap<String, Regex>,
+            &mut HashMap<Vec<u8>, String>,
+        ) + Copy,
+) -> impl Fn(Value<StringType>, Value<StringType>, &mut EvalContext) -> Value<BooleanType> + Copy {
     move |arg1, arg2, ctx| {
         let mut map = HashMap::new();
         let mut string_map = HashMap::new();
         match (arg1, arg2) {
-            (ValueRef::Scalar(arg1), ValueRef::Scalar(arg2)) => {
+            (Value::Scalar(arg1), Value::Scalar(arg2)) => {
                 let mut builder = MutableBitmap::with_capacity(1);
-                func(arg1, arg2, &mut builder, ctx, &mut map, &mut string_map);
+                func(&arg1, &arg2, &mut builder, ctx, &mut map, &mut string_map);
                 Value::Scalar(BooleanType::build_scalar(builder))
             }
-            (ValueRef::Column(arg1), ValueRef::Scalar(arg2)) => {
+            (Value::Column(arg1), Value::Scalar(arg2)) => {
                 let arg1_iter = StringType::iter_column(&arg1);
                 let mut builder = MutableBitmap::with_capacity(arg1.len());
                 for arg1 in arg1_iter {
-                    func(arg1, arg2, &mut builder, ctx, &mut map, &mut string_map);
+                    func(arg1, &arg2, &mut builder, ctx, &mut map, &mut string_map);
                 }
                 Value::Column(builder.into())
             }
-            (ValueRef::Scalar(arg1), ValueRef::Column(arg2)) => {
+            (Value::Scalar(arg1), Value::Column(arg2)) => {
                 let arg2_iter = StringType::iter_column(&arg2);
                 let mut builder = MutableBitmap::with_capacity(arg2.len());
                 for arg2 in arg2_iter {
-                    func(arg1, arg2, &mut builder, ctx, &mut map, &mut string_map);
+                    func(&arg1, arg2, &mut builder, ctx, &mut map, &mut string_map);
                 }
                 Value::Column(builder.into())
             }
-            (ValueRef::Column(arg1), ValueRef::Column(arg2)) => {
+            (Value::Column(arg1), Value::Column(arg2)) => {
                 let arg1_iter = StringType::iter_column(&arg1);
                 let arg2_iter = StringType::iter_column(&arg2);
                 let mut builder = MutableBitmap::with_capacity(arg2.len());
@@ -728,322 +719,5 @@ fn vectorize_regexp(
                 Value::Column(builder.into())
             }
         }
-    }
-}
-
-#[derive(Debug, Eq, PartialEq, Hash)]
-pub enum PatternType {
-    // e.g. 'Arrow'.
-    OrdinalStr,
-    // e.g. '%rrow'.
-    StartOfPercent,
-    // e.g. 'Arrow%'.
-    EndOfPercent,
-    // e.g. '%Arrow%'.
-    SurroundByPercent,
-    // Only includes %, e.g. 'A%r%w'.
-    // SimplePattern is composed of: (has_start_percent, has_end_percent, segments).
-    SimplePattern((bool, bool, Vec<Vec<u8>>)),
-    // e.g. 'A%row', 'A_row', 'A\\%row'.
-    ComplexPattern,
-}
-
-#[inline]
-pub fn is_like_pattern_escape(c: char) -> bool {
-    c == '%' || c == '_' || c == '\\'
-}
-
-/// Check the like pattern type.
-///
-/// is_pruning: indicate whether to be called on range_filter for pruning.
-///
-/// For example:
-///
-/// 'a\\%row'
-/// '\\%' will be escaped to a percent. Need transform to `a%row`.
-///
-/// If is_pruning is true, will be called on range_filter:L379.
-/// OrdinalStr is returned, because the pattern can be transformed by range_filter:L382.
-///
-/// If is_pruning is false, will be called on like.rs:L74.
-/// PatternStr is returned, because the pattern cannot be used directly on like.rs:L76.
-#[inline]
-pub fn check_pattern_type(pattern: &[u8], is_pruning: bool) -> PatternType {
-    let len = pattern.len();
-    if len == 0 {
-        return PatternType::OrdinalStr;
-    }
-
-    let mut index = 0;
-    let mut first_non_percent = 0;
-    let mut percent_num = 0;
-    let has_start_percent = pattern[0] == b'%';
-    let mut has_end_percent = false;
-    let mut segments = Vec::new();
-    let mut simple_pattern = true;
-    if has_start_percent {
-        if is_pruning {
-            return PatternType::ComplexPattern;
-        }
-        index += 1;
-        first_non_percent += 1;
-        percent_num += 1;
-    }
-
-    while index < len {
-        match pattern[index] {
-            b'_' => return PatternType::ComplexPattern,
-            b'%' => {
-                percent_num += 1;
-                if index > first_non_percent {
-                    segments.push(pattern[first_non_percent..index].to_vec());
-                }
-                first_non_percent = index + 1;
-                if index == len - 1 {
-                    has_end_percent = true;
-                }
-            }
-            b'\\' => {
-                simple_pattern = false;
-                if index < len - 1 {
-                    index += 1;
-                    if !is_pruning && is_like_pattern_escape(pattern[index] as char) {
-                        return PatternType::ComplexPattern;
-                    }
-                }
-            }
-            _ => {}
-        }
-        index += 1;
-    }
-
-    match percent_num {
-        0 => PatternType::OrdinalStr,
-        1 if has_start_percent => PatternType::StartOfPercent,
-        1 if has_end_percent => PatternType::EndOfPercent,
-        2 if has_start_percent && has_end_percent => PatternType::SurroundByPercent,
-        _ => {
-            if simple_pattern {
-                if first_non_percent < len {
-                    segments.push(pattern[first_non_percent..len].to_vec());
-                }
-                PatternType::SimplePattern((has_start_percent, has_end_percent, segments))
-            } else {
-                PatternType::ComplexPattern
-            }
-        }
-    }
-}
-
-#[inline]
-fn decode_one(data: &[u8]) -> Option<(u8, usize)> {
-    if data.is_empty() {
-        None
-    } else {
-        Some((data[0], 1))
-    }
-}
-
-#[inline]
-/// Borrow from [tikv](https://github.com/tikv/tikv/blob/fe997db4db8a5a096f8a45c0db3eb3c2e5879262/components/tidb_query_expr/src/impl_like.rs)
-fn like(haystack: &[u8], pattern: &[u8]) -> bool {
-    // current search positions in pattern and target.
-    let (mut px, mut tx) = (0, 0);
-    // positions for backtrace.
-    let (mut next_px, mut next_tx) = (0, 0);
-    while px < pattern.len() || tx < haystack.len() {
-        if let Some((c, mut poff)) = decode_one(&pattern[px..]) {
-            let code: u32 = c.into();
-            if code == '_' as u32 {
-                if let Some((_, toff)) = decode_one(&haystack[tx..]) {
-                    px += poff;
-                    tx += toff;
-                    continue;
-                }
-            } else if code == '%' as u32 {
-                // update the backtrace point.
-                next_px = px;
-                px += poff;
-                next_tx = tx;
-                next_tx += if let Some((_, toff)) = decode_one(&haystack[tx..]) {
-                    toff
-                } else {
-                    1
-                };
-                continue;
-            } else {
-                if code == '\\' as u32 && px + poff < pattern.len() {
-                    px += poff;
-                    poff = if let Some((_, off)) = decode_one(&pattern[px..]) {
-                        off
-                    } else {
-                        break;
-                    }
-                }
-                if let Some((_, toff)) = decode_one(&haystack[tx..]) {
-                    if let std::cmp::Ordering::Equal =
-                        haystack[tx..tx + toff].cmp(&pattern[px..px + poff])
-                    {
-                        tx += toff;
-                        px += poff;
-                        continue;
-                    }
-                }
-            }
-        }
-        // mismatch and backtrace to last %.
-        if 0 < next_tx && next_tx <= haystack.len() {
-            px = next_px;
-            tx = next_tx;
-            continue;
-        }
-        return false;
-    }
-    true
-}
-
-fn find(mut haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    let haystack_len = haystack.len();
-    let needle_len = needle.len();
-    if needle_len > haystack_len {
-        return None;
-    }
-    let offset = memchr(needle[0], haystack)?;
-    // # Safety
-    // The `offset` returned by `memchr` is less than `haystack_len`.
-    haystack = unsafe { haystack.get_unchecked(offset..) };
-    let haystack_len = haystack.len();
-    if needle_len > haystack_len {
-        return None;
-    }
-    // Inspired by fast_strstr (https://github.com/RaphaelJ/fast_strstr).
-    let mut checksum = 0;
-    for i in 0..needle_len {
-        // # Safety
-        // `needle_len` <= haystack_len
-        unsafe {
-            checksum += haystack.get_unchecked(i);
-            checksum -= needle.get_unchecked(i);
-        }
-    }
-    let mut idx = 0;
-    loop {
-        // # Safety
-        // `idx` < `haystack_len` and `idx` + `needle_len` <= `haystack_len`.
-        unsafe {
-            if checksum == 0
-                && haystack[idx] == needle[0]
-                && haystack.get_unchecked(idx..(idx + needle_len)) == needle
-            {
-                return Some(offset + idx + needle_len);
-            }
-        }
-        if idx + needle_len >= haystack_len {
-            return None;
-        }
-        // # Safety
-        // `idx` < `haystack_len` and `idx` + `needle_len` < `haystack_len`.
-        unsafe {
-            checksum -= haystack.get_unchecked(idx);
-            checksum += haystack.get_unchecked(idx + needle_len);
-        }
-        idx += 1;
-    }
-}
-
-#[inline]
-fn simple_like(
-    haystack: &[u8],
-    has_start_percent: bool,
-    has_end_percent: bool,
-    segments: &Vec<Vec<u8>>,
-) -> bool {
-    let haystack_len = haystack.len();
-    if haystack_len == 0 {
-        return false;
-    }
-    let segments_len = segments.len();
-    debug_assert!(haystack_len > 0);
-    debug_assert!(segments_len > 1);
-    let mut haystack_start_idx = 0;
-    let mut segment_idx = 0;
-    if !has_start_percent {
-        let segment = &segments[0];
-        let haystack_end = haystack_start_idx + segment.len();
-        if haystack_end > haystack_len {
-            return false;
-        }
-        // # Safety
-        // `haystack_start_idx` = 0, `haystack_len` > 0, `haystack_end` <= `haystack_len`.
-        if unsafe { haystack.get_unchecked(haystack_start_idx..haystack_end) } != segment {
-            return false;
-        }
-        haystack_start_idx = haystack_end;
-        segment_idx += 1;
-    }
-    while segment_idx < segments_len {
-        if haystack_start_idx >= haystack_len {
-            return false;
-        }
-        let segment = &segments[segment_idx];
-        if segment_idx == segments_len - 1 && !has_end_percent {
-            if haystack_len - haystack_start_idx < segment.len() {
-                return false;
-            }
-            // # Safety
-            // `haystack_start_idx` + `segment.len()` <= `haystack_len`.
-            if unsafe { haystack.get_unchecked((haystack_len - segment.len())..) } != segment {
-                return false;
-            }
-        } else if let Some(offset) =
-            unsafe { find(haystack.get_unchecked(haystack_start_idx..), segment) }
-        {
-            haystack_start_idx += offset;
-        } else {
-            return false;
-        }
-        segment_idx += 1;
-    }
-    true
-}
-
-#[test]
-fn test_check_pattern_type() {
-    let segments = vec![
-        "databend".as_bytes().to_vec(),
-        "cloud".as_bytes().to_vec(),
-        "data".as_bytes().to_vec(),
-        "warehouse".as_bytes().to_vec(),
-    ];
-    let test_cases = vec![
-        ("databend", PatternType::OrdinalStr),
-        ("%databend", PatternType::StartOfPercent),
-        ("databend%", PatternType::EndOfPercent),
-        ("%databend%", PatternType::SurroundByPercent),
-        (
-            "databend%cloud%data%warehouse",
-            PatternType::SimplePattern((false, false, segments.clone())),
-        ),
-        (
-            "%databend%cloud%data%warehouse",
-            PatternType::SimplePattern((true, false, segments.clone())),
-        ),
-        (
-            "databend%cloud%data%warehouse%",
-            PatternType::SimplePattern((false, true, segments.clone())),
-        ),
-        (
-            "%databend%cloud%data%warehouse%",
-            PatternType::SimplePattern((true, true, segments)),
-        ),
-        ("databend_cloud%data%warehouse", PatternType::ComplexPattern),
-        (
-            "databend\\%cloud%data%warehouse",
-            PatternType::ComplexPattern,
-        ),
-        ("databend%cloud_data%warehouse", PatternType::ComplexPattern),
-    ];
-    for (pattern, pattern_type) in test_cases {
-        assert_eq!(pattern_type, check_pattern_type(pattern.as_bytes(), false));
     }
 }

@@ -20,10 +20,11 @@ use std::str::FromStr;
 
 use chrono::DateTime;
 use chrono::Utc;
-use common_exception::ErrorCode;
-use common_exception::Result;
-use common_io::constants::NAN_BYTES_SNAKE;
-use common_io::escape_string;
+pub use databend_common_ast::ast::OnErrorMode;
+use databend_common_exception::ErrorCode;
+use databend_common_exception::Result;
+use databend_common_io::constants::NAN_BYTES_SNAKE;
+use databend_common_io::escape_string;
 
 use crate::principal::FileFormatParams;
 use crate::principal::UserIdentity;
@@ -34,7 +35,6 @@ use crate::storage::StorageParams;
 // internalStageParams
 // directoryTableParams
 // [ FILE_FORMAT = ( { FORMAT_NAME = '<file_format_name>' | TYPE = { CSV | JSON | AVRO | ORC | PARQUET | XML } [ formatTypeOptions ] ) } ]
-// [ COPY_OPTIONS = ( copyOptions ) ]
 // [ COMMENT = '<string_literal>' ]
 //
 // -- External stage
@@ -42,19 +42,23 @@ use crate::storage::StorageParams;
 // externalStageParams
 // directoryTableParams
 // [ FILE_FORMAT = ( { FORMAT_NAME = '<file_format_name>' | TYPE = { CSV | JSON | AVRO | ORC | PARQUET | XML } [ formatTypeOptions ] ) } ]
-// [ COPY_OPTIONS = ( copyOptions ) ]
 // [ COMMENT = '<string_literal>' ]
 //
 //
 // WHERE
 //
 // externalStageParams (for Amazon S3) ::=
-// URL = 's3://<bucket>[/<path>/]'
+// 's3://<bucket>[/<path>/]'
 // [ { CREDENTIALS = ( {  { AWS_KEY_ID = '<string>' AWS_SECRET_KEY = '<string>' [ AWS_TOKEN = '<string>' ] } | AWS_ROLE = '<string>'  } ) ) } ]
 //
-// copyOptions ::=
 // ON_ERROR = { CONTINUE | SKIP_FILE | SKIP_FILE_<num> | SKIP_FILE_<num>% | ABORT_STATEMENT }
 // SIZE_LIMIT = <num>
+
+/// Maximum files per 'copy into table' commit.
+pub const COPY_MAX_FILES_PER_COMMIT: usize = 15000;
+
+/// Instruction for exceeding 'copy into table' file limit.
+pub const COPY_MAX_FILES_COMMIT_MSG: &str = "Commit limit reached: 15,000 files for 'copy into table'. To handle more files, adjust 'CopyOption' with 'max_files=<num>'(e.g., 'max_files=10000') and perform several operations until all files are processed.";
 
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug, Eq, PartialEq)]
 pub enum StageType {
@@ -74,7 +78,7 @@ pub enum StageType {
 }
 
 impl fmt::Display for StageType {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         let name = match self {
             // LegacyInternal will print the same name as Internal, this is by design.
             StageType::LegacyInternal => "Internal",
@@ -140,20 +144,20 @@ impl FromStr for StageFileCompression {
     }
 }
 
-impl ToString for StageFileCompression {
-    fn to_string(&self) -> String {
-        match *self {
-            StageFileCompression::Auto => "auto".to_string(),
-            StageFileCompression::Gzip => "gzip".to_string(),
-            StageFileCompression::Bz2 => "bz2".to_string(),
-            StageFileCompression::Brotli => "brotli".to_string(),
-            StageFileCompression::Zstd => "zstd".to_string(),
-            StageFileCompression::Deflate => "deflate".to_string(),
-            StageFileCompression::RawDeflate => "raw_deflate".to_string(),
-            StageFileCompression::Lzo => "lzo".to_string(),
-            StageFileCompression::Snappy => "snappy".to_string(),
-            StageFileCompression::Xz => "xz".to_string(),
-            StageFileCompression::None => "none".to_string(),
+impl Display for StageFileCompression {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+        match self {
+            StageFileCompression::Auto => write!(f, "auto"),
+            StageFileCompression::Gzip => write!(f, "gzip"),
+            StageFileCompression::Bz2 => write!(f, "bz2"),
+            StageFileCompression::Brotli => write!(f, "brotli"),
+            StageFileCompression::Zstd => write!(f, "zstd"),
+            StageFileCompression::Deflate => write!(f, "deflate"),
+            StageFileCompression::RawDeflate => write!(f, "raw_deflate"),
+            StageFileCompression::Lzo => write!(f, "lzo"),
+            StageFileCompression::Snappy => write!(f, "snappy"),
+            StageFileCompression::Xz => write!(f, "xz"),
+            StageFileCompression::None => write!(f, "none"),
         }
     }
 }
@@ -187,19 +191,30 @@ impl FromStr for StageFileFormatType {
             "PARQUET" => Ok(StageFileFormatType::Parquet),
             "XML" => Ok(StageFileFormatType::Xml),
             "JSON" => Ok(StageFileFormatType::Json),
-            "ORC" | "AVRO" => Err(format!(
-                "File format type '{s}' not implemented yet', must be one of ( CSV | TSV | NDJSON | PARQUET | XML)"
+            "ORC" => Ok(StageFileFormatType::Orc),
+            "AVRO" => Err(format!(
+                "File format type '{s}' not implemented yet', must be one of ( CSV | TSV | NDJSON | PARQUET | ORC)"
             )),
             _ => Err(format!(
-                "Unknown file format type '{s}', must be one of ( CSV | TSV | NDJSON | PARQUET | XML)"
+                "Unknown file format type '{s}', must be one of ( CSV | TSV | NDJSON | PARQUET | ORC)"
             )),
         }
     }
 }
 
-impl ToString for StageFileFormatType {
-    fn to_string(&self) -> String {
-        format!("{:?}", *self)
+impl Display for StageFileFormatType {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+        match self {
+            StageFileFormatType::Csv => write!(f, "CSV"),
+            StageFileFormatType::Tsv => write!(f, "TSV"),
+            StageFileFormatType::Json => write!(f, "JSON"),
+            StageFileFormatType::NdJson => write!(f, "NDJSON"),
+            StageFileFormatType::Avro => write!(f, "AVRO"),
+            StageFileFormatType::Orc => write!(f, "ORC"),
+            StageFileFormatType::Parquet => write!(f, "PARQUET"),
+            StageFileFormatType::Xml => write!(f, "XML"),
+            StageFileFormatType::None => write!(f, "NONE"),
+        }
     }
 }
 
@@ -340,7 +355,7 @@ impl FileFormatOptions {
 }
 
 impl Display for FileFormatOptions {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         write!(f, "TYPE = {}", self.format.to_string().to_uppercase())?;
         match self.format {
             StageFileFormatType::Csv => {
@@ -386,84 +401,6 @@ pub struct StageParams {
     pub storage: StorageParams,
 }
 
-#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, Eq, PartialEq)]
-pub enum OnErrorMode {
-    Continue,
-    SkipFileNum(u64),
-    AbortNum(u64),
-}
-
-impl Default for OnErrorMode {
-    fn default() -> Self {
-        Self::AbortNum(1)
-    }
-}
-
-impl Display for OnErrorMode {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        match self {
-            OnErrorMode::Continue => {
-                write!(f, "continue")
-            }
-            OnErrorMode::SkipFileNum(n) => {
-                if *n <= 1 {
-                    write!(f, "skipfile")
-                } else {
-                    write!(f, "skipfile_{}", n)
-                }
-            }
-            OnErrorMode::AbortNum(n) => {
-                if *n <= 1 {
-                    write!(f, "abort")
-                } else {
-                    write!(f, "abort_{}", n)
-                }
-            }
-        }
-    }
-}
-
-impl FromStr for OnErrorMode {
-    type Err = String;
-    fn from_str(s: &str) -> std::result::Result<Self, String> {
-        match s.to_uppercase().as_str() {
-            "" | "ABORT" => Ok(OnErrorMode::AbortNum(1)),
-            "CONTINUE" => Ok(OnErrorMode::Continue),
-            "SKIP_FILE" => Ok(OnErrorMode::SkipFileNum(1)),
-            v => {
-                if v.starts_with("ABORT_") {
-                    let num_str = v.replace("ABORT_", "");
-                    let nums = num_str.parse::<u64>();
-                    match nums {
-                        Ok(n) if n < 1 => {
-                            Err("OnError mode `ABORT_<num>` num must be greater than 0".to_string())
-                        }
-                        Ok(n) => Ok(OnErrorMode::AbortNum(n)),
-                        Err(_) => Err(format!(
-                            "Unknown OnError mode:{:?}, must one of {{ CONTINUE | SKIP_FILE | SKIP_FILE_<num> | ABORT | ABORT_<num> }}",
-                            v
-                        )),
-                    }
-                } else {
-                    let num_str = v.replace("SKIP_FILE_", "");
-                    let nums = num_str.parse::<u64>();
-                    match nums {
-                        Ok(n) if n < 1 => {
-                            Err("OnError mode `SKIP_FILE_<num>` num must be greater than 0"
-                                .to_string())
-                        }
-                        Ok(n) => Ok(OnErrorMode::SkipFileNum(n)),
-                        Err(_) => Err(format!(
-                            "Unknown OnError mode:{:?}, must one of {{ CONTINUE | SKIP_FILE | SKIP_FILE_<num> | ABORT | ABORT_<num> }}",
-                            v
-                        )),
-                    }
-                }
-            }
-        }
-    }
-}
-
 #[derive(serde::Serialize, serde::Deserialize, Clone, Default, Debug, Eq, PartialEq)]
 #[serde(default)]
 pub struct CopyOptions {
@@ -472,71 +409,13 @@ pub struct CopyOptions {
     pub max_files: usize,
     pub split_size: usize,
     pub purge: bool,
-    pub single: bool,
-    pub max_file_size: usize,
     pub disable_variant_check: bool,
-}
+    pub return_failed_only: bool,
 
-impl CopyOptions {
-    pub fn apply(&mut self, opts: &BTreeMap<String, String>, ignore_unknown: bool) -> Result<()> {
-        if opts.is_empty() {
-            return Ok(());
-        }
-        for (k, v) in opts.iter() {
-            match k.as_str() {
-                "on_error" => {
-                    let on_error = OnErrorMode::from_str(v)?;
-                    self.on_error = on_error;
-                }
-                "size_limit" => {
-                    let size_limit = usize::from_str(v)?;
-                    self.size_limit = size_limit;
-                }
-                "max_files" => {
-                    let max_files = usize::from_str(v)?;
-                    self.max_files = max_files;
-                }
-                "split_size" => {
-                    let split_size = usize::from_str(v)?;
-                    self.split_size = split_size;
-                }
-                "purge" => {
-                    let purge = bool::from_str(v).map_err(|_| {
-                        ErrorCode::StrParseError(format!("Cannot parse purge: {} as bool", v))
-                    })?;
-                    self.purge = purge;
-                }
-                "single" => {
-                    let single = bool::from_str(v).map_err(|_| {
-                        ErrorCode::StrParseError(format!("Cannot parse single: {} as bool", v))
-                    })?;
-                    self.single = single;
-                }
-                "max_file_size" => {
-                    let max_file_size = usize::from_str(v)?;
-                    self.max_file_size = max_file_size;
-                }
-                "disable_variant_check" => {
-                    let disable_variant_check = bool::from_str(v).map_err(|_| {
-                        ErrorCode::StrParseError(format!(
-                            "Cannot parse disable_variant_check: {} as bool",
-                            v
-                        ))
-                    })?;
-                    self.disable_variant_check = disable_variant_check;
-                }
-                _ => {
-                    if !ignore_unknown {
-                        return Err(ErrorCode::BadArguments(format!(
-                            "Unknown stage copy option {}",
-                            k
-                        )));
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
+    // unload only
+    pub max_file_size: usize,
+    pub single: bool,
+    pub detailed_output: bool,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Default, Clone, Debug, Eq, PartialEq)]
@@ -545,12 +424,15 @@ pub struct StageInfo {
     pub stage_name: String,
     pub stage_type: StageType,
     pub stage_params: StageParams,
+    // on `COPY INTO xx FROM 's3://xxx?ak=?&sk=?'`, the URL(ExternalLocation) will be treated as an temporary stage.
+    pub is_temporary: bool,
     pub file_format_params: FileFormatParams,
     pub copy_options: CopyOptions,
     pub comment: String,
     /// TODO(xuanwo): stage doesn't have this info anymore, remove it.
     pub number_of_files: u64,
     pub creator: Option<UserIdentity>,
+    pub created_on: DateTime<Utc>,
 }
 
 impl StageInfo {
@@ -563,10 +445,11 @@ impl StageInfo {
         }
     }
 
-    pub fn new_external_stage(storage: StorageParams, path: &str) -> StageInfo {
+    pub fn new_external_stage(storage: StorageParams, is_temporary: bool) -> StageInfo {
         StageInfo {
-            stage_name: format!("{storage},path={path}"),
+            stage_name: format!("{storage}"),
             stage_type: StageType::External,
+            is_temporary,
             stage_params: StageParams { storage },
             ..Default::default()
         }

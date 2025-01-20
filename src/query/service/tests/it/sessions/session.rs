@@ -1,4 +1,4 @@
-// Copyright 2021 Datafuse Labs.
+// Copyright 2021 Datafuse Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,29 +12,26 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use common_base::base::tokio;
-use common_exception::Result;
-use databend_query::sessions::SessionManager;
-use databend_query::sessions::SessionType;
+use databend_common_base::base::tokio;
+use databend_common_exception::Result;
+use databend_common_meta_app::tenant::Tenant;
 use databend_query::test_kits::ConfigBuilder;
-use databend_query::test_kits::TestGlobalServices;
+use databend_query::test_kits::TestFixture;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn test_session() -> Result<()> {
-    let _guard = TestGlobalServices::setup(ConfigBuilder::create().build().clone()).await?;
-    let session = SessionManager::instance()
-        .create_session(SessionType::Dummy)
-        .await?;
+    let _fixture = TestFixture::setup().await?;
+    let mut session = TestFixture::create_dummy_session().await;
 
     // Tenant.
     {
         let actual = session.get_current_tenant();
-        assert_eq!(&actual, "test");
+        assert_eq!(actual.tenant_name(), "test");
 
         // We are not in management mode, so always get the config tenant.
-        session.set_current_tenant("tenant2".to_string());
+        session.set_current_tenant(Tenant::new_literal("tenant2"));
         let actual = session.get_current_tenant();
-        assert_eq!(&actual, "test");
+        assert_eq!(actual.tenant_name(), "test");
     }
 
     // Settings.
@@ -50,20 +47,19 @@ async fn test_session() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn test_session_in_management_mode() -> Result<()> {
-    let _guard =
-        TestGlobalServices::setup(ConfigBuilder::create().with_management_mode().build()).await?;
-    let session = SessionManager::instance()
-        .create_session(SessionType::Dummy)
-        .await?;
+    let config = ConfigBuilder::create().with_management_mode().build();
+    let _fixture = TestFixture::setup_with_config(&config).await?;
+
+    let mut session = TestFixture::create_dummy_session().await;
 
     // Tenant.
     {
         let actual = session.get_current_tenant();
-        assert_eq!(&actual, "test");
+        assert_eq!(actual.tenant_name(), "test");
 
-        session.set_current_tenant("tenant2".to_string());
+        session.set_current_tenant(Tenant::new_literal("tenant2"));
         let actual = session.get_current_tenant();
-        assert_eq!(&actual, "tenant2");
+        assert_eq!(actual.tenant_name(), "tenant2");
     }
 
     Ok(())

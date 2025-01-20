@@ -12,22 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::sync::Arc;
-
-use common_exception::Result;
+use databend_common_exception::Result;
+use databend_storages_common_cache::CacheAccessor;
+use databend_storages_common_cache::CachedObject;
+use databend_storages_common_table_meta::meta::SegmentInfo;
+use databend_storages_common_table_meta::meta::TableSnapshot;
+use databend_storages_common_table_meta::meta::TableSnapshotStatistics;
+use databend_storages_common_table_meta::meta::Versioned;
 use opendal::Operator;
-use storages_common_cache::CacheAccessor;
-use storages_common_cache_manager::CachedObject;
-use storages_common_table_meta::meta::CompactSegmentInfo;
-use storages_common_table_meta::meta::SegmentInfo;
-use storages_common_table_meta::meta::TableSnapshot;
-use storages_common_table_meta::meta::TableSnapshotStatistics;
-use storages_common_table_meta::meta::Versioned;
 
 #[async_trait::async_trait]
 pub trait MetaWriter<T> {
-    /// If meta has a `to_bytes` function, such as `SegmentInfo` and `TableSnapshot`
-    /// We should not use `write_meta`. Instead, use `write_meta_data`
     async fn write_meta(&self, data_accessor: &Operator, location: &str) -> Result<()>;
 }
 
@@ -44,27 +39,25 @@ where T: Marshal + Sync + Send
 
 #[async_trait::async_trait]
 pub trait CachedMetaWriter<T> {
-    /// If meta has a `to_bytes` function, such as `SegmentInfo` and `TableSnapshot`
-    /// We should not use `write_meta_through_cache`. Instead, use `write_meta_data_through_cache`
-    async fn write_meta_through_cache(self, data_accessor: &Operator, location: &str)
-    -> Result<()>;
+    async fn write_meta_through_cache(
+        &self,
+        data_accessor: &Operator,
+        location: &str,
+    ) -> Result<()>;
 }
 
 #[async_trait::async_trait]
 impl CachedMetaWriter<SegmentInfo> for SegmentInfo {
     #[async_backtrace::framed]
     async fn write_meta_through_cache(
-        self,
+        &self,
         data_accessor: &Operator,
         location: &str,
     ) -> Result<()> {
         let bytes = self.marshal()?;
         data_accessor.write(location, bytes.clone()).await?;
-        if let Some(cache) = CompactSegmentInfo::cache() {
-            cache.put(
-                location.to_owned(),
-                Arc::new(CompactSegmentInfo::try_from(&self)?),
-            )
+        if let Some(cache) = SegmentInfo::cache() {
+            cache.insert(location.to_owned(), self.try_into()?);
         }
         Ok(())
     }
@@ -104,12 +97,11 @@ impl Marshal for TableSnapshotStatistics {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
-    use std::panic::catch_unwind;
 
-    use common_expression::TableSchema;
-    use storages_common_table_meta::meta::SnapshotId;
-    use storages_common_table_meta::meta::Statistics;
+    use databend_common_base::runtime::catch_unwind;
+    use databend_common_expression::TableSchema;
+    use databend_storages_common_table_meta::meta::SnapshotId;
+    use databend_storages_common_table_meta::meta::Statistics;
 
     use super::*;
 
@@ -137,12 +129,12 @@ mod tests {
             let r = catch_unwind(|| {
                 let mut snapshot = TableSnapshot::new(
                     SnapshotId::new_v4(),
+                    None,
                     &None,
                     None,
                     TableSchema::default(),
                     Statistics::default(),
                     vec![],
-                    None,
                     None,
                 );
                 snapshot.format_version = v;
@@ -154,24 +146,14 @@ mod tests {
         // current version allowed
         let snapshot = TableSnapshot::new(
             SnapshotId::new_v4(),
+            None,
             &None,
             None,
             TableSchema::default(),
             Statistics::default(),
             vec![],
             None,
-            None,
         );
         snapshot.marshal().unwrap();
-    }
-
-    #[test]
-    fn test_table_snapshot_statistics_format_version_validation() {
-        // since there is only one version for TableSnapshotStatistics,
-        // we omit the checking of invalid format versions, otherwise clippy will complain about empty_ranges
-
-        // current version allowed
-        let snapshot_stats = TableSnapshotStatistics::new(HashMap::new());
-        snapshot_stats.marshal().unwrap();
     }
 }

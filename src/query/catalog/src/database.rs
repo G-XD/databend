@@ -15,28 +15,31 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use common_exception::ErrorCode;
-use common_exception::Result;
-use common_meta_app::schema::CreateTableReply;
-use common_meta_app::schema::CreateTableReq;
-use common_meta_app::schema::DatabaseInfo;
-use common_meta_app::schema::DropTableByIdReq;
-use common_meta_app::schema::DropTableReply;
-use common_meta_app::schema::GetTableCopiedFileReply;
-use common_meta_app::schema::GetTableCopiedFileReq;
-use common_meta_app::schema::RenameTableReply;
-use common_meta_app::schema::RenameTableReq;
-use common_meta_app::schema::SetTableColumnMaskPolicyReply;
-use common_meta_app::schema::SetTableColumnMaskPolicyReq;
-use common_meta_app::schema::TableInfo;
-use common_meta_app::schema::TruncateTableReply;
-use common_meta_app::schema::TruncateTableReq;
-use common_meta_app::schema::UndropTableReply;
-use common_meta_app::schema::UndropTableReq;
-use common_meta_app::schema::UpdateTableMetaReply;
-use common_meta_app::schema::UpdateTableMetaReq;
-use common_meta_app::schema::UpsertTableOptionReply;
-use common_meta_app::schema::UpsertTableOptionReq;
+use databend_common_exception::ErrorCode;
+use databend_common_exception::Result;
+use databend_common_meta_app::schema::CommitTableMetaReply;
+use databend_common_meta_app::schema::CommitTableMetaReq;
+use databend_common_meta_app::schema::CreateTableReply;
+use databend_common_meta_app::schema::CreateTableReq;
+use databend_common_meta_app::schema::DatabaseInfo;
+use databend_common_meta_app::schema::DropTableByIdReq;
+use databend_common_meta_app::schema::DropTableReply;
+use databend_common_meta_app::schema::GetTableCopiedFileReply;
+use databend_common_meta_app::schema::GetTableCopiedFileReq;
+use databend_common_meta_app::schema::RenameTableReply;
+use databend_common_meta_app::schema::RenameTableReq;
+use databend_common_meta_app::schema::SetTableColumnMaskPolicyReply;
+use databend_common_meta_app::schema::SetTableColumnMaskPolicyReq;
+use databend_common_meta_app::schema::TableInfo;
+use databend_common_meta_app::schema::TruncateTableReply;
+use databend_common_meta_app::schema::TruncateTableReq;
+use databend_common_meta_app::schema::UndropTableReq;
+use databend_common_meta_app::schema::UpdateMultiTableMetaReq;
+use databend_common_meta_app::schema::UpdateMultiTableMetaResult;
+use databend_common_meta_app::schema::UpsertTableOptionReply;
+use databend_common_meta_app::schema::UpsertTableOptionReq;
+use databend_common_meta_app::tenant::Tenant;
+use databend_common_meta_app::KeyWithTenant;
 use dyn_clone::DynClone;
 
 use crate::table::Table;
@@ -60,12 +63,12 @@ pub trait Database: DynClone + Sync + Send {
 
     fn get_db_info(&self) -> &DatabaseInfo;
 
-    fn get_tenant(&self) -> &String {
-        &self.get_db_info().name_ident.tenant
+    fn get_tenant(&self) -> &Tenant {
+        self.get_db_info().name_ident.tenant()
     }
 
-    fn get_db_name(&self) -> &String {
-        &self.get_db_info().name_ident.db_name
+    fn get_db_name(&self) -> &str {
+        self.get_db_info().name_ident.database_name()
     }
 
     // Initial a database.
@@ -91,16 +94,25 @@ pub trait Database: DynClone + Sync + Send {
         )))
     }
 
+    // Get one table history by db and table name.
     #[async_backtrace::framed]
-    async fn list_tables(&self) -> Result<Vec<Arc<dyn Table>>> {
+    async fn get_table_history(&self, _table_name: &str) -> Result<Vec<Arc<dyn Table>>> {
         Err(ErrorCode::Unimplemented(format!(
-            "UnImplement list_tables in {} Database",
+            "UnImplement get_table in {} Database",
             self.name()
         )))
     }
 
     #[async_backtrace::framed]
-    async fn list_tables_history(&self) -> Result<Vec<Arc<dyn Table>>> {
+    async fn list_tables(&self) -> Result<Vec<Arc<dyn Table>>> {
+        Ok(vec![])
+    }
+
+    #[async_backtrace::framed]
+    async fn list_tables_history(
+        &self,
+        _include_non_retainable: bool,
+    ) -> Result<Vec<Arc<dyn Table>>> {
         Err(ErrorCode::Unimplemented(format!(
             "UnImplement list_tables_history in {} Database",
             self.name()
@@ -124,9 +136,16 @@ pub trait Database: DynClone + Sync + Send {
     }
 
     #[async_backtrace::framed]
-    async fn undrop_table(&self, _req: UndropTableReq) -> Result<UndropTableReply> {
+    async fn undrop_table(&self, _req: UndropTableReq) -> Result<()> {
         Err(ErrorCode::Unimplemented(format!(
             "UnImplement undrop_table in {} Database",
+            self.name()
+        )))
+    }
+
+    async fn commit_table_meta(&self, _req: CommitTableMetaReq) -> Result<CommitTableMetaReply> {
+        Err(ErrorCode::Unimplemented(format!(
+            "UnImplement commit_table_meta in {} Database",
             self.name()
         )))
     }
@@ -146,14 +165,6 @@ pub trait Database: DynClone + Sync + Send {
     ) -> Result<UpsertTableOptionReply> {
         Err(ErrorCode::Unimplemented(format!(
             "UnImplement upsert_table_option in {} Database",
-            self.name()
-        )))
-    }
-
-    #[async_backtrace::framed]
-    async fn update_table_meta(&self, _req: UpdateTableMetaReq) -> Result<UpdateTableMetaReply> {
-        Err(ErrorCode::Unimplemented(format!(
-            "UnImplement update_table_meta in {} Database",
             self.name()
         )))
     }
@@ -184,6 +195,17 @@ pub trait Database: DynClone + Sync + Send {
     async fn truncate_table(&self, _req: TruncateTableReq) -> Result<TruncateTableReply> {
         Err(ErrorCode::Unimplemented(format!(
             "UnImplement truncate_table in {} Database",
+            self.name()
+        )))
+    }
+
+    #[async_backtrace::framed]
+    async fn retryable_update_multi_table_meta(
+        &self,
+        _req: UpdateMultiTableMetaReq,
+    ) -> Result<UpdateMultiTableMetaResult> {
+        Err(ErrorCode::Unimplemented(format!(
+            "UnImplement retryable_update_multi_table_meta in {} Database",
             self.name()
         )))
     }

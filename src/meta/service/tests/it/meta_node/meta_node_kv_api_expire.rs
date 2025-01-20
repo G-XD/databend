@@ -14,15 +14,16 @@
 
 use std::time::Duration;
 
-use common_base::base::tokio::time::sleep;
-use common_meta_kvapi::kvapi::KVApi;
-use common_meta_types::Cmd;
-use common_meta_types::KVMeta;
-use common_meta_types::LogEntry;
-use common_meta_types::MatchSeq;
-use common_meta_types::SeqV;
-use common_meta_types::UpsertKV;
-use common_meta_types::With;
+use databend_common_base::base::tokio::time::sleep;
+use databend_common_meta_kvapi::kvapi::KVApi;
+use databend_common_meta_types::seq_value::KVMeta;
+use databend_common_meta_types::seq_value::SeqV;
+use databend_common_meta_types::Cmd;
+use databend_common_meta_types::LogEntry;
+use databend_common_meta_types::MatchSeq;
+use databend_common_meta_types::MetaSpec;
+use databend_common_meta_types::UpsertKV;
+use databend_common_meta_types::With;
 use log::info;
 use test_harness::test;
 
@@ -36,7 +37,7 @@ use crate::tests::meta_node::start_meta_node_non_voter;
 /// - Assert expired kv can not be read and write.
 /// - Bring up a learner, replicate logs from leader, rebuild the same state machine.
 #[test(harness = meta_service_test_harness)]
-#[minitrace::trace]
+#[fastrace::trace]
 async fn test_meta_node_replicate_kv_with_expire() -> anyhow::Result<()> {
     let mut log_index = 0;
 
@@ -49,7 +50,7 @@ async fn test_meta_node_replicate_kv_with_expire() -> anyhow::Result<()> {
     leader
         .raft
         .wait(timeout())
-        .log(Some(log_index), "leader log index")
+        .applied_index(Some(log_index), "leader log index")
         .await?;
 
     let key = "expire-kv";
@@ -58,9 +59,8 @@ async fn test_meta_node_replicate_kv_with_expire() -> anyhow::Result<()> {
 
     info!("--- write a kv expiring in 3 sec");
     {
-        let upsert = UpsertKV::update(key, key.as_bytes()).with(KVMeta {
-            expire_at: Some(now_sec + 3),
-        });
+        let upsert =
+            UpsertKV::update(key, key.as_bytes()).with(MetaSpec::new_ttl(Duration::from_secs(3)));
 
         leader.write(LogEntry::new(Cmd::UpsertKV(upsert))).await?;
         log_index += 1;
@@ -70,12 +70,7 @@ async fn test_meta_node_replicate_kv_with_expire() -> anyhow::Result<()> {
     let seq = {
         let resp = leader.get_kv(key).await?;
         let seq_v = resp.unwrap();
-        assert_eq!(
-            Some(KVMeta {
-                expire_at: Some(now_sec + 3)
-            }),
-            seq_v.meta
-        );
+        assert_eq!(Some(KVMeta::new_expire(now_sec + 3)), seq_v.meta);
         seq_v.seq
     };
 
@@ -83,9 +78,7 @@ async fn test_meta_node_replicate_kv_with_expire() -> anyhow::Result<()> {
     {
         let upsert = UpsertKV::update(key, value2.as_bytes())
             .with(MatchSeq::Exact(seq))
-            .with(KVMeta {
-                expire_at: Some(now_sec + 1000),
-            });
+            .with(MetaSpec::new_ttl(Duration::from_secs(1000)));
         leader.write(LogEntry::new(Cmd::UpsertKV(upsert))).await?;
         log_index += 1;
     }
@@ -94,11 +87,11 @@ async fn test_meta_node_replicate_kv_with_expire() -> anyhow::Result<()> {
     {
         let resp = leader.get_kv(key).await?;
         let seq_v = resp.unwrap();
-        assert_eq!(
-            Some(KVMeta {
-                expire_at: Some(now_sec + 1000),
-            }),
-            seq_v.meta
+        let want = (now_sec + 1000) * 1000;
+        let expire_ms = seq_v.meta.unwrap().get_expire_at_ms().unwrap();
+        assert!(
+            (want..want + 2_000).contains(&expire_ms),
+            "want: {want} got: {expire_ms}"
         );
         assert_eq!(value2.to_string().into_bytes(), seq_v.data);
     }
@@ -115,22 +108,17 @@ async fn test_meta_node_replicate_kv_with_expire() -> anyhow::Result<()> {
     learner
         .raft
         .wait(timeout())
-        .log(Some(log_index), "learner received all logs")
+        .applied_index(Some(log_index), "learner received all logs")
         .await?;
 
     // A learner should use the time embedded in raft-log to expire records.
     // This way on every node applying a log always get the same result.
     info!("--- get updated kv with new expire, assert the updated value");
     {
-        let sm = learner.sto.state_machine.read().await;
+        let sm = learner.raft_store.state_machine.read().await;
         let resp = sm.kv_api().get_kv(key).await.unwrap();
         let seq_v = resp.unwrap();
-        assert_eq!(
-            Some(KVMeta {
-                expire_at: Some(now_sec + 1000),
-            }),
-            seq_v.meta
-        );
+        assert_eq!(Some(KVMeta::new_expire(now_sec + 1000)), seq_v.meta);
         assert_eq!(value2.to_string().into_bytes(), seq_v.data);
     }
 

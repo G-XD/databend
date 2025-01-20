@@ -1,4 +1,4 @@
-// Copyright 2021 Datafuse Labs.
+// Copyright 2021 Datafuse Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,16 +14,17 @@
 
 use std::collections::BTreeMap;
 
-use common_exception::Result;
-use common_expression::types::number::Int32Type;
-use common_expression::types::NumberDataType;
-use common_expression::FromOptData;
-use common_expression::TableDataType;
-use common_expression::TableField;
-use common_formats::FileFormatOptionsExt;
-use common_meta_app::principal::FileFormatOptionsAst;
-use common_meta_app::principal::FileFormatParams;
-use common_settings::Settings;
+use databend_common_exception::Result;
+use databend_common_expression::types::number::Int32Type;
+use databend_common_expression::types::NumberDataType;
+use databend_common_expression::FromData;
+use databend_common_expression::TableDataType;
+use databend_common_expression::TableField;
+use databend_common_formats::FileFormatOptionsExt;
+use databend_common_meta_app::principal::FileFormatOptionsReader;
+use databend_common_meta_app::principal::FileFormatParams;
+use databend_common_meta_app::tenant::Tenant;
+use databend_common_settings::Settings;
 use pretty_assertions::assert_eq;
 
 use crate::get_output_format_clickhouse;
@@ -40,7 +41,7 @@ fn test_data_block(is_nullable: bool) -> Result<()> {
         let tsv_block = String::from_utf8(buffer)?;
         let expect = "1\ta\t1\t1.1\t1970-01-02\n\
                             2\tb\"\t1\t2.2\t1970-01-03\n\
-                            3\tc\\'\t0\tnan\t1970-01-04\n";
+                            3\tc\'\t0\tnan\t1970-01-04\n";
         assert_eq!(&tsv_block, expect);
 
         let formatter = get_output_format_clickhouse("TsvWithNames", schema.clone())?;
@@ -62,14 +63,16 @@ fn test_data_block(is_nullable: bool) -> Result<()> {
     }
 
     {
-        let settings = Settings::create("default".to_string());
+        let settings = Settings::create(Tenant::new_literal("default"));
         let mut options = BTreeMap::<String, String>::new();
         options.insert("type".to_string(), "csv".to_string());
         options.insert("field_delimiter".to_string(), "$".to_string());
         options.insert("record_delimiter".to_string(), "\r\n".to_string());
 
-        let params =
-            FileFormatParams::try_from_ast(FileFormatOptionsAst::new(options.clone()), false)?;
+        let params = FileFormatParams::try_from_reader(
+            FileFormatOptionsReader::from_map(options.clone()),
+            false,
+        )?;
         let mut options = FileFormatOptionsExt::create_from_settings(&settings, false)?;
         let mut output_format = options.get_output_format(schema, params)?;
         let buffer = output_format.serialize_block(&block)?;
@@ -125,12 +128,15 @@ fn test_data_block_not_nullable() -> Result<()> {
 fn test_field_delimiter_with_ascii_control_code() -> Result<()> {
     let (schema, block) = get_simple_block(false);
 
-    let settings = Settings::create("default".to_string());
+    let settings = Settings::create(Tenant::new_literal("default"));
     let mut options = BTreeMap::<String, String>::new();
     options.insert("type".to_string(), "csv".to_string());
     options.insert("field_delimiter".to_string(), "\x01".to_string());
     options.insert("record_delimiter".to_string(), "\r\n".to_string());
-    let params = FileFormatParams::try_from_ast(FileFormatOptionsAst::new(options.clone()), false)?;
+    let params = FileFormatParams::try_from_reader(
+        FileFormatOptionsReader::from_map(options.clone()),
+        false,
+    )?;
     let mut options = FileFormatOptionsExt::create_from_settings(&settings, false)?;
     let mut output_format = options.get_output_format(schema, params)?;
     let buffer = output_format.serialize_block(&block)?;

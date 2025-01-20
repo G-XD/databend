@@ -12,18 +12,22 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-mod sort;
-pub mod transform;
-pub mod transform_accumulating;
-pub mod transform_accumulating_async;
+pub mod sort;
+mod transform;
+mod transform_accumulating;
+mod transform_accumulating_async;
 mod transform_async;
-pub mod transform_block_compact;
-pub mod transform_block_compact_for_copy;
-pub mod transform_compact;
+mod transform_blocking;
+mod transform_compact_block;
+mod transform_compact_builder;
+mod transform_compact_no_split_builder;
 mod transform_dummy;
+mod transform_k_way_merge_sort;
 mod transform_multi_sort_merge;
-pub mod transform_sort;
+mod transform_pipeline_helper;
+mod transform_retry_async;
 mod transform_sort_merge;
+mod transform_sort_merge_base;
 mod transform_sort_merge_limit;
 pub mod transform_sort_partial;
 
@@ -31,9 +35,17 @@ pub use transform::*;
 pub use transform_accumulating::*;
 pub use transform_accumulating_async::*;
 pub use transform_async::*;
-pub use transform_block_compact::*;
-pub use transform_compact::*;
+pub use transform_blocking::*;
+pub use transform_compact_block::*;
+pub use transform_compact_builder::*;
+pub use transform_compact_no_split_builder::*;
 pub use transform_dummy::*;
-pub use transform_sort::*;
+pub use transform_k_way_merge_sort::*;
+pub use transform_multi_sort_merge::try_add_multi_sort_merge;
+pub use transform_pipeline_helper::TransformPipelineHelper;
+pub use transform_retry_async::*;
 pub use transform_sort_merge::sort_merge;
+pub use transform_sort_merge::*;
+pub use transform_sort_merge_base::*;
+pub use transform_sort_merge_limit::*;
 pub use transform_sort_partial::*;

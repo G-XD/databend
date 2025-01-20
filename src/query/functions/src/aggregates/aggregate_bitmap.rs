@@ -14,6 +14,7 @@
 
 use std::alloc::Layout;
 use std::fmt;
+use std::io::BufRead;
 use std::marker::PhantomData;
 use std::ops::BitAndAssign;
 use std::ops::BitOrAssign;
@@ -21,23 +22,24 @@ use std::ops::BitXorAssign;
 use std::ops::SubAssign;
 use std::sync::Arc;
 
-use common_arrow::arrow::bitmap::Bitmap;
-use common_arrow::arrow::bitmap::MutableBitmap;
-use common_exception::ErrorCode;
-use common_exception::Result;
-use common_expression::type_check::check_number;
-use common_expression::types::decimal::DecimalType;
-use common_expression::types::*;
-use common_expression::with_number_mapped_type;
-use common_expression::Column;
-use common_expression::ColumnBuilder;
-use common_expression::Expr;
-use common_expression::FunctionContext;
-use common_expression::Scalar;
-use common_io::prelude::BinaryWrite;
-use croaring::treemap::NativeSerializer;
-use croaring::Treemap;
+use databend_common_exception::ErrorCode;
+use databend_common_exception::Result;
+use databend_common_expression::type_check::check_number;
+use databend_common_expression::types::decimal::DecimalType;
+use databend_common_expression::types::Bitmap;
+use databend_common_expression::types::MutableBitmap;
+use databend_common_expression::types::*;
+use databend_common_expression::with_number_mapped_type;
+use databend_common_expression::AggrStateRegistry;
+use databend_common_expression::AggrStateType;
+use databend_common_expression::ColumnBuilder;
+use databend_common_expression::Expr;
+use databend_common_expression::FunctionContext;
+use databend_common_expression::InputColumns;
+use databend_common_expression::Scalar;
+use databend_common_io::prelude::BinaryWrite;
 use ethnum::i256;
+use roaring::RoaringTreemap;
 
 use super::aggregate_function_factory::AggregateFunctionDescription;
 use super::StateAddr;
@@ -45,6 +47,8 @@ use super::StateAddrs;
 use crate::aggregates::assert_arguments;
 use crate::aggregates::assert_unary_arguments;
 use crate::aggregates::assert_variadic_params;
+use crate::aggregates::AggrState;
+use crate::aggregates::AggrStateLoc;
 use crate::aggregates::AggregateFunction;
 use crate::with_simple_no_number_mapped_type;
 use crate::BUILTIN_FUNCTIONS;
@@ -87,7 +91,7 @@ macro_rules! with_bitmap_agg_mapped_type {
 }
 
 trait BitmapAggResult: Send + Sync + 'static {
-    fn merge_result(place: StateAddr, builder: &mut ColumnBuilder) -> Result<()>;
+    fn merge_result(place: AggrState, builder: &mut ColumnBuilder) -> Result<()>;
 
     fn return_type() -> Result<DataType>;
 }
@@ -97,10 +101,10 @@ struct BitmapCountResult;
 struct BitmapRawResult;
 
 impl BitmapAggResult for BitmapCountResult {
-    fn merge_result(place: StateAddr, builder: &mut ColumnBuilder) -> Result<()> {
+    fn merge_result(place: AggrState, builder: &mut ColumnBuilder) -> Result<()> {
         let builder = UInt64Type::try_downcast_builder(builder).unwrap();
         let state = place.get::<BitmapAggState>();
-        builder.push(state.rb.as_ref().map(|rb| rb.cardinality()).unwrap_or(0));
+        builder.push(state.rb.as_ref().map(|rb| rb.len()).unwrap_or(0));
         Ok(())
     }
 
@@ -110,11 +114,11 @@ impl BitmapAggResult for BitmapCountResult {
 }
 
 impl BitmapAggResult for BitmapRawResult {
-    fn merge_result(place: StateAddr, builder: &mut ColumnBuilder) -> Result<()> {
+    fn merge_result(place: AggrState, builder: &mut ColumnBuilder) -> Result<()> {
         let builder = BitmapType::try_downcast_builder(builder).unwrap();
         let state = place.get::<BitmapAggState>();
         if let Some(rb) = state.rb.as_ref() {
-            builder.put(&rb.serialize()?);
+            rb.serialize_into(&mut builder.data)?;
         };
         builder.commit_row();
         Ok(())
@@ -145,7 +149,7 @@ macro_rules! with_bitmap_op_mapped_type {
 }
 
 trait BitmapOperate: Send + Sync + 'static {
-    fn operate(lhs: &mut Treemap, rhs: Treemap);
+    fn operate(lhs: &mut RoaringTreemap, rhs: RoaringTreemap);
 }
 
 struct BitmapAndOp;
@@ -157,31 +161,31 @@ struct BitmapXorOp;
 struct BitmapNotOp;
 
 impl BitmapOperate for BitmapAndOp {
-    fn operate(lhs: &mut Treemap, rhs: Treemap) {
+    fn operate(lhs: &mut RoaringTreemap, rhs: RoaringTreemap) {
         lhs.bitand_assign(rhs);
     }
 }
 
 impl BitmapOperate for BitmapOrOp {
-    fn operate(lhs: &mut Treemap, rhs: Treemap) {
+    fn operate(lhs: &mut RoaringTreemap, rhs: RoaringTreemap) {
         lhs.bitor_assign(rhs);
     }
 }
 
 impl BitmapOperate for BitmapXorOp {
-    fn operate(lhs: &mut Treemap, rhs: Treemap) {
+    fn operate(lhs: &mut RoaringTreemap, rhs: RoaringTreemap) {
         lhs.bitxor_assign(rhs);
     }
 }
 
 impl BitmapOperate for BitmapNotOp {
-    fn operate(lhs: &mut Treemap, rhs: Treemap) {
+    fn operate(lhs: &mut RoaringTreemap, rhs: RoaringTreemap) {
         lhs.sub_assign(rhs);
     }
 }
 
 struct BitmapAggState {
-    rb: Option<Treemap>,
+    rb: Option<RoaringTreemap>,
 }
 
 impl BitmapAggState {
@@ -189,7 +193,7 @@ impl BitmapAggState {
         Self { rb: None }
     }
 
-    fn add<OP: BitmapOperate>(&mut self, other: Treemap) {
+    fn add<OP: BitmapOperate>(&mut self, other: RoaringTreemap) {
         match &mut self.rb {
             Some(v) => {
                 OP::operate(v, other);
@@ -214,23 +218,23 @@ where
         AGG::return_type()
     }
 
-    fn init_state(&self, place: super::StateAddr) {
+    fn init_state(&self, place: AggrState) {
         place.write(BitmapAggState::new);
     }
 
-    fn state_layout(&self) -> Layout {
-        Layout::new::<BitmapAggState>()
+    fn register_state(&self, registry: &mut AggrStateRegistry) {
+        registry.register(AggrStateType::Custom(Layout::new::<BitmapAggState>()));
     }
 
     fn accumulate(
         &self,
-        place: StateAddr,
-        columns: &[Column],
+        place: AggrState,
+        columns: InputColumns,
         validity: Option<&Bitmap>,
         _input_rows: usize,
     ) -> Result<()> {
         let column = BitmapType::try_downcast_column(&columns[0]).unwrap();
-        if column.len() == 0 {
+        if column.is_empty() {
             return Ok(());
         }
 
@@ -238,7 +242,7 @@ where
         let state = place.get::<BitmapAggState>();
 
         if let Some(validity) = validity {
-            if validity.unset_bits() == column.len() {
+            if validity.null_count() == column.len() {
                 return Ok(());
             }
 
@@ -246,12 +250,12 @@ where
                 if !valid {
                     continue;
                 }
-                let rb = Treemap::deserialize(data)?;
+                let rb = deserialize_bitmap(data)?;
                 state.add::<OP>(rb);
             }
         } else {
             for data in column_iter {
-                let rb = Treemap::deserialize(data)?;
+                let rb = deserialize_bitmap(data)?;
                 state.add::<OP>(rb);
             }
         }
@@ -261,63 +265,64 @@ where
     fn accumulate_keys(
         &self,
         places: &[StateAddr],
-        offset: usize,
-        columns: &[Column],
+        loc: &[AggrStateLoc],
+        columns: InputColumns,
         _input_rows: usize,
     ) -> Result<()> {
         let column = BitmapType::try_downcast_column(&columns[0]).unwrap();
 
-        for (data, place) in column.iter().zip(places.iter()) {
-            let addr = place.next(offset);
-            let state = addr.get::<BitmapAggState>();
-            let rb = Treemap::deserialize(data)?;
+        for (data, addr) in column.iter().zip(places.iter().cloned()) {
+            let state = AggrState::new(addr, loc).get::<BitmapAggState>();
+            let rb = deserialize_bitmap(data)?;
             state.add::<OP>(rb);
         }
         Ok(())
     }
 
-    fn accumulate_row(&self, place: StateAddr, columns: &[Column], row: usize) -> Result<()> {
+    fn accumulate_row(&self, place: AggrState, columns: InputColumns, row: usize) -> Result<()> {
         let column = BitmapType::try_downcast_column(&columns[0]).unwrap();
         let state = place.get::<BitmapAggState>();
         if let Some(data) = BitmapType::index_column(&column, row) {
-            let rb = Treemap::deserialize(data)?;
+            let rb = deserialize_bitmap(data)?;
             state.add::<OP>(rb);
         }
         Ok(())
     }
 
-    fn serialize(&self, place: StateAddr, writer: &mut Vec<u8>) -> Result<()> {
+    fn serialize(&self, place: AggrState, writer: &mut Vec<u8>) -> Result<()> {
         let state = place.get::<BitmapAggState>();
         // flag indicate where bitmap is none
         let flag: u8 = if state.rb.is_some() { 1 } else { 0 };
         writer.write_scalar(&flag)?;
         if let Some(rb) = &state.rb {
-            writer.extend_from_slice(rb.serialize()?.as_slice());
+            rb.serialize_into(writer)?;
         }
         Ok(())
     }
 
-    fn deserialize(&self, place: StateAddr, reader: &mut &[u8]) -> Result<()> {
+    fn merge(&self, place: AggrState, reader: &mut &[u8]) -> Result<()> {
         let state = place.get::<BitmapAggState>();
+
         let flag = reader[0];
-        state.rb = if flag == 1 {
-            Some(Treemap::deserialize(&reader[1..])?)
-        } else {
-            None
-        };
-        Ok(())
-    }
-
-    fn merge(&self, place: StateAddr, rhs: StateAddr) -> Result<()> {
-        let state = place.get::<BitmapAggState>();
-        let rhs = rhs.get::<BitmapAggState>();
-        if let Some(rb) = &rhs.rb {
-            state.add::<OP>(rb.clone());
+        reader.consume(1);
+        if flag == 1 {
+            let rb = deserialize_bitmap(reader)?;
+            state.add::<OP>(rb);
         }
         Ok(())
     }
 
-    fn merge_result(&self, place: StateAddr, builder: &mut ColumnBuilder) -> Result<()> {
+    fn merge_states(&self, place: AggrState, rhs: AggrState) -> Result<()> {
+        let state = place.get::<BitmapAggState>();
+        let other = rhs.get::<BitmapAggState>();
+
+        if let Some(rb) = other.rb.take() {
+            state.add::<OP>(rb);
+        }
+        Ok(())
+    }
+
+    fn merge_result(&self, place: AggrState, builder: &mut ColumnBuilder) -> Result<()> {
         AGG::merge_result(place, builder)
     }
 
@@ -325,7 +330,7 @@ where
         true
     }
 
-    unsafe fn drop_state(&self, place: StateAddr) {
+    unsafe fn drop_state(&self, place: AggrState) {
         let state = place.get::<BitmapAggState>();
         std::ptr::drop_in_place(state);
     }
@@ -370,7 +375,7 @@ where
         Ok(Arc::new(func))
     }
 
-    fn get_filter_bitmap(&self, columns: &[Column]) -> Bitmap {
+    fn get_filter_bitmap(&self, columns: InputColumns) -> Bitmap {
         let filter_col = T::try_downcast_column(&columns[1]).unwrap();
 
         let mut result = MutableBitmap::from_len_zeroed(columns[0].len());
@@ -388,7 +393,7 @@ where
         Bitmap::from(result)
     }
 
-    fn filter_row(&self, columns: &[Column], row: usize) -> Result<bool> {
+    fn filter_row(&self, columns: InputColumns, row: usize) -> Result<bool> {
         let check_col = T::try_downcast_column(&columns[1]).unwrap();
         let check_val_opt = T::index_column(&check_col, row);
 
@@ -404,7 +409,7 @@ where
     }
 
     fn filter_place(places: &[StateAddr], predicate: &Bitmap) -> StateAddrs {
-        if predicate.unset_bits() == 0 {
+        if predicate.null_count() == 0 {
             return places.to_vec();
         }
         let it = predicate
@@ -430,18 +435,18 @@ where
         self.inner.return_type()
     }
 
-    fn init_state(&self, place: StateAddr) {
+    fn init_state(&self, place: AggrState) {
         self.inner.init_state(place);
     }
 
-    fn state_layout(&self) -> Layout {
-        self.inner.state_layout()
+    fn register_state(&self, registry: &mut AggrStateRegistry) {
+        self.inner.register_state(registry);
     }
 
     fn accumulate(
         &self,
-        place: StateAddr,
-        columns: &[Column],
+        place: AggrState,
+        columns: InputColumns,
         validity: Option<&Bitmap>,
         input_rows: usize,
     ) -> Result<()> {
@@ -457,8 +462,8 @@ where
     fn accumulate_keys(
         &self,
         places: &[StateAddr],
-        offset: usize,
-        columns: &[Column],
+        loc: &[AggrStateLoc],
+        columns: InputColumns,
         _input_rows: usize,
     ) -> Result<()> {
         let predicate = self.get_filter_bitmap(columns);
@@ -466,32 +471,33 @@ where
 
         let new_places = Self::filter_place(places, &predicate);
         let new_places_slice = new_places.as_slice();
-        let row_size = predicate.len() - predicate.unset_bits();
+        let row_size = predicate.len() - predicate.null_count();
 
+        let input = [column];
         self.inner
-            .accumulate_keys(new_places_slice, offset, vec![column].as_slice(), row_size)
+            .accumulate_keys(new_places_slice, loc, input.as_slice().into(), row_size)
     }
 
-    fn accumulate_row(&self, place: StateAddr, columns: &[Column], row: usize) -> Result<()> {
+    fn accumulate_row(&self, place: AggrState, columns: InputColumns, row: usize) -> Result<()> {
         if self.filter_row(columns, row)? {
             return self.inner.accumulate_row(place, columns, row);
         }
         Ok(())
     }
 
-    fn serialize(&self, place: StateAddr, writer: &mut Vec<u8>) -> Result<()> {
+    fn serialize(&self, place: AggrState, writer: &mut Vec<u8>) -> Result<()> {
         self.inner.serialize(place, writer)
     }
 
-    fn deserialize(&self, place: StateAddr, reader: &mut &[u8]) -> Result<()> {
-        self.inner.deserialize(place, reader)
+    fn merge(&self, place: AggrState, reader: &mut &[u8]) -> Result<()> {
+        self.inner.merge(place, reader)
     }
 
-    fn merge(&self, place: StateAddr, rhs: StateAddr) -> Result<()> {
-        self.inner.merge(place, rhs)
+    fn merge_states(&self, place: AggrState, rhs: AggrState) -> Result<()> {
+        self.inner.merge_states(place, rhs)
     }
 
-    fn merge_result(&self, place: StateAddr, builder: &mut ColumnBuilder) -> Result<()> {
+    fn merge_result(&self, place: AggrState, builder: &mut ColumnBuilder) -> Result<()> {
         self.inner.merge_result(place, builder)
     }
 }
@@ -501,7 +507,7 @@ where
     T: ValueType + Send + Sync,
     <T as ValueType>::Scalar: Send + Sync,
 {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "{}", self.display_name)
     }
 }
@@ -574,7 +580,7 @@ pub fn try_create_aggregate_bitmap_intersect_count_function(
                 NumberDataType::NUM => {
                     AggregateBitmapIntersectCountFunction::<NumberType<NUM>>::try_create(
                         display_name,
-                        extract_number_params::<NUM>(num_type, params)?,
+                        extract_number_params::<NUM>(params)?,
                     )
                 }
             })
@@ -624,25 +630,17 @@ fn extract_params<T: ValueType>(
     Ok(filter_values)
 }
 
-fn extract_number_params<N: Number>(
-    num_type: NumberDataType,
-    params: Vec<Scalar>,
-) -> Result<Vec<N>> {
+fn extract_number_params<N: Number>(params: Vec<Scalar>) -> Result<Vec<N>> {
     let mut result = Vec::with_capacity(params.len());
     for param in &params {
         let data_type = param.as_ref().infer_data_type();
-        let val: N = check_number(
+        let val: N = check_number::<_, N>(
             None,
             &FunctionContext::default(),
-            &Expr::<usize>::Cast {
+            &Expr::<usize>::Constant {
                 span: None,
-                is_try: false,
-                expr: Box::new(Expr::Constant {
-                    span: None,
-                    scalar: param.clone(),
-                    data_type,
-                }),
-                dest_type: DataType::Number(num_type),
+                scalar: param.clone(),
+                data_type,
             },
             &BUILTIN_FUNCTIONS,
         )?;

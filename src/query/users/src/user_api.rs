@@ -15,52 +15,58 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use common_base::base::GlobalInstance;
-use common_exception::Result;
-use common_grpc::RpcClientConf;
-use common_management::FileFormatApi;
-use common_management::FileFormatMgr;
-use common_management::NetworkPolicyApi;
-use common_management::NetworkPolicyMgr;
-use common_management::QuotaApi;
-use common_management::QuotaMgr;
-use common_management::RoleApi;
-use common_management::RoleMgr;
-use common_management::SettingApi;
-use common_management::SettingMgr;
-use common_management::StageApi;
-use common_management::StageMgr;
-use common_management::UdfApi;
-use common_management::UdfMgr;
-use common_management::UserApi;
-use common_management::UserMgr;
-use common_meta_app::principal::AuthInfo;
-use common_meta_app::tenant::TenantQuota;
-use common_meta_kvapi::kvapi;
-use common_meta_store::MetaStore;
-use common_meta_store::MetaStoreProvider;
-use common_meta_types::MatchSeq;
-use common_meta_types::MetaError;
+use databend_common_base::base::GlobalInstance;
+use databend_common_config::GlobalConfig;
+use databend_common_exception::Result;
+use databend_common_grpc::RpcClientConf;
+use databend_common_management::udf::UdfMgr;
+use databend_common_management::ClientSessionMgr;
+use databend_common_management::ConnectionMgr;
+use databend_common_management::FileFormatMgr;
+use databend_common_management::NetworkPolicyMgr;
+use databend_common_management::PasswordPolicyMgr;
+use databend_common_management::ProcedureMgr;
+use databend_common_management::QuotaApi;
+use databend_common_management::QuotaMgr;
+use databend_common_management::RoleApi;
+use databend_common_management::RoleMgr;
+use databend_common_management::SettingMgr;
+use databend_common_management::StageApi;
+use databend_common_management::StageMgr;
+use databend_common_management::UserApi;
+use databend_common_management::UserMgr;
+use databend_common_meta_app::principal::AuthInfo;
+use databend_common_meta_app::principal::RoleInfo;
+use databend_common_meta_app::principal::UserDefinedFunction;
+use databend_common_meta_app::tenant::Tenant;
+use databend_common_meta_app::tenant::TenantQuota;
+use databend_common_meta_kvapi::kvapi;
+use databend_common_meta_store::MetaStore;
+use databend_common_meta_store::MetaStoreProvider;
+use databend_common_meta_types::MatchSeq;
+use databend_common_meta_types::MetaError;
 
-use crate::idm_config::IDMConfig;
+use crate::builtin::BuiltIn;
+use crate::BUILTIN_ROLE_PUBLIC;
 
 pub struct UserApiProvider {
     meta: MetaStore,
-    client: Arc<dyn kvapi::KVApi<Error = MetaError>>,
-    idm_config: IDMConfig,
+    client: Arc<dyn kvapi::KVApi<Error = MetaError> + Send + Sync>,
+    builtin: BuiltIn,
 }
 
 impl UserApiProvider {
     #[async_backtrace::framed]
     pub async fn init(
         conf: RpcClientConf,
-        idm_config: IDMConfig,
-        tenant: &str,
+        builtin: BuiltIn,
+        tenant: &Tenant,
         quota: Option<TenantQuota>,
     ) -> Result<()> {
-        GlobalInstance::set(Self::try_create(conf, idm_config).await?);
+        GlobalInstance::set(Self::try_create(conf, builtin, tenant).await?);
+        let user_mgr = UserApiProvider::instance();
         if let Some(q) = quota {
-            let i = UserApiProvider::instance().get_tenant_quota_api_client(tenant)?;
+            let i = user_mgr.tenant_quota_api(tenant);
             let res = i.get_quota(MatchSeq::GE(0)).await?;
             i.set_quota(&q, MatchSeq::Exact(res.seq)).await?;
         }
@@ -70,64 +76,98 @@ impl UserApiProvider {
     #[async_backtrace::framed]
     pub async fn try_create(
         conf: RpcClientConf,
-        idm_config: IDMConfig,
+        builtin: BuiltIn,
+        tenant: &Tenant,
     ) -> Result<Arc<UserApiProvider>> {
         let client = MetaStoreProvider::new(conf).create_meta_store().await?;
-        Ok(Arc::new(UserApiProvider {
+        let user_mgr = UserApiProvider {
             meta: client.clone(),
             client: client.arc(),
-            idm_config,
-        }))
+            builtin,
+        };
+
+        // init built-in role
+        // Currently we have two builtin roles:
+        // 1. ACCOUNT_ADMIN, which has the equivalent privileges of `GRANT ALL ON *.* TO ROLE account_admin`,
+        //    it also contains all roles. ACCOUNT_ADMIN can access the data objects which owned by any role.
+        // 2. PUBLIC, on the other side only includes the public accessible privileges, but every role
+        //    contains the PUBLIC role. The data objects which owned by PUBLIC can be accessed by any role.
+        // But we only can set PUBLIC role into meta.
+        // Because the previous deserialization using from_bits caused forward compatibility issues after adding new privilege type
+        // Until we can confirm all product use https://github.com/datafuselabs/databend/releases/tag/v1.2.321-nightly or later,
+        // We can add account_admin into meta.
+        {
+            let public = RoleInfo::new(BUILTIN_ROLE_PUBLIC);
+            user_mgr.add_role(tenant, public, true).await?;
+        }
+
+        Ok(Arc::new(user_mgr))
     }
 
     #[async_backtrace::framed]
-    pub async fn try_create_simple(conf: RpcClientConf) -> Result<Arc<UserApiProvider>> {
-        Self::try_create(conf, IDMConfig::default()).await
+    pub async fn try_create_simple(
+        conf: RpcClientConf,
+        tenant: &Tenant,
+    ) -> Result<Arc<UserApiProvider>> {
+        Self::try_create(conf, BuiltIn::default(), tenant).await
     }
 
     pub fn instance() -> Arc<UserApiProvider> {
         GlobalInstance::get()
     }
 
-    pub fn get_user_api_client(&self, tenant: &str) -> Result<Arc<impl UserApi>> {
-        Ok(Arc::new(UserMgr::create(self.client.clone(), tenant)?))
+    pub fn udf_api(&self, tenant: &Tenant) -> UdfMgr {
+        UdfMgr::create(self.client.clone(), tenant)
     }
 
-    pub fn get_role_api_client(&self, tenant: &str) -> Result<Arc<impl RoleApi>> {
-        Ok(Arc::new(RoleMgr::create(self.client.clone(), tenant)?))
+    pub fn user_api(&self, tenant: &Tenant) -> Arc<impl UserApi> {
+        let user_mgr = UserMgr::create(self.client.clone(), tenant);
+        Arc::new(user_mgr)
     }
 
-    pub fn get_stage_api_client(&self, tenant: &str) -> Result<Arc<dyn StageApi>> {
-        Ok(Arc::new(StageMgr::create(self.client.clone(), tenant)?))
-    }
-
-    pub fn get_file_format_api_client(&self, tenant: &str) -> Result<Arc<dyn FileFormatApi>> {
-        Ok(Arc::new(FileFormatMgr::create(
+    pub fn role_api(&self, tenant: &Tenant) -> Arc<impl RoleApi> {
+        let role_mgr = RoleMgr::create(
             self.client.clone(),
             tenant,
-        )?))
+            GlobalConfig::instance().query.upgrade_to_pb,
+        );
+        Arc::new(role_mgr)
     }
 
-    pub fn get_udf_api_client(&self, tenant: &str) -> Result<Arc<dyn UdfApi>> {
-        Ok(Arc::new(UdfMgr::create(self.client.clone(), tenant)?))
+    pub fn stage_api(&self, tenant: &Tenant) -> Arc<dyn StageApi> {
+        Arc::new(StageMgr::create(self.client.clone(), tenant))
     }
 
-    pub fn get_tenant_quota_api_client(&self, tenant: &str) -> Result<Arc<dyn QuotaApi>> {
-        Ok(Arc::new(QuotaMgr::create(self.client.clone(), tenant)?))
+    pub fn file_format_api(&self, tenant: &Tenant) -> FileFormatMgr {
+        FileFormatMgr::create(self.client.clone(), tenant)
     }
 
-    pub fn get_setting_api_client(&self, tenant: &str) -> Result<Arc<dyn SettingApi>> {
-        Ok(Arc::new(SettingMgr::create(self.client.clone(), tenant)?))
+    pub fn connection_api(&self, tenant: &Tenant) -> ConnectionMgr {
+        ConnectionMgr::create(self.client.clone(), tenant)
     }
 
-    pub fn get_network_policy_api_client(
-        &self,
-        tenant: &str,
-    ) -> Result<Arc<impl NetworkPolicyApi>> {
-        Ok(Arc::new(NetworkPolicyMgr::create(
-            self.client.clone(),
-            tenant,
-        )?))
+    pub fn tenant_quota_api(&self, tenant: &Tenant) -> Arc<dyn QuotaApi> {
+        const WRITE_PB: bool = false;
+        Arc::new(QuotaMgr::<WRITE_PB>::create(self.client.clone(), tenant))
+    }
+
+    pub fn setting_api(&self, tenant: &Tenant) -> SettingMgr {
+        SettingMgr::create(self.client.clone(), tenant)
+    }
+    pub fn procedure_api(&self, _tenant: &Tenant) -> ProcedureMgr {
+        ProcedureMgr::create(self.client.clone())
+    }
+
+    pub fn network_policy_api(&self, tenant: &Tenant) -> NetworkPolicyMgr {
+        NetworkPolicyMgr::create(self.client.clone(), tenant)
+    }
+
+    pub fn password_policy_api(&self, tenant: &Tenant) -> PasswordPolicyMgr {
+        PasswordPolicyMgr::create(self.client.clone(), tenant)
+    }
+
+    pub fn client_session_api(&self, tenant: &Tenant) -> ClientSessionMgr {
+        ClientSessionMgr::create(self.client.clone(), tenant)
     }
 
     pub fn get_meta_store_client(&self) -> Arc<MetaStore> {
@@ -135,10 +175,18 @@ impl UserApiProvider {
     }
 
     pub fn get_configured_user(&self, user_name: &str) -> Option<&AuthInfo> {
-        self.idm_config.users.get(user_name)
+        self.builtin.users.get(user_name)
     }
 
     pub fn get_configured_users(&self) -> HashMap<String, AuthInfo> {
-        self.idm_config.users.clone()
+        self.builtin.users.clone()
+    }
+
+    pub fn get_configured_udf(&self, udf_name: &str) -> Option<UserDefinedFunction> {
+        self.builtin.udfs.get(udf_name).cloned()
+    }
+
+    pub fn get_configured_udfs(&self) -> HashMap<String, UserDefinedFunction> {
+        self.builtin.udfs.clone()
     }
 }

@@ -1,5 +1,5 @@
 [package]
-name = "common-hashtable"
+name = "databend-common-hashtable"
 version = { workspace = true }
 authors = { workspace = true }
 license = { workspace = true }
@@ -8,20 +8,19 @@ edition = { workspace = true }
 
 [lib]
 doctest = false
-test = false
+test = true
 
-[dependencies] # In alphabetical order
-# Workspace dependencies
-common-base = { path = "../base" }
-
-# Crates.io dependencies
-
+[dependencies]
+databend-common-base = { workspace = true }
+databend-common-column = { workspace = true }
 ## Must disable feature "runtime-rng", it will make the hash results unstable in cluster
-ahash = { version = "0.8.2", features = ["no-rng"] }
-bumpalo = "3.10.0"
-cfg-if = "1.0.0"
+ahash = { workspace = true, features = ["no-rng"] }
+bumpalo = { workspace = true }
+cfg-if = { workspace = true }
 ethnum = { workspace = true }
-ordered-float = { workspace = true, features = ["serde"] }
 
 [dev-dependencies]
-rand = "0.8.5"
+rand = { workspace = true }
+
+[lints]
+workspace = true

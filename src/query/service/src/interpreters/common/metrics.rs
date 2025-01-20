@@ -12,14 +12,30 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use metrics::increment_gauge;
+use std::sync::LazyLock;
 
-// the time used in executing the whole replace-into statement
-pub fn metrics_inc_replace_execution_time_ms(c: u64) {
-    increment_gauge!("replace_into_time_execution_ms", c as f64);
+use databend_common_base::runtime::metrics::register_histogram_family_in_milliseconds;
+use databend_common_base::runtime::metrics::FamilyHistogram;
+
+static COMPACT_HOOK_EXECUTION_MS: LazyLock<FamilyHistogram<Vec<(&'static str, String)>>> =
+    LazyLock::new(|| register_histogram_family_in_milliseconds("compact_hook_execution_ms"));
+static COMPACT_HOOK_COMPACTION_MS: LazyLock<FamilyHistogram<Vec<(&'static str, String)>>> =
+    LazyLock::new(|| register_histogram_family_in_milliseconds("compact_hook_compaction_ms"));
+
+// the time used in executing the main operation  (replace-into, copy-into, etc)
+// metrics names with pattern `compact_hook_{operation_name}_time_execution_ms`
+pub fn metrics_inc_compact_hook_main_operation_time_ms(operation_name: &str, c: u64) {
+    let labels = &vec![("operation", operation_name.to_string())];
+    COMPACT_HOOK_EXECUTION_MS
+        .get_or_create(labels)
+        .observe(c as f64);
 }
 
-// the time used in executing the mutation (upsert) part of the replace-into statement
-pub fn metrics_inc_replace_mutation_time_ms(c: u64) {
-    increment_gauge!("replace_into_time_mutation_ms", c as f64);
+// the time used in executing the compaction
+// metrics names with pattern `compact_hook_{operation_name}_time_compaction_ms`
+pub fn metrics_inc_compact_hook_compact_time_ms(operation_name: &str, c: u64) {
+    let labels = &vec![("operation", operation_name.to_string())];
+    COMPACT_HOOK_COMPACTION_MS
+        .get_or_create(labels)
+        .observe(c as f64);
 }

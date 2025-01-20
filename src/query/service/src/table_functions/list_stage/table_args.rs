@@ -12,11 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use common_catalog::table_args::TableArgs;
-use common_exception::ErrorCode;
-use common_exception::Result;
-use common_storage::StageFilesInfo;
-use common_storages_fuse::table_functions::string_value;
+use databend_common_catalog::table_args::TableArgs;
+use databend_common_exception::ErrorCode;
+use databend_common_exception::Result;
+use databend_common_storage::StageFilesInfo;
+use databend_common_storages_fuse::table_functions::string_value;
 
 #[derive(Clone)]
 pub(crate) struct ListStageArgsParsed {
@@ -38,7 +38,15 @@ impl ListStageArgsParsed {
         for (k, v) in &args {
             match k.to_lowercase().as_str() {
                 "location" => {
-                    location = Some(string_value(v)?);
+                    let v = string_value(v)?;
+                    if let Some(name) = v.strip_prefix('@') {
+                        location = Some(name.to_string());
+                    } else {
+                        return Err(ErrorCode::BadArguments(format!(
+                            "location must start with @, but got {}",
+                            v
+                        )));
+                    }
                 }
                 "pattern" => {
                     files_info.pattern = Some(string_value(v)?);
@@ -53,7 +61,7 @@ impl ListStageArgsParsed {
         }
 
         let location =
-            location.ok_or(ErrorCode::BadArguments("list_stage must specify location"))?;
+            location.ok_or_else(|| ErrorCode::BadArguments("list_stage must specify location"))?;
 
         Ok(Self {
             location,

@@ -13,88 +13,119 @@
 // limitations under the License.
 
 use std::any::Any;
+use std::fmt::Debug;
+use std::net::ToSocketAddrs;
 use std::sync::Arc;
+use std::time::Duration;
 
-use common_base::base::tokio;
-use common_catalog::catalog::Catalog;
-use common_catalog::catalog::CatalogCreator;
-use common_catalog::catalog::StorageDescription;
-use common_catalog::database::Database;
-use common_catalog::table::Table;
-use common_catalog::table_args::TableArgs;
-use common_catalog::table_function::TableFunction;
-use common_exception::ErrorCode;
-use common_exception::Result;
-use common_hive_meta_store::Partition;
-use common_hive_meta_store::TThriftHiveMetastoreSyncClient;
-use common_hive_meta_store::ThriftHiveMetastoreSyncClient;
-use common_meta_app::schema::CatalogInfo;
-use common_meta_app::schema::CatalogOption;
-use common_meta_app::schema::CountTablesReply;
-use common_meta_app::schema::CountTablesReq;
-use common_meta_app::schema::CreateDatabaseReply;
-use common_meta_app::schema::CreateDatabaseReq;
-use common_meta_app::schema::CreateIndexReply;
-use common_meta_app::schema::CreateIndexReq;
-use common_meta_app::schema::CreateTableLockRevReply;
-use common_meta_app::schema::CreateTableReply;
-use common_meta_app::schema::CreateTableReq;
-use common_meta_app::schema::CreateVirtualColumnReply;
-use common_meta_app::schema::CreateVirtualColumnReq;
-use common_meta_app::schema::DropDatabaseReply;
-use common_meta_app::schema::DropDatabaseReq;
-use common_meta_app::schema::DropIndexReply;
-use common_meta_app::schema::DropIndexReq;
-use common_meta_app::schema::DropTableByIdReq;
-use common_meta_app::schema::DropTableReply;
-use common_meta_app::schema::DropVirtualColumnReply;
-use common_meta_app::schema::DropVirtualColumnReq;
-use common_meta_app::schema::GetIndexReply;
-use common_meta_app::schema::GetIndexReq;
-use common_meta_app::schema::GetTableCopiedFileReply;
-use common_meta_app::schema::GetTableCopiedFileReq;
-use common_meta_app::schema::IndexMeta;
-use common_meta_app::schema::ListIndexesByIdReq;
-use common_meta_app::schema::ListIndexesReq;
-use common_meta_app::schema::ListVirtualColumnsReq;
-use common_meta_app::schema::RenameDatabaseReply;
-use common_meta_app::schema::RenameDatabaseReq;
-use common_meta_app::schema::RenameTableReply;
-use common_meta_app::schema::RenameTableReq;
-use common_meta_app::schema::SetTableColumnMaskPolicyReply;
-use common_meta_app::schema::SetTableColumnMaskPolicyReq;
-use common_meta_app::schema::TableIdent;
-use common_meta_app::schema::TableInfo;
-use common_meta_app::schema::TableMeta;
-use common_meta_app::schema::TruncateTableReply;
-use common_meta_app::schema::TruncateTableReq;
-use common_meta_app::schema::UndropDatabaseReply;
-use common_meta_app::schema::UndropDatabaseReq;
-use common_meta_app::schema::UndropTableReply;
-use common_meta_app::schema::UndropTableReq;
-use common_meta_app::schema::UpdateIndexReply;
-use common_meta_app::schema::UpdateIndexReq;
-use common_meta_app::schema::UpdateTableMetaReply;
-use common_meta_app::schema::UpdateTableMetaReq;
-use common_meta_app::schema::UpdateVirtualColumnReply;
-use common_meta_app::schema::UpdateVirtualColumnReq;
-use common_meta_app::schema::UpsertTableOptionReply;
-use common_meta_app::schema::UpsertTableOptionReq;
-use common_meta_app::schema::VirtualColumnMeta;
-use common_meta_types::*;
-use thrift::protocol::*;
-use thrift::transport::*;
+use databend_common_catalog::catalog::Catalog;
+use databend_common_catalog::catalog::CatalogCreator;
+use databend_common_catalog::catalog::StorageDescription;
+use databend_common_catalog::database::Database;
+use databend_common_catalog::table::Table;
+use databend_common_catalog::table_args::TableArgs;
+use databend_common_catalog::table_function::TableFunction;
+use databend_common_config::InnerConfig;
+use databend_common_exception::ErrorCode;
+use databend_common_exception::Result;
+use databend_common_meta_app::schema::database_name_ident::DatabaseNameIdent;
+use databend_common_meta_app::schema::dictionary_name_ident::DictionaryNameIdent;
+use databend_common_meta_app::schema::CatalogInfo;
+use databend_common_meta_app::schema::CatalogOption;
+use databend_common_meta_app::schema::CommitTableMetaReply;
+use databend_common_meta_app::schema::CommitTableMetaReq;
+use databend_common_meta_app::schema::CreateDatabaseReply;
+use databend_common_meta_app::schema::CreateDatabaseReq;
+use databend_common_meta_app::schema::CreateDictionaryReply;
+use databend_common_meta_app::schema::CreateDictionaryReq;
+use databend_common_meta_app::schema::CreateIndexReply;
+use databend_common_meta_app::schema::CreateIndexReq;
+use databend_common_meta_app::schema::CreateLockRevReply;
+use databend_common_meta_app::schema::CreateLockRevReq;
+use databend_common_meta_app::schema::CreateSequenceReply;
+use databend_common_meta_app::schema::CreateSequenceReq;
+use databend_common_meta_app::schema::CreateTableIndexReq;
+use databend_common_meta_app::schema::CreateTableReply;
+use databend_common_meta_app::schema::CreateTableReq;
+use databend_common_meta_app::schema::CreateVirtualColumnReq;
+use databend_common_meta_app::schema::DeleteLockRevReq;
+use databend_common_meta_app::schema::DictionaryMeta;
+use databend_common_meta_app::schema::DropDatabaseReply;
+use databend_common_meta_app::schema::DropDatabaseReq;
+use databend_common_meta_app::schema::DropIndexReq;
+use databend_common_meta_app::schema::DropSequenceReply;
+use databend_common_meta_app::schema::DropSequenceReq;
+use databend_common_meta_app::schema::DropTableByIdReq;
+use databend_common_meta_app::schema::DropTableIndexReq;
+use databend_common_meta_app::schema::DropTableReply;
+use databend_common_meta_app::schema::DropVirtualColumnReq;
+use databend_common_meta_app::schema::ExtendLockRevReq;
+use databend_common_meta_app::schema::GetDictionaryReply;
+use databend_common_meta_app::schema::GetIndexReply;
+use databend_common_meta_app::schema::GetIndexReq;
+use databend_common_meta_app::schema::GetSequenceNextValueReply;
+use databend_common_meta_app::schema::GetSequenceNextValueReq;
+use databend_common_meta_app::schema::GetSequenceReply;
+use databend_common_meta_app::schema::GetSequenceReq;
+use databend_common_meta_app::schema::GetTableCopiedFileReply;
+use databend_common_meta_app::schema::GetTableCopiedFileReq;
+use databend_common_meta_app::schema::IndexMeta;
+use databend_common_meta_app::schema::ListDictionaryReq;
+use databend_common_meta_app::schema::ListIndexesByIdReq;
+use databend_common_meta_app::schema::ListIndexesReq;
+use databend_common_meta_app::schema::ListLockRevReq;
+use databend_common_meta_app::schema::ListLocksReq;
+use databend_common_meta_app::schema::ListVirtualColumnsReq;
+use databend_common_meta_app::schema::LockInfo;
+use databend_common_meta_app::schema::LockMeta;
+use databend_common_meta_app::schema::RenameDatabaseReply;
+use databend_common_meta_app::schema::RenameDatabaseReq;
+use databend_common_meta_app::schema::RenameDictionaryReq;
+use databend_common_meta_app::schema::RenameTableReply;
+use databend_common_meta_app::schema::RenameTableReq;
+use databend_common_meta_app::schema::SetTableColumnMaskPolicyReply;
+use databend_common_meta_app::schema::SetTableColumnMaskPolicyReq;
+use databend_common_meta_app::schema::TableInfo;
+use databend_common_meta_app::schema::TableMeta;
+use databend_common_meta_app::schema::TruncateTableReply;
+use databend_common_meta_app::schema::TruncateTableReq;
+use databend_common_meta_app::schema::UndropDatabaseReply;
+use databend_common_meta_app::schema::UndropDatabaseReq;
+use databend_common_meta_app::schema::UndropTableReq;
+use databend_common_meta_app::schema::UpdateDictionaryReply;
+use databend_common_meta_app::schema::UpdateDictionaryReq;
+use databend_common_meta_app::schema::UpdateIndexReply;
+use databend_common_meta_app::schema::UpdateIndexReq;
+use databend_common_meta_app::schema::UpdateVirtualColumnReq;
+use databend_common_meta_app::schema::UpsertTableOptionReply;
+use databend_common_meta_app::schema::UpsertTableOptionReq;
+use databend_common_meta_app::schema::VirtualColumnMeta;
+use databend_common_meta_app::storage::StorageParams;
+use databend_common_meta_app::tenant::Tenant;
+use databend_common_meta_store::MetaStore;
+use databend_common_meta_types::*;
+use faststr::FastStr;
+use hive_metastore::Partition;
+use hive_metastore::ThriftHiveMetastoreClient;
+use hive_metastore::ThriftHiveMetastoreClientBuilder;
+use volo_thrift::transport::pool;
+use volo_thrift::MaybeException;
 
 use super::hive_database::HiveDatabase;
 use crate::hive_table::HiveTable;
-
-pub const HIVE_CATALOG: &str = "hive";
+use crate::utils::from_thrift_error;
+use crate::utils::from_thrift_exception;
 
 #[derive(Debug)]
 pub struct HiveCreator;
 
 impl CatalogCreator for HiveCreator {
-    fn try_create(&self, info: &CatalogInfo) -> Result<Arc<dyn Catalog>> {
+    fn try_create(
+        &self,
+        info: Arc<CatalogInfo>,
+        _conf: InnerConfig,
+        _meta: &MetaStore,
+    ) -> Result<Arc<dyn Catalog>> {
         let opt = match &info.meta.catalog_option {
             CatalogOption::Hive(opt) => opt,
             _ => unreachable!(
@@ -102,39 +133,77 @@ impl CatalogCreator for HiveCreator {
             ),
         };
 
-        let catalog: Arc<dyn Catalog> =
-            Arc::new(HiveCatalog::try_create(info.clone(), &opt.address)?);
+        let catalog: Arc<dyn Catalog> = Arc::new(HiveCatalog::try_create(
+            info.clone(),
+            opt.storage_params.clone().map(|v| *v),
+            &opt.address,
+        )?);
 
         Ok(catalog)
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct HiveCatalog {
-    info: CatalogInfo,
+    info: Arc<CatalogInfo>,
+
+    /// storage params for this hive catalog
+    ///
+    /// - Some(sp) means the catalog has its own storage.
+    /// - None means the catalog is using the same storage with default catalog.
+    sp: Option<StorageParams>,
 
     /// address of hive meta store service
     client_address: String,
+    client: ThriftHiveMetastoreClient,
+}
+
+impl Debug for HiveCatalog {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.debug_struct("HiveCatalog")
+            .field("info", &self.info)
+            .field("sp", &self.sp)
+            .field("client_address", &self.client_address)
+            .finish_non_exhaustive()
+    }
 }
 
 impl HiveCatalog {
-    pub fn try_create(info: CatalogInfo, hms_address: impl Into<String>) -> Result<HiveCatalog> {
+    pub fn try_create(
+        info: Arc<CatalogInfo>,
+        sp: Option<StorageParams>,
+        hms_address: impl Into<String>,
+    ) -> Result<HiveCatalog> {
+        let client_address = hms_address.into();
+
+        let address = client_address
+            .as_str()
+            .to_socket_addrs()
+            .map_err(|e| {
+                ErrorCode::InvalidConfig(format!(
+                    "hms address {} is not valid: {}",
+                    client_address, e
+                ))
+            })?
+            .next()
+            .ok_or_else(|| {
+                ErrorCode::InvalidConfig(format!("hms address {} is not valid", client_address))
+            })?;
+
+        let client = ThriftHiveMetastoreClientBuilder::new("hms")
+            .address(address)
+            // Framed thrift rpc is not enabled by default, we use buffered instead.
+            .make_codec(volo_thrift::codec::default::DefaultMakeCodec::buffered())
+            // TODO: Disable connection pool now to avoid cross runtime issues.
+            .pool_config(pool::Config::new(0, Duration::NANOSECOND))
+            .build();
+
         Ok(HiveCatalog {
             info,
-            client_address: hms_address.into(),
+            sp,
+            client_address,
+            client,
         })
-    }
-
-    pub fn get_client(&self) -> Result<impl TThriftHiveMetastoreSyncClient> {
-        let mut c = TTcpChannel::new();
-        c.open(self.client_address.as_str())
-            .map_err(from_thrift_error)?;
-        let (i_chan, o_chan) = c.split().map_err(from_thrift_error)?;
-        let i_tran = TBufferedReadTransport::new(i_chan);
-        let o_tran = TBufferedWriteTransport::new(o_chan);
-        let i_prot = TBinaryInputProtocol::new(i_tran, true);
-        let o_prot = TBinaryOutputProtocol::new(o_tran, true);
-        Ok(ThriftHiveMetastoreSyncClient::new(i_prot, o_prot))
     }
 
     #[async_backtrace::framed]
@@ -144,36 +213,18 @@ impl HiveCatalog {
         table: String,
         partition_names: Vec<String>,
     ) -> Result<Vec<Partition>> {
-        let client = self.get_client()?;
-        tokio::task::spawn_blocking(move || {
-            Self::do_get_partitions(client, db, table, partition_names)
-        })
-        .await
-        .unwrap()
+        self.client
+            .get_partitions_by_names(
+                FastStr::new(db),
+                FastStr::new(table),
+                partition_names.into_iter().map(FastStr::new).collect(),
+            )
+            .await
+            .map(from_thrift_exception)
+            .map_err(from_thrift_error)?
     }
 
-    pub fn do_get_partitions(
-        client: impl TThriftHiveMetastoreSyncClient,
-        db_name: String,
-        tbl_name: String,
-        partition_names: Vec<String>,
-    ) -> Result<Vec<Partition>> {
-        let mut client = client;
-        let max_partitions = 10_000;
-
-        let partitions = partition_names
-            .chunks(max_partitions)
-            .flat_map(|names| {
-                client
-                    .get_partitions_by_names(db_name.clone(), tbl_name.clone(), names.to_vec())
-                    .map_err(from_thrift_error)
-                    .unwrap()
-            })
-            .collect::<Vec<_>>();
-        Ok(partitions)
-    }
-
-    #[minitrace::trace]
+    #[fastrace::trace]
     #[async_backtrace::framed]
     pub async fn get_partition_names(
         &self,
@@ -181,49 +232,17 @@ impl HiveCatalog {
         table: String,
         max_parts: i16,
     ) -> Result<Vec<String>> {
-        let client = self.get_client()?;
-        tokio::task::spawn_blocking(move || {
-            Self::do_get_partition_names(client, db, table, max_parts)
-        })
-        .await
-        .unwrap()
+        let partition_names = self
+            .client
+            .get_partition_names(FastStr::new(db), FastStr::new(table), max_parts)
+            .await
+            .map(from_thrift_exception)
+            .map_err(from_thrift_error)??;
+
+        Ok(partition_names.into_iter().map(|v| v.to_string()).collect())
     }
 
-    pub fn do_get_partition_names(
-        client: impl TThriftHiveMetastoreSyncClient,
-        db: String,
-        table: String,
-        max_parts: i16,
-    ) -> Result<Vec<String>> {
-        let mut client = client;
-        client
-            .get_partition_names(db, table, max_parts)
-            .map_err(from_thrift_error)
-    }
-
-    fn do_get_table(
-        client: impl TThriftHiveMetastoreSyncClient,
-        db_name: String,
-        table_name: String,
-    ) -> Result<Arc<dyn Table>> {
-        let mut client = client;
-        let table = client.get_table(db_name.clone(), table_name.clone());
-        let table_meta = match table {
-            Ok(table_meta) => table_meta,
-            Err(e) => {
-                if let thrift::Error::User(err) = &e {
-                    if let Some(e) =
-                        err.downcast_ref::<common_hive_meta_store::NoSuchObjectException>()
-                    {
-                        return Err(ErrorCode::TableInfoError(
-                            e.message.clone().unwrap_or_default(),
-                        ));
-                    }
-                }
-                return Err(from_thrift_error(e));
-            }
-        };
-
+    fn handle_table_meta(table_meta: &hive_metastore::Table) -> Result<()> {
         if let Some(sd) = table_meta.sd.as_ref() {
             if let Some(input_format) = sd.input_format.as_ref() {
                 if input_format != "org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat" {
@@ -241,28 +260,8 @@ impl HiveCatalog {
             }
         }
 
-        let fields = client
-            .get_schema(db_name, table_name)
-            .map_err(from_thrift_error)?;
-        let table_info: TableInfo = super::converters::try_into_table_info(table_meta, fields)?;
-        let res: Arc<dyn Table> = Arc::new(HiveTable::try_create(table_info)?);
-        Ok(res)
+        Ok(())
     }
-
-    fn do_get_database(
-        client: impl TThriftHiveMetastoreSyncClient,
-        db_name: String,
-    ) -> Result<Arc<dyn Database>> {
-        let mut client = client;
-        let thrift_db_meta = client.get_database(db_name).map_err(from_thrift_error)?;
-        let hive_database: HiveDatabase = thrift_db_meta.into();
-        let res: Arc<dyn Database> = Arc::new(hive_database);
-        Ok(res)
-    }
-}
-
-fn from_thrift_error(error: thrift::Error) -> ErrorCode {
-    ErrorCode::from_std_error(error)
 }
 
 #[async_trait::async_trait]
@@ -275,25 +274,57 @@ impl Catalog for HiveCatalog {
         self.info.name_ident.catalog_name.clone()
     }
 
-    fn info(&self) -> CatalogInfo {
+    fn info(&self) -> Arc<CatalogInfo> {
         self.info.clone()
     }
 
-    #[minitrace::trace]
+    #[fastrace::trace]
     #[async_backtrace::framed]
-    async fn get_database(&self, _tenant: &str, db_name: &str) -> Result<Arc<dyn Database>> {
-        let client = self.get_client()?;
-        let _tenant = _tenant.to_string();
-        let db_name = db_name.to_string();
-        tokio::task::spawn_blocking(move || Self::do_get_database(client, db_name))
+    async fn get_database(&self, _tenant: &Tenant, db_name: &str) -> Result<Arc<dyn Database>> {
+        let db = self
+            .client
+            .get_database(FastStr::new(db_name))
             .await
-            .unwrap()
+            .map(from_thrift_exception)
+            .map_err(from_thrift_error)??;
+
+        let hive_database: HiveDatabase = db.into();
+        let res: Arc<dyn Database> = Arc::new(hive_database);
+        Ok(res)
+    }
+
+    async fn list_databases_history(&self, _tenant: &Tenant) -> Result<Vec<Arc<dyn Database>>> {
+        // TODO: Implement list_databases_history
+        unimplemented!()
     }
 
     // Get all the databases.
+    #[fastrace::trace]
     #[async_backtrace::framed]
-    async fn list_databases(&self, _tenant: &str) -> Result<Vec<Arc<dyn Database>>> {
-        todo!()
+    async fn list_databases(&self, _tenant: &Tenant) -> Result<Vec<Arc<dyn Database>>> {
+        let db_names = self
+            .client
+            .get_all_databases()
+            .await
+            .map(from_thrift_exception)
+            .map_err(from_thrift_error)??;
+
+        let mut dbs = Vec::with_capacity(db_names.len());
+
+        for name in db_names {
+            let db = self
+                .client
+                .get_database(name)
+                .await
+                .map(from_thrift_exception)
+                .map_err(from_thrift_error)??;
+
+            let hive_database: HiveDatabase = db.into();
+            let res: Arc<dyn Database> = Arc::new(hive_database);
+            dbs.push(res)
+        }
+
+        Ok(dbs)
     }
 
     // Operation with database.
@@ -331,41 +362,133 @@ impl Catalog for HiveCatalog {
     }
 
     #[async_backtrace::framed]
-    async fn get_table_meta_by_id(
-        &self,
-        _table_id: MetaId,
-    ) -> Result<(TableIdent, Arc<TableMeta>)> {
+    async fn get_table_meta_by_id(&self, _table_id: MetaId) -> Result<Option<SeqV<TableMeta>>> {
         Err(ErrorCode::Unimplemented(
             "Cannot get table by id in HIVE catalog",
         ))
     }
 
-    // Get one table by db and table name.
-    #[minitrace::trace]
-    #[async_backtrace::framed]
-    async fn get_table(
+    async fn mget_table_names_by_ids(
         &self,
-        _tenant: &str,
-        db_name: &str,
-        table_name: &str,
-    ) -> Result<Arc<dyn Table>> {
-        let client = self.get_client()?;
-        let db_name = db_name.to_string();
-        let table_name = table_name.to_string();
-        tokio::task::spawn_blocking(move || Self::do_get_table(client, db_name, table_name))
-            .await
-            .unwrap()
+        _tenant: &Tenant,
+        _table_ids: &[MetaId],
+        _get_dropped_table: bool,
+    ) -> Result<Vec<Option<String>>> {
+        Err(ErrorCode::Unimplemented(
+            "Cannot get tables name by ids in HIVE catalog",
+        ))
     }
 
     #[async_backtrace::framed]
-    async fn list_tables(&self, _tenant: &str, _db_name: &str) -> Result<Vec<Arc<dyn Table>>> {
-        todo!()
+    async fn get_table_name_by_id(&self, _table_id: MetaId) -> Result<Option<String>> {
+        Err(ErrorCode::Unimplemented(
+            "Cannot get table name by id in HIVE catalog",
+        ))
+    }
+
+    async fn get_db_name_by_id(&self, _db_id: MetaId) -> Result<String> {
+        Err(ErrorCode::Unimplemented(
+            "Cannot get db name by id in HIVE catalog",
+        ))
+    }
+
+    async fn mget_databases(
+        &self,
+        _tenant: &Tenant,
+        _db_names: &[DatabaseNameIdent],
+    ) -> Result<Vec<Arc<dyn Database>>> {
+        Err(ErrorCode::Unimplemented(
+            "Cannot mget databases in HIVE catalog",
+        ))
+    }
+
+    async fn mget_database_names_by_ids(
+        &self,
+        _tenant: &Tenant,
+        _db_ids: &[MetaId],
+    ) -> Result<Vec<Option<String>>> {
+        Err(ErrorCode::Unimplemented(
+            "Cannot get dbs name by ids in HIVE catalog",
+        ))
+    }
+
+    // Get one table by db and table name.
+    #[fastrace::trace]
+    #[async_backtrace::framed]
+    async fn get_table(
+        &self,
+        _tenant: &Tenant,
+        db_name: &str,
+        table_name: &str,
+    ) -> Result<Arc<dyn Table>> {
+        let table_meta = match self
+            .client
+            .get_table(FastStr::new(db_name), FastStr::new(table_name))
+            .await
+        {
+            Ok(MaybeException::Ok(meta)) => meta,
+            Ok(MaybeException::Exception(exception)) => {
+                return Err(ErrorCode::TableInfoError(format!("{exception:?}")));
+            }
+            Err(e) => {
+                return Err(from_thrift_error(e));
+            }
+        };
+
+        Self::handle_table_meta(&table_meta)?;
+
+        let fields = self
+            .client
+            .get_schema(FastStr::new(db_name), FastStr::new(table_name))
+            .await
+            .map(from_thrift_exception)
+            .map_err(from_thrift_error)??;
+        let table_info: TableInfo = super::converters::try_into_table_info(
+            self.info.clone(),
+            self.sp.clone(),
+            table_meta,
+            fields,
+        )?;
+        let res: Arc<dyn Table> = Arc::new(HiveTable::try_create(table_info)?);
+
+        Ok(res)
+    }
+
+    #[fastrace::trace]
+    #[async_backtrace::framed]
+    async fn list_tables(&self, _tenant: &Tenant, db_name: &str) -> Result<Vec<Arc<dyn Table>>> {
+        let table_names = self
+            .client
+            .get_all_tables(FastStr::new(db_name))
+            .await
+            .map(from_thrift_exception)
+            .map_err(from_thrift_error)??;
+
+        let mut tables = Vec::with_capacity(table_names.len());
+
+        for name in table_names {
+            let table = self.get_table(_tenant, db_name, name.as_str()).await?;
+            tables.push(table)
+        }
+
+        Ok(tables)
+    }
+
+    async fn get_table_history(
+        &self,
+        _tenant: &Tenant,
+        _db_name: &str,
+        _table_name: &str,
+    ) -> Result<Vec<Arc<dyn Table>>> {
+        Err(ErrorCode::Unimplemented(
+            "Cannot get table history in HIVE catalog",
+        ))
     }
 
     #[async_backtrace::framed]
     async fn list_tables_history(
         &self,
-        _tenant: &str,
+        _tenant: &Tenant,
         _db_name: &str,
     ) -> Result<Vec<Arc<dyn Table>>> {
         Err(ErrorCode::Unimplemented(
@@ -388,9 +511,16 @@ impl Catalog for HiveCatalog {
     }
 
     #[async_backtrace::framed]
-    async fn undrop_table(&self, _req: UndropTableReq) -> Result<UndropTableReply> {
+    async fn undrop_table(&self, _req: UndropTableReq) -> Result<()> {
         Err(ErrorCode::Unimplemented(
             "Cannot undrop table in HIVE catalog",
+        ))
+    }
+
+    #[async_backtrace::framed]
+    async fn commit_table_meta(&self, _req: CommitTableMetaReq) -> Result<CommitTableMetaReply> {
+        Err(ErrorCode::Unimplemented(
+            "Cannot commit_table_meta in HIVE catalog",
         ))
     }
 
@@ -403,7 +533,7 @@ impl Catalog for HiveCatalog {
 
     // Check a db.table is exists or not.
     #[async_backtrace::framed]
-    async fn exists_table(&self, tenant: &str, db_name: &str, table_name: &str) -> Result<bool> {
+    async fn exists_table(&self, tenant: &Tenant, db_name: &str, table_name: &str) -> Result<bool> {
         // TODO refine this
         match self.get_table(tenant, db_name, table_name).await {
             Ok(_) => Ok(true),
@@ -420,23 +550,12 @@ impl Catalog for HiveCatalog {
     #[async_backtrace::framed]
     async fn upsert_table_option(
         &self,
-        _tenant: &str,
+        _tenant: &Tenant,
         _db_name: &str,
         _req: UpsertTableOptionReq,
     ) -> Result<UpsertTableOptionReply> {
         Err(ErrorCode::Unimplemented(
             "Cannot upsert table option in HIVE catalog",
-        ))
-    }
-
-    #[async_backtrace::framed]
-    async fn update_table_meta(
-        &self,
-        _table_info: &TableInfo,
-        _req: UpdateTableMetaReq,
-    ) -> Result<UpdateTableMetaReply> {
-        Err(ErrorCode::Unimplemented(
-            "Cannot update table meta in HIVE catalog",
         ))
     }
 
@@ -453,7 +572,7 @@ impl Catalog for HiveCatalog {
     #[async_backtrace::framed]
     async fn get_table_copied_file_info(
         &self,
-        _tenant: &str,
+        _tenant: &Tenant,
         _db_name: &str,
         _req: GetTableCopiedFileReq,
     ) -> Result<GetTableCopiedFileReply> {
@@ -470,36 +589,37 @@ impl Catalog for HiveCatalog {
     }
 
     #[async_backtrace::framed]
-    async fn list_table_lock_revs(&self, _table_id: u64) -> Result<Vec<u64>> {
+    async fn list_lock_revisions(&self, _req: ListLockRevReq) -> Result<Vec<(u64, LockMeta)>> {
         unimplemented!()
     }
 
     #[async_backtrace::framed]
-    async fn create_table_lock_rev(
-        &self,
-        _expire_sec: u64,
-        _table_info: &TableInfo,
-    ) -> Result<CreateTableLockRevReply> {
+    async fn create_lock_revision(&self, _req: CreateLockRevReq) -> Result<CreateLockRevReply> {
         unimplemented!()
     }
 
     #[async_backtrace::framed]
-    async fn extend_table_lock_rev(
-        &self,
-        _expire_sec: u64,
-        _table_info: &TableInfo,
-        _revision: u64,
-    ) -> Result<()> {
+    async fn extend_lock_revision(&self, _req: ExtendLockRevReq) -> Result<()> {
         unimplemented!()
     }
 
     #[async_backtrace::framed]
-    async fn delete_table_lock_rev(&self, _table_info: &TableInfo, _revision: u64) -> Result<()> {
+    async fn delete_lock_revision(&self, _req: DeleteLockRevReq) -> Result<()> {
         unimplemented!()
     }
 
     #[async_backtrace::framed]
-    async fn count_tables(&self, _req: CountTablesReq) -> Result<CountTablesReply> {
+    async fn list_locks(&self, _req: ListLocksReq) -> Result<Vec<LockInfo>> {
+        unimplemented!()
+    }
+
+    #[async_backtrace::framed]
+    async fn create_table_index(&self, _req: CreateTableIndexReq) -> Result<()> {
+        unimplemented!()
+    }
+
+    #[async_backtrace::framed]
+    async fn drop_table_index(&self, _req: DropTableIndexReq) -> Result<()> {
         unimplemented!()
     }
 
@@ -509,7 +629,7 @@ impl Catalog for HiveCatalog {
     }
 
     #[async_backtrace::framed]
-    async fn drop_index(&self, _req: DropIndexReq) -> Result<DropIndexReply> {
+    async fn drop_index(&self, _req: DropIndexReq) -> Result<()> {
         unimplemented!()
     }
 
@@ -529,31 +649,30 @@ impl Catalog for HiveCatalog {
     }
 
     #[async_backtrace::framed]
-    async fn list_indexes_by_table_id(&self, _req: ListIndexesByIdReq) -> Result<Vec<u64>> {
+    async fn list_index_ids_by_table_id(&self, _req: ListIndexesByIdReq) -> Result<Vec<u64>> {
         unimplemented!()
     }
 
     #[async_backtrace::framed]
-    async fn create_virtual_column(
+    async fn list_indexes_by_table_id(
         &self,
-        _req: CreateVirtualColumnReq,
-    ) -> Result<CreateVirtualColumnReply> {
+        _req: ListIndexesByIdReq,
+    ) -> Result<Vec<(u64, String, IndexMeta)>> {
         unimplemented!()
     }
 
     #[async_backtrace::framed]
-    async fn update_virtual_column(
-        &self,
-        _req: UpdateVirtualColumnReq,
-    ) -> Result<UpdateVirtualColumnReply> {
+    async fn create_virtual_column(&self, _req: CreateVirtualColumnReq) -> Result<()> {
         unimplemented!()
     }
 
     #[async_backtrace::framed]
-    async fn drop_virtual_column(
-        &self,
-        _req: DropVirtualColumnReq,
-    ) -> Result<DropVirtualColumnReply> {
+    async fn update_virtual_column(&self, _req: UpdateVirtualColumnReq) -> Result<()> {
+        unimplemented!()
+    }
+
+    #[async_backtrace::framed]
+    async fn drop_virtual_column(&self, _req: DropVirtualColumnReq) -> Result<()> {
         unimplemented!()
     }
 
@@ -564,8 +683,6 @@ impl Catalog for HiveCatalog {
     ) -> Result<Vec<VirtualColumnMeta>> {
         unimplemented!()
     }
-
-    /// Table function
 
     // Get function by name.
     fn get_table_function(
@@ -583,6 +700,63 @@ impl Catalog for HiveCatalog {
 
     // Get table engines
     fn get_table_engines(&self) -> Vec<StorageDescription> {
+        unimplemented!()
+    }
+
+    async fn create_sequence(&self, _req: CreateSequenceReq) -> Result<CreateSequenceReply> {
+        unimplemented!()
+    }
+    async fn get_sequence(&self, _req: GetSequenceReq) -> Result<GetSequenceReply> {
+        unimplemented!()
+    }
+
+    async fn get_sequence_next_value(
+        &self,
+        _req: GetSequenceNextValueReq,
+    ) -> Result<GetSequenceNextValueReply> {
+        unimplemented!()
+    }
+
+    async fn drop_sequence(&self, _req: DropSequenceReq) -> Result<DropSequenceReply> {
+        unimplemented!()
+    }
+
+    /// Dictionary
+    #[async_backtrace::framed]
+    async fn create_dictionary(&self, _req: CreateDictionaryReq) -> Result<CreateDictionaryReply> {
+        unimplemented!()
+    }
+
+    #[async_backtrace::framed]
+    async fn update_dictionary(&self, _req: UpdateDictionaryReq) -> Result<UpdateDictionaryReply> {
+        unimplemented!()
+    }
+
+    #[async_backtrace::framed]
+    async fn drop_dictionary(
+        &self,
+        _dict_ident: DictionaryNameIdent,
+    ) -> Result<Option<SeqV<DictionaryMeta>>> {
+        unimplemented!()
+    }
+
+    #[async_backtrace::framed]
+    async fn get_dictionary(
+        &self,
+        _req: DictionaryNameIdent,
+    ) -> Result<Option<GetDictionaryReply>> {
+        unimplemented!()
+    }
+
+    #[async_backtrace::framed]
+    async fn list_dictionaries(
+        &self,
+        _req: ListDictionaryReq,
+    ) -> Result<Vec<(String, DictionaryMeta)>> {
+        unimplemented!()
+    }
+
+    async fn rename_dictionary(&self, _req: RenameDictionaryReq) -> Result<()> {
         unimplemented!()
     }
 }

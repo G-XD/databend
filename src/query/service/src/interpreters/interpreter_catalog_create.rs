@@ -14,13 +14,15 @@
 
 use std::sync::Arc;
 
-use common_catalog::catalog::CatalogManager;
-use common_config::GlobalConfig;
-use common_exception::ErrorCode;
-use common_exception::Result;
-use common_meta_app::schema::CatalogOption;
-use common_sql::plans::CreateCatalogPlan;
-use common_storages_fuse::TableContext;
+use databend_common_catalog::catalog::CatalogManager;
+use databend_common_exception::Result;
+use databend_common_meta_app::schema::CatalogIdIdent;
+use databend_common_meta_app::schema::CatalogInfo;
+use databend_common_meta_app::schema::CatalogMeta;
+use databend_common_meta_app::schema::CatalogNameIdent;
+use databend_common_meta_app::tenant::Tenant;
+use databend_common_sql::plans::CreateCatalogPlan;
+use databend_common_storages_fuse::TableContext;
 use log::debug;
 
 use super::Interpreter;
@@ -45,20 +47,35 @@ impl Interpreter for CreateCatalogInterpreter {
         "CreateCatalogInterpreter"
     }
 
-    #[minitrace::trace]
+    fn is_ddl(&self) -> bool {
+        true
+    }
+
+    #[fastrace::trace]
     #[async_backtrace::framed]
     async fn execute2(&self) -> Result<PipelineBuildResult> {
         debug!("ctx.id" = self.ctx.get_id().as_str(); "create_catalog_execute");
 
-        if let CatalogOption::Iceberg(opt) = &self.plan.meta.catalog_option {
-            if !opt.storage_params.is_secure() && !GlobalConfig::instance().storage.allow_insecure {
-                return Err(ErrorCode::CatalogNotSupported(
-                    "Accessing insecure storage in not allowed by configuration",
-                ));
-            }
-        }
-
         let catalog_manager = CatalogManager::instance();
+
+        // Build and check if catalog is valid.
+        let ctl_info = CatalogInfo {
+            id: CatalogIdIdent::new(Tenant::new_literal("dummy"), 0).into(),
+            name_ident: CatalogNameIdent::new(self.plan.tenant.clone(), &self.plan.catalog).into(),
+            meta: CatalogMeta {
+                catalog_option: self.plan.meta.catalog_option.clone(),
+                created_on: chrono::Utc::now(),
+            },
+        };
+        let ctl = catalog_manager
+            .build_catalog(Arc::new(ctl_info), self.ctx.session_state())
+            .map_err(|err| err.add_message("Error creating catalog."))?;
+
+        // list databases to check if the catalog is valid.
+        let _ = ctl.list_databases(&self.plan.tenant).await.map_err(|err| {
+            err.add_message("Catalog creation failed. Check your parameter values.")
+        })?;
+
         catalog_manager
             .create_catalog(self.plan.clone().into())
             .await?;

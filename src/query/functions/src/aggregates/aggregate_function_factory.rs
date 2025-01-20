@@ -14,17 +14,30 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::LazyLock;
 
-use common_exception::ErrorCode;
-use common_exception::Result;
-use common_expression::types::DataType;
-use common_expression::Scalar;
-use once_cell::sync::Lazy;
+use databend_common_exception::ErrorCode;
+use databend_common_exception::Result;
+use databend_common_expression::types::DataType;
+use databend_common_expression::Scalar;
 
 use super::AggregateFunctionCombinatorNull;
 use super::AggregateFunctionOrNullAdaptor;
 use crate::aggregates::AggregateFunctionRef;
 use crate::aggregates::Aggregators;
+
+// The NULL value in the those function needs to be handled separately.
+const NEED_NULL_AGGREGATE_FUNCTIONS: [&str; 7] = [
+    "array_agg",
+    "list",
+    "json_array_agg",
+    "json_object_agg",
+    "group_array_moving_avg",
+    "group_array_moving_sum",
+    "st_collect",
+];
+
+const STATE_SUFFIX: &str = "_state";
 
 pub type AggregateFunctionCreator =
     Box<dyn Fn(&str, Vec<Scalar>, Vec<DataType>) -> Result<AggregateFunctionRef> + Sync + Send>;
@@ -40,7 +53,7 @@ pub type AggregateFunctionCombinatorCreator = Box<
         + Send,
 >;
 
-static FACTORY: Lazy<Arc<AggregateFunctionFactory>> = Lazy::new(|| {
+static FACTORY: LazyLock<Arc<AggregateFunctionFactory>> = LazyLock::new(|| {
     let mut factory = AggregateFunctionFactory::create();
     Aggregators::register(&mut factory);
     Aggregators::register_combinator(&mut factory);
@@ -170,37 +183,36 @@ impl AggregateFunctionFactory {
     ) -> Result<AggregateFunctionRef> {
         let name = name.as_ref();
         let mut features = AggregateFunctionFeatures::default();
-        // The NULL value in the array_agg function needs to be added to the returned array column,
-        // so handled separately.
-        if name == "array_agg"
-            || name == "list"
-            || name == "group_array_moving_avg"
-            || name == "group_array_moving_sum"
-        {
+
+        if NEED_NULL_AGGREGATE_FUNCTIONS.contains(&name) {
             let agg = self.get_impl(name, params, arguments, &mut features)?;
             return Ok(agg);
         }
 
-        if !arguments.is_empty() && arguments.iter().any(|f| f.is_nullable_or_null()) {
-            let new_params = AggregateFunctionCombinatorNull::transform_params(&params)?;
-            let new_arguments = AggregateFunctionCombinatorNull::transform_arguments(&arguments)?;
-
-            let nested = self.get_impl(name, new_params, new_arguments, &mut features)?;
-            let agg = AggregateFunctionCombinatorNull::try_create(
-                name,
-                params,
-                arguments,
-                nested,
-                features.clone(),
-            )?;
-            if or_null {
-                return AggregateFunctionOrNullAdaptor::create(agg, features);
+        if arguments.iter().all(|f| !f.is_nullable_or_null()) {
+            let agg = self.get_impl(name, params, arguments, &mut features)?;
+            return if or_null {
+                AggregateFunctionOrNullAdaptor::create(agg, features)
             } else {
-                return Ok(agg);
-            }
+                Ok(agg)
+            };
         }
 
-        let agg = self.get_impl(name, params, arguments, &mut features)?;
+        let nested = if name.to_lowercase().strip_suffix(STATE_SUFFIX).is_some() {
+            self.get_impl(name, params.clone(), arguments.clone(), &mut features)?
+        } else {
+            let new_params = AggregateFunctionCombinatorNull::transform_params(&params)?;
+            let new_arguments = AggregateFunctionCombinatorNull::transform_arguments(&arguments)?;
+            self.get_impl(name, new_params, new_arguments, &mut features)?
+        };
+
+        let agg = AggregateFunctionCombinatorNull::try_create(
+            name,
+            params,
+            arguments,
+            nested,
+            features.clone(),
+        )?;
         if or_null {
             AggregateFunctionOrNullAdaptor::create(agg, features)
         } else {
@@ -233,7 +245,7 @@ impl AggregateFunctionFactory {
                     }
                     Some(nested_desc) => {
                         *features = nested_desc.features.clone();
-                        if suffix == "_state" {
+                        if suffix.eq_ignore_ascii_case(STATE_SUFFIX) {
                             features.returns_default_when_only_null = true;
                         }
                         return (desc.creator)(

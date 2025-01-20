@@ -15,31 +15,36 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
 
-use common_catalog::plan::DataSourcePlan;
-use common_catalog::plan::InternalColumnMeta;
-use common_catalog::plan::PartInfoPtr;
-use common_catalog::plan::StealablePartitions;
-use common_catalog::plan::TopK;
-use common_catalog::table_context::TableContext;
-use common_exception::Result;
-use common_expression::BlockMetaInfoPtr;
-use common_expression::DataBlock;
-use common_pipeline_core::processors::port::OutputPort;
-use common_pipeline_core::Pipeline;
-use common_pipeline_core::SourcePipeBuilder;
+use async_channel::Receiver;
+use databend_common_catalog::plan::DataSourcePlan;
+use databend_common_catalog::plan::PartInfoPtr;
+use databend_common_catalog::plan::PartInfoType;
+use databend_common_catalog::plan::StealablePartitions;
+use databend_common_catalog::plan::TopK;
+use databend_common_catalog::table_context::TableContext;
+use databend_common_exception::Result;
+use databend_common_expression::TableSchema;
+use databend_common_pipeline_core::processors::OutputPort;
+use databend_common_pipeline_core::Pipe;
+use databend_common_pipeline_core::Pipeline;
+use databend_common_pipeline_core::SourcePipeBuilder;
 use log::info;
 
-use crate::fuse_part::FusePartInfo;
+use crate::fuse_part::FuseBlockPartInfo;
 use crate::io::AggIndexReader;
 use crate::io::BlockReader;
-use crate::operations::read::native_data_source_deserializer::NativeDeserializeDataTransform;
-use crate::operations::read::native_data_source_reader::ReadNativeDataSource;
-use crate::operations::read::parquet_data_source_deserializer::DeserializeDataTransform;
-use crate::operations::read::parquet_data_source_reader::ReadParquetDataSource;
+use crate::io::VirtualColumnReader;
+use crate::operations::read::block_partition_receiver_source::BlockPartitionReceiverSource;
+use crate::operations::read::block_partition_source::BlockPartitionSource;
+use crate::operations::read::native_data_transform_reader::ReadNativeDataTransform;
+use crate::operations::read::parquet_data_transform_reader::ReadParquetDataTransform;
+use crate::operations::read::DeserializeDataTransform;
+use crate::operations::read::NativeDeserializeDataTransform;
 
 #[allow(clippy::too_many_arguments)]
 pub fn build_fuse_native_source_pipeline(
     ctx: Arc<dyn TableContext>,
+    table_schema: Arc<TableSchema>,
     pipeline: &mut Pipeline,
     block_reader: Arc<BlockReader>,
     mut max_threads: usize,
@@ -47,6 +52,8 @@ pub fn build_fuse_native_source_pipeline(
     topk: Option<TopK>,
     mut max_io_requests: usize,
     index_reader: Arc<Option<AggIndexReader>>,
+    virtual_reader: Arc<Option<VirtualColumnReader>>,
+    receiver: Option<Receiver<Result<PartInfoPtr>>>,
 ) -> Result<()> {
     (max_threads, max_io_requests) =
         adjust_threads_and_request(true, max_threads, max_io_requests, plan);
@@ -56,8 +63,6 @@ pub fn build_fuse_native_source_pipeline(
         max_io_requests = max_io_requests.min(16);
     }
 
-    let mut source_builder = SourcePipeBuilder::create();
-
     match block_reader.support_blocking_api() {
         true => {
             let partitions = dispatch_partitions(ctx.clone(), plan, max_threads);
@@ -66,22 +71,28 @@ pub fn build_fuse_native_source_pipeline(
             if topk.is_some() {
                 partitions.disable_steal();
             }
-
-            for i in 0..max_threads {
-                let output = OutputPort::create();
-                source_builder.add_source(
-                    output.clone(),
-                    ReadNativeDataSource::<true>::create(
-                        i,
-                        ctx.clone(),
-                        output,
-                        block_reader.clone(),
-                        partitions.clone(),
-                        index_reader.clone(),
-                    )?,
-                );
+            match receiver {
+                Some(rx) => {
+                    let pipe = build_receiver_source(max_threads, ctx.clone(), rx.clone())?;
+                    pipeline.add_pipe(pipe);
+                }
+                None => {
+                    let pipe = build_block_source(max_threads, partitions.clone(), 1, ctx.clone())?;
+                    pipeline.add_pipe(pipe);
+                }
             }
-            pipeline.add_pipe(source_builder.finalize());
+            pipeline.add_transform(|input, output| {
+                ReadNativeDataTransform::<true>::create(
+                    plan.table_index,
+                    ctx.clone(),
+                    table_schema.clone(),
+                    block_reader.clone(),
+                    index_reader.clone(),
+                    virtual_reader.clone(),
+                    input,
+                    output,
+                )
+            })?;
         }
         false => {
             let partitions = dispatch_partitions(ctx.clone(), plan, max_io_requests);
@@ -90,22 +101,36 @@ pub fn build_fuse_native_source_pipeline(
             if topk.is_some() {
                 partitions.disable_steal();
             }
-
-            for i in 0..max_io_requests {
-                let output = OutputPort::create();
-                source_builder.add_source(
-                    output.clone(),
-                    ReadNativeDataSource::<false>::create(
-                        i,
-                        ctx.clone(),
-                        output,
-                        block_reader.clone(),
+            match receiver {
+                Some(rx) => {
+                    let pipe = build_receiver_source(max_io_requests, ctx.clone(), rx.clone())?;
+                    pipeline.add_pipe(pipe);
+                }
+                None => {
+                    let batch_size = ctx.get_settings().get_storage_fetch_part_num()? as usize;
+                    let pipe = build_block_source(
+                        max_io_requests,
                         partitions.clone(),
-                        index_reader.clone(),
-                    )?,
-                );
+                        batch_size,
+                        ctx.clone(),
+                    )?;
+                    pipeline.add_pipe(pipe);
+                }
             }
-            pipeline.add_pipe(source_builder.finalize());
+
+            pipeline.add_transform(|input, output| {
+                ReadNativeDataTransform::<false>::create(
+                    plan.table_index,
+                    ctx.clone(),
+                    table_schema.clone(),
+                    block_reader.clone(),
+                    index_reader.clone(),
+                    virtual_reader.clone(),
+                    input,
+                    output,
+                )
+            })?;
+
             pipeline.try_resize(max_threads)?;
         }
     };
@@ -119,46 +144,58 @@ pub fn build_fuse_native_source_pipeline(
             transform_input,
             transform_output,
             index_reader.clone(),
+            virtual_reader.clone(),
         )
     })?;
 
-    pipeline.try_resize(max_threads)
+    pipeline.try_resize(max_threads)?;
+
+    Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn build_fuse_parquet_source_pipeline(
     ctx: Arc<dyn TableContext>,
+    table_schema: Arc<TableSchema>,
     pipeline: &mut Pipeline,
     block_reader: Arc<BlockReader>,
     plan: &DataSourcePlan,
     mut max_threads: usize,
     mut max_io_requests: usize,
     index_reader: Arc<Option<AggIndexReader>>,
+    virtual_reader: Arc<Option<VirtualColumnReader>>,
+    receiver: Option<Receiver<Result<PartInfoPtr>>>,
 ) -> Result<()> {
     (max_threads, max_io_requests) =
         adjust_threads_and_request(false, max_threads, max_io_requests, plan);
-
-    let mut source_builder = SourcePipeBuilder::create();
 
     match block_reader.support_blocking_api() {
         true => {
             let partitions = dispatch_partitions(ctx.clone(), plan, max_threads);
             let partitions = StealablePartitions::new(partitions, ctx.clone());
 
-            for i in 0..max_threads {
-                let output = OutputPort::create();
-                source_builder.add_source(
-                    output.clone(),
-                    ReadParquetDataSource::<true>::create(
-                        i,
-                        ctx.clone(),
-                        output,
-                        block_reader.clone(),
-                        partitions.clone(),
-                        index_reader.clone(),
-                    )?,
-                );
+            match receiver {
+                Some(rx) => {
+                    let pipe = build_receiver_source(max_threads, ctx.clone(), rx.clone())?;
+                    pipeline.add_pipe(pipe);
+                }
+                None => {
+                    let pipe = build_block_source(max_threads, partitions.clone(), 1, ctx.clone())?;
+                    pipeline.add_pipe(pipe);
+                }
             }
-            pipeline.add_pipe(source_builder.finalize());
+            pipeline.add_transform(|input, output| {
+                ReadParquetDataTransform::<true>::create(
+                    plan.table_index,
+                    ctx.clone(),
+                    table_schema.clone(),
+                    block_reader.clone(),
+                    index_reader.clone(),
+                    virtual_reader.clone(),
+                    input,
+                    output,
+                )
+            })?;
         }
         false => {
             info!("read block data adjust max io requests:{}", max_io_requests);
@@ -166,21 +203,36 @@ pub fn build_fuse_parquet_source_pipeline(
             let partitions = dispatch_partitions(ctx.clone(), plan, max_io_requests);
             let partitions = StealablePartitions::new(partitions, ctx.clone());
 
-            for i in 0..max_io_requests {
-                let output = OutputPort::create();
-                source_builder.add_source(
-                    output.clone(),
-                    ReadParquetDataSource::<false>::create(
-                        i,
-                        ctx.clone(),
-                        output,
-                        block_reader.clone(),
+            match receiver {
+                Some(rx) => {
+                    let pipe = build_receiver_source(max_io_requests, ctx.clone(), rx.clone())?;
+                    pipeline.add_pipe(pipe);
+                }
+                None => {
+                    let batch_size = ctx.get_settings().get_storage_fetch_part_num()? as usize;
+                    let pipe = build_block_source(
+                        max_io_requests,
                         partitions.clone(),
-                        index_reader.clone(),
-                    )?,
-                );
+                        batch_size,
+                        ctx.clone(),
+                    )?;
+                    pipeline.add_pipe(pipe);
+                }
             }
-            pipeline.add_pipe(source_builder.finalize());
+
+            pipeline.add_transform(|input, output| {
+                ReadParquetDataTransform::<false>::create(
+                    plan.table_index,
+                    ctx.clone(),
+                    table_schema.clone(),
+                    block_reader.clone(),
+                    index_reader.clone(),
+                    virtual_reader.clone(),
+                    input,
+                    output,
+                )
+            })?;
+
             pipeline.try_resize(std::cmp::min(max_threads, max_io_requests))?;
 
             info!(
@@ -195,11 +247,15 @@ pub fn build_fuse_parquet_source_pipeline(
         DeserializeDataTransform::create(
             ctx.clone(),
             block_reader.clone(),
+            plan,
             transform_input,
             transform_output,
             index_reader.clone(),
+            virtual_reader.clone(),
         )
-    })
+    })?;
+
+    Ok(())
 }
 
 pub fn dispatch_partitions(
@@ -209,7 +265,7 @@ pub fn dispatch_partitions(
 ) -> Vec<VecDeque<PartInfoPtr>> {
     let mut results = Vec::with_capacity(max_streams);
     // Lazy part, we can dispatch them now.
-    if plan.parts.is_lazy {
+    if plan.parts.partitions_type() == PartInfoType::LazyLevel {
         return results;
     }
 
@@ -241,7 +297,7 @@ pub fn adjust_threads_and_request(
     mut max_io_requests: usize,
     plan: &DataSourcePlan,
 ) -> (usize, usize) {
-    if !plan.parts.is_lazy {
+    if plan.parts.partitions_type() == PartInfoType::BlockLevel {
         let mut block_nums = plan.parts.partitions.len();
 
         // If the read bytes of a partition is small enough, less than 16k rows
@@ -250,7 +306,7 @@ pub fn adjust_threads_and_request(
         static MIN_ROWS_READ_PER_THREAD: u64 = 16 * 1024;
         if is_native {
             plan.parts.partitions.iter().for_each(|part| {
-                if let Some(part) = part.as_any().downcast_ref::<FusePartInfo>() {
+                if let Some(part) = part.as_any().downcast_ref::<FuseBlockPartInfo>() {
                     let to_read_rows = part
                         .columns_meta
                         .values()
@@ -275,22 +331,35 @@ pub fn adjust_threads_and_request(
     (max_threads, max_io_requests)
 }
 
-pub(crate) fn fill_internal_column_meta(
-    data_block: DataBlock,
-    fuse_part: &FusePartInfo,
-    offsets: Option<Vec<usize>>,
-) -> Result<DataBlock> {
-    // Fill `BlockMetaInfoPtr` if query internal columns
-    let block_meta = fuse_part.block_meta_index().unwrap();
-    let internal_column_meta = InternalColumnMeta {
-        segment_idx: block_meta.segment_idx,
-        block_id: block_meta.block_id,
-        block_location: block_meta.block_location.clone(),
-        segment_location: block_meta.segment_location.clone(),
-        snapshot_location: block_meta.snapshot_location.as_ref().unwrap().clone(),
-        offsets,
-    };
+pub fn build_receiver_source(
+    max_threads: usize,
+    ctx: Arc<dyn TableContext>,
+    rx: Receiver<Result<PartInfoPtr>>,
+) -> Result<Pipe> {
+    let mut source_builder = SourcePipeBuilder::create();
+    for _i in 0..max_threads {
+        let output = OutputPort::create();
+        source_builder.add_source(
+            output.clone(),
+            BlockPartitionReceiverSource::create(ctx.clone(), rx.clone(), output)?,
+        );
+    }
+    Ok(source_builder.finalize())
+}
 
-    let meta: Option<BlockMetaInfoPtr> = Some(Box::new(internal_column_meta));
-    data_block.add_meta(meta)
+pub fn build_block_source(
+    max_threads: usize,
+    partitions: StealablePartitions,
+    max_batch: usize,
+    ctx: Arc<dyn TableContext>,
+) -> Result<Pipe> {
+    let mut source_builder = SourcePipeBuilder::create();
+    for i in 0..max_threads {
+        let output = OutputPort::create();
+        source_builder.add_source(
+            output.clone(),
+            BlockPartitionSource::create(i, partitions.clone(), max_batch, ctx.clone(), output)?,
+        )
+    }
+    Ok(source_builder.finalize())
 }

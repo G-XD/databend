@@ -12,17 +12,20 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use common_meta_kvapi::kvapi::GetKVReply;
-use common_meta_kvapi::kvapi::GetKVReq;
-use common_meta_kvapi::kvapi::ListKVReply;
-use common_meta_kvapi::kvapi::ListKVReq;
-use common_meta_kvapi::kvapi::MGetKVReply;
-use common_meta_kvapi::kvapi::MGetKVReq;
-use common_meta_types::protobuf::RaftRequest;
-use common_meta_types::AppliedState;
-use common_meta_types::Endpoint;
-use common_meta_types::LogEntry;
-use common_meta_types::NodeId;
+use anyerror::AnyError;
+use databend_common_meta_client::MetaGrpcReadReq;
+use databend_common_meta_kvapi::kvapi::GetKVReply;
+use databend_common_meta_kvapi::kvapi::GetKVReq;
+use databend_common_meta_kvapi::kvapi::ListKVReply;
+use databend_common_meta_kvapi::kvapi::ListKVReq;
+use databend_common_meta_kvapi::kvapi::MGetKVReply;
+use databend_common_meta_kvapi::kvapi::MGetKVReq;
+use databend_common_meta_types::protobuf::RaftRequest;
+use databend_common_meta_types::raft_types::NodeId;
+use databend_common_meta_types::AppliedState;
+use databend_common_meta_types::Endpoint;
+use databend_common_meta_types::LogEntry;
+use databend_common_meta_types::MetaAPIError;
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Default, Clone, PartialEq, Eq)]
 pub struct JoinRequest {
@@ -81,16 +84,50 @@ pub enum ForwardRequestBody {
 
 /// A request that is forwarded from one raft node to another
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
-pub struct ForwardRequest {
+pub struct ForwardRequest<T> {
     /// Forward the request to leader if the node received this request is not leader.
     pub forward_to_leader: u64,
 
-    pub body: ForwardRequestBody,
+    pub body: T,
 }
 
-impl ForwardRequest {
+impl<T> ForwardRequest<T> {
+    pub fn new(forward_to_leader: u64, body: T) -> Self {
+        Self {
+            forward_to_leader,
+            body,
+        }
+    }
+
     pub fn decr_forward(&mut self) {
         self.forward_to_leader -= 1;
+    }
+
+    /// Return a new request that will be forwarded to the leader.
+    ///
+    /// If the max forward number is reached, it returns an error.
+    pub fn next(&self) -> Result<Self, MetaAPIError>
+    where T: Clone {
+        self.ensure_forwardable()?;
+
+        let mut next = self.clone();
+        next.decr_forward();
+
+        Ok(next)
+    }
+
+    pub fn ensure_forwardable(&self) -> Result<(), MetaAPIError> {
+        if self.can_forward() {
+            Ok(())
+        } else {
+            Err(MetaAPIError::CanNotForward(AnyError::error(
+                "max number of forward reached",
+            )))
+        }
+    }
+
+    pub fn can_forward(&self) -> bool {
+        self.forward_to_leader > 0
     }
 }
 
@@ -111,7 +148,7 @@ pub enum ForwardResponse {
     ListKV(ListKVReply),
 }
 
-impl tonic::IntoRequest<RaftRequest> for ForwardRequest {
+impl tonic::IntoRequest<RaftRequest> for ForwardRequest<ForwardRequestBody> {
     fn into_request(self) -> tonic::Request<RaftRequest> {
         let mes = RaftRequest {
             data: serde_json::to_string(&self).expect("fail to serialize"),
@@ -120,7 +157,16 @@ impl tonic::IntoRequest<RaftRequest> for ForwardRequest {
     }
 }
 
-impl TryFrom<RaftRequest> for ForwardRequest {
+impl tonic::IntoRequest<RaftRequest> for ForwardRequest<MetaGrpcReadReq> {
+    fn into_request(self) -> tonic::Request<RaftRequest> {
+        let mes = RaftRequest {
+            data: serde_json::to_string(&self).expect("fail to serialize"),
+        };
+        tonic::Request::new(mes)
+    }
+}
+
+impl TryFrom<RaftRequest> for ForwardRequest<ForwardRequestBody> {
     type Error = tonic::Status;
 
     fn try_from(mes: RaftRequest) -> Result<Self, Self::Error> {

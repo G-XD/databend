@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::collections::hash_map::Entry;
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::ops::RangeInclusive;
 use std::str::FromStr;
@@ -19,50 +21,60 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
+use std::time::Instant;
 
-use common_arrow::arrow_format::flight::service::flight_service_client::FlightServiceClient;
-use common_base::base::tokio;
-use common_base::base::tokio::sync::Mutex;
-use common_base::base::tokio::sync::Notify;
-use common_base::base::tokio::task::JoinHandle;
-use common_base::base::tokio::time::sleep as tokio_async_sleep;
-use common_base::base::DummySignalStream;
-use common_base::base::GlobalInstance;
-use common_base::base::GlobalUniqName;
-use common_base::base::SignalStream;
-use common_base::base::SignalType;
-pub use common_catalog::cluster_info::Cluster;
-use common_config::InnerConfig;
-use common_config::DATABEND_COMMIT_VERSION;
-use common_exception::ErrorCode;
-use common_exception::Result;
-use common_grpc::ConnectionFactory;
-use common_management::ClusterApi;
-use common_management::ClusterMgr;
-use common_meta_store::MetaStore;
-use common_meta_store::MetaStoreProvider;
-use common_meta_types::MatchSeq;
-use common_meta_types::NodeInfo;
-use common_metrics::label_counter_with_val_and_labels;
+use arrow_flight::flight_service_client::FlightServiceClient;
+use databend_common_base::base::tokio::sync::Mutex;
+use databend_common_base::base::tokio::sync::Notify;
+use databend_common_base::base::tokio::task::JoinHandle;
+use databend_common_base::base::tokio::time::sleep as tokio_async_sleep;
+use databend_common_base::base::DummySignalStream;
+use databend_common_base::base::GlobalInstance;
+use databend_common_base::base::SignalStream;
+use databend_common_base::base::SignalType;
+use databend_common_cache::Cache;
+use databend_common_cache::LruCache;
+use databend_common_cache::MemSized;
+pub use databend_common_catalog::cluster_info::Cluster;
+use databend_common_config::GlobalConfig;
+use databend_common_config::InnerConfig;
+use databend_common_config::DATABEND_COMMIT_VERSION;
+use databend_common_exception::ErrorCode;
+use databend_common_exception::Result;
+use databend_common_grpc::ConnectionFactory;
+use databend_common_management::WarehouseApi;
+use databend_common_management::WarehouseMgr;
+use databend_common_meta_store::MetaStore;
+use databend_common_meta_store::MetaStoreProvider;
+use databend_common_meta_types::NodeInfo;
+use databend_common_meta_types::SeqV;
+use databend_common_meta_types::SeqValue;
+use databend_common_metrics::cluster::*;
+use databend_enterprise_resources_management::ResourcesManagement;
 use futures::future::select;
 use futures::future::Either;
 use futures::Future;
 use futures::StreamExt;
 use log::error;
+use log::info;
 use log::warn;
-use metrics::gauge;
 use rand::thread_rng;
 use rand::Rng;
+use serde::Deserialize;
+use serde::Serialize;
+use tokio::time::sleep;
 
-use crate::api::FlightClient;
+use crate::servers::flight::FlightClient;
 
 pub struct ClusterDiscovery {
     local_id: String,
+    local_secret: String,
     heartbeat: Mutex<ClusterHeartbeat>,
-    api_provider: Arc<dyn ClusterApi>,
+    warehouse_manager: Arc<dyn WarehouseApi>,
     cluster_id: String,
     tenant_id: String,
     flight_address: String,
+    lru_cache: parking_lot::Mutex<LruCache<String, CachedNode>>,
 }
 
 // avoid leak FlightClient to common-xxx
@@ -73,18 +85,33 @@ pub trait ClusterHelper {
     fn is_empty(&self) -> bool;
     fn is_local(&self, node: &NodeInfo) -> bool;
     fn local_id(&self) -> String;
-    async fn create_node_conn(&self, name: &str, config: &InnerConfig) -> Result<FlightClient>;
+    fn ordered_index(&self) -> usize;
+    fn index_of_nodeid(&self, node_id: &str) -> Option<usize>;
+
     fn get_nodes(&self) -> Vec<Arc<NodeInfo>>;
+
+    async fn do_action<T: Serialize + Send + Clone, Res: for<'de> Deserialize<'de> + Send>(
+        &self,
+        path: &str,
+        message: HashMap<String, T>,
+        flight_params: FlightParams,
+    ) -> Result<HashMap<String, Res>>;
 }
 
 #[async_trait::async_trait]
 impl ClusterHelper for Cluster {
     fn create(nodes: Vec<Arc<NodeInfo>>, local_id: String) -> Arc<Cluster> {
-        Arc::new(Cluster { local_id, nodes })
+        let unassign = nodes.iter().all(|node| !node.assigned_warehouse());
+        Arc::new(Cluster {
+            unassign,
+            local_id,
+            nodes,
+        })
     }
 
     fn empty() -> Arc<Cluster> {
         Arc::new(Cluster {
+            unassign: false,
             local_id: String::from(""),
             nodes: Vec::new(),
         })
@@ -102,45 +129,91 @@ impl ClusterHelper for Cluster {
         self.local_id.clone()
     }
 
-    #[async_backtrace::framed]
-    async fn create_node_conn(&self, name: &str, config: &InnerConfig) -> Result<FlightClient> {
-        for node in &self.nodes {
-            if node.id == name {
-                return match config.tls_query_cli_enabled() {
-                    true => Ok(FlightClient::new(FlightServiceClient::new(
-                        ConnectionFactory::create_rpc_channel(
-                            node.flight_address.clone(),
-                            None,
-                            Some(config.query.to_rpc_client_tls_config()),
-                        )
-                        .await?,
-                    ))),
-                    false => Ok(FlightClient::new(FlightServiceClient::new(
-                        ConnectionFactory::create_rpc_channel(
-                            node.flight_address.clone(),
-                            None,
-                            None,
-                        )
-                        .await?,
-                    ))),
-                };
-            }
-        }
+    fn ordered_index(&self) -> usize {
+        let mut nodes = self.get_nodes();
+        nodes.sort_by(|a, b| a.id.cmp(&b.id));
+        nodes
+            .iter()
+            .position(|x| x.id == self.local_id)
+            .unwrap_or(0)
+    }
 
-        Err(ErrorCode::NotFoundClusterNode(format!(
-            "The node \"{}\" not found in the cluster",
-            name
-        )))
+    fn index_of_nodeid(&self, node_id: &str) -> Option<usize> {
+        let mut nodes = self.get_nodes();
+        nodes.sort_by(|a, b| a.id.cmp(&b.id));
+        nodes.iter().position(|x| x.id == node_id)
     }
 
     fn get_nodes(&self) -> Vec<Arc<NodeInfo>> {
         self.nodes.to_vec()
     }
+
+    async fn do_action<T: Serialize + Send + Clone, Res: for<'de> Deserialize<'de> + Send>(
+        &self,
+        path: &str,
+        message: HashMap<String, T>,
+        flight_params: FlightParams,
+    ) -> Result<HashMap<String, Res>> {
+        fn get_node<'a>(nodes: &'a [Arc<NodeInfo>], id: &str) -> Result<&'a Arc<NodeInfo>> {
+            for node in nodes {
+                if node.id == id {
+                    return Ok(node);
+                }
+            }
+
+            Err(ErrorCode::NotFoundClusterNode(format!(
+                "Not found node {} in cluster",
+                id
+            )))
+        }
+
+        let mut response = HashMap::with_capacity(message.len());
+        for (id, message) in message {
+            let node = get_node(&self.nodes, &id)?;
+
+            let do_action_with_retry = {
+                let config = GlobalConfig::instance();
+                let flight_address = node.flight_address.clone();
+                let node_secret = node.secret.clone();
+
+                async move {
+                    let mut attempt = 0;
+
+                    loop {
+                        let mut conn = create_client(&config, &flight_address).await?;
+                        match conn
+                            .do_action::<_, Res>(
+                                path,
+                                node_secret.clone(),
+                                message.clone(),
+                                flight_params.timeout,
+                            )
+                            .await
+                        {
+                            Ok(result) => return Ok(result),
+                            Err(e)
+                                if e.code() == ErrorCode::CANNOT_CONNECT_NODE
+                                    && attempt < flight_params.retry_times =>
+                            {
+                                // only retry when error is network problem
+                                info!("retry do_action, attempt: {}", attempt);
+                                attempt += 1;
+                                sleep(Duration::from_secs(flight_params.retry_interval)).await;
+                            }
+                            Err(e) => return Err(e),
+                        }
+                    }
+                }
+            };
+
+            response.insert(id, do_action_with_retry.await?);
+        }
+
+        Ok(response)
+    }
 }
 
 impl ClusterDiscovery {
-    const METRIC_LABEL_FUNCTION: &'static str = "function";
-
     #[async_backtrace::framed]
     pub async fn create_meta_client(cfg: &InnerConfig) -> Result<MetaStore> {
         let meta_api_provider = MetaStoreProvider::new(cfg.meta.to_meta_grpc_client_conf());
@@ -153,9 +226,9 @@ impl ClusterDiscovery {
     }
 
     #[async_backtrace::framed]
-    pub async fn init(cfg: InnerConfig) -> Result<()> {
-        let metastore = ClusterDiscovery::create_meta_client(&cfg).await?;
-        GlobalInstance::set(Self::try_create(&cfg, metastore).await?);
+    pub async fn init(cfg: &InnerConfig) -> Result<()> {
+        let metastore = ClusterDiscovery::create_meta_client(cfg).await?;
+        GlobalInstance::set(Self::try_create(cfg, metastore).await?);
 
         Ok(())
     }
@@ -168,17 +241,19 @@ impl ClusterDiscovery {
         let (lift_time, provider) = Self::create_provider(cfg, metastore)?;
 
         Ok(Arc::new(ClusterDiscovery {
-            local_id: GlobalUniqName::unique(),
-            api_provider: provider.clone(),
+            local_id: cfg.query.node_id.clone(),
+            local_secret: cfg.query.node_secret.clone(),
+            warehouse_manager: provider.clone(),
             heartbeat: Mutex::new(ClusterHeartbeat::create(
                 lift_time,
                 provider,
                 cfg.query.cluster_id.clone(),
-                cfg.query.tenant_id.clone(),
+                cfg.query.tenant_id.tenant_name().to_string(),
             )),
             cluster_id: cfg.query.cluster_id.clone(),
-            tenant_id: cfg.query.tenant_id.clone(),
+            tenant_id: cfg.query.tenant_id.tenant_name().to_string(),
             flight_address: cfg.query.flight_api_address.clone(),
+            lru_cache: parking_lot::Mutex::new(LruCache::with_items_capacity(100)),
         }))
     }
 
@@ -189,45 +264,28 @@ impl ClusterDiscovery {
     fn create_provider(
         cfg: &InnerConfig,
         metastore: MetaStore,
-    ) -> Result<(Duration, Arc<dyn ClusterApi>)> {
+    ) -> Result<(Duration, Arc<dyn WarehouseApi>)> {
         // TODO: generate if tenant or cluster id is empty
         let tenant_id = &cfg.query.tenant_id;
-        let cluster_id = &cfg.query.cluster_id;
         let lift_time = Duration::from_secs(60);
-        let cluster_manager = ClusterMgr::create(metastore, tenant_id, cluster_id, lift_time)?;
+        let cluster_manager = WarehouseMgr::create(metastore, tenant_id.tenant_name(), lift_time)?;
 
         Ok((lift_time, Arc::new(cluster_manager)))
     }
 
-    #[async_backtrace::framed]
-    pub async fn discover(&self, config: &InnerConfig) -> Result<Arc<Cluster>> {
-        match self.api_provider.get_nodes().await {
+    async fn create_cluster_with_try_connect(
+        &self,
+        config: &InnerConfig,
+        nodes: Result<Vec<NodeInfo>>,
+    ) -> Result<Arc<Cluster>> {
+        match nodes {
             Err(cause) => {
-                label_counter_with_val_and_labels(
-                    super::metrics::METRIC_CLUSTER_ERROR_COUNT,
-                    &vec![
-                        (
-                            super::metrics::METRIC_LABEL_LOCAL_ID,
-                            String::from(&self.local_id),
-                        ),
-                        (
-                            ClusterDiscovery::METRIC_LABEL_FUNCTION,
-                            String::from("discover"),
-                        ),
-                        (
-                            super::metrics::METRIC_LABEL_CLUSTER_ID,
-                            self.cluster_id.clone(),
-                        ),
-                        (
-                            super::metrics::METRIC_LABEL_TENANT_ID,
-                            self.tenant_id.clone(),
-                        ),
-                        (
-                            super::metrics::METRIC_LABEL_FLIGHT_ADDRESS,
-                            self.flight_address.clone(),
-                        ),
-                    ],
-                    1,
+                metric_incr_cluster_error_count(
+                    &self.local_id,
+                    "discover",
+                    &self.cluster_id,
+                    &self.tenant_id,
+                    &self.flight_address,
                 );
                 Err(cause.add_message_back("(while cluster api get_nodes)."))
             }
@@ -235,10 +293,13 @@ impl ClusterDiscovery {
                 let mut res = Vec::with_capacity(cluster_nodes.len());
                 for node in &cluster_nodes {
                     if node.id != self.local_id {
+                        let start_at = Instant::now();
                         if let Err(cause) = create_client(config, &node.flight_address).await {
                             warn!(
-                                "Cannot connect node [{:?}], remove it in query. cause: {:?}",
-                                node.flight_address, cause
+                                "Cannot connect node [{:?}] after {:?}s, remove it in query. cause: {:?}",
+                                node.flight_address,
+                                start_at.elapsed().as_secs_f32(),
+                                cause
                             );
 
                             continue;
@@ -248,75 +309,141 @@ impl ClusterDiscovery {
                     res.push(Arc::new(node.clone()));
                 }
 
-                gauge!(
-                    super::metrics::METRIC_CLUSTER_DISCOVERED_NODE_GAUGE,
+                metrics_gauge_discovered_nodes(
+                    &self.local_id,
+                    &self.cluster_id,
+                    &self.tenant_id,
+                    &self.flight_address,
                     cluster_nodes.len() as f64,
-                    &[
-                        (
-                            super::metrics::METRIC_LABEL_LOCAL_ID,
-                            String::from(&self.local_id)
-                        ),
-                        (
-                            super::metrics::METRIC_LABEL_CLUSTER_ID,
-                            self.cluster_id.clone(),
-                        ),
-                        (
-                            super::metrics::METRIC_LABEL_TENANT_ID,
-                            self.tenant_id.clone(),
-                        ),
-                        (
-                            super::metrics::METRIC_LABEL_FLIGHT_ADDRESS,
-                            self.flight_address.clone(),
-                        ),
-                    ]
                 );
+
+                // compatibility, for self-managed nodes, we allow queries to continue executing even when the heartbeat fails.
+                if cluster_nodes.is_empty() && !config.query.cluster_id.is_empty() {
+                    let mut cluster = Cluster::empty();
+                    let mut_cluster = Arc::get_mut(&mut cluster).unwrap();
+                    mut_cluster.local_id = self.local_id.clone();
+                    return Ok(cluster);
+                }
 
                 Ok(Cluster::create(res, self.local_id.clone()))
             }
         }
     }
 
+    pub async fn discover_warehouse_nodes(&self, config: &InnerConfig) -> Result<Arc<Cluster>> {
+        let nodes = match config.query.cluster_id.is_empty() {
+            true => {
+                self.warehouse_manager
+                    .discover_warehouse_nodes(&config.query.node_id)
+                    .await
+            }
+            false => {
+                self.warehouse_manager
+                    .list_warehouse_nodes(self.cluster_id.clone())
+                    .await
+            }
+        };
+
+        self.create_cluster_with_try_connect(config, nodes).await
+    }
+
+    #[async_backtrace::framed]
+    pub async fn discover(&self, config: &InnerConfig) -> Result<Arc<Cluster>> {
+        let nodes = match config.query.cluster_id.is_empty() {
+            true => self.warehouse_manager.discover(&config.query.node_id).await,
+            false => {
+                self.warehouse_manager
+                    .list_warehouse_cluster_nodes(&self.cluster_id, &self.cluster_id)
+                    .await
+            }
+        };
+
+        self.create_cluster_with_try_connect(config, nodes).await
+    }
+
+    pub async fn find_node_by_warehouse(
+        self: Arc<Self>,
+        warehouse: &str,
+    ) -> Result<Option<Arc<NodeInfo>>> {
+        let nodes = self
+            .warehouse_manager
+            .list_warehouse_nodes(warehouse.to_string())
+            .await?;
+
+        let mut warehouse_clusters_nodes = Vec::new();
+        let mut warehouse_clusters_nodes_index = HashMap::new();
+
+        for node in nodes {
+            match warehouse_clusters_nodes_index
+                .entry((node.version.to_string(), node.cluster_id.clone()))
+            {
+                Entry::Vacant(v) => {
+                    v.insert(warehouse_clusters_nodes.len());
+                    warehouse_clusters_nodes.push(vec![Arc::new(node)]);
+                }
+                Entry::Occupied(v) => {
+                    warehouse_clusters_nodes[*v.get()].push(Arc::new(node));
+                }
+            };
+        }
+
+        if warehouse_clusters_nodes.is_empty() {
+            return Ok(None);
+        }
+
+        let system_time = std::time::SystemTime::now();
+        let system_timestamp = system_time
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("expect time");
+
+        let millis = system_timestamp.as_millis();
+        let cluster_idx = (millis % warehouse_clusters_nodes_index.len() as u128) as usize;
+        let pick_cluster_nodes = &warehouse_clusters_nodes[cluster_idx];
+        let nodes_idx = (millis % pick_cluster_nodes.len() as u128) as usize;
+        Ok(Some(pick_cluster_nodes[nodes_idx].clone()))
+    }
+
+    pub async fn find_node_by_id(self: Arc<Self>, id: &str) -> Result<Option<Arc<NodeInfo>>> {
+        {
+            let mut lru_cache = self.lru_cache.lock();
+            if let Some(node_info) = lru_cache.get(id) {
+                return Ok(Some(node_info.node.clone()));
+            }
+        }
+
+        if let Some(node_info) = self.warehouse_manager.get_node_info(id).await? {
+            let cache_object = Arc::new(node_info);
+            let mut lru_cache = self.lru_cache.lock();
+            lru_cache.insert(id.to_string(), CachedNode {
+                node: cache_object.clone(),
+            });
+            return Ok(Some(cache_object));
+        }
+
+        Ok(None)
+    }
+
     #[async_backtrace::framed]
     async fn drop_invalid_nodes(self: &Arc<Self>, node_info: &NodeInfo) -> Result<()> {
-        let current_nodes_info = match self.api_provider.get_nodes().await {
+        let online_nodes = match self.warehouse_manager.list_online_nodes().await {
             Ok(nodes) => nodes,
             Err(cause) => {
-                label_counter_with_val_and_labels(
-                    super::metrics::METRIC_CLUSTER_ERROR_COUNT,
-                    &vec![
-                        (
-                            super::metrics::METRIC_LABEL_LOCAL_ID,
-                            String::from(&self.local_id),
-                        ),
-                        (
-                            ClusterDiscovery::METRIC_LABEL_FUNCTION,
-                            String::from("drop_invalid_nodes.get_nodes"),
-                        ),
-                        (
-                            super::metrics::METRIC_LABEL_CLUSTER_ID,
-                            self.cluster_id.clone(),
-                        ),
-                        (
-                            super::metrics::METRIC_LABEL_TENANT_ID,
-                            self.tenant_id.clone(),
-                        ),
-                        (
-                            super::metrics::METRIC_LABEL_FLIGHT_ADDRESS,
-                            self.flight_address.clone(),
-                        ),
-                    ],
-                    1,
+                metric_incr_cluster_error_count(
+                    &self.local_id,
+                    "drop_invalid_ndes.get_nodes",
+                    &self.cluster_id,
+                    &self.tenant_id,
+                    &self.flight_address,
                 );
                 return Err(cause.add_message_back("(while drop_invalid_nodes)"));
             }
         };
 
-        for before_node in current_nodes_info {
+        for before_node in online_nodes {
             // Restart in a very short time(< heartbeat timeout) after abnormal shutdown, Which will
             // lead to some invalid information
             if before_node.flight_address.eq(&node_info.flight_address) {
-                let drop_invalid_node =
-                    self.api_provider.drop_node(before_node.id, MatchSeq::GE(1));
+                let drop_invalid_node = self.warehouse_manager.shutdown_node(before_node.id);
                 if let Err(cause) = drop_invalid_node.await {
                     warn!("Drop invalid node failure: {:?}", cause);
                 }
@@ -339,10 +466,7 @@ impl ClusterDiscovery {
 
         let mut mut_signal_pin = signal.as_mut();
         let signal_future = Box::pin(mut_signal_pin.next());
-        let drop_node = Box::pin(
-            self.api_provider
-                .drop_node(self.local_id.clone(), MatchSeq::GE(1)),
-        );
+        let drop_node = Box::pin(self.warehouse_manager.shutdown_node(self.local_id.clone()));
         match futures::future::select(drop_node, signal_future).await {
             Either::Left((drop_node_result, _)) => {
                 if let Err(drop_node_failure) = drop_node_result {
@@ -365,43 +489,69 @@ impl ClusterDiscovery {
     pub async fn register_to_metastore(self: &Arc<Self>, cfg: &InnerConfig) -> Result<()> {
         let cpus = cfg.query.num_cpus;
         let mut address = cfg.query.flight_api_address.clone();
+        let mut http_address = format!(
+            "{}:{}",
+            cfg.query.http_handler_host, cfg.query.http_handler_port
+        );
+        let mut discovery_address = match cfg.query.discovery_address.is_empty() {
+            true => format!(
+                "{}:{}",
+                cfg.query.http_handler_host, cfg.query.http_handler_port
+            ),
+            false => cfg.query.discovery_address.clone(),
+        };
 
-        if let Ok(socket_addr) = SocketAddr::from_str(&address) {
-            let ip_addr = socket_addr.ip();
-            if ip_addr.is_loopback() || ip_addr.is_unspecified() {
-                if let Some(local_addr) = self.api_provider.get_local_addr().await? {
-                    let local_socket_addr = SocketAddr::from_str(&local_addr)?;
-                    let new_addr = format!("{}:{}", local_socket_addr.ip(), socket_addr.port());
-                    warn!(
-                        "Used loopback or unspecified address as cluster flight address. \
-                        we rewrite it(\"{}\" -> \"{}\") for other nodes can connect it.\
-                        If your has proxy between nodes, you can specify the node's IP address in the configuration file.",
-                        address, new_addr
-                    );
+        for (lookup_ip, typ) in [
+            (&mut address, "flight-api-address"),
+            (&mut discovery_address, "discovery-address"),
+            (&mut http_address, "http-address"),
+        ] {
+            if let Ok(socket_addr) = SocketAddr::from_str(lookup_ip) {
+                let ip_addr = socket_addr.ip();
+                if ip_addr.is_loopback() || ip_addr.is_unspecified() {
+                    if let Some(local_addr) = self.warehouse_manager.get_local_addr().await? {
+                        let local_socket_addr = SocketAddr::from_str(&local_addr)?;
+                        let new_addr = format!("{}:{}", local_socket_addr.ip(), socket_addr.port());
+                        warn!(
+                            "Detected loopback or unspecified address as {} endpoint. \
+                            We rewrite it(\"{}\" -> \"{}\") for advertising to other nodes. \
+                            If there are proxies between nodes, you can specify endpoint with --{}.",
+                            typ, lookup_ip, new_addr, typ
+                        );
 
-                    address = new_addr;
+                        *lookup_ip = new_addr;
+                    }
                 }
             }
         }
 
-        let node_info = NodeInfo::create(
+        let mut node_info = NodeInfo::create(
             self.local_id.clone(),
+            self.local_secret.clone(),
             cpus,
+            http_address,
             address,
+            discovery_address,
             DATABEND_COMMIT_VERSION.to_string(),
         );
 
+        let resources_management = GlobalInstance::get::<Arc<dyn ResourcesManagement>>();
+        resources_management.init_node(&mut node_info).await?;
+
         self.drop_invalid_nodes(&node_info).await?;
-        match self.api_provider.add_node(node_info.clone()).await {
-            Ok(_) => self.start_heartbeat(node_info).await,
+
+        match self.warehouse_manager.start_node(node_info).await {
+            Ok(seq_node) => self.start_heartbeat(seq_node).await,
             Err(cause) => Err(cause.add_message_back("(while cluster api add_node).")),
         }
     }
 
     #[async_backtrace::framed]
-    async fn start_heartbeat(self: &Arc<Self>, node_info: NodeInfo) -> Result<()> {
+    async fn start_heartbeat(self: &Arc<Self>, seq_node: SeqV<NodeInfo>) -> Result<()> {
         let mut heartbeat = self.heartbeat.lock().await;
-        heartbeat.start(node_info);
+        let seq = seq_node.seq;
+        let node_info = seq_node.into_value().unwrap();
+        heartbeat.start(node_info, seq);
         Ok(())
     }
 }
@@ -410,18 +560,16 @@ struct ClusterHeartbeat {
     timeout: Duration,
     shutdown: Arc<AtomicBool>,
     shutdown_notify: Arc<Notify>,
-    cluster_api: Arc<dyn ClusterApi>,
+    cluster_api: Arc<dyn WarehouseApi>,
     shutdown_handler: Option<JoinHandle<()>>,
     cluster_id: String,
     tenant_id: String,
 }
 
 impl ClusterHeartbeat {
-    const METRIC_LABEL_RESULT: &'static str = "result";
-
     pub fn create(
         timeout: Duration,
-        cluster_api: Arc<dyn ClusterApi>,
+        cluster_api: Arc<dyn WarehouseApi>,
         cluster_id: String,
         tenant_id: String,
     ) -> ClusterHeartbeat {
@@ -436,7 +584,7 @@ impl ClusterHeartbeat {
         }
     }
 
-    fn heartbeat_loop(&self, node: NodeInfo) -> impl Future<Output = ()> + 'static {
+    fn heartbeat_loop(&self, mut node: NodeInfo, seq: u64) -> impl Future<Output = ()> + 'static {
         let shutdown = self.shutdown.clone();
         let shutdown_notify = self.shutdown_notify.clone();
         let cluster_api = self.cluster_api.clone();
@@ -447,6 +595,7 @@ impl ClusterHeartbeat {
         async move {
             let mut shutdown_notified = Box::pin(shutdown_notify.notified());
 
+            let mut match_seq = seq;
             while !shutdown.load(Ordering::Relaxed) {
                 let mills = {
                     let mut rng = thread_rng();
@@ -461,29 +610,21 @@ impl ClusterHeartbeat {
                     }
                     Either::Right((_, new_shutdown_notified)) => {
                         shutdown_notified = new_shutdown_notified;
-                        let heartbeat = cluster_api.heartbeat(&node, MatchSeq::GE(1));
-                        if let Err(failure) = heartbeat.await {
-                            label_counter_with_val_and_labels(
-                                super::metrics::METRIC_CLUSTER_HEARTBEAT_COUNT,
-                                &vec![
-                                    (
-                                        super::metrics::METRIC_LABEL_LOCAL_ID,
-                                        String::from(&node.id),
-                                    ),
-                                    (
-                                        super::metrics::METRIC_LABEL_FLIGHT_ADDRESS,
-                                        String::from(&node.flight_address),
-                                    ),
-                                    (super::metrics::METRIC_LABEL_CLUSTER_ID, cluster_id.clone()),
-                                    (super::metrics::METRIC_LABEL_TENANT_ID, tenant_id.clone()),
-                                    (
-                                        ClusterHeartbeat::METRIC_LABEL_RESULT,
-                                        String::from("failure"),
-                                    ),
-                                ],
-                                1,
-                            );
-                            error!("Cluster cluster api heartbeat failure: {:?}", failure);
+                        let heartbeat = cluster_api.heartbeat_node(&mut node, match_seq);
+                        match heartbeat.await {
+                            Ok(new_match_seq) => {
+                                match_seq = new_match_seq;
+                            }
+                            Err(failure) => {
+                                metric_incr_cluster_heartbeat_count(
+                                    &node.id,
+                                    &node.flight_address,
+                                    &cluster_id,
+                                    &tenant_id,
+                                    "failure",
+                                );
+                                error!("Cluster cluster api heartbeat failure: {:?}", failure);
+                            }
                         }
                     }
                 }
@@ -495,9 +636,9 @@ impl ClusterHeartbeat {
         (duration / 3).as_millis()..=((duration / 3) * 2).as_millis()
     }
 
-    pub fn start(&mut self, node_info: NodeInfo) {
-        self.shutdown_handler = Some(tokio::spawn(
-            async_backtrace::location!().frame(self.heartbeat_loop(node_info)),
+    pub fn start(&mut self, node_info: NodeInfo, seq: u64) {
+        self.shutdown_handler = Some(databend_common_base::runtime::spawn(
+            self.heartbeat_loop(node_info, seq),
         ));
     }
 
@@ -519,17 +660,37 @@ impl ClusterHeartbeat {
 
 #[async_backtrace::framed]
 pub async fn create_client(config: &InnerConfig, address: &str) -> Result<FlightClient> {
-    match config.tls_query_cli_enabled() {
-        true => Ok(FlightClient::new(FlightServiceClient::new(
-            ConnectionFactory::create_rpc_channel(
-                address.to_owned(),
-                None,
-                Some(config.query.to_rpc_client_tls_config()),
-            )
-            .await?,
-        ))),
-        false => Ok(FlightClient::new(FlightServiceClient::new(
-            ConnectionFactory::create_rpc_channel(address.to_owned(), None, None).await?,
-        ))),
+    let timeout = if config.query.rpc_client_timeout_secs > 0 {
+        Some(Duration::from_secs(config.query.rpc_client_timeout_secs))
+    } else {
+        None
+    };
+
+    let rpc_tls_config = if config.tls_query_cli_enabled() {
+        Some(config.query.to_rpc_client_tls_config())
+    } else {
+        None
+    };
+
+    Ok(FlightClient::new(FlightServiceClient::new(
+        ConnectionFactory::create_rpc_channel(address.to_owned(), timeout, rpc_tls_config).await?,
+    )))
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct FlightParams {
+    pub(crate) timeout: u64,
+    pub(crate) retry_times: u64,
+    pub(crate) retry_interval: u64,
+}
+
+#[derive(Clone)]
+pub struct CachedNode {
+    pub node: Arc<NodeInfo>,
+}
+
+impl MemSized for CachedNode {
+    fn mem_bytes(&self) -> usize {
+        0
     }
 }

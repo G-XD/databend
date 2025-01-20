@@ -14,8 +14,8 @@
 
 use std::io::Write;
 
-use common_expression::types::*;
-use common_expression::FromData;
+use databend_common_expression::types::*;
+use databend_common_expression::FromData;
 use goldenfile::Mint;
 
 use super::run_ast;
@@ -26,7 +26,6 @@ fn test_datetime() {
     let file = &mut mint.new_goldenfile("datetime.txt").unwrap();
 
     test_to_timestamp(file);
-    test_to_datetime(file);
     test_to_date(file);
     test_date_add_subtract(file);
     test_timestamp_add_subtract(file);
@@ -36,6 +35,7 @@ fn test_datetime() {
     test_timestamp_arith(file);
     test_to_number(file);
     test_rounder_functions(file);
+    test_date_date_diff(file);
 }
 
 fn test_to_timestamp(file: &mut impl Write) {
@@ -50,31 +50,6 @@ fn test_to_timestamp(file: &mut impl Write) {
     run_ast(file, "to_timestamp(315360000000000)", &[]);
     run_ast(file, "to_timestamp(253402300800000000)", &[]);
     run_ast(file, "to_timestamp(a)", &[(
-        "a",
-        Int64Type::from_data(vec![
-            -315360000000000i64,
-            315360000000,
-            -100,
-            0,
-            100,
-            315360000000,
-            315360000000000,
-        ]),
-    )]);
-}
-
-fn test_to_datetime(file: &mut impl Write) {
-    run_ast(file, "to_datetime(-30610224000000001)", &[]);
-    run_ast(file, "to_datetime(-315360000000000)", &[]);
-    run_ast(file, "to_datetime(-315360000000)", &[]);
-    run_ast(file, "to_datetime(-100)", &[]);
-    run_ast(file, "to_datetime(-0)", &[]);
-    run_ast(file, "to_datetime(0)", &[]);
-    run_ast(file, "to_datetime(100)", &[]);
-    run_ast(file, "to_datetime(315360000000)", &[]);
-    run_ast(file, "to_datetime(315360000000000)", &[]);
-    run_ast(file, "to_datetime(253402300800000000)", &[]);
-    run_ast(file, "to_datetime(a)", &[(
         "a",
         Int64Type::from_data(vec![
             -315360000000000i64,
@@ -108,10 +83,14 @@ fn test_date_add_subtract(file: &mut impl Write) {
     run_ast(file, "add_years(to_date(0), 100)", &[]);
     run_ast(file, "add_months(to_date(0), 100)", &[]);
     run_ast(file, "add_days(to_date(0), 100)", &[]);
+    run_ast(file, "add(to_date(0), 100)", &[]);
+    run_ast(file, "add(to_date(0), 10000000)", &[]);
     run_ast(file, "subtract_years(to_date(0), 100)", &[]);
     run_ast(file, "subtract_quarters(to_date(0), 100)", &[]);
     run_ast(file, "subtract_months(to_date(0), 100)", &[]);
     run_ast(file, "subtract_days(to_date(0), 100)", &[]);
+    run_ast(file, "subtract(to_date(0), 100)", &[]);
+    run_ast(file, "subtract(to_date(0), 10000000)", &[]);
     run_ast(file, "add_years(a, b)", &[
         ("a", DateType::from_data(vec![-100, 0, 100])),
         ("b", Int32Type::from_data(vec![1, 2, 3])),
@@ -155,6 +134,8 @@ fn test_timestamp_add_subtract(file: &mut impl Write) {
     run_ast(file, "add_hours(to_timestamp(0), 100)", &[]);
     run_ast(file, "add_minutes(to_timestamp(0), 100)", &[]);
     run_ast(file, "add_seconds(to_timestamp(0), 100)", &[]);
+    run_ast(file, "add(to_timestamp(0), 100000000000000)", &[]);
+    run_ast(file, "add(to_timestamp(0), 1000000000000000000)", &[]);
     run_ast(file, "subtract_years(to_timestamp(0), 100)", &[]);
     run_ast(file, "subtract_quarters(to_timestamp(0), 100)", &[]);
     run_ast(file, "subtract_months(to_timestamp(0), 100)", &[]);
@@ -162,6 +143,8 @@ fn test_timestamp_add_subtract(file: &mut impl Write) {
     run_ast(file, "subtract_hours(to_timestamp(0), 100)", &[]);
     run_ast(file, "subtract_minutes(to_timestamp(0), 100)", &[]);
     run_ast(file, "subtract_seconds(to_timestamp(0), 100)", &[]);
+    run_ast(file, "subtract(to_timestamp(0), 100000000000000)", &[]);
+    run_ast(file, "subtract(to_timestamp(0), 1000000000000000000)", &[]);
     run_ast(file, "add_years(a, b)", &[
         ("a", TimestampType::from_data(vec![-100, 0, 100])),
         ("b", Int32Type::from_data(vec![1, 2, 3])),
@@ -462,10 +445,12 @@ fn test_to_number(file: &mut impl Write) {
     run_ast(file, "to_yyyymmdd(to_date(18875))", &[]);
     run_ast(file, "to_yyyymmddhhmmss(to_date(18875))", &[]);
     run_ast(file, "to_year(to_date(18875))", &[]);
+    run_ast(file, "to_quarter(to_date(18875))", &[]);
     run_ast(file, "to_month(to_date(18875))", &[]);
     run_ast(file, "to_day_of_year(to_date(18875))", &[]);
     run_ast(file, "to_day_of_month(to_date(18875))", &[]);
     run_ast(file, "to_day_of_week(to_date(18875))", &[]);
+    run_ast(file, "to_week_of_year(to_date(18875))", &[]);
     run_ast(file, "to_yyyymm(a)", &[(
         "a",
         DateType::from_data(vec![-100, 0, 100]),
@@ -479,6 +464,10 @@ fn test_to_number(file: &mut impl Write) {
         DateType::from_data(vec![-100, 0, 100]),
     )]);
     run_ast(file, "to_year(a)", &[(
+        "a",
+        DateType::from_data(vec![-100, 0, 100]),
+    )]);
+    run_ast(file, "to_quarter(a)", &[(
         "a",
         DateType::from_data(vec![-100, 0, 100]),
     )]);
@@ -498,16 +487,22 @@ fn test_to_number(file: &mut impl Write) {
         "a",
         DateType::from_data(vec![-100, 0, 100]),
     )]);
+    run_ast(file, "to_week_of_year(a)", &[(
+        "a",
+        DateType::from_data(vec![-100, 0, 100]),
+    )]);
 
     // timestamp
     run_ast(file, "to_yyyymm(to_timestamp(1630812366))", &[]);
     run_ast(file, "to_yyyymmdd(to_timestamp(1630812366))", &[]);
     run_ast(file, "to_yyyymmddhhmmss(to_timestamp(1630812366))", &[]);
     run_ast(file, "to_year(to_timestamp(1630812366))", &[]);
+    run_ast(file, "to_quarter(to_timestamp(1630812366))", &[]);
     run_ast(file, "to_month(to_timestamp(1630812366))", &[]);
     run_ast(file, "to_day_of_year(to_timestamp(1630812366))", &[]);
     run_ast(file, "to_day_of_month(to_timestamp(1630812366))", &[]);
     run_ast(file, "to_day_of_week(to_timestamp(1630812366))", &[]);
+    run_ast(file, "to_week_of_year(to_timestamp(1630812366))", &[]);
     run_ast(file, "to_hour(to_timestamp(1630812366))", &[]);
     run_ast(file, "to_minute(to_timestamp(1630812366))", &[]);
     run_ast(file, "to_second(to_timestamp(1630812366))", &[]);
@@ -527,6 +522,10 @@ fn test_to_number(file: &mut impl Write) {
         "a",
         TimestampType::from_data(vec![-100, 0, 100]),
     )]);
+    run_ast(file, "to_quarter(a)", &[(
+        "a",
+        TimestampType::from_data(vec![-100, 0, 100]),
+    )]);
     run_ast(file, "to_month(a)", &[(
         "a",
         TimestampType::from_data(vec![-100, 0, 100]),
@@ -540,6 +539,10 @@ fn test_to_number(file: &mut impl Write) {
         TimestampType::from_data(vec![-100, 0, 100]),
     )]);
     run_ast(file, "to_day_of_week(a)", &[(
+        "a",
+        TimestampType::from_data(vec![-100, 0, 100]),
+    )]);
+    run_ast(file, "to_week_of_year(a)", &[(
         "a",
         TimestampType::from_data(vec![-100, 0, 100]),
     )]);
@@ -594,4 +597,130 @@ fn test_rounder_functions(file: &mut impl Write) {
     run_ast(file, "date_trunc(hour, to_timestamp(1630812366))", &[]);
     run_ast(file, "date_trunc(minute, to_timestamp(1630812366))", &[]);
     run_ast(file, "date_trunc(second, to_timestamp(1630812366))", &[]);
+
+    run_ast(file, "last_day(to_timestamp(1630812366), year)", &[]);
+    run_ast(file, "last_day(to_timestamp(1630812366), quarter)", &[]);
+    run_ast(file, "last_day(to_timestamp(1630812366), month)", &[]);
+    run_ast(file, "last_day(to_timestamp(1630812366), week)", &[]);
+
+    run_ast(file, "previous_day(to_timestamp(1630812366), monday)", &[]);
+    run_ast(file, "previous_day(to_timestamp(1630812366), tuesday)", &[]);
+    run_ast(
+        file,
+        "previous_day(to_timestamp(1630812366), wednesday)",
+        &[],
+    );
+    run_ast(file, "previous_day(to_timestamp(1630812366), thursday)", &[
+    ]);
+    run_ast(file, "previous_day(to_timestamp(1630812366), friday)", &[]);
+    run_ast(file, "previous_day(to_timestamp(1630812366), saturday)", &[
+    ]);
+    run_ast(file, "previous_day(to_timestamp(1630812366), sunday)", &[]);
+
+    run_ast(file, "next_day(to_timestamp(1630812366), monday)", &[]);
+    run_ast(file, "next_day(to_timestamp(1630812366), tuesday)", &[]);
+    run_ast(file, "next_day(to_timestamp(1630812366), wednesday)", &[]);
+    run_ast(file, "next_day(to_timestamp(1630812366), thursday)", &[]);
+    run_ast(file, "next_day(to_timestamp(1630812366), friday)", &[]);
+    run_ast(file, "next_day(to_timestamp(1630812366), saturday)", &[]);
+    run_ast(file, "next_day(to_timestamp(1630812366), sunday)", &[]);
+}
+
+fn test_date_date_diff(file: &mut impl Write) {
+    run_ast(file, "date_diff(year, to_date(0), to_date(10000))", &[]);
+    run_ast(file, "date_diff(year, to_date(10000), to_date(0))", &[]);
+    run_ast(
+        file,
+        "date_diff(year, to_date('2000-01-01'), to_date('2024-12-31'))",
+        &[],
+    );
+    run_ast(
+        file,
+        "date_diff(year, to_date('2023-12-31'), to_date('2024-01-01'))",
+        &[],
+    );
+    run_ast(
+        file,
+        "date_diff(year, to_date('2024-01-01'), to_date('2023-12-31'))",
+        &[],
+    );
+    run_ast(
+        file,
+        "date_diff(year, to_timestamp('2023-11-12 09:38:18.165575'), to_timestamp('2025-03-27 21:01:35.423179'))",
+        &[],
+    );
+    run_ast(
+        file,
+        "date_diff(year, to_timestamp('2020-02-29 23:59:59.165575'), to_timestamp('2019-02-28 23:59:59.423179'))",
+        &[],
+    );
+    run_ast(file, "date_diff(month, to_date(0), to_date(10000))", &[]);
+    run_ast(file, "date_diff(month, to_date(10000), to_date(0))", &[]);
+    run_ast(
+        file,
+        "date_diff(month, to_date('2000-01-01'), to_date('2024-12-31'))",
+        &[],
+    );
+    run_ast(
+        file,
+        "date_diff(month, to_timestamp('2023-11-12 09:38:18.165575'), to_timestamp('2025-03-27 21:01:35.423179'))",
+        &[],
+    );
+    run_ast(
+        file,
+        "date_diff(month, to_timestamp('2020-02-29 23:59:59.165575'), to_timestamp('2019-02-28 23:59:59.423179'))",
+        &[],
+    );
+    run_ast(file, "date_diff(day, to_date(0), to_date(10000))", &[]);
+    run_ast(file, "date_diff(day, to_date(10000), to_date(0))", &[]);
+    run_ast(
+        file,
+        "date_diff(day, to_date('2000-01-01'), to_date('2024-12-31'))",
+        &[],
+    );
+    run_ast(
+        file,
+        "date_diff(day, to_timestamp('2023-11-12 09:38:18.165575'), to_timestamp('2025-03-27 21:01:35.423179'))",
+        &[],
+    );
+    run_ast(
+        file,
+        "date_diff(day, to_timestamp('2020-02-29 23:59:59.165575'), to_timestamp('2019-02-28 23:59:59.423179'))",
+        &[],
+    );
+    run_ast(
+        file,
+        "date_diff(hour, to_timestamp('2023-11-12 09:38:18.165575'), to_timestamp('2025-03-27 21:01:35.423179'))",
+        &[],
+    );
+    run_ast(
+        file,
+        "date_diff(hour, to_timestamp('2020-02-29 23:59:59.165575'), to_timestamp('2019-02-28 23:59:59.423179'))",
+        &[],
+    );
+    run_ast(
+        file,
+        "date_diff(minute, to_timestamp('2023-11-12 09:38:18.165575'), to_timestamp('2025-03-27 21:01:35.423179'))",
+        &[],
+    );
+    run_ast(
+        file,
+        "date_diff(minute, to_timestamp('2020-02-29 23:59:59.165575'), to_timestamp('2019-02-28 23:59:59.423179'))",
+        &[],
+    );
+    run_ast(
+        file,
+        "date_diff(second, to_timestamp('2023-11-12 09:38:18.165575'), to_timestamp('2025-03-27 21:01:35.423179'))",
+        &[],
+    );
+    run_ast(
+        file,
+        "date_diff(second, to_timestamp('2020-02-29 23:59:59.165575'), to_timestamp('2019-02-28 23:59:59.423179'))",
+        &[],
+    );
+    run_ast(
+        file,
+        "date_diff(second, to_timestamp('2020-02-29 23:59:59'), to_timestamp('2019-02-28 23:59:59'))",
+        &[],
+    );
 }

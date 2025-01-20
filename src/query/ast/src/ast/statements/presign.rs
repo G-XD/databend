@@ -16,9 +16,12 @@ use std::fmt::Display;
 use std::fmt::Formatter;
 use std::time::Duration;
 
-use crate::ast::StageLocation;
+use derive_visitor::Drive;
+use derive_visitor::DriveMut;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+use crate::ast::quote::AtString;
+
+#[derive(Debug, Clone, PartialEq, Eq, Drive, DriveMut)]
 pub enum PresignAction {
     Download,
     Upload,
@@ -31,7 +34,7 @@ impl Default for PresignAction {
 }
 
 impl Display for PresignAction {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
         match self {
             PresignAction::Download => write!(f, "DOWNLOAD"),
             PresignAction::Upload => write!(f, "UPLOAD"),
@@ -40,29 +43,30 @@ impl Display for PresignAction {
 }
 
 /// TODO: we can support uri location in the future.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Drive, DriveMut)]
 pub enum PresignLocation {
-    StageLocation(StageLocation),
+    StageLocation(String),
 }
 
 impl Display for PresignLocation {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
         match self {
-            PresignLocation::StageLocation(v) => v.fmt(f),
+            PresignLocation::StageLocation(v) => write!(f, "{}", AtString(v)),
         }
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Drive, DriveMut)]
 pub struct PresignStmt {
     pub action: PresignAction,
     pub location: PresignLocation,
+    #[drive(skip)]
     pub expire: Duration,
     pub content_type: Option<String>,
 }
 
 impl Display for PresignStmt {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
         write!(
             f,
             "PRESIGN {} {} EXPIRE = {}",

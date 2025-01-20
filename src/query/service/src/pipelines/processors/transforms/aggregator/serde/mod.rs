@@ -18,37 +18,23 @@ mod transform_aggregate_spill_writer;
 mod transform_deserializer;
 mod transform_exchange_aggregate_serializer;
 mod transform_exchange_async_barrier;
-mod transform_exchange_group_by_serializer;
-mod transform_group_by_serializer;
-mod transform_group_by_spill_writer;
 mod transform_spill_reader;
 
-pub use serde_meta::AggregateSerdeMeta;
-pub use serde_meta::BUCKET_TYPE;
-pub use serde_meta::SPILLED_TYPE;
-pub use transform_aggregate_serializer::TransformAggregateSerializer;
-pub use transform_aggregate_spill_writer::TransformAggregateSpillWriter;
-pub use transform_deserializer::TransformAggregateDeserializer;
-pub use transform_deserializer::TransformGroupByDeserializer;
-pub use transform_exchange_aggregate_serializer::TransformExchangeAggregateSerializer;
-pub use transform_exchange_async_barrier::TransformExchangeAsyncBarrier;
-pub use transform_exchange_group_by_serializer::TransformExchangeGroupBySerializer;
-pub use transform_group_by_serializer::TransformGroupBySerializer;
-pub use transform_group_by_spill_writer::TransformGroupBySpillWriter;
-pub use transform_spill_reader::TransformAggregateSpillReader;
-pub use transform_spill_reader::TransformGroupBySpillReader;
+pub use serde_meta::*;
+pub use transform_aggregate_serializer::*;
+pub use transform_aggregate_spill_writer::*;
+pub use transform_deserializer::*;
+pub use transform_exchange_aggregate_serializer::*;
+pub use transform_exchange_async_barrier::*;
+pub use transform_spill_reader::*;
 
 pub mod exchange_defines {
-    use common_arrow::arrow::datatypes::Field;
-    use common_arrow::arrow::io::flight::default_ipc_fields;
-    use common_arrow::arrow::io::flight::WriteOptions;
-    use common_arrow::arrow::io::ipc::IpcField;
-    use common_arrow::arrow::io::ipc::IpcSchema;
-    use common_expression::types::DataType;
-    use common_expression::types::NumberDataType;
-    use common_expression::DataField;
-    use common_expression::DataSchema;
-    use once_cell::sync::OnceCell;
+    use arrow_ipc::writer::IpcWriteOptions;
+    use arrow_schema::Schema;
+    use databend_common_expression::types::DataType;
+    use databend_common_expression::types::NumberDataType;
+    use databend_common_expression::DataField;
+    use databend_common_expression::DataSchema;
 
     pub fn spilled_schema() -> DataSchema {
         DataSchema::new(vec![
@@ -62,44 +48,12 @@ pub mod exchange_defines {
         ])
     }
 
-    pub fn spilled_fields() -> &'static [Field] {
-        static IPC_SCHEMA: OnceCell<Vec<Field>> = OnceCell::new();
-
-        IPC_SCHEMA.get_or_init(|| {
-            let schema = spilled_schema();
-
-            schema.to_arrow().fields
-        })
+    pub fn spilled_arrow_schema() -> Schema {
+        let schema = spilled_schema();
+        Schema::from(&schema)
     }
 
-    pub fn spilled_ipc_schema() -> &'static IpcSchema {
-        static IPC_SCHEMA: OnceCell<IpcSchema> = OnceCell::new();
-
-        IPC_SCHEMA.get_or_init(|| {
-            let schema = spilled_schema();
-
-            let arrow_schema = schema.to_arrow();
-            let ipc_fields = default_ipc_fields(&arrow_schema.fields);
-
-            IpcSchema {
-                fields: ipc_fields,
-                is_little_endian: true,
-            }
-        })
-    }
-
-    pub fn spilled_ipc_fields() -> &'static [IpcField] {
-        static IPC_FIELDS: OnceCell<Vec<IpcField>> = OnceCell::new();
-
-        IPC_FIELDS.get_or_init(|| {
-            let schema = spilled_schema();
-            let arrow_schema = schema.to_arrow();
-            default_ipc_fields(&arrow_schema.fields)
-        })
-    }
-
-    pub fn spilled_write_options() -> &'static WriteOptions {
-        static WRITE_OPTIONS: WriteOptions = WriteOptions { compression: None };
-        &WRITE_OPTIONS
+    pub fn spilled_write_options() -> IpcWriteOptions {
+        IpcWriteOptions::default()
     }
 }

@@ -1,0 +1,101 @@
+# need to run with '-p 0'
+
+statement ok
+drop stage if exists unload;
+
+statement ok
+create stage unload;
+
+statement ok
+remove @unload;
+
+statement ok
+drop table if exists ii;
+
+statement ok
+create table ii (a int, b int);
+
+statement ok
+insert into ii values (1, 2), (3, 4), (5, 6);
+
+statement ok
+create file format if not exists csv_gzip type=csv compression=gzip;
+
+# test csv
+query 
+copy into @unload from ii file_format=(type=csv);
+-----
+----
+3 12 12
+
+query 
+select right(name, 4), size from list_stage(location=>'@unload');
+----
+.csv 12
+
+query 
+select $1, $2 from @unload(file_format=>'csv');
+----
+1 2
+3 4
+5 6
+
+# test csv_gzip
+statement ok
+remove @unload;
+
+query 
+copy into @unload from ii file_format=(format_name='csv_gzip');
+----
+3 12 32
+
+query 
+select right(name, 7), size from list_stage(location=>'@unload');
+----
+.csv.gz 32
+
+query 
+select $1, $2 from @unload(file_format => 'csv_gzip');
+----
+1 2
+3 4
+5 6
+
+# test tsv
+statement ok
+remove @unload;
+
+query 
+copy into @unload from ii file_format=(format_name='tsv');
+----
+3 12 12
+
+query 
+select right(name, 4), size from list_stage(location=>'@unload');
+----
+.tsv 12
+
+query 
+select $1, $2 from @unload(file_format => 'tsv');
+----
+1 2
+3 4
+5 6
+
+query
+copy into @unload/a_raw_path.csv from (select 1,2) file_format=(type=csv) single=true include_query_id=false use_raw_path=true detailed_output=true overwrite=true;
+----
+a_raw_path.csv 4 1
+
+query
+copy into @unload/a_raw_path.csv from (select 3,4) file_format=(type=csv) single=true include_query_id=false use_raw_path=true detailed_output=true overwrite=true;
+----
+a_raw_path.csv 4 1
+
+query
+select $1, $2 from @unload/a_raw_path.csv (file_format => 'csv');
+----
+3 4
+
+statement error 1006.*file already exists
+copy into @unload/a_raw_path.csv from (select 3,4) file_format=(type=csv) single=true include_query_id=false use_raw_path=true detailed_output=false overwrite=false;

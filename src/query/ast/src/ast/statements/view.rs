@@ -15,14 +15,19 @@
 use std::fmt::Display;
 use std::fmt::Formatter;
 
+use derive_visitor::Drive;
+use derive_visitor::DriveMut;
+
 use crate::ast::write_comma_separated_list;
-use crate::ast::write_period_separated_list;
+use crate::ast::write_dot_separated_list;
+use crate::ast::CreateOption;
 use crate::ast::Identifier;
 use crate::ast::Query;
+use crate::ast::ShowLimit;
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Drive, DriveMut)]
 pub struct CreateViewStmt {
-    pub if_not_exists: bool,
+    pub create_option: CreateOption,
     pub catalog: Option<Identifier>,
     pub database: Option<Identifier>,
     pub view: Identifier,
@@ -32,11 +37,15 @@ pub struct CreateViewStmt {
 
 impl Display for CreateViewStmt {
     fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
-        write!(f, "CREATE VIEW ")?;
-        if self.if_not_exists {
+        write!(f, "CREATE ")?;
+        if let CreateOption::CreateOrReplace = self.create_option {
+            write!(f, "OR REPLACE ")?;
+        }
+        write!(f, "VIEW ")?;
+        if let CreateOption::CreateIfNotExists = self.create_option {
             write!(f, "IF NOT EXISTS ")?;
         }
-        write_period_separated_list(
+        write_dot_separated_list(
             f,
             self.catalog
                 .iter()
@@ -52,7 +61,7 @@ impl Display for CreateViewStmt {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Drive, DriveMut)]
 pub struct AlterViewStmt {
     pub catalog: Option<Identifier>,
     pub database: Option<Identifier>,
@@ -64,7 +73,7 @@ pub struct AlterViewStmt {
 impl Display for AlterViewStmt {
     fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
         write!(f, "ALTER VIEW ")?;
-        write_period_separated_list(
+        write_dot_separated_list(
             f,
             self.catalog
                 .iter()
@@ -80,7 +89,7 @@ impl Display for AlterViewStmt {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Drive, DriveMut)]
 pub struct DropViewStmt {
     pub if_exists: bool,
     pub catalog: Option<Identifier>,
@@ -94,12 +103,65 @@ impl Display for DropViewStmt {
         if self.if_exists {
             write!(f, "IF EXISTS ")?;
         }
-        write_period_separated_list(
+        write_dot_separated_list(
             f,
             self.catalog
                 .iter()
                 .chain(&self.database)
                 .chain(Some(&self.view)),
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Drive, DriveMut)]
+pub struct ShowViewsStmt {
+    pub catalog: Option<Identifier>,
+    pub database: Option<Identifier>,
+    pub full: bool,
+    pub limit: Option<ShowLimit>,
+    pub with_history: bool,
+}
+
+impl Display for ShowViewsStmt {
+    fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
+        write!(f, "SHOW")?;
+        if self.full {
+            write!(f, " FULL")?;
+        }
+        write!(f, " VIEWS")?;
+        if self.with_history {
+            write!(f, " HISTORY")?;
+        }
+        if let Some(database) = &self.database {
+            write!(f, " FROM ")?;
+            if let Some(catalog) = &self.catalog {
+                write!(f, "{catalog}.",)?;
+            }
+            write!(f, "{database}")?;
+        }
+        if let Some(limit) = &self.limit {
+            write!(f, " {limit}")?;
+        }
+
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Drive, DriveMut)]
+pub struct DescribeViewStmt {
+    pub catalog: Option<Identifier>,
+    pub database: Option<Identifier>,
+    pub view: Identifier,
+}
+
+impl Display for DescribeViewStmt {
+    fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
+        write!(f, "DESCRIBE VIEW ")?;
+        write_dot_separated_list(
+            f,
+            self.catalog
+                .iter()
+                .chain(self.database.iter().chain(Some(&self.view))),
         )
     }
 }

@@ -12,12 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::any::Any;
 use std::ops::Range;
 
-use common_expression::BlockMetaInfo;
-use common_expression::BlockMetaInfoDowncast;
-use common_expression::BlockMetaInfoPtr;
+use databend_common_expression::BlockMetaInfo;
+use databend_common_expression::BlockMetaInfoDowncast;
+use databend_common_expression::BlockMetaInfoPtr;
 
 pub const BUCKET_TYPE: usize = 1;
 pub const SPILLED_TYPE: usize = 2;
@@ -30,16 +29,25 @@ pub struct AggregateSerdeMeta {
     pub location: Option<String>,
     pub data_range: Option<Range<u64>>,
     pub columns_layout: Vec<usize>,
+    // use for new agg hashtable
+    pub max_partition_count: usize,
+    pub is_empty: bool,
 }
 
 impl AggregateSerdeMeta {
-    pub fn create(bucket: isize) -> BlockMetaInfoPtr {
+    pub fn create_agg_payload(
+        bucket: isize,
+        max_partition_count: usize,
+        is_empty: bool,
+    ) -> BlockMetaInfoPtr {
         Box::new(AggregateSerdeMeta {
             typ: BUCKET_TYPE,
             bucket,
             location: None,
             data_range: None,
             columns_layout: vec![],
+            max_partition_count,
+            is_empty,
         })
     }
 
@@ -48,6 +56,7 @@ impl AggregateSerdeMeta {
         location: String,
         data_range: Range<u64>,
         columns_layout: Vec<usize>,
+        is_empty: bool,
     ) -> BlockMetaInfoPtr {
         Box::new(AggregateSerdeMeta {
             typ: SPILLED_TYPE,
@@ -55,16 +64,32 @@ impl AggregateSerdeMeta {
             columns_layout,
             location: Some(location),
             data_range: Some(data_range),
+            max_partition_count: 0,
+            is_empty,
+        })
+    }
+
+    pub fn create_agg_spilled(
+        bucket: isize,
+        location: String,
+        data_range: Range<u64>,
+        columns_layout: Vec<usize>,
+        max_partition_count: usize,
+    ) -> BlockMetaInfoPtr {
+        Box::new(AggregateSerdeMeta {
+            typ: SPILLED_TYPE,
+            bucket,
+            columns_layout,
+            location: Some(location),
+            data_range: Some(data_range),
+            max_partition_count,
+            is_empty: false,
         })
     }
 }
 
 #[typetag::serde(name = "aggregate_serde")]
 impl BlockMetaInfo for AggregateSerdeMeta {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn equals(&self, info: &Box<dyn BlockMetaInfo>) -> bool {
         AggregateSerdeMeta::downcast_ref_from(info).is_some_and(|other| self == other)
     }

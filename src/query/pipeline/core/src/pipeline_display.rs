@@ -28,14 +28,14 @@ struct PipelineIndentDisplayWrapper<'a> {
     pipeline: &'a Pipeline,
 }
 
-impl<'a> PipelineIndentDisplayWrapper<'a> {
+impl PipelineIndentDisplayWrapper<'_> {
     fn pipe_name(pipe: &Pipe) -> String {
         unsafe { pipe.items[0].processor.name() }
     }
 }
 
-impl<'a> Display for PipelineIndentDisplayWrapper<'a> {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+impl Display for PipelineIndentDisplayWrapper<'_> {
+    fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
         let pipes = &self.pipeline.pipes;
         for (index, pipe) in pipes.iter().rev().enumerate() {
             if index > 0 {
@@ -46,51 +46,14 @@ impl<'a> Display for PipelineIndentDisplayWrapper<'a> {
                 write!(f, "  ")?;
             }
 
+            let pipe_name = Self::pipe_name(pipe);
             if pipe.input_length == pipe.output_length
                 || pipe.input_length == 0
                 || pipe.output_length == 0
             {
-                write!(
-                    f,
-                    "{} × {} {}",
-                    Self::pipe_name(pipe),
-                    pipe.items.len(),
-                    if pipe.items.len() == 1 {
-                        "processor"
-                    } else {
-                        "processors"
-                    },
-                )?;
+                write!(f, "{} × {}", Self::pipe_name(pipe), pipe.items.len(),)?;
             } else {
-                let prev_name = Self::pipe_name(&pipes[pipes.len() - index - 2]);
-                if index > 0 {
-                    let post_name = Self::pipe_name(&pipes[pipes.len() - index]);
-                    write!(
-                        f,
-                        "Merge ({} × {} {}) to ({} × {})",
-                        prev_name,
-                        pipe.input_length,
-                        if pipe.input_length == 1 {
-                            "processor"
-                        } else {
-                            "processors"
-                        },
-                        post_name,
-                        pipe.output_length,
-                    )?;
-                } else {
-                    write!(
-                        f,
-                        "Merge ({} × {} {})",
-                        prev_name,
-                        pipe.input_length,
-                        if pipe.input_length == 1 {
-                            "processor"
-                        } else {
-                            "processors"
-                        },
-                    )?;
-                }
+                write!(f, "Merge to {pipe_name} × {}", pipe.output_length,)?;
             }
         }
 

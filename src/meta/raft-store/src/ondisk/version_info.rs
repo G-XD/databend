@@ -37,7 +37,7 @@ pub struct VersionInfo {
 }
 
 impl fmt::Display for VersionInfo {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "{}: {}", self.build, self.desc)
     }
 }
@@ -92,26 +92,44 @@ impl VersionInfo {
         )
     }
 
-    // TODO: enable this when V002 is merged.
-    #[allow(dead_code)]
     const fn v002() -> Self {
-        Self::new("", "2023-xx-xx", new_semver(0, 0, 0), "TODO")
+        Self::new(
+            "3694e259c8e7c227fadfac5faa881cd2f2af6bbe",
+            "2023-08-08",
+            new_semver(1, 2, 53),
+            "Persistent snapshot, in-memory state-machine",
+        )
+    }
+
+    const fn v003() -> Self {
+        Self::new(
+            "af63a77b73ecb4b331cc84cf923007e432021a1c",
+            "2024-06-27",
+            new_semver(1, 2, 547),
+            "Persistent snapshot in rotbl, rotbl backed in-memory state-machine",
+        )
+    }
+
+    const fn v004() -> Self {
+        Self::new(
+            "3d76dc68e79db72341c6006808a6e1773ab8b565",
+            "2024-11-11",
+            new_semver(1, 2, 655),
+            "WAL based raft-log",
+        )
     }
 }
 
-lazy_static::lazy_static! {
-
-    pub static ref VERSION_INFOS: BTreeMap<DataVersion, VersionInfo> = {
-
+pub static VERSION_INFOS: std::sync::LazyLock<BTreeMap<DataVersion, VersionInfo>> =
+    std::sync::LazyLock::new(|| {
         btreemap! {
             DataVersion::V0 => VersionInfo::v0(),
             DataVersion::V001 => VersionInfo::v001() ,
-            // TODO: enable this when V002 is merged.
-            // DataVersion::V002 => VersionInfo::v002() ,
+            DataVersion::V002 => VersionInfo::v002() ,
+            DataVersion::V003 => VersionInfo::v003() ,
+            DataVersion::V004 => VersionInfo::v004() ,
         }
-
-    };
-}
+    });
 
 const fn new_semver(major: u64, minor: u64, patch: u64) -> semver::Version {
     semver::Version {

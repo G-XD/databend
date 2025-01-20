@@ -20,165 +20,89 @@
 //! # Examples
 //!
 //! ```rust,ignore
-//! use common_cache::{Cache, LruCache};
+//! use databend_common_cache::{Cache, LruCache};
 //!
 //! let mut cache = LruCache::new(2);
 //!
 //! cache.put(1, 10);
 //! cache.put(2, 20);
 //! cache.put(3, 30);
-//! assert!(cache.get_mut(&1).is_none());
-//! assert_eq!(*cache.get_mut(&2).unwrap(), 20);
-//! assert_eq!(*cache.get_mut(&3).unwrap(), 30);
+//! assert!(cache.get(&1).is_none());
+//! assert_eq!(*cache.get(&2).unwrap(), 20);
+//! assert_eq!(*cache.get(&3).unwrap(), 30);
 //!
 //! cache.put(2, 22);
-//! assert_eq!(*cache.get_mut(&2).unwrap(), 22);
+//! assert_eq!(*cache.get(&2).unwrap(), 22);
 //!
 //! cache.put(6, 60);
-//! assert!(cache.get_mut(&3).is_none());
+//! assert!(cache.get(&3).is_none());
 //!
 //! cache.set_capacity(1);
-//! assert!(cache.get_mut(&2).is_none());
+//! assert!(cache.get(&2).is_none());
 //! ```
 //!
 //! The cache can also be limited by an arbitrary metric calculated from its key-value pairs, see
-//! [`LruCache::with_meter`][with_meter] for more information. If the `heapsize` feature is enabled,
-//! this crate provides one such alternate metric&mdash;`HeapSize`. Custom metrics can be written by
+//! [`LruCache::with_meter`][with_meter] for more information. Custom metrics can be written by
 //! implementing the [`Meter`][meter] trait.
 //!
 //! [with_meter]: struct.LruCache.html#method.with_meter
 //! [meter]: trait.Meter.html
 
-#[cfg(feature = "heapsize")]
-#[cfg(not(target_os = "macos"))]
-extern crate heapsize_;
-
 use std::borrow::Borrow;
 use std::fmt;
-use std::hash::BuildHasher;
 use std::hash::Hash;
 
-use hashbrown::hash_map::DefaultHashBuilder;
 use hashlink::linked_hash_map;
 use hashlink::LinkedHashMap;
 
 use crate::cache::Cache;
-use crate::meter::count_meter::Count;
-use crate::meter::count_meter::CountableMeter;
+use crate::mem_sized::MemSized;
 
 /// An LRU cache.
 #[derive(Clone)]
-pub struct LruCache<
-    K: Eq + Hash,
-    V,
-    S: BuildHasher = DefaultHashBuilder,
-    M: CountableMeter<K, V> = Count,
-> {
-    map: LinkedHashMap<K, V, S>,
-    current_measure: M::Measure,
-    max_capacity: u64,
-    meter: M,
+pub struct LruCache<K: Eq + Hash + MemSized, V: MemSized> {
+    map: LinkedHashMap<K, V>,
+    max_items: usize,
+    max_bytes: usize,
+    bytes: usize,
 }
 
-impl<K: Eq + Hash, V> LruCache<K, V> {
+impl<K: Eq + Hash + MemSized, V: MemSized> LruCache<K, V> {
     /// Creates an empty cache that can hold at most `capacity` items.
     ///
     /// # Examples
     ///
     /// ```rust,ignore
-    /// use common_cache::{Cache, LruCache};
+    /// use databend_common_cache::{Cache, LruCache};
     /// let mut cache: LruCache<i32, &str> = LruCache::new(10);
     /// ```
-    pub fn new(capacity: u64) -> Self {
+    pub fn with_items_capacity(items_capacity: usize) -> Self {
         LruCache {
             map: LinkedHashMap::new(),
-            current_measure: (),
-            max_capacity: capacity,
-            meter: Count,
+            max_items: items_capacity,
+            max_bytes: usize::MAX,
+            bytes: 0,
         }
     }
-}
 
-impl<K: Eq + Hash, V, M: CountableMeter<K, V>> LruCache<K, V, DefaultHashBuilder, M> {
-    /// Creates an empty cache that can hold at most `capacity` as measured by `meter`.
-    ///
-    /// You can implement the [`Meter`][meter] trait to allow custom metrics.
-    ///
-    /// [meter]: trait.Meter.html
-    ///
-    /// # Examples
-    ///
-    /// ```rust,ignore
-    /// use common_cache::{Cache, LruCache, Meter};
-    /// use std::borrow::Borrow;
-    ///
-    /// /// Measure Vec items by their length
-    /// struct VecLen;
-    ///
-    /// impl<K, T> Meter<K, Vec<T>> for VecLen {
-    ///     // Use `Measure = usize` or implement `CountableMeter` as well.
-    ///     type Measure = usize;
-    ///     fn measure<Q: ?Sized>(&self, _: &Q, v: &Vec<T>) -> usize
-    ///         where K: Borrow<Q>
-    ///     {
-    ///         v.len()
-    ///     }
-    /// }
-    ///
-    /// let mut cache = LruCache::with_meter(5, VecLen);
-    /// cache.put(1, vec![1, 2]);
-    /// assert_eq!(cache.size(), 2);
-    /// cache.put(2, vec![3, 4]);
-    /// cache.put(3, vec![5, 6]);
-    /// assert_eq!(cache.size(), 4);
-    /// assert_eq!(cache.len(), 2);
-    /// ```
-    pub fn with_meter(capacity: u64, meter: M) -> LruCache<K, V, DefaultHashBuilder, M> {
+    pub fn with_bytes_capacity(bytes_capacity: usize) -> Self {
         LruCache {
             map: LinkedHashMap::new(),
-            current_measure: Default::default(),
-            max_capacity: capacity,
-            meter,
+            max_items: usize::MAX,
+            max_bytes: bytes_capacity,
+            bytes: 0,
         }
     }
 }
 
-impl<K: Eq + Hash, V, S: BuildHasher> LruCache<K, V, S, Count> {
-    /// Creates an empty cache that can hold at most `capacity` items with the given hash builder.
-    pub fn with_hasher(capacity: u64, hash_builder: S) -> LruCache<K, V, S, Count> {
-        LruCache {
-            map: LinkedHashMap::with_hasher(hash_builder),
-            current_measure: (),
-            max_capacity: capacity,
-            meter: Count,
-        }
-    }
-}
-
-impl<K: Eq + Hash, V, S: BuildHasher, M: CountableMeter<K, V>> Cache<K, V, S, M>
-    for LruCache<K, V, S, M>
-{
-    /// Creates an empty cache that can hold at most `capacity` as measured by `meter` with the
-    /// given hash builder.
-    fn with_meter_and_hasher(capacity: u64, meter: M, hash_builder: S) -> Self {
-        LruCache {
-            map: LinkedHashMap::with_hasher(hash_builder),
-            current_measure: Default::default(),
-            max_capacity: capacity,
-            meter,
-        }
-    }
-
+impl<K: Eq + Hash + MemSized, V: MemSized> Cache<K, V> for LruCache<K, V> {
     /// Returns a reference to the value corresponding to the given key in the cache, if
     /// any.
     ///
-    /// Note that this method is not available for cache objects using `Meter` implementations
-    /// other than `Count`.
-    ///
     /// # Examples
     ///
     /// ```rust,ignore
-    /// use common_cache::{Cache, LruCache};
+    /// use databend_common_cache::{Cache, LruCache};
     ///
     /// let mut cache = LruCache::new(2);
     ///
@@ -191,35 +115,6 @@ impl<K: Eq + Hash, V, S: BuildHasher, M: CountableMeter<K, V>> Cache<K, V, S, M>
     /// assert_eq!(cache.get(&2), Some(&"c"));
     /// ```
     fn get<Q>(&mut self, k: &Q) -> Option<&V>
-    where
-        K: Borrow<Q>,
-        Q: Hash + Eq + ?Sized,
-    {
-        self.get_mut(k).map(|v| &*v)
-    }
-
-    /// Returns a mutable reference to the value corresponding to the given key in the cache, if
-    /// any.
-    ///
-    /// Note that this method is not available for cache objects using `Meter` implementations
-    /// other than `Count`.
-    ///
-    /// # Examples
-    ///
-    /// ```rust,ignore
-    /// use common_cache::{Cache, LruCache};
-    ///
-    /// let mut cache = LruCache::new(2);
-    ///
-    /// cache.put(1, "a");
-    /// cache.put(2, "b");
-    /// cache.put(2, "c");
-    /// cache.put(3, "d");
-    ///
-    /// assert_eq!(cache.get_mut(&1), None);
-    /// assert_eq!(cache.get_mut(&2), Some(&mut "c"));
-    /// ```
-    fn get_mut<Q>(&mut self, k: &Q) -> Option<&mut V>
     where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
@@ -240,7 +135,7 @@ impl<K: Eq + Hash, V, S: BuildHasher, M: CountableMeter<K, V>> Cache<K, V, S, M>
     /// # Example
     ///
     /// ```rust,ignore
-    /// use common_cache::{Cache, LruCache};
+    /// use databend_common_cache::{Cache, LruCache};
     /// let mut cache = LruCache::new(2);
     ///
     /// cache.put(1, "a");
@@ -249,36 +144,12 @@ impl<K: Eq + Hash, V, S: BuildHasher, M: CountableMeter<K, V>> Cache<K, V, S, M>
     /// assert_eq!(cache.peek(&1), Some(&"a"));
     /// assert_eq!(cache.peek(&2), Some(&"b"));
     /// ```
-    fn peek<'a, Q>(&'a self, k: &Q) -> Option<&'a V>
+    fn peek<Q>(&self, k: &Q) -> Option<&V>
     where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
     {
         self.map.get(k)
-    }
-
-    /// Returns a mutable reference to the value corresponding to the key in the cache or `None`
-    /// if it is not present in the cache. Unlike `get_mut`, `peek_mut` does not update the LRU
-    /// list so the key's position will be unchanged.
-    ///
-    /// # Example
-    ///
-    /// ```rust,ignore
-    /// use common_cache::{Cache, LruCache};
-    /// let mut cache = LruCache::new(2);
-    ///
-    /// cache.put(1, "a");
-    /// cache.put(2, "b");
-    ///
-    /// assert_eq!(cache.peek_mut(&1), Some(&mut "a"));
-    /// assert_eq!(cache.peek_mut(&2), Some(&mut "b"));
-    /// ```
-    fn peek_mut<'a, Q>(&'a mut self, k: &Q) -> Option<&'a mut V>
-    where
-        K: Borrow<Q>,
-        Q: Hash + Eq + ?Sized,
-    {
-        self.map.get_mut(k)
     }
 
     /// Returns the value corresponding to the least recently used item or `None` if the
@@ -288,7 +159,7 @@ impl<K: Eq + Hash, V, S: BuildHasher, M: CountableMeter<K, V>> Cache<K, V, S, M>
     /// # Example
     ///
     /// ```rust,ignore
-    /// use common_cache::{Cache, LruCache};
+    /// use databend_common_cache::{Cache, LruCache};
     /// let mut cache = LruCache::new(2);
     ///
     /// cache.put(1, "a");
@@ -300,51 +171,32 @@ impl<K: Eq + Hash, V, S: BuildHasher, M: CountableMeter<K, V>> Cache<K, V, S, M>
         self.map.front()
     }
 
-    /// Checks if the map contains the given key.
-    ///
-    /// # Examples
-    ///
-    /// ```rust,ignore
-    /// use common_cache::{Cache, LruCache};
-    ///
-    /// let mut cache = LruCache::new(1);
-    ///
-    /// cache.put(1, "a");
-    /// assert!(cache.contains(&1));
-    /// ```
-    fn contains<Q: ?Sized>(&self, key: &Q) -> bool
-    where
-        K: Borrow<Q>,
-        Q: Hash + Eq,
-    {
-        self.map.contains_key(key)
-    }
-
     /// Inserts a key-value pair into the cache. If the key already existed, the old value is
     /// returned.
     ///
     /// # Examples
     ///
     /// ```rust,ignore
-    /// use common_cache::{Cache, LruCache};
+    /// use databend_common_cache::{Cache, LruCache};
     ///
     /// let mut cache = LruCache::new(2);
     ///
     /// cache.put(1, "a");
     /// cache.put(2, "b");
-    /// assert_eq!(cache.get_mut(&1), Some(&mut "a"));
-    /// assert_eq!(cache.get_mut(&2), Some(&mut "b"));
+    /// assert_eq!(cache.get(&1), Some(&"a"));
+    /// assert_eq!(cache.get(&2), Some(&"b"));
     /// ```
-    fn put(&mut self, k: K, v: V) -> Option<V> {
-        let new_size = self.meter.measure(&k, &v);
-        self.current_measure = self.meter.add(self.current_measure, new_size);
+    fn insert(&mut self, k: K, v: V) -> Option<V> {
+        // self.bytes += k.mem_bytes();
+        self.bytes += v.mem_bytes();
+
         if let Some(old) = self.map.get(&k) {
-            self.current_measure = self
-                .meter
-                .sub(self.current_measure, self.meter.measure(&k, old));
+            // self.bytes -= k.mem_bytes();
+            self.bytes -= old.mem_bytes();
         }
+
         let old_val = self.map.insert(k, v);
-        while self.size() > self.capacity() {
+        while self.bytes > self.max_bytes || self.map.len() > self.max_items {
             self.pop_by_policy();
         }
         old_val
@@ -355,7 +207,7 @@ impl<K: Eq + Hash, V, S: BuildHasher, M: CountableMeter<K, V>> Cache<K, V, S, M>
     /// # Examples
     ///
     /// ```rust,ignore
-    /// use common_cache::{Cache, LruCache};
+    /// use databend_common_cache::{Cache, LruCache};
     ///
     /// let mut cache = LruCache::new(2);
     ///
@@ -371,10 +223,9 @@ impl<K: Eq + Hash, V, S: BuildHasher, M: CountableMeter<K, V>> Cache<K, V, S, M>
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
     {
-        self.map.remove(k).map(|v| {
-            self.current_measure = self
-                .meter
-                .sub(self.current_measure, self.meter.measure(k, &v));
+        self.map.remove_entry(k).map(|(_k, v)| {
+            // self.bytes -= k.mem_bytes();
+            self.bytes -= v.mem_bytes();
             v
         })
     }
@@ -384,7 +235,7 @@ impl<K: Eq + Hash, V, S: BuildHasher, M: CountableMeter<K, V>> Cache<K, V, S, M>
     /// # Examples
     ///
     /// ```rust,ignore
-    /// use common_cache::{Cache, LruCache};
+    /// use databend_common_cache::{Cache, LruCache};
     ///
     /// let mut cache = LruCache::new(2);
     ///
@@ -397,52 +248,30 @@ impl<K: Eq + Hash, V, S: BuildHasher, M: CountableMeter<K, V>> Cache<K, V, S, M>
     #[inline]
     fn pop_by_policy(&mut self) -> Option<(K, V)> {
         self.map.pop_front().map(|(k, v)| {
-            self.current_measure = self
-                .meter
-                .sub(self.current_measure, self.meter.measure(&k, &v));
+            // self.bytes -= k.mem_bytes();
+            self.bytes -= v.mem_bytes();
             (k, v)
         })
     }
 
-    /// Sets the size of the key-value pairs the cache can hold, as measured by the `Meter` used by
-    /// the cache.
-    ///
-    /// Removes least-recently-used key-value pairs if necessary.
+    /// Checks if the map contains the given key.
     ///
     /// # Examples
     ///
     /// ```rust,ignore
-    /// use common_cache::{Cache, LruCache};
+    /// use databend_common_cache::{Cache, LruCache};
     ///
-    /// let mut cache = LruCache::new(2);
+    /// let mut cache = LruCache::new(1);
     ///
     /// cache.put(1, "a");
-    /// cache.put(2, "b");
-    /// cache.put(3, "c");
-    ///
-    /// assert_eq!(cache.get_mut(&1), None);
-    /// assert_eq!(cache.get_mut(&2), Some(&mut "b"));
-    /// assert_eq!(cache.get_mut(&3), Some(&mut "c"));
-    ///
-    /// cache.set_capacity(3);
-    /// cache.put(1, "a");
-    /// cache.put(2, "b");
-    ///
-    /// assert_eq!(cache.get_mut(&1), Some(&mut "a"));
-    /// assert_eq!(cache.get_mut(&2), Some(&mut "b"));
-    /// assert_eq!(cache.get_mut(&3), Some(&mut "c"));
-    ///
-    /// cache.set_capacity(1);
-    ///
-    /// assert_eq!(cache.get_mut(&1), None);
-    /// assert_eq!(cache.get_mut(&2), None);
-    /// assert_eq!(cache.get_mut(&3), Some(&mut "c"));
+    /// assert!(cache.contains(&1));
     /// ```
-    fn set_capacity(&mut self, capacity: u64) {
-        while self.size() > capacity {
-            self.pop_by_policy();
-        }
-        self.max_capacity = capacity;
+    fn contains<Q>(&self, key: &Q) -> bool
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        self.map.contains_key(key)
     }
 
     /// Returns the number of key-value pairs in the cache.
@@ -450,41 +279,55 @@ impl<K: Eq + Hash, V, S: BuildHasher, M: CountableMeter<K, V>> Cache<K, V, S, M>
         self.map.len()
     }
 
-    /// Returns the size of all the key-value pairs in the cache, as measured by the `Meter` used
-    /// by the cache.
-    fn size(&self) -> u64 {
-        self.meter
-            .size(self.current_measure)
-            .unwrap_or_else(|| self.map.len() as u64)
-    }
-
-    /// Returns the maximum size of the key-value pairs the cache can hold, as measured by the
-    /// `Meter` used by the cache.
-    ///
-    /// # Examples
-    ///
-    /// ```rust,ignore
-    /// use common_cache::{Cache, LruCache};
-    /// let mut cache: LruCache<i32, &str> = LruCache::new(2);
-    /// assert_eq!(cache.capacity(), 2);
-    /// ```
-    fn capacity(&self) -> u64 {
-        self.max_capacity
-    }
-
     /// Returns `true` if the cache contains no key-value pairs.
     fn is_empty(&self) -> bool {
         self.map.is_empty()
     }
 
+    /// Returns the maximum bytes size of the key-value pairs the cache can hold.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,ignore
+    /// use databend_common_cache::{Cache, LruCache};
+    /// let mut cache: LruCache<i32, &str> = LruCache::new(2);
+    /// assert_eq!(cache.capacity(), 2);
+    /// ```
+    fn bytes_capacity(&self) -> u64 {
+        self.max_bytes as u64
+    }
+
+    fn items_capacity(&self) -> u64 {
+        self.max_items as u64
+    }
+
+    fn set_bytes_capacity(&mut self, max_bytes: usize) {
+        while self.bytes > max_bytes || self.map.len() > self.max_items {
+            self.pop_by_policy();
+        }
+        self.max_bytes = max_bytes;
+    }
+
+    fn set_items_capacity(&mut self, max_items: usize) {
+        while self.bytes > self.max_bytes || self.map.len() > max_items {
+            self.pop_by_policy();
+        }
+        self.max_items = max_items;
+    }
+
+    /// Returns the bytes size of all the key-value pairs in the cache.
+    fn bytes_size(&self) -> u64 {
+        self.bytes as u64
+    }
+
     /// Removes all key-value pairs from the cache.
     fn clear(&mut self) {
         self.map.clear();
-        self.current_measure = Default::default();
+        self.bytes = 0;
     }
 }
 
-impl<K: Eq + Hash, V, S: BuildHasher, M: CountableMeter<K, V>> LruCache<K, V, S, M> {
+impl<K: Eq + Hash + MemSized, V: MemSized> LruCache<K, V> {
     /// Returns an iterator over the cache's key-value pairs in least- to most-recently-used order.
     ///
     /// Accessing the cache through the iterator does _not_ affect the cache's LRU state.
@@ -492,7 +335,7 @@ impl<K: Eq + Hash, V, S: BuildHasher, M: CountableMeter<K, V>> LruCache<K, V, S,
     /// # Examples
     ///
     /// ```rust,ignore
-    /// use common_cache::{Cache, LruCache};
+    /// use databend_common_cache::{Cache, LruCache};
     ///
     /// let mut cache = LruCache::new(2);
     ///
@@ -517,7 +360,7 @@ impl<K: Eq + Hash, V, S: BuildHasher, M: CountableMeter<K, V>> LruCache<K, V, S,
     /// # Examples
     ///
     /// ```rust,ignore
-    /// use common_cache::{Cache, LruCache};
+    /// use databend_common_cache::{Cache, LruCache};
     ///
     /// let mut cache = LruCache::new(2);
     ///
@@ -535,35 +378,29 @@ impl<K: Eq + Hash, V, S: BuildHasher, M: CountableMeter<K, V>> LruCache<K, V, S,
     /// }
     ///
     /// assert_eq!(n, 4);
-    /// assert_eq!(cache.get_mut(&2), Some(&mut 200));
-    /// assert_eq!(cache.get_mut(&3), Some(&mut 300));
+    /// assert_eq!(cache.gett(&2), Some(&200));
+    /// assert_eq!(cache.gett(&3), Some(&300));
     /// ```
     pub fn iter_mut(&mut self) -> IterMut<'_, K, V> {
         IterMut(self.map.iter_mut())
     }
 }
 
-impl<K: Eq + Hash, V, S: BuildHasher, M: CountableMeter<K, V>> Extend<(K, V)>
-    for LruCache<K, V, S, M>
-{
+impl<K: Eq + Hash + MemSized, V: MemSized> Extend<(K, V)> for LruCache<K, V> {
     fn extend<I: IntoIterator<Item = (K, V)>>(&mut self, iter: I) {
         for (k, v) in iter {
-            self.put(k, v);
+            self.insert(k, v);
         }
     }
 }
 
-impl<K: fmt::Debug + Eq + Hash, V: fmt::Debug, S: BuildHasher, M: CountableMeter<K, V>> fmt::Debug
-    for LruCache<K, V, S, M>
-{
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl<K: fmt::Debug + Eq + Hash + MemSized, V: fmt::Debug + MemSized> fmt::Debug for LruCache<K, V> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.debug_map().entries(self.iter().rev()).finish()
     }
 }
 
-impl<K: Eq + Hash, V, S: BuildHasher, M: CountableMeter<K, V>> IntoIterator
-    for LruCache<K, V, S, M>
-{
+impl<K: Eq + Hash + MemSized, V: MemSized> IntoIterator for LruCache<K, V> {
     type Item = (K, V);
     type IntoIter = IntoIter<K, V>;
 
@@ -572,9 +409,7 @@ impl<K: Eq + Hash, V, S: BuildHasher, M: CountableMeter<K, V>> IntoIterator
     }
 }
 
-impl<'a, K: Eq + Hash, V, S: BuildHasher, M: CountableMeter<K, V>> IntoIterator
-    for &'a LruCache<K, V, S, M>
-{
+impl<'a, K: Eq + Hash + MemSized, V: MemSized> IntoIterator for &'a LruCache<K, V> {
     type Item = (&'a K, &'a V);
     type IntoIter = Iter<'a, K, V>;
     fn into_iter(self) -> Iter<'a, K, V> {
@@ -582,9 +417,7 @@ impl<'a, K: Eq + Hash, V, S: BuildHasher, M: CountableMeter<K, V>> IntoIterator
     }
 }
 
-impl<'a, K: Eq + Hash, V, S: BuildHasher, M: CountableMeter<K, V>> IntoIterator
-    for &'a mut LruCache<K, V, S, M>
-{
+impl<'a, K: Eq + Hash + MemSized, V: MemSized> IntoIterator for &'a mut LruCache<K, V> {
     type Item = (&'a K, &'a mut V);
     type IntoIter = IterMut<'a, K, V>;
     fn into_iter(self) -> IterMut<'a, K, V> {
@@ -597,7 +430,7 @@ impl<'a, K: Eq + Hash, V, S: BuildHasher, M: CountableMeter<K, V>> IntoIterator
 /// # Examples
 ///
 /// ```rust,ignore
-/// use common_cache::{Cache, LruCache};
+/// use databend_common_cache::{Cache, LruCache};
 ///
 /// let mut cache = LruCache::new(2);
 ///
@@ -668,7 +501,7 @@ impl<'a, K, V> DoubleEndedIterator for Iter<'a, K, V> {
     }
 }
 
-impl<'a, K, V> ExactSizeIterator for Iter<'a, K, V> {
+impl<K, V> ExactSizeIterator for Iter<'_, K, V> {
     fn len(&self) -> usize {
         self.0.len()
     }
@@ -696,7 +529,7 @@ impl<'a, K, V> DoubleEndedIterator for IterMut<'a, K, V> {
     }
 }
 
-impl<'a, K, V> ExactSizeIterator for IterMut<'a, K, V> {
+impl<K, V> ExactSizeIterator for IterMut<'_, K, V> {
     fn len(&self) -> usize {
         self.0.len()
     }

@@ -14,10 +14,10 @@
 
 use std::sync::Arc;
 
-use common_exception::Result;
-use common_meta_app::schema::RenameTableReq;
-use common_meta_app::schema::TableNameIdent;
-use common_sql::plans::RenameTablePlan;
+use databend_common_exception::Result;
+use databend_common_meta_app::schema::RenameTableReq;
+use databend_common_meta_app::schema::TableNameIdent;
+use databend_common_sql::plans::RenameTablePlan;
 
 use crate::interpreters::Interpreter;
 use crate::pipelines::PipelineBuildResult;
@@ -41,13 +41,17 @@ impl Interpreter for RenameTableInterpreter {
         "RenameTableInterpreter"
     }
 
+    fn is_ddl(&self) -> bool {
+        true
+    }
+
     #[async_backtrace::framed]
     async fn execute2(&self) -> Result<PipelineBuildResult> {
         // TODO check privileges
         // You must have ALTER and DROP privileges for the original table,
         // and CREATE and INSERT privileges for the new table.
         let catalog = self.ctx.get_catalog(&self.plan.catalog).await?;
-        catalog
+        let _resp = catalog
             .rename_table(RenameTableReq {
                 if_exists: self.plan.if_exists,
                 name_ident: TableNameIdent {

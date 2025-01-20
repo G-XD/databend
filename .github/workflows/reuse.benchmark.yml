@@ -23,6 +23,14 @@ on:
         description: The version of databend to run
         required: true
         type: string
+      runner_provider:
+        description: "Self-hosted runner provider, aws or gcp"
+        type: string
+        required: true
+      target:
+        description: "The target of benchmark, local or cloud or all"
+        type: string
+        required: true
 
 permissions:
   id-token: write
@@ -30,47 +38,40 @@ permissions:
   contents: read
 
 env:
-  BENCHMARK_S3_PREFIX: s3://repo.databend.rs/benchmark/clickbench
+  BUILD_PROFILE: release
+  RUNNER_PROVIDER: ${{ inputs.runner_provider }}
 
 jobs:
   local:
     timeout-minutes: 60
-    runs-on: [self-hosted, X64, Linux, 16c32g]
+    runs-on: [self-hosted, X64, Linux, 8c32g, "${{ inputs.runner_provider }}"]
     strategy:
       matrix:
         dataset:
-          - hits
-          # - tpch
+          - internal
+          # - hits
       fail-fast: true
       max-parallel: 1
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
         if: inputs.source == 'release'
-      - uses: actions/checkout@v3
+        with:
+          ref: ${{ inputs.sha }}
+      - uses: actions/checkout@v4
         if: inputs.source == 'pr'
         with:
           ref: "refs/pull/${{ inputs.source_id }}/merge"
       - uses: ./.github/actions/setup_bendsql
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
       - name: Download artifact
-        run: |
-          mkdir -p ./target/release
-          case ${{ inputs.source }} in
-            pr)
-              aws s3 sync s3://databend-ci/release/${{ inputs.sha }}/x86_64-unknown-linux-gnu/default/ \
-                target/release/ --exclude "*" --include "databend-*" --no-progress
-              ;;
-            release)
-              version=${{ inputs.source_id }}
-              target=x86_64-unknown-linux-gnu
-              aws s3 cp s3://repo.databend.rs/databend/${version}/databend-${version}-${target}.tar.gz distro/ --no-progress
-              tar x -C ./target/release -f ./distro/databend-${version}-${target}.tar.gz --strip-components 1 bin/
-              ;;
-            *)
-              echo "Unknown source: ${{ inputs.source }}"
-              exit 1
-              ;;
-          esac
-          chmod +x ./target/release/databend-*
+        uses: ./.github/actions/artifact_download
+        with:
+          sha: ${{ inputs.sha }}
+          target: x86_64-unknown-linux-gnu
+          category: udf
+          artifacts: meta,query
       - name: Setup Databend Binary
         shell: bash
         run: |
@@ -78,6 +79,7 @@ jobs:
           databend-query --version
           databend-meta --version
       - uses: ./.github/actions/benchmark_local
+        if: inputs.target == 'local' || inputs.target == 'all'
         timeout-minutes: 30
         id: benchmark
         with:
@@ -87,28 +89,67 @@ jobs:
           source: ${{ inputs.source }}
           source_id: ${{ inputs.source_id }}
 
-  cloud:
-    timeout-minutes: 90
-    runs-on: [self-hosted, X64, Linux, 4c8g]
-    strategy:
-      matrix:
-        include:
-          - { dataset: hits, size: Medium }
-          - { dataset: hits, size: XLarge }
-          - { dataset: tpch, size: Medium }
-          - { dataset: tpch, size: XLarge }
-      fail-fast: true
-      max-parallel: 1
+  load:
+    runs-on: [self-hosted, X64, Linux, 2c8g, "${{ inputs.runner_provider }}"]
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
         if: inputs.source == 'release'
-      - uses: actions/checkout@v3
+        with:
+          ref: ${{ inputs.sha }}
+      - uses: actions/checkout@v4
         if: inputs.source == 'pr'
         with:
           ref: "refs/pull/${{ inputs.source_id }}/merge"
       - uses: ./.github/actions/setup_bendsql
       - uses: ./.github/actions/benchmark_cloud
-        timeout-minutes: 60
+        if: inputs.target == 'load' || inputs.target == 'all'
+        timeout-minutes: 120
+        id: benchmark
+        with:
+          sha: ${{ inputs.sha }}
+          run_id: ${{ inputs.run_id }}
+          dataset: load
+          source: ${{ inputs.source }}
+          source_id: ${{ inputs.source_id }}
+          size: Small
+          version: ${{ inputs.version }}
+          cloud_user: ${{ secrets.BENCHMARK_CLOUD_USER }}
+          cloud_password: ${{ secrets.BENCHMARK_CLOUD_PASSWORD }}
+          cloud_gateway: ${{ secrets.BENCHMARK_CLOUD_GATEWAY }}
+      - name: clean
+        if: always()
+        continue-on-error: true
+        env:
+          BENDSQL_DSN: "databend://${{ secrets.BENCHMARK_CLOUD_USER }}:${{ secrets.BENCHMARK_CLOUD_PASSWORD }}@${{ secrets.BENCHMARK_CLOUD_GATEWAY }}:443/?warehouse=default"
+        run: |
+          echo "DROP DATABASE IF EXISTS load_test_${{ inputs.run_id }};" | bendsql
+          echo "DROP WAREHOUSE IF EXISTS 'benchmark-${{ inputs.run_id }}';" | bendsql
+
+  cloud:
+    runs-on: [self-hosted, X64, Linux, 2c8g, "${{ inputs.runner_provider }}"]
+    needs: load
+    strategy:
+      matrix:
+        include:
+          - { dataset: hits, size: Small }
+          - { dataset: hits, size: Large }
+          - { dataset: tpch, size: Small }
+          - { dataset: tpch, size: Large }
+      fail-fast: true
+      max-parallel: 1
+    steps:
+      - uses: actions/checkout@v4
+        if: inputs.source == 'release'
+        with:
+          ref: ${{ inputs.sha }}
+      - uses: actions/checkout@v4
+        if: inputs.source == 'pr'
+        with:
+          ref: "refs/pull/${{ inputs.source_id }}/merge"
+      - uses: ./.github/actions/setup_bendsql
+      - uses: ./.github/actions/benchmark_cloud
+        if: inputs.target == 'cloud' || inputs.target == 'all'
+        timeout-minutes: 20
         id: benchmark
         with:
           sha: ${{ inputs.sha }}
@@ -121,105 +162,107 @@ jobs:
           cloud_user: ${{ secrets.BENCHMARK_CLOUD_USER }}
           cloud_password: ${{ secrets.BENCHMARK_CLOUD_PASSWORD }}
           cloud_gateway: ${{ secrets.BENCHMARK_CLOUD_GATEWAY }}
+      - name: clean
+        if: always()
+        continue-on-error: true
+        env:
+          BENDSQL_DSN: "databend://${{ secrets.BENCHMARK_CLOUD_USER }}:${{ secrets.BENCHMARK_CLOUD_PASSWORD }}@${{ secrets.BENCHMARK_CLOUD_GATEWAY }}:443/?warehouse=default"
+        run: |
+          echo "DROP WAREHOUSE IF EXISTS 'benchmark-${{ inputs.run_id }}';" | bendsql
 
   comment:
-    runs-on: [self-hosted, X64, Linux, 4c8g]
     needs: [local, cloud]
     if: inputs.source == 'pr'
+    runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
       - name: Install Dependencies
         run: |
-          sudo apt update -y
-          sudo apt install -y python3-jinja2
-      - name: Configure AWS Credentials
-        uses: aws-actions/configure-aws-credentials@v2
+          sudo apt-get update -yq
+          sudo apt-get install -yq python3-jinja2
+      - uses: actions/download-artifact@v4
         with:
-          role-to-assume: ${{ secrets.REPO_ROLE_ARN }}
-          role-duration-seconds: 900
-          aws-region: us-east-2
-      - uses: actions/download-artifact@v3
-        with:
-          name: benchmark-hits
-          path: benchmark/clickbench/results/hits
-      - uses: actions/download-artifact@v3
-        with:
-          name: benchmark-tpch
-          path: benchmark/clickbench/results/tpch
+          path: benchmark/clickbench/results
+          pattern: benchmark-*
+          merge-multiple: true
       - name: Get Report Prefix
         run: |
-          echo "REPORT_S3_PREFIX=${{ env.BENCHMARK_S3_PREFIX }}/pr/${{ inputs.source_id }}/${{ inputs.run_id }}" >> $GITHUB_ENV
-      - name: Upload PR clickbench result to repo.databend.rs
+          for result in benchmark/clickbench/results/*.json; do
+            dataset=$(echo $result | sed -E 's/.*result-(\w+)-.*\.json/\1/')
+            mkdir -p benchmark/clickbench/results/${dataset}/
+            mv $result benchmark/clickbench/results/${dataset}/$(basename $result)
+          done
+          echo "REPORT_S3_PREFIX=s3://benchmark/clickbench/pr/${{ inputs.source_id }}/${{ inputs.run_id }}" >> $GITHUB_ENV
+      - name: Upload PR clickbench result to R2
+        id: result
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          AWS_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT_URL }}
         working-directory: benchmark/clickbench
         run: |
-          aws s3 sync ./results/hits/ ${REPORT_S3_PREFIX}/ --include "*.json"
-          aws s3 sync ./results/tpch/ ${REPORT_S3_PREFIX}/ --include "*.json"
-      - name: Get latest release clickbench result
-        working-directory: benchmark/clickbench
-        run: |
-          aws s3 sync "${BENCHMARK_S3_PREFIX}/release/hits/latest/" ./results/hits/
-          aws s3 sync "${BENCHMARK_S3_PREFIX}/release/tpch/latest/" ./results/tpch/
-      - name: Generate clickbench report
-        working-directory: benchmark/clickbench
-        run: |
-          ./update_results.py --dataset hits --pr ${{ inputs.source_id }}
-          ./update_results.py --dataset tpch --pr ${{ inputs.source_id }}
-      - name: Upload PR clickbench report to repo.databend.rs
-        working-directory: benchmark/clickbench
-        run: |
-          aws s3 cp ./results/hits.html ${REPORT_S3_PREFIX}/hits.html
-          aws s3 cp ./results/tpch.html ${REPORT_S3_PREFIX}/tpch.html
+          echo -e "## ClickBench Report\n" > /tmp/body
+          for p in results/*; do
+            dataset=$(basename $p)
+            aws s3 sync results/$dataset/ ${REPORT_S3_PREFIX}/ --include "*.json"
+            aws s3 sync "s3://benchmark/clickbench/release/${dataset}/latest/" ./results/${dataset}/ --exclude "*" --include "*.json"
+            ./update_results.py --dataset $dataset --pr ${{ inputs.source_id }}
+            aws s3 cp ./results/${dataset}.html ${REPORT_S3_PREFIX}/${dataset}.html
+            echo "* **${dataset}**: https://benchmark.databend.com/clickbench/pr/${{ inputs.source_id }}/${{ inputs.run_id }}/${dataset}.html" >> /tmp/body
+          done
       - name: Comment on PR
         uses: everpcpc/comment-on-pr-action@v1
         with:
-          number: ${{ inputs.source_id }}
           token: ${{ github.token }}
-          body: |
-            ![local](https://img.shields.io/static/v1?label=AWS%20EC2&message=c5.4xlarge&color=orange&logo=amazonec2) ![cloud](https://img.shields.io/static/v1?label=Databend%20Cloud&message=Medium&color=blue&logo=icloud) ![cloud](https://img.shields.io/static/v1?label=Databend%20Cloud&message=XLarge&color=blue&logo=icloud)
-            ## ClickBench Report
-            * **hits**: https://repo.databend.rs/benchmark/clickbench/pr/${{ inputs.source_id }}/${{ inputs.run_id }}/hits.html
-            * **tpch**: https://repo.databend.rs/benchmark/clickbench/pr/${{ inputs.source_id }}/${{ inputs.run_id }}/tpch.html
+          files: /tmp/body
+          number: ${{ inputs.source_id }}
 
   archive:
-    runs-on: [self-hosted, X64, Linux, 4c8g]
     needs: [local, cloud]
     if: inputs.source == 'release'
+    runs-on: ubuntu-latest
     strategy:
       matrix:
         dataset:
           - "tpch"
           - "hits"
+          - "load"
+          - "internal"
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
       - name: Install Dependencies
         run: |
-          sudo apt update -y
-          sudo apt install -y python3-jinja2
-      - name: Configure AWS Credentials
-        uses: aws-actions/configure-aws-credentials@v2
+          sudo apt-get update -yq
+          sudo apt-get install -yq python3-jinja2
+      - uses: actions/download-artifact@v4
         with:
-          role-to-assume: ${{ secrets.REPO_ROLE_ARN }}
-          role-duration-seconds: 900
-          aws-region: us-east-2
-      - uses: actions/download-artifact@v3
-        with:
-          name: benchmark-${{ matrix.dataset }}
-          path: benchmark/clickbench/results/${{ matrix.dataset }}
-      - name: Generate report
+          path: benchmark/clickbench/results
+          pattern: benchmark-${{ matrix.dataset }}-*
+          merge-multiple: true
+      - name: Generate report and upload to R2
         working-directory: benchmark/clickbench
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          AWS_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT_URL }}
         run: |
-          aws s3 sync ${{ env.BENCHMARK_S3_PREFIX }}/release/${{ matrix.dataset }}/$(date -u +%Y)/$(date -u +%m)/ ./results/${{ matrix.dataset }}/ --no-progress
+          for result in results/*.json; do
+            dataset=$(echo $result | sed -E 's/.*result-(\w+)-.*\.json/\1/')
+            mkdir -p results/${dataset}/
+            mv $result results/${dataset}/$(basename $result)
+          done
+
+          aws s3 sync s3://benchmark/clickbench/release/${{ matrix.dataset }}/$(date --date='-1 month' -u +%Y)/$(date --date='-1 month' -u +%m)/ ./results/${{ matrix.dataset }}/ --no-progress
+          aws s3 sync s3://benchmark/clickbench/release/${{ matrix.dataset }}/$(date -u +%Y)/$(date -u +%m)/ ./results/${{ matrix.dataset }}/ --no-progress
           ./update_results.py --dataset ${{ matrix.dataset }} --release ${{ inputs.source_id }}
-      - name: Upload nightly results to repo.databend.rs
-        working-directory: benchmark/clickbench/
-        run: |
-          RESULT_PREFIX="${{ env.BENCHMARK_S3_PREFIX }}/release/${{ matrix.dataset }}/$(date -u +%Y)/$(date -u +%m)/$(date -u +%Y-%m-%d)/${{ inputs.source_id }}"
-          LATEST_PREFIX="${{ env.BENCHMARK_S3_PREFIX }}/release/${{ matrix.dataset }}/latest/latest"
+
+          RESULT_PREFIX="s3://benchmark/clickbench/release/${{ matrix.dataset }}/$(date -u +%Y)/$(date -u +%m)/$(date -u +%Y-%m-%d)/${{ inputs.source_id }}"
+          LATEST_PREFIX="s3://benchmark/clickbench/release/${{ matrix.dataset }}/latest/latest"
           for file in ./results/${{ matrix.dataset }}/*.json; do
             aws s3 cp $file "${RESULT_PREFIX}-$(basename $file)"
             aws s3 cp $file "${LATEST_PREFIX}-$(basename $file)"
           done
-      - name: Upload PR clickbench report to repo.databend.rs
-        working-directory: benchmark/clickbench
-        run: |
-          aws s3 cp ./results/${{ matrix.dataset }}.html ${{ env.BENCHMARK_S3_PREFIX }}/release/${{ matrix.dataset }}.html
+
+          aws s3 cp ./results/${{ matrix.dataset }}.html s3://benchmark/clickbench/release/${{ matrix.dataset }}.html

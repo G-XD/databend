@@ -15,13 +15,13 @@
 //! This mod is the key point about compatibility.
 //! Everytime update anything in this file, update the `VER` and let the tests pass.
 
-use common_expression as ex;
-use common_expression::types::NumberDataType;
-use common_expression::TableDataType;
-use common_protos::pb;
-use common_protos::pb::data_type::Dt;
-use common_protos::pb::data_type::Dt24;
-use common_protos::pb::number::Num;
+use databend_common_expression as ex;
+use databend_common_expression::types::NumberDataType;
+use databend_common_expression::TableDataType;
+use databend_common_protos::pb;
+use databend_common_protos::pb::data_type::Dt;
+use databend_common_protos::pb::data_type::Dt24;
+use databend_common_protos::pb::number::Num;
 
 use crate::reader_check_msg;
 use crate::FromToProto;
@@ -78,8 +78,8 @@ impl FromToProto for ex::TableField {
 
         let v = ex::TableField::new_from_column_id(
             &p.name,
-            ex::TableDataType::from_pb(p.data_type.ok_or_else(|| Incompatible {
-                reason: "DataField.data_type can not be None".to_string(),
+            ex::TableDataType::from_pb(p.data_type.ok_or_else(|| {
+                Incompatible::new("DataField.data_type can not be None".to_string())
             })?)?,
             p.column_id,
         )
@@ -116,8 +116,8 @@ impl FromToProto for ex::ComputedExpr {
     fn from_pb(p: pb::ComputedExpr) -> Result<Self, Incompatible> {
         reader_check_msg(p.ver, p.min_reader_ver)?;
 
-        let computed_expr = p.computed_expr.ok_or(Incompatible {
-            reason: "Invalid ComputedExpr: .computed_expr can not be None".to_string(),
+        let computed_expr = p.computed_expr.ok_or_else(|| {
+            Incompatible::new("Invalid ComputedExpr: .computed_expr can not be None".to_string())
         })?;
 
         let x = match computed_expr {
@@ -153,9 +153,9 @@ impl FromToProto for ex::TableDataType {
         reader_check_msg(p.ver, p.min_reader_ver)?;
 
         match (&p.dt, &p.dt24) {
-            (None, None) => Err(Incompatible {
-                reason: "DataType .dt and .dt24 are both None".to_string(),
-            }),
+            (None, None) => Err(Incompatible::new(
+                "DataType .dt and .dt24 are both None".to_string(),
+            )),
             (Some(_), None) => {
                 // Convert from version 23 or lower:
                 let x = match p.dt.unwrap() {
@@ -165,8 +165,8 @@ impl FromToProto for ex::TableDataType {
                         reader_check_msg(nullable_type.ver, nullable_type.min_reader_ver)?;
 
                         let inner = Box::into_inner(nullable_type).inner;
-                        let inner = inner.ok_or_else(|| Incompatible {
-                            reason: "NullableType.inner can not be None".to_string(),
+                        let inner = inner.ok_or_else(|| {
+                            Incompatible::new("NullableType.inner can not be None".to_string())
                         })?;
                         let inner = Box::into_inner(inner);
                         ex::TableDataType::Nullable(Box::new(ex::TableDataType::from_pb(inner)?))
@@ -203,8 +203,8 @@ impl FromToProto for ex::TableDataType {
                         reader_check_msg(a.ver, a.min_reader_ver)?;
 
                         let inner = Box::into_inner(a).inner;
-                        let inner = inner.ok_or_else(|| Incompatible {
-                            reason: "Array.inner can not be None".to_string(),
+                        let inner = inner.ok_or_else(|| {
+                            Incompatible::new("Array.inner can not be None".to_string())
                         })?;
                         let inner = Box::into_inner(inner);
                         ex::TableDataType::Array(Box::new(ex::TableDataType::from_pb(inner)?))
@@ -225,12 +225,14 @@ impl FromToProto for ex::TableDataType {
                     Dt24::NullT(_) => ex::TableDataType::Null,
                     Dt24::EmptyArrayT(_) => ex::TableDataType::EmptyArray,
                     Dt24::BoolT(_) => ex::TableDataType::Boolean,
+                    Dt24::BinaryT(_) => ex::TableDataType::Binary,
                     Dt24::StringT(_) => ex::TableDataType::String,
                     Dt24::NumberT(n) => {
                         ex::TableDataType::Number(ex::types::NumberDataType::from_pb(n)?)
                     }
                     Dt24::TimestampT(_) => ex::TableDataType::Timestamp,
                     Dt24::DateT(_) => ex::TableDataType::Date,
+                    Dt24::IntervalT(_) => ex::TableDataType::Interval,
                     Dt24::NullableT(x) => ex::TableDataType::Nullable(Box::new(
                         ex::TableDataType::from_pb(Box::into_inner(x))?,
                     )),
@@ -256,6 +258,8 @@ impl FromToProto for ex::TableDataType {
                         }
                     }
                     Dt24::VariantT(_) => ex::TableDataType::Variant,
+                    Dt24::GeometryT(_) => ex::TableDataType::Geometry,
+                    Dt24::GeographyT(_) => ex::TableDataType::Geography,
                     Dt24::DecimalT(x) => {
                         ex::TableDataType::Decimal(ex::types::decimal::DecimalDataType::from_pb(x)?)
                     }
@@ -263,10 +267,9 @@ impl FromToProto for ex::TableDataType {
                 };
                 Ok(x)
             }
-            (Some(_), Some(_)) => Err(Incompatible {
-                reason: "Invalid DataType: at most only one of .dt and .dt23 can be Some"
-                    .to_string(),
-            }),
+            (Some(_), Some(_)) => Err(Incompatible::new(
+                "Invalid DataType: at most only one of .dt and .dt23 can be Some".to_string(),
+            )),
         }
     }
 
@@ -276,6 +279,7 @@ impl FromToProto for ex::TableDataType {
             TableDataType::EmptyArray => new_pb_dt24(Dt24::EmptyArrayT(pb::Empty {})),
             TableDataType::EmptyMap => new_pb_dt24(Dt24::EmptyMapT(pb::Empty {})),
             TableDataType::Boolean => new_pb_dt24(Dt24::BoolT(pb::Empty {})),
+            TableDataType::Binary => new_pb_dt24(Dt24::BinaryT(pb::Empty {})),
             TableDataType::String => new_pb_dt24(Dt24::StringT(pb::Empty {})),
             TableDataType::Number(n) => {
                 let x = n.to_pb()?;
@@ -287,6 +291,7 @@ impl FromToProto for ex::TableDataType {
             }
             TableDataType::Timestamp => new_pb_dt24(Dt24::TimestampT(pb::Empty {})),
             TableDataType::Date => new_pb_dt24(Dt24::DateT(pb::Empty {})),
+            TableDataType::Interval => new_pb_dt24(Dt24::IntervalT(pb::Empty {})),
             TableDataType::Nullable(v) => {
                 let x = v.to_pb()?;
                 new_pb_dt24(Dt24::NullableT(Box::new(x)))
@@ -320,6 +325,8 @@ impl FromToProto for ex::TableDataType {
                 new_pb_dt24(Dt24::TupleT(x))
             }
             TableDataType::Variant => new_pb_dt24(Dt24::VariantT(pb::Empty {})),
+            TableDataType::Geometry => new_pb_dt24(Dt24::GeometryT(pb::Empty {})),
+            TableDataType::Geography => new_pb_dt24(Dt24::GeographyT(pb::Empty {})),
         };
         Ok(x)
     }
@@ -335,9 +342,9 @@ impl FromToProto for ex::types::NumberDataType {
     fn from_pb(p: pb::Number) -> Result<Self, Incompatible> {
         reader_check_msg(p.ver, p.min_reader_ver)?;
 
-        let num = p.num.ok_or(Incompatible {
-            reason: "Invalid Number: .num can not be None".to_string(),
-        })?;
+        let num = p
+            .num
+            .ok_or_else(|| Incompatible::new("Invalid Number: .num can not be None".to_string()))?;
 
         let x = match num {
             Num::Uint8Type(_) => Self::UInt8,
@@ -386,8 +393,8 @@ impl FromToProto for ex::types::DecimalDataType {
     fn from_pb(p: pb::Decimal) -> Result<Self, Incompatible> {
         reader_check_msg(p.ver, p.min_reader_ver)?;
 
-        let num = p.decimal.ok_or(Incompatible {
-            reason: "Invalid Decimal: .decimal can not be None".to_string(),
+        let num = p.decimal.ok_or_else(|| {
+            Incompatible::new("Invalid Decimal: .decimal can not be None".to_string())
         })?;
 
         let x = match num {

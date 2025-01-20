@@ -1,56 +1,63 @@
 [package]
-name = "common-storages-system"
+name = "databend-common-storages-system"
 version = { workspace = true }
 authors = { workspace = true }
 license = { workspace = true }
 publish = { workspace = true }
 edition = { workspace = true }
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 [lib]
 doctest = false
-test = false
+test = true
 
 [features]
-enable-histogram-metrics = ["common-metrics/enable-histogram"]
+jemalloc = ["databend-common-base/jemalloc", "tikv-jemalloc-ctl"]
 
 [dependencies]
-common-base = { path = "../../../common/base" }
-common-catalog = { path = "../../catalog" }
-common-config = { path = "../../config" }
-common-exception = { path = "../../../common/exception" }
-common-expression = { path = "../../expression" }
-common-functions = { path = "../../functions" }
-common-meta-api = { path = "../../../meta/api" }
-common-meta-app = { path = "../../../meta/app" }
-common-metrics = { path = "../../../common/metrics" }
-common-pipeline-core = { path = "../../pipeline/core" }
-common-pipeline-sources = { path = "../../pipeline/sources" }
-common-profile = { path = "../../profile" }
-common-sql = { path = "../../sql" }
-common-storages-fuse = { path = "../fuse" }
-common-storages-result-cache = { path = "../result_cache" }
-common-storages-view = { path = "../view" }
-common-users = { path = "../../users" }
-jsonb = { workspace = true }
-storages-common-cache = { path = "../common/cache" }
-storages-common-cache-manager = { path = "../common/cache-manager" }
-
 async-backtrace = { workspace = true }
-async-trait = { version = "0.1.57", package = "async-trait-fn" }
+async-trait = { workspace = true }
 chrono = { workspace = true }
-itertools = "0.10.5"
+databend-common-ast = { workspace = true }
+databend-common-base = { workspace = true }
+databend-common-catalog = { workspace = true }
+databend-common-cloud-control = { workspace = true }
+databend-common-config = { workspace = true }
+databend-common-exception = { workspace = true }
+databend-common-expression = { workspace = true }
+databend-common-functions = { workspace = true }
+databend-common-management = { workspace = true }
+databend-common-meta-api = { workspace = true }
+databend-common-meta-app = { workspace = true }
+databend-common-meta-types = { workspace = true }
+databend-common-metrics = { workspace = true }
+databend-common-pipeline-core = { workspace = true }
+databend-common-pipeline-sources = { workspace = true }
+databend-common-sql = { workspace = true }
+databend-common-storage = { workspace = true }
+databend-common-storages-fuse = { workspace = true }
+databend-common-storages-result-cache = { workspace = true }
+databend-common-storages-stream = { workspace = true }
+databend-common-storages-view = { workspace = true }
+databend-common-users = { workspace = true }
+databend-storages-common-cache = { workspace = true }
+futures = { workspace = true }
+itertools = { workspace = true }
+jiff = { workspace = true }
+jsonb = { workspace = true }
 log = { workspace = true }
-once_cell = "1.15.0"
-parking_lot = "0.12.1"
+once_cell = { workspace = true }
+opendal = { workspace = true }
+parking_lot = { workspace = true }
+regex = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-serde_repr = "0.1.9"
-snailquote = "0.3.1"
-tikv-jemalloc-ctl = { workspace = true }
-
-typetag = "0.2.3"
-walkdir = "2.3.2"
+serde_repr = { workspace = true }
+snailquote = { workspace = true }
+tikv-jemalloc-ctl = { workspace = true, optional = true }
+typetag = { workspace = true }
 
 [build-dependencies]
-common-building = { path = "../../../common/building" }
+databend-common-building = { workspace = true }
+
+[lints]
+workspace = true

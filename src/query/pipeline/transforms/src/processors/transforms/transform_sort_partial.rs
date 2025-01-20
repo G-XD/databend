@@ -14,27 +14,38 @@
 
 use std::sync::Arc;
 
-use common_exception::Result;
-use common_expression::DataBlock;
-use common_expression::SortColumnDescription;
-use common_pipeline_core::processors::port::InputPort;
-use common_pipeline_core::processors::port::OutputPort;
-use common_pipeline_core::processors::Processor;
+use databend_common_exception::Result;
+use databend_common_expression::DataBlock;
+use databend_common_expression::LimitType;
+use databend_common_expression::SortColumnDescription;
+use databend_common_pipeline_core::processors::InputPort;
+use databend_common_pipeline_core::processors::OutputPort;
+use databend_common_pipeline_core::processors::Processor;
 
 use crate::processors::transforms::Transform;
 use crate::processors::transforms::Transformer;
 
 pub struct TransformSortPartial {
-    limit: Option<usize>,
-    sort_columns_descriptions: Vec<SortColumnDescription>,
+    limit: LimitType,
+    sort_columns_descriptions: Arc<Vec<SortColumnDescription>>,
 }
 
 impl TransformSortPartial {
+    pub fn new(
+        limit: LimitType,
+        sort_columns_descriptions: Arc<Vec<SortColumnDescription>>,
+    ) -> Self {
+        Self {
+            limit,
+            sort_columns_descriptions,
+        }
+    }
+
     pub fn try_create(
         input: Arc<InputPort>,
         output: Arc<OutputPort>,
-        limit: Option<usize>,
-        sort_columns_descriptions: Vec<SortColumnDescription>,
+        limit: LimitType,
+        sort_columns_descriptions: Arc<Vec<SortColumnDescription>>,
     ) -> Result<Box<dyn Processor>> {
         Ok(Transformer::create(input, output, TransformSortPartial {
             limit,
@@ -48,6 +59,6 @@ impl Transform for TransformSortPartial {
     const NAME: &'static str = "SortPartialTransform";
 
     fn transform(&mut self, block: DataBlock) -> Result<DataBlock> {
-        DataBlock::sort(&block, &self.sort_columns_descriptions, self.limit)
+        DataBlock::sort_with_type(&block, &self.sort_columns_descriptions, self.limit)
     }
 }

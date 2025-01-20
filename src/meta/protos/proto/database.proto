@@ -21,16 +21,27 @@ syntax = "proto3";
 package databend_proto;
 
 import "share.proto";
+import "tenant.proto";
 
-message DatabaseNameIdent {
+message ShareDbId {
+  oneof db_id {
+    ShareUsageDbId usage = 1;
+    ShareReferenceDbId reference = 2;
+  }
+}
+
+message ShareUsageDbId {
   uint64 ver = 100;
   uint64 min_reader_ver = 101;
 
-  // The user this db belongs to
-  string tenant = 1;
+  uint64 id = 1;
+}
 
-  // Database name
-  string db_name = 2;
+message ShareReferenceDbId {
+  uint64 ver = 100;
+  uint64 min_reader_ver = 101;
+
+  uint64 id = 1;
 }
 
 // DatabaseMeta is a container of all non-identity information.
@@ -59,9 +70,26 @@ message DatabaseMeta {
   // The time table dropped.
   optional string drop_on = 23;
 
+  // Indicates whether garbage collection is currently in progress for this dropped database.
+  //
+  // If it is in progress, the database should not be un-dropped, because the data may be incomplete.
+  bool gc_in_progress = 29;
+
   repeated uint64 shared_by = 24;
 
-  optional ShareNameIdent from_share = 25;
+  optional TIdent from_share = 25;
+
+  // Now the owner is stored independently in the meta. Prefix with __fd_object_owners
+  // optional Ownership owner = 26;
+  reserved 26;
+
+  // share endpoint name
+  optional string using_share_endpoint = 27;
+
+  // share db id
+  optional ShareDbId from_share_db_id = 28;
+
+  reserved 30;
 }
 
 // Save db name id list history.

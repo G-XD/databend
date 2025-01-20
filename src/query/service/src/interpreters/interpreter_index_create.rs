@@ -14,17 +14,17 @@
 
 use std::sync::Arc;
 
-use aggregating_index::get_agg_index_handler;
 use chrono::Utc;
-use common_exception::ErrorCode;
-use common_exception::Result;
-use common_license::license::Feature;
-use common_license::license_manager::get_license_manager;
-use common_meta_app::schema::CreateIndexReq;
-use common_meta_app::schema::IndexMeta;
-use common_meta_app::schema::IndexNameIdent;
-use common_meta_app::schema::IndexType;
-use common_sql::plans::CreateIndexPlan;
+use databend_common_exception::ErrorCode;
+use databend_common_exception::Result;
+use databend_common_license::license::Feature;
+use databend_common_license::license_manager::LicenseManagerSwitch;
+use databend_common_meta_app::schema::CreateIndexReq;
+use databend_common_meta_app::schema::IndexMeta;
+use databend_common_meta_app::schema::IndexNameIdent;
+use databend_common_meta_app::schema::IndexType;
+use databend_common_sql::plans::CreateIndexPlan;
+use databend_enterprise_aggregating_index::get_agg_index_handler;
 
 use crate::interpreters::Interpreter;
 use crate::pipelines::PipelineBuildResult;
@@ -48,15 +48,16 @@ impl Interpreter for CreateIndexInterpreter {
         "CreateIndexInterpreter"
     }
 
+    fn is_ddl(&self) -> bool {
+        true
+    }
+
     #[async_backtrace::framed]
     async fn execute2(&self) -> Result<PipelineBuildResult> {
         let tenant = self.ctx.get_tenant();
-        let license_manager = get_license_manager();
-        license_manager.manager.check_enterprise_enabled(
-            &self.ctx.get_settings(),
-            tenant.clone(),
-            Feature::AggregateIndex,
-        )?;
+
+        LicenseManagerSwitch::instance()
+            .check_enterprise_enabled(self.ctx.get_license_key(), Feature::AggregateIndex)?;
 
         let index_name = self.plan.index_name.clone();
         let catalog = self.ctx.get_current_catalog();
@@ -69,15 +70,17 @@ impl Interpreter for CreateIndexInterpreter {
         let catalog = self.ctx.get_catalog(&catalog).await?;
 
         let create_index_req = CreateIndexReq {
-            if_not_exists: self.plan.if_not_exists,
-            name_ident: IndexNameIdent { tenant, index_name },
+            create_option: self.plan.create_option,
+            name_ident: IndexNameIdent::new(tenant, &index_name),
             meta: IndexMeta {
                 table_id: self.plan.table_id,
                 index_type: IndexType::AGGREGATING,
                 created_on: Utc::now(),
                 dropped_on: None,
                 updated_on: None,
+                original_query: self.plan.original_query.clone(),
                 query: self.plan.query.clone(),
+                sync_creation: self.plan.sync_creation,
             },
         };
 

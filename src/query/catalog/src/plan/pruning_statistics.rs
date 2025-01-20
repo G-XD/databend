@@ -25,4 +25,21 @@ pub struct PruningStatistics {
     /// Block bloom filter pruning stats.
     pub blocks_bloom_pruning_before: usize,
     pub blocks_bloom_pruning_after: usize,
+
+    /// Block inverted index filter pruning stats.
+    pub blocks_inverted_index_pruning_before: usize,
+    pub blocks_inverted_index_pruning_after: usize,
+}
+
+impl PruningStatistics {
+    pub fn merge(&mut self, other: &Self) {
+        self.segments_range_pruning_before += other.segments_range_pruning_before;
+        self.segments_range_pruning_after += other.segments_range_pruning_after;
+        self.blocks_range_pruning_before += other.blocks_range_pruning_before;
+        self.blocks_range_pruning_after += other.blocks_range_pruning_after;
+        self.blocks_bloom_pruning_before += other.blocks_bloom_pruning_before;
+        self.blocks_bloom_pruning_after += other.blocks_bloom_pruning_after;
+        self.blocks_inverted_index_pruning_before += other.blocks_inverted_index_pruning_before;
+        self.blocks_inverted_index_pruning_after += other.blocks_inverted_index_pruning_after;
+    }
 }

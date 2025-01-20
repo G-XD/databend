@@ -12,15 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use common_expression::type_check::ALL_SIMPLE_CAST_FUNCTIONS;
-use common_expression::types::DataType;
-use common_expression::types::NumberDataType;
-use common_expression::types::ALL_INTEGER_TYPES;
-use common_expression::types::ALL_NUMERICS_TYPES;
-use common_expression::AutoCastRules;
-use common_expression::FunctionRegistry;
+use databend_common_expression::type_check::ALL_SIMPLE_CAST_FUNCTIONS;
+use databend_common_expression::types::DataType;
+use databend_common_expression::types::NumberDataType;
+use databend_common_expression::types::ALL_INTEGER_TYPES;
+use databend_common_expression::types::ALL_NUMERICS_TYPES;
+use databend_common_expression::AutoCastRules;
+use databend_common_expression::FunctionRegistry;
 
 use crate::scalars::ALL_COMP_FUNC_NAMES;
+use crate::scalars::ALL_STRING_FUNC_NAMES;
 
 pub fn register(registry: &mut FunctionRegistry) {
     registry.register_default_cast_rules(GENERAL_CAST_RULES.iter().cloned());
@@ -28,7 +29,7 @@ pub fn register(registry: &mut FunctionRegistry) {
     registry.register_default_cast_rules(CAST_FROM_VARIANT_RULES());
     registry.register_auto_try_cast_rules(CAST_FROM_VARIANT_RULES());
 
-    for func_name in ["and", "or", "not", "xor"] {
+    for func_name in ["and", "or", "not", "xor", "and_filters"] {
         for data_type in ALL_INTEGER_TYPES {
             registry.register_additional_cast_rules(func_name, [(
                 DataType::Number(*data_type),
@@ -46,11 +47,26 @@ pub fn register(registry: &mut FunctionRegistry) {
         registry.register_additional_cast_rules(func_name, GENERAL_CAST_RULES.iter().cloned());
     }
 
+    for func_name in ALL_STRING_FUNC_NAMES {
+        registry.register_additional_cast_rules(func_name, GENERAL_CAST_RULES.iter().cloned());
+        registry.register_additional_cast_rules(func_name, CAST_FROM_STRING_RULES.iter().cloned());
+        registry.register_additional_cast_rules(func_name, CAST_FROM_VARIANT_RULES());
+        registry.register_additional_cast_rules(func_name, CAST_INT_TO_UINT64.iter().cloned());
+    }
+
+    for func_name in ["slice", "get"] {
+        registry.register_additional_cast_rules(func_name, GENERAL_CAST_RULES.iter().cloned());
+        registry.register_additional_cast_rules(func_name, CAST_FROM_STRING_RULES.iter().cloned());
+        registry.register_additional_cast_rules(func_name, CAST_INT_TO_UINT64.iter().cloned());
+    }
+
     for func_name in ALL_COMP_FUNC_NAMES {
         // Disable auto cast from strings, e.g., `1 < '1'`.
         registry.register_additional_cast_rules(func_name, GENERAL_CAST_RULES.iter().cloned());
         registry.register_additional_cast_rules(func_name, CAST_FROM_VARIANT_RULES());
     }
+    // for eq function: we allow cast from string to int or float, eg: col_int = '1'
+    registry.register_additional_cast_rules("eq", CAST_FROM_STRING_RULES.iter().cloned());
 
     // Timestamp/Date --> other ints and floats
     // Now it only overload 'to_int64'
@@ -68,6 +84,7 @@ pub fn register(registry: &mut FunctionRegistry) {
 
 /// The cast rules for any situation, including comparison functions, joins, etc.
 pub const GENERAL_CAST_RULES: AutoCastRules = &[
+    (DataType::String, DataType::Binary),
     (DataType::String, DataType::Timestamp),
     (DataType::String, DataType::Date),
     (DataType::String, DataType::Boolean),
@@ -206,16 +223,10 @@ pub const GENERAL_CAST_RULES: AutoCastRules = &[
 /// used to allow `add_hours('2023-01-01 00:00:00', '1')`. But they should be disabled
 /// for comparison functions, because `1 < '1'` should be an error.
 pub const CAST_FROM_STRING_RULES: AutoCastRules = &[
-    (DataType::String, DataType::Number(NumberDataType::UInt8)),
-    (DataType::String, DataType::Number(NumberDataType::UInt16)),
-    (DataType::String, DataType::Number(NumberDataType::UInt32)),
-    (DataType::String, DataType::Number(NumberDataType::UInt64)),
-    (DataType::String, DataType::Number(NumberDataType::Int8)),
-    (DataType::String, DataType::Number(NumberDataType::Int16)),
-    (DataType::String, DataType::Number(NumberDataType::Int32)),
     (DataType::String, DataType::Number(NumberDataType::Int64)),
-    (DataType::String, DataType::Number(NumberDataType::Float32)),
+    (DataType::String, DataType::Number(NumberDataType::UInt64)),
     (DataType::String, DataType::Number(NumberDataType::Float64)),
+    (DataType::String, DataType::Number(NumberDataType::Float32)),
 ];
 
 #[allow(non_snake_case)]
@@ -335,3 +346,22 @@ pub fn CAST_FROM_VARIANT_RULES() -> impl IntoIterator<Item = (DataType, DataType
         ),
     ]
 }
+
+pub const CAST_INT_TO_UINT64: AutoCastRules = &[
+    (
+        DataType::Number(NumberDataType::Int8),
+        DataType::Number(NumberDataType::UInt64),
+    ),
+    (
+        DataType::Number(NumberDataType::Int16),
+        DataType::Number(NumberDataType::UInt64),
+    ),
+    (
+        DataType::Number(NumberDataType::Int32),
+        DataType::Number(NumberDataType::UInt64),
+    ),
+    (
+        DataType::Number(NumberDataType::Int64),
+        DataType::Number(NumberDataType::UInt64),
+    ),
+];

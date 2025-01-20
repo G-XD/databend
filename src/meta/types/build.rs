@@ -19,7 +19,7 @@ use std::path::Path;
 use std::path::PathBuf;
 
 fn main() {
-    common_building::setup();
+    databend_common_building::setup();
     build_proto();
 }
 
@@ -29,6 +29,7 @@ fn build_proto() {
 
     let proto_dir = Path::new(&manifest_dir).join("proto");
     let protos = [
+        &Path::new(&proto_dir).join(Path::new("raft.proto")),
         &Path::new(&proto_dir).join(Path::new("meta.proto")),
         &Path::new(&proto_dir).join(Path::new("request.proto")),
     ];
@@ -37,96 +38,123 @@ fn build_proto() {
         println!("cargo:rerun-if-changed={}", proto.to_str().unwrap());
     }
 
+    println!("cargo:rerun-if-changed=build.rs");
+
     let mut config = prost_build::Config::new();
     config.protoc_arg("--experimental_allow_proto3_optional");
 
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     tonic_build::configure()
+        .btree_map(["RaftLogStatus.wal_closed_chunk_sizes"])
         .file_descriptor_set_path(out_dir.join("meta_descriptor.bin"))
         .type_attribute(
             "SeqV",
-            "#[derive(Eq, serde::Serialize, serde::Deserialize)]",
+            "#[derive(Eq, serde::Serialize, serde::Deserialize, deepsize::DeepSizeOf)]",
         )
         .type_attribute(
             "TxnGetRequest",
-            "#[derive(Eq, serde::Serialize, serde::Deserialize)]",
+            "#[derive(Eq, serde::Serialize, serde::Deserialize, deepsize::DeepSizeOf)]",
         )
         .type_attribute(
             "TxnPutRequest",
-            "#[derive(Eq, serde::Serialize, serde::Deserialize)]",
+            "#[derive(Eq, serde::Serialize, serde::Deserialize, deepsize::DeepSizeOf)]",
         )
         .type_attribute(
             "TxnDeleteRequest",
-            "#[derive(Eq, serde::Serialize, serde::Deserialize)]",
+            "#[derive(Eq, serde::Serialize, serde::Deserialize, deepsize::DeepSizeOf)]",
         )
         .type_attribute(
             "TxnDeleteByPrefixRequest",
-            "#[derive(Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]",
+            "#[derive(Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize, deepsize::DeepSizeOf)]",
         )
         .type_attribute(
             "TxnCondition.ConditionResult",
-            "#[derive(serde::Serialize, serde::Deserialize, num_derive::FromPrimitive)]",
+            "#[derive(serde::Serialize, serde::Deserialize, num_derive::FromPrimitive, deepsize::DeepSizeOf)]",
         )
         .type_attribute(
             "TxnCondition.target",
-            "#[derive(Eq,serde::Serialize, serde::Deserialize)]",
+            "#[derive(Eq,serde::Serialize, serde::Deserialize, deepsize::DeepSizeOf)]",
         )
         .type_attribute(
             "TxnOp.request",
-            "#[derive(Eq,serde::Serialize, serde::Deserialize)]",
+            "#[derive(Eq,serde::Serialize, serde::Deserialize, deepsize::DeepSizeOf)]",
         )
         .type_attribute(
             "TxnCondition",
-            "#[derive(Eq, serde::Serialize, serde::Deserialize)]",
+            "#[derive(Eq, serde::Serialize, serde::Deserialize, deepsize::DeepSizeOf)]",
+        )
+        .type_attribute(
+            "ConditionalOperation",
+            "#[derive(Eq, serde::Serialize, serde::Deserialize, deepsize::DeepSizeOf)]",
+        )
+        .type_attribute(
+            "BooleanExpression",
+            "#[derive(Eq, serde::Serialize, serde::Deserialize, deepsize::DeepSizeOf)]",
+        )
+        .type_attribute(
+            "BooleanExpression.CombiningOperator",
+            "#[derive(serde::Serialize, serde::Deserialize, deepsize::DeepSizeOf)]",
         )
         .type_attribute(
             "TxnOp",
-            "#[derive(Eq, serde::Serialize, serde::Deserialize)]",
+            "#[derive(Eq, serde::Serialize, serde::Deserialize, deepsize::DeepSizeOf)]",
         )
         .type_attribute(
             "TxnRequest",
-            "#[derive(Eq, serde::Serialize, serde::Deserialize)]",
+            "#[derive(Eq, serde::Serialize, serde::Deserialize, deepsize::DeepSizeOf)]",
         )
         .type_attribute(
             "TxnGetResponse",
-            "#[derive(Eq, serde::Serialize, serde::Deserialize)]",
+            "#[derive(Eq, serde::Serialize, serde::Deserialize, deepsize::DeepSizeOf)]",
         )
         .type_attribute(
             "TxnPutResponse",
-            "#[derive(Eq, serde::Serialize, serde::Deserialize)]",
+            "#[derive(Eq, serde::Serialize, serde::Deserialize, deepsize::DeepSizeOf)]",
         )
         .type_attribute(
             "TxnDeleteResponse",
-            "#[derive(Eq, serde::Serialize, serde::Deserialize)]",
+            "#[derive(Eq, serde::Serialize, serde::Deserialize, deepsize::DeepSizeOf)]",
         )
         .type_attribute(
             "TxnDeleteByPrefixResponse",
-            "#[derive(Eq, serde::Serialize, serde::Deserialize)]",
+            "#[derive(Eq, serde::Serialize, serde::Deserialize, deepsize::DeepSizeOf)]",
         )
         .type_attribute(
             "TxnOpResponse.response",
-            "#[derive(Eq, serde::Serialize, serde::Deserialize)]",
+            "#[derive(Eq, serde::Serialize, serde::Deserialize, derive_more::TryInto, deepsize::DeepSizeOf)]",
         )
         .type_attribute(
             "TxnOpResponse",
-            "#[derive(Eq, serde::Serialize, serde::Deserialize)]",
+            "#[derive(Eq, serde::Serialize, serde::Deserialize, deepsize::DeepSizeOf)]",
         )
         .type_attribute(
             "TxnReply",
-            "#[derive(Eq, serde::Serialize, serde::Deserialize)]",
+            "#[derive(Eq, serde::Serialize, serde::Deserialize, deepsize::DeepSizeOf)]",
         )
         .type_attribute(
             "WatchRequest",
-            "#[derive(Eq, serde::Serialize, serde::Deserialize)]",
+            "#[derive(Eq, deepsize::DeepSizeOf)]",
         )
         .type_attribute(
             "WatchResponse",
-            "#[derive(Eq, serde::Serialize, serde::Deserialize)]",
+            "#[derive(Eq, deepsize::DeepSizeOf)]",
         )
         .type_attribute(
             "Event",
-            "#[derive(Eq, serde::Serialize, serde::Deserialize)]",
+            "#[derive(Eq, deepsize::DeepSizeOf)]",
         )
-        .compile_with_config(config, &protos, &[&proto_dir])
+        .type_attribute(
+            "KVMeta",
+            "#[derive(Eq, serde::Serialize, serde::Deserialize, deepsize::DeepSizeOf)]",
+        )
+        .field_attribute(
+            "TxnPutRequest.ttl_ms",
+            r#"#[serde(skip_serializing_if = "Option::is_none")]"#,
+        )
+        .field_attribute(
+            "TxnRequest.operations",
+            r#"#[serde(skip_serializing_if = "Vec::is_empty")] #[serde(default)]"#,
+        )
+        .compile_protos_with_config(config, &protos, &[&proto_dir])
         .unwrap();
 }

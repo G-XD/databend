@@ -14,9 +14,10 @@
 
 use std::sync::Arc;
 
-use common_catalog::table_context::TableContext;
-use common_exception::ErrorCode;
-use common_exception::Result;
+use databend_common_catalog::table_context::TableContext;
+use databend_common_exception::ErrorCode;
+use databend_common_exception::Result;
+use databend_common_expression::types::DataType;
 
 use crate::optimizer::ColumnSet;
 use crate::optimizer::Distribution;
@@ -26,6 +27,7 @@ use crate::optimizer::RelationalProperty;
 use crate::optimizer::RequiredProperty;
 use crate::optimizer::StatInfo;
 use crate::optimizer::Statistics;
+use crate::plans::sort::SortItem;
 use crate::plans::Operator;
 use crate::plans::RelOp;
 use crate::plans::ScalarItem;
@@ -41,6 +43,18 @@ pub enum AggregateMode {
     Initial,
 }
 
+/// Information for `GROUPING SETS`.
+/// See the comment of [`crate::planner::binder::aggregate::GroupingSetsInfo`].
+#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct GroupingSets {
+    /// The index of the virtual column `_grouping_id`. It's valid only if `grouping_sets` is not empty.
+    pub grouping_id_index: IndexType,
+    /// See the comment in `GroupingSetsInfo`.
+    pub sets: Vec<Vec<IndexType>>,
+    /// See the comment in `GroupingSetsInfo`.
+    pub dup_group_items: Vec<(IndexType, DataType)>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Aggregate {
     pub mode: AggregateMode,
@@ -50,11 +64,22 @@ pub struct Aggregate {
     pub aggregate_functions: Vec<ScalarItem>,
     // True if the plan is generated from distinct, else the plan is a normal aggregate;
     pub from_distinct: bool,
-    pub limit: Option<usize>,
-    /// The index of the virtual column `_grouping_id`. It's valid only if `grouping_sets` is not empty.
-    pub grouping_id_index: IndexType,
-    /// The grouping sets, each grouping set is a list of `group_items` indices.
-    pub grouping_sets: Vec<Vec<IndexType>>,
+    pub rank_limit: Option<(Vec<SortItem>, usize)>,
+
+    pub grouping_sets: Option<GroupingSets>,
+}
+
+impl Default for Aggregate {
+    fn default() -> Self {
+        Self {
+            mode: AggregateMode::Initial,
+            group_items: vec![],
+            aggregate_functions: vec![],
+            from_distinct: false,
+            rank_limit: None,
+            grouping_sets: None,
+        }
+    }
 }
 
 impl Aggregate {
@@ -79,6 +104,59 @@ impl Aggregate {
         }
         Ok(col_set)
     }
+
+    pub fn derive_agg_stats(&self, stat_info: Arc<StatInfo>) -> Result<Arc<StatInfo>> {
+        let (cardinality, mut statistics) = (stat_info.cardinality, stat_info.statistics.clone());
+        let cardinality = if self.group_items.is_empty() {
+            // Scalar aggregation
+            1.0
+        } else if self
+            .group_items
+            .iter()
+            .any(|item| !statistics.column_stats.contains_key(&item.index))
+        {
+            cardinality
+        } else {
+            // A upper bound
+            let res = self.group_items.iter().fold(1.0, |acc, item| {
+                let item_stat = statistics.column_stats.get(&item.index).unwrap();
+                acc * item_stat.ndv
+            });
+            for item in self.group_items.iter() {
+                let item_stat = statistics.column_stats.get_mut(&item.index).unwrap();
+                if let Some(histogram) = &mut item_stat.histogram {
+                    let mut num_values = 0.0;
+                    let mut num_distinct = 0.0;
+                    for bucket in histogram.buckets.iter() {
+                        num_distinct += bucket.num_distinct();
+                        num_values += bucket.num_values();
+                    }
+                    // When there is a high probability that eager aggregation
+                    // is better, we will update the histogram.
+                    if num_values / num_distinct >= 10.0 {
+                        for bucket in histogram.buckets.iter_mut() {
+                            bucket.aggregate_values();
+                        }
+                    }
+                }
+            }
+            // To avoid res is very large
+            f64::min(res, cardinality)
+        };
+
+        let precise_cardinality = if self.group_items.is_empty() {
+            Some(1)
+        } else {
+            None
+        };
+        Ok(Arc::new(StatInfo {
+            cardinality,
+            statistics: Statistics {
+                precise_cardinality,
+                column_stats: statistics.column_stats,
+            },
+        }))
+    }
 }
 
 impl Operator for Aggregate {
@@ -87,7 +165,41 @@ impl Operator for Aggregate {
     }
 
     fn derive_physical_prop(&self, rel_expr: &RelExpr) -> Result<PhysicalProperty> {
-        rel_expr.derive_physical_prop_child(0)
+        let input_physical_prop = rel_expr.derive_physical_prop_child(0)?;
+
+        if input_physical_prop.distribution == Distribution::Serial {
+            return Ok(input_physical_prop);
+        }
+
+        match self.mode {
+            AggregateMode::Partial => {
+                // TODO(leiysky): in current implementation we are using the `_group_by_key` produced
+                // by partial aggregation as the distribution key, which is not exactly the same with
+                // `Hash(group_items)`. Because of this we cannot leverage the distribution key to
+                // satisfy the required hash distribution from parent node. We should fix this in the future.
+                Ok(PhysicalProperty {
+                    distribution: Distribution::Random,
+                })
+            }
+
+            AggregateMode::Final => {
+                if self.group_items.is_empty() {
+                    // Scalar aggregation
+                    Ok(PhysicalProperty {
+                        distribution: Distribution::Serial,
+                    })
+                } else {
+                    // The distribution should have been derived by partial aggregation
+                    Ok(PhysicalProperty {
+                        distribution: input_physical_prop.distribution,
+                    })
+                }
+            }
+
+            AggregateMode::Initial => Err(ErrorCode::Internal(
+                "Cannot derive physical property for initial aggregate".to_string(),
+            ))?,
+        }
     }
 
     fn compute_required_prop_child(
@@ -173,60 +285,89 @@ impl Operator for Aggregate {
             output_columns,
             outer_columns,
             used_columns,
+            orderings: vec![],
+            partition_orderings: None,
         }))
     }
 
-    fn derive_cardinality(&self, rel_expr: &RelExpr) -> Result<Arc<StatInfo>> {
+    fn derive_stats(&self, rel_expr: &RelExpr) -> Result<Arc<StatInfo>> {
+        if self.mode == AggregateMode::Final {
+            return rel_expr.derive_cardinality_child(0);
+        }
         let stat_info = rel_expr.derive_cardinality_child(0)?;
-        let (cardinality, mut statistics) = (stat_info.cardinality, stat_info.statistics.clone());
-        let cardinality = if self.group_items.is_empty() {
-            // Scalar aggregation
-            1.0
-        } else if self
-            .group_items
-            .iter()
-            .any(|item| statistics.column_stats.get(&item.index).is_none())
-        {
-            cardinality
-        } else {
-            // A upper bound
-            let res = self.group_items.iter().fold(1.0, |acc, item| {
-                let item_stat = statistics.column_stats.get(&item.index).unwrap();
-                acc * item_stat.ndv
-            });
-            for item in self.group_items.iter() {
-                let item_stat = statistics.column_stats.get_mut(&item.index).unwrap();
-                if let Some(histogram) = &mut item_stat.histogram {
-                    let mut num_values = 0.0;
-                    let mut num_distinct = 0.0;
-                    for bucket in histogram.buckets.iter() {
-                        num_distinct += bucket.num_distinct();
-                        num_values += bucket.num_values();
-                    }
-                    // When there is a high probability that eager aggregation
-                    // is better, we will update the histogram.
-                    if num_values / num_distinct >= 10.0 {
-                        for bucket in histogram.buckets.iter_mut() {
-                            bucket.aggregate_values();
+        self.derive_agg_stats(stat_info)
+    }
+
+    fn compute_required_prop_children(
+        &self,
+        ctx: Arc<dyn TableContext>,
+        _rel_expr: &RelExpr,
+        _required: &RequiredProperty,
+    ) -> Result<Vec<Vec<RequiredProperty>>> {
+        let mut children_required = vec![];
+
+        match self.mode {
+            AggregateMode::Partial => {
+                if self.group_items.is_empty() {
+                    // Scalar aggregation
+                    children_required.push(vec![RequiredProperty {
+                        distribution: Distribution::Any,
+                    }]);
+
+                    children_required.push(vec![RequiredProperty {
+                        distribution: Distribution::Serial,
+                    }]);
+                } else {
+                    let settings = ctx.get_settings();
+
+                    // Group aggregation, enforce `Hash` distribution
+                    match settings.get_group_by_shuffle_mode()?.as_str() {
+                        "before_partial" => {
+                            children_required.push(vec![RequiredProperty {
+                                distribution: Distribution::Hash(
+                                    self.group_items
+                                        .iter()
+                                        .map(|item| item.scalar.clone())
+                                        .collect(),
+                                ),
+                            }]);
+                        }
+                        "before_merge" => {
+                            children_required.push(vec![RequiredProperty {
+                                distribution: Distribution::Hash(vec![self.group_items[0]
+                                    .scalar
+                                    .clone()]),
+                            }]);
+                        }
+                        value => {
+                            return Err(ErrorCode::Internal(format!(
+                                "Bad settings value group_by_shuffle_mode = {:?}",
+                                value
+                            )));
                         }
                     }
                 }
             }
-            // To avoid res is very large
-            f64::min(res, cardinality)
-        };
 
-        let precise_cardinality = if self.group_items.is_empty() {
-            Some(1)
-        } else {
-            None
-        };
-        Ok(Arc::new(StatInfo {
-            cardinality,
-            statistics: Statistics {
-                precise_cardinality,
-                column_stats: statistics.column_stats,
-            },
-        }))
+            AggregateMode::Final => {
+                if self.group_items.is_empty() {
+                    // Scalar aggregation
+                    children_required.push(vec![RequiredProperty {
+                        distribution: Distribution::Serial,
+                    }]);
+                } else {
+                    // The distribution should have been derived by partial aggregation
+                    children_required.push(vec![RequiredProperty {
+                        distribution: Distribution::Any,
+                    }]);
+                }
+            }
+
+            AggregateMode::Initial => Err(ErrorCode::Internal(
+                "Cannot compute required property for initial aggregate".to_string(),
+            ))?,
+        }
+
+        Ok(children_required)
     }
 }

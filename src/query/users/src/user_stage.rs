@@ -12,10 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use common_exception::ErrorCode;
-use common_exception::Result;
-use common_meta_app::principal::StageInfo;
-use common_meta_types::MatchSeq;
+use databend_common_exception::ErrorCode;
+use databend_common_exception::Result;
+use databend_common_meta_app::principal::StageInfo;
+use databend_common_meta_app::schema::CreateOption;
+use databend_common_meta_app::tenant::Tenant;
 
 use crate::UserApiProvider;
 
@@ -25,36 +26,39 @@ impl UserApiProvider {
     #[async_backtrace::framed]
     pub async fn add_stage(
         &self,
-        tenant: &str,
+        tenant: &Tenant,
         info: StageInfo,
-        if_not_exists: bool,
-    ) -> Result<u64> {
-        let stage_api_provider = self.get_stage_api_client(tenant)?;
-        let add_stage = stage_api_provider.add_stage(info);
-        match add_stage.await {
-            Ok(res) => Ok(res),
-            Err(e) => {
-                if if_not_exists && e.code() == ErrorCode::STAGE_ALREADY_EXISTS {
-                    Ok(u64::MIN)
+        create_option: &CreateOption,
+    ) -> Result<()> {
+        let stage_api_provider = self.stage_api(tenant);
+        stage_api_provider.add_stage(info, create_option).await
+    }
+
+    // Get one stage from by tenant.
+    #[async_backtrace::framed]
+    pub async fn get_stage(&self, tenant: &Tenant, stage_name: &str) -> Result<StageInfo> {
+        let stage_api_provider = self.stage_api(tenant);
+        stage_api_provider.get_stage(stage_name).await
+    }
+
+    #[async_backtrace::framed]
+    pub async fn exists_stage(&self, tenant: &Tenant, stage_name: &str) -> Result<bool> {
+        match self.get_stage(tenant, stage_name).await {
+            Ok(_) => Ok(true),
+            Err(err) => {
+                if err.code() == ErrorCode::UNKNOWN_STAGE {
+                    Ok(false)
                 } else {
-                    Err(e)
+                    Err(err)
                 }
             }
         }
     }
 
-    // Get one stage from by tenant.
-    #[async_backtrace::framed]
-    pub async fn get_stage(&self, tenant: &str, stage_name: &str) -> Result<StageInfo> {
-        let stage_api_provider = self.get_stage_api_client(tenant)?;
-        let get_stage = stage_api_provider.get_stage(stage_name, MatchSeq::GE(0));
-        Ok(get_stage.await?.data)
-    }
-
     // Get the tenant all stage list.
     #[async_backtrace::framed]
-    pub async fn get_stages(&self, tenant: &str) -> Result<Vec<StageInfo>> {
-        let stage_api_provider = self.get_stage_api_client(tenant)?;
+    pub async fn get_stages(&self, tenant: &Tenant) -> Result<Vec<StageInfo>> {
+        let stage_api_provider = self.stage_api(tenant);
         let get_stages = stage_api_provider.get_stages();
 
         match get_stages.await {
@@ -65,8 +69,8 @@ impl UserApiProvider {
 
     // Drop a stage by name.
     #[async_backtrace::framed]
-    pub async fn drop_stage(&self, tenant: &str, name: &str, if_exists: bool) -> Result<()> {
-        let stage_api_provider = self.get_stage_api_client(tenant)?;
+    pub async fn drop_stage(&self, tenant: &Tenant, name: &str, if_exists: bool) -> Result<()> {
+        let stage_api_provider = self.stage_api(tenant);
         let drop_stage = stage_api_provider.drop_stage(name);
         match drop_stage.await {
             Ok(res) => Ok(res),

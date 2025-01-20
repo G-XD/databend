@@ -16,11 +16,17 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use common_catalog::table::ColumnStatistics;
-use common_catalog::table::TableStatistics;
-use common_catalog::table_context::TableContext;
-use common_exception::Result;
-use common_expression::TableSchemaRef;
+use databend_common_ast::ast::SampleConfig;
+use databend_common_catalog::plan::InvertedIndexInfo;
+use databend_common_catalog::statistics::BasicColumnStatistics;
+use databend_common_catalog::table::TableStatistics;
+use databend_common_catalog::table_context::TableContext;
+use databend_common_exception::ErrorCode;
+use databend_common_exception::Result;
+use databend_common_expression::TableSchemaRef;
+use databend_common_storage::Histogram;
+use databend_common_storage::DEFAULT_HISTOGRAM_BUCKETS;
+use databend_storages_common_table_meta::table::ChangeType;
 use itertools::Itertools;
 
 use super::ScalarItem;
@@ -28,7 +34,6 @@ use crate::optimizer::histogram_from_ndv;
 use crate::optimizer::ColumnSet;
 use crate::optimizer::ColumnStat;
 use crate::optimizer::ColumnStatSet;
-use crate::optimizer::Datum;
 use crate::optimizer::Distribution;
 use crate::optimizer::PhysicalProperty;
 use crate::optimizer::RelExpr;
@@ -37,7 +42,6 @@ use crate::optimizer::RequiredProperty;
 use crate::optimizer::SelectivityEstimator;
 use crate::optimizer::StatInfo;
 use crate::optimizer::Statistics as OpStatistics;
-use crate::optimizer::DEFAULT_HISTOGRAM_BUCKETS;
 use crate::optimizer::MAX_SELECTIVITY;
 use crate::plans::Operator;
 use crate::plans::RelOp;
@@ -62,6 +66,7 @@ pub struct AggIndexInfo {
     pub selection: Vec<ScalarItem>,
     pub predicates: Vec<ScalarExpr>,
     pub is_agg: bool,
+    pub num_agg_funcs: usize,
 }
 
 impl AggIndexInfo {
@@ -80,9 +85,10 @@ impl AggIndexInfo {
 #[derive(Clone, Debug, Default)]
 pub struct Statistics {
     // statistics will be ignored in comparison and hashing
-    pub statistics: Option<TableStatistics>,
+    pub table_stats: Option<TableStatistics>,
     // statistics will be ignored in comparison and hashing
-    pub col_stats: HashMap<IndexType, Option<ColumnStatistics>>,
+    pub column_stats: HashMap<IndexType, Option<BasicColumnStatistics>>,
+    pub histograms: HashMap<IndexType, Option<Histogram>>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -94,18 +100,34 @@ pub struct Scan {
     pub order_by: Option<Vec<SortItem>>,
     pub prewhere: Option<Prewhere>,
     pub agg_index: Option<AggIndexInfo>,
+    pub change_type: Option<ChangeType>,
+    // Whether to update stream columns.
+    pub update_stream_columns: bool,
+    pub inverted_index: Option<InvertedIndexInfo>,
+    // Lazy row fetch.
+    pub is_lazy_table: bool,
+    pub sample: Option<SampleConfig>,
+    pub scan_id: usize,
 
-    pub statistics: Statistics,
+    pub statistics: Arc<Statistics>,
 }
 
 impl Scan {
     pub fn prune_columns(&self, columns: ColumnSet, prewhere: Option<Prewhere>) -> Self {
-        let col_stats = self
+        let column_stats = self
             .statistics
-            .col_stats
+            .column_stats
             .iter()
             .filter(|(col, _)| columns.contains(*col))
             .map(|(col, stat)| (*col, stat.clone()))
+            .collect();
+
+        let histograms = self
+            .statistics
+            .histograms
+            .iter()
+            .filter(|(col, _)| columns.contains(*col))
+            .map(|(col, hist)| (*col, hist.clone()))
             .collect();
 
         Scan {
@@ -114,13 +136,24 @@ impl Scan {
             push_down_predicates: self.push_down_predicates.clone(),
             limit: self.limit,
             order_by: self.order_by.clone(),
-            statistics: Statistics {
-                statistics: self.statistics.statistics,
-                col_stats,
-            },
+            statistics: Arc::new(Statistics {
+                table_stats: self.statistics.table_stats,
+                column_stats,
+                histograms,
+            }),
             prewhere,
             agg_index: self.agg_index.clone(),
+            change_type: self.change_type.clone(),
+            update_stream_columns: self.update_stream_columns,
+            inverted_index: self.inverted_index.clone(),
+            is_lazy_table: self.is_lazy_table,
+            sample: self.sample.clone(),
+            scan_id: self.scan_id,
         }
+    }
+
+    pub fn set_update_stream_columns(&mut self, update_stream_columns: bool) {
+        self.update_stream_columns = update_stream_columns;
     }
 
     fn used_columns(&self) -> ColumnSet {
@@ -164,11 +197,17 @@ impl Operator for Scan {
         RelOp::Scan
     }
 
+    fn arity(&self) -> usize {
+        0
+    }
+
     fn derive_relational_prop(&self, _rel_expr: &RelExpr) -> Result<Arc<RelationalProperty>> {
         Ok(Arc::new(RelationalProperty {
             output_columns: self.columns.clone(),
             outer_columns: Default::default(),
             used_columns: self.used_columns(),
+            orderings: vec![],
+            partition_orderings: None,
         }))
     }
 
@@ -178,50 +217,60 @@ impl Operator for Scan {
         })
     }
 
-    fn derive_cardinality(&self, _rel_expr: &RelExpr) -> Result<Arc<StatInfo>> {
+    fn derive_stats(&self, _rel_expr: &RelExpr) -> Result<Arc<StatInfo>> {
         let used_columns = self.used_columns();
 
         let num_rows = self
             .statistics
-            .statistics
+            .table_stats
             .as_ref()
             .map(|s| s.num_rows.unwrap_or(0))
             .unwrap_or(0);
 
         let mut column_stats: ColumnStatSet = Default::default();
-        for (k, v) in &self.statistics.col_stats {
+        for (k, v) in &self.statistics.column_stats {
             // No need to cal histogram for unused columns
             if !used_columns.contains(k) {
                 continue;
             }
-            if let Some(col_stat) = v {
-                let min = col_stat.min.clone();
-                let max = col_stat.max.clone();
-                let min_datum = Datum::from_scalar(&min);
-                let max_datum = Datum::from_scalar(&max);
-                if let (Some(min), Some(max)) = (min_datum, max_datum) {
-                    let histogram = histogram_from_ndv(
-                        col_stat.number_of_distinct_values,
-                        num_rows,
-                        Some((min.clone(), max.clone())),
-                        DEFAULT_HISTOGRAM_BUCKETS,
-                    )
-                    .ok();
-                    let column_stat = ColumnStat {
-                        min,
-                        max,
-                        ndv: col_stat.number_of_distinct_values as f64,
-                        null_count: col_stat.null_count,
-                        histogram,
-                    };
-                    column_stats.insert(*k as IndexType, column_stat);
-                }
+            if let Some(col_stat) = v.clone() {
+                // Safe to unwrap: min, max and ndv are all `Some(_)`.
+                let min = col_stat.min.unwrap();
+                let max = col_stat.max.unwrap();
+                let ndv = col_stat.ndv.unwrap();
+                let histogram = if let Some(histogram) = self.statistics.histograms.get(k)
+                    && histogram.is_some()
+                {
+                    histogram.clone()
+                } else {
+                    let num_rows = num_rows.saturating_sub(col_stat.null_count);
+                    let ndv = std::cmp::min(num_rows, ndv);
+                    if num_rows != 0 {
+                        histogram_from_ndv(
+                            ndv,
+                            num_rows,
+                            Some((min.clone(), max.clone())),
+                            DEFAULT_HISTOGRAM_BUCKETS,
+                        )
+                        .ok()
+                    } else {
+                        None
+                    }
+                };
+                let column_stat = ColumnStat {
+                    min,
+                    max,
+                    ndv: ndv as f64,
+                    null_count: col_stat.null_count,
+                    histogram,
+                };
+                column_stats.insert(*k as IndexType, column_stat);
             }
         }
 
         let precise_cardinality = self
             .statistics
-            .statistics
+            .table_stats
             .as_ref()
             .and_then(|stat| stat.num_rows);
 
@@ -232,7 +281,11 @@ impl Operator for Scan {
                     column_stats,
                 };
                 // Derive cardinality
-                let mut sb = SelectivityEstimator::new(&mut statistics, HashSet::new());
+                let mut sb = SelectivityEstimator::new(
+                    &mut statistics,
+                    precise_cardinality as f64,
+                    HashSet::new(),
+                );
                 let mut selectivity = MAX_SELECTIVITY;
                 for pred in prewhere.predicates.iter() {
                     // Compute selectivity for each conjunction
@@ -248,7 +301,7 @@ impl Operator for Scan {
         };
 
         // If prewhere is not none, we can't get precise cardinality
-        let precise_cardinality = if self.prewhere.is_none() {
+        let precise_cardinality = if self.prewhere.is_none() && self.sample.is_none() {
             precise_cardinality
         } else {
             None
@@ -270,6 +323,8 @@ impl Operator for Scan {
         _child_index: usize,
         _required: &RequiredProperty,
     ) -> Result<RequiredProperty> {
-        unreachable!()
+        Err(ErrorCode::Internal(
+            "Cannot compute required property for children of scan".to_string(),
+        ))
     }
 }

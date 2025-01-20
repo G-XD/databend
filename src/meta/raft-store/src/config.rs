@@ -13,27 +13,26 @@
 // limitations under the License.
 
 use std::net::Ipv4Addr;
+use std::path::Path;
+use std::sync::LazyLock;
 
-use common_exception::Result;
-use common_grpc::DNSResolver;
-use common_meta_types::Endpoint;
-use common_meta_types::MetaStartupError;
-use common_meta_types::NodeId;
-use once_cell::sync::Lazy;
+use databend_common_exception::Result;
+use databend_common_grpc::DNSResolver;
+use databend_common_meta_types::raft_types::NodeId;
+use databend_common_meta_types::Endpoint;
+use databend_common_meta_types::MetaStartupError;
 
-pub static DATABEND_COMMIT_VERSION: Lazy<String> = Lazy::new(|| {
+use crate::ondisk::DATA_VERSION;
+use crate::raft_log_v004;
+
+pub static DATABEND_COMMIT_VERSION: LazyLock<String> = LazyLock::new(|| {
     let build_semver = option_env!("VERGEN_BUILD_SEMVER");
     let git_sha = option_env!("VERGEN_GIT_SHA");
     let rustc_semver = option_env!("VERGEN_RUSTC_SEMVER");
     let timestamp = option_env!("VERGEN_BUILD_TIMESTAMP");
 
     match (build_semver, git_sha, rustc_semver, timestamp) {
-        #[cfg(not(feature = "simd"))]
         (Some(v1), Some(v2), Some(v3), Some(v4)) => format!("{}-{}({}-{})", v1, v2, v3, v4),
-        #[cfg(feature = "simd")]
-        (Some(v1), Some(v2), Some(v3), Some(v4)) => {
-            format!("{}-{}-simd({}-{})", v1, v2, v3, v4)
-        }
         _ => String::new(),
     }
 });
@@ -56,7 +55,7 @@ pub struct RaftConfig {
     pub raft_advertise_host: String,
 
     /// The listening port for metadata communication.
-    pub raft_api_port: u32,
+    pub raft_api_port: u16,
 
     /// The dir to store persisted meta state, including raft logs, state machine etc.
     pub raft_dir: String,
@@ -65,6 +64,18 @@ pub struct RaftConfig {
     /// No-sync brings risks of data loss during a crash.
     /// You should only use this in a testing environment, unless YOU KNOW WHAT YOU ARE DOING.
     pub no_sync: bool,
+
+    /// The maximum number of log entries for log entries cache.
+    pub log_cache_max_items: u64,
+
+    /// The maximum memory in bytes for the log entries cache.
+    pub log_cache_capacity: u64,
+
+    /// Maximum number of records in a chunk of raft-log WAL.
+    pub log_wal_chunk_max_records: u64,
+
+    /// Maximum size in bytes for a chunk of raft-log WAL.
+    pub log_wal_chunk_max_size: u64,
 
     /// The number of logs since the last snapshot to trigger next snapshot.
     pub snapshot_logs_since_last: u64,
@@ -78,6 +89,26 @@ pub struct RaftConfig {
 
     /// The maximum number of applied logs to keep before purging
     pub max_applied_log_to_keep: u64,
+
+    /// The size of chunk for transmitting snapshot. The default is 64MB
+    pub snapshot_chunk_size: u64,
+
+    /// Whether to check keys fed to snapshot are sorted.
+    pub snapshot_db_debug_check: bool,
+
+    /// The maximum number of keys allowed in a block within a snapshot db.
+    ///
+    /// A block serves as the caching unit in a snapshot database.
+    /// Smaller blocks enable more granular cache control but may increase the index size.
+    pub snapshot_db_block_keys: u64,
+
+    /// The total block to cache.
+    pub snapshot_db_block_cache_item: u64,
+
+    /// The total cache size for snapshot blocks.
+    ///
+    /// By default it is 1GB.
+    pub snapshot_db_block_cache_size: u64,
 
     /// Single node metasrv. It creates a single node cluster if meta data is not initialized.
     /// Otherwise it opens the previous one.
@@ -103,9 +134,6 @@ pub struct RaftConfig {
     ///  e.g. --boot or --single for the first time.
     ///  Otherwise this argument is ignored.
     pub id: NodeId,
-
-    /// For test only: specifies the tree name prefix
-    pub sled_tree_prefix: String,
 
     ///  The node name. If the user specifies a name,
     /// the user-supplied name is used, if not, the default name is used.
@@ -134,16 +162,28 @@ impl Default for RaftConfig {
             raft_api_port: 28004,
             raft_dir: "./.databend/meta".to_string(),
             no_sync: false,
+
+            log_cache_max_items: 1_000_000,
+            log_cache_capacity: 1024 * 1024 * 1024,
+            log_wal_chunk_max_records: 100_000,
+            log_wal_chunk_max_size: 256 * 1024 * 1024,
+
             snapshot_logs_since_last: 1024,
             heartbeat_interval: 1000,
             install_snapshot_timeout: 4000,
             max_applied_log_to_keep: 1000,
+            snapshot_chunk_size: 4194304, // 4MB
+
+            snapshot_db_debug_check: true,
+            snapshot_db_block_keys: 8000,
+            snapshot_db_block_cache_item: 1024,
+            snapshot_db_block_cache_size: 1073741824,
+
             single: false,
             join: vec![],
             leave_via: vec![],
             leave_id: None,
             id: 0,
-            sled_tree_prefix: "".to_string(),
             cluster_name: "foo_cluster".to_string(),
             wait_leader_timeout: 70000,
         }
@@ -151,6 +191,40 @@ impl Default for RaftConfig {
 }
 
 impl RaftConfig {
+    pub fn to_rotbl_config(&self) -> rotbl::v001::Config {
+        rotbl::v001::Config::default()
+            .with_debug_check(self.snapshot_db_debug_check)
+            .with_block_config(
+                rotbl::v001::BlockConfig::default()
+                    .with_max_items(self.snapshot_db_block_keys as usize),
+            )
+            .with_block_cache_config(
+                rotbl::v001::BlockCacheConfig::default()
+                    .with_max_items(self.snapshot_db_block_cache_item as usize)
+                    .with_capacity(self.snapshot_db_block_cache_size as usize),
+            )
+    }
+
+    /// Build [`RaftLogV004`](crate::raft_log_v004::RaftLogV004) config from [`RaftConfig`].
+    pub fn to_raft_log_config(&self) -> raft_log_v004::RaftLogConfig {
+        let p = Path::new(&self.raft_dir)
+            .join("df_meta")
+            .join(format!("{}", DATA_VERSION))
+            .join("log");
+
+        let dir = p.to_str().unwrap().to_string();
+
+        raft_log_v004::RaftLogConfig {
+            dir,
+            log_cache_max_items: Some(self.log_cache_max_items as usize),
+            log_cache_capacity: Some(self.log_cache_capacity as usize),
+            chunk_max_records: Some(self.log_wal_chunk_max_records as usize),
+            chunk_max_size: Some(self.log_wal_chunk_max_size as usize),
+            read_buffer_size: None,
+            truncate_incomplete_record: None,
+        }
+    }
+
     pub fn raft_api_listen_host_string(&self) -> String {
         format!("{}:{}", self.raft_listen_host, self.raft_api_port)
     }
@@ -160,35 +234,23 @@ impl RaftConfig {
     }
 
     pub fn raft_api_listen_host_endpoint(&self) -> Endpoint {
-        Endpoint {
-            addr: self.raft_listen_host.clone(),
-            port: self.raft_api_port,
-        }
+        Endpoint::new(&self.raft_listen_host, self.raft_api_port)
     }
 
     pub fn raft_api_advertise_host_endpoint(&self) -> Endpoint {
-        Endpoint {
-            addr: self.raft_advertise_host.clone(),
-            port: self.raft_api_port,
-        }
+        Endpoint::new(&self.raft_advertise_host, self.raft_api_port)
     }
 
     /// Support ip address and hostname
     pub async fn raft_api_addr(&self) -> Result<Endpoint> {
         let ipv4_addr = self.raft_advertise_host.as_str().parse::<Ipv4Addr>();
         match ipv4_addr {
-            Ok(addr) => Ok(Endpoint {
-                addr: addr.to_string(),
-                port: self.raft_api_port,
-            }),
+            Ok(addr) => Ok(Endpoint::new(addr, self.raft_api_port)),
             Err(_) => {
                 let _ip_addrs = DNSResolver::instance()?
                     .resolve(self.raft_advertise_host.clone())
                     .await?;
-                Ok(Endpoint {
-                    addr: _ip_addrs[0].to_string(),
-                    port: self.raft_api_port,
-                })
+                Ok(Endpoint::new(_ip_addrs[0], self.raft_api_port))
             }
         }
     }
@@ -202,7 +264,7 @@ impl RaftConfig {
     ///
     /// Raft will choose a random timeout in this range for next election.
     pub fn election_timeout(&self) -> (u64, u64) {
-        (self.heartbeat_interval * 5, self.heartbeat_interval * 7)
+        (self.heartbeat_interval * 2, self.heartbeat_interval * 3)
     }
 
     pub fn check(&self) -> std::result::Result<(), MetaStartupError> {
@@ -227,12 +289,5 @@ impl RaftConfig {
             )));
         }
         Ok(())
-    }
-
-    /// Create a unique sled::Tree name by prepending a unique prefix.
-    /// So that multiple instance that depends on a sled::Tree can be used in one process.
-    /// sled does not allow to open multiple `sled::Db` in one process.
-    pub fn tree_name(&self, name: impl std::fmt::Display) -> String {
-        format!("{}{}", self.sled_tree_prefix, name)
     }
 }

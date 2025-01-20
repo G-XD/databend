@@ -15,50 +15,42 @@
 use std::cmp;
 use std::sync::Arc;
 
-use common_exception::Result;
+use databend_common_exception::Result;
 
+use crate::optimizer::extract::Matcher;
 use crate::optimizer::rule::Rule;
 use crate::optimizer::rule::TransformResult;
 use crate::optimizer::RuleID;
 use crate::optimizer::SExpr;
 use crate::plans::Limit;
-use crate::plans::PatternPlan;
 use crate::plans::RelOp;
 use crate::plans::RelOperator;
 use crate::plans::Scan;
 
 /// Input:  Limit
 ///           \
-///          LogicalGet
+///          Scan
 ///
 /// Output:
 ///         Limit
 ///           \
-///           LogicalGet(padding limit)
-
+///           Scan(padding limit)
 pub struct RulePushDownLimitScan {
     id: RuleID,
-    patterns: Vec<SExpr>,
+    matchers: Vec<Matcher>,
 }
 
 impl RulePushDownLimitScan {
     pub fn new() -> Self {
         Self {
             id: RuleID::PushDownLimitScan,
-            patterns: vec![SExpr::create_unary(
-                Arc::new(
-                    PatternPlan {
-                        plan_type: RelOp::Limit,
-                    }
-                    .into(),
-                ),
-                Arc::new(SExpr::create_leaf(Arc::new(
-                    PatternPlan {
-                        plan_type: RelOp::Scan,
-                    }
-                    .into(),
-                ))),
-            )],
+            matchers: vec![Matcher::MatchOp {
+                op_type: RelOp::Limit,
+                children: vec![Matcher::MatchOp {
+                    op_type: RelOp::Scan,
+                    children: vec![],
+                }],
+            }],
         }
     }
 }
@@ -84,7 +76,7 @@ impl Rule for RulePushDownLimitScan {
         Ok(())
     }
 
-    fn patterns(&self) -> &Vec<SExpr> {
-        &self.patterns
+    fn matchers(&self) -> &[Matcher] {
+        &self.matchers
     }
 }

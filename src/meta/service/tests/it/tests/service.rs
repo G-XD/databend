@@ -1,4 +1,4 @@
-// Copyright 2021 Datafuse Labs.
+// Copyright 2021 Datafuse Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -20,14 +20,15 @@ use std::time::Duration;
 
 use anyhow::Result;
 use async_trait::async_trait;
-use common_base::base::tokio;
-use common_base::base::GlobalSequence;
-use common_base::base::Stoppable;
-use common_meta_client::ClientHandle;
-use common_meta_client::MetaGrpcClient;
-use common_meta_kvapi::kvapi;
-use common_meta_types::protobuf::raft_service_client::RaftServiceClient;
-use common_meta_types::NodeId;
+use databend_common_base::base::tokio;
+use databend_common_base::base::GlobalSequence;
+use databend_common_base::base::Stoppable;
+use databend_common_meta_client::ClientHandle;
+use databend_common_meta_client::MetaGrpcClient;
+use databend_common_meta_kvapi::kvapi;
+use databend_common_meta_types::protobuf::raft_service_client::RaftServiceClient;
+use databend_common_meta_types::raft_types::NodeId;
+use databend_common_meta_types::MetaClientError;
 use databend_meta::api::GrpcServer;
 use databend_meta::configs;
 use databend_meta::message::ForwardRequest;
@@ -37,7 +38,7 @@ use log::info;
 use log::warn;
 
 // Start one random service and get the session manager.
-#[minitrace::trace]
+#[fastrace::trace]
 pub async fn start_metasrv() -> Result<(MetaSrvTestContext, String)> {
     let mut tc = MetaSrvTestContext::new(0);
 
@@ -90,13 +91,27 @@ pub async fn start_metasrv_cluster(node_ids: &[NodeId]) -> anyhow::Result<Vec<Me
     Ok(res)
 }
 
-pub fn next_port() -> u32 {
-    29000u32 + (GlobalSequence::next() as u32)
+pub fn make_grpc_client(addresses: Vec<String>) -> Result<Arc<ClientHandle>, MetaClientError> {
+    let client = MetaGrpcClient::try_create(
+        addresses,
+        "root",
+        "xxx",
+        None,
+        Some(Duration::from_secs(10)),
+        None,
+    )?;
+
+    Ok(client)
 }
 
+pub fn next_port() -> u16 {
+    29000u16 + (GlobalSequence::next() as u16)
+}
+
+/// It holds a reference to a MetaNode or a GrpcServer, for testing MetaNode or GrpcServer.
 pub struct MetaSrvTestContext {
-    // /// To hold a per-case logging guard
-    // logging_guard: (WorkerGuard, DefaultGuard),
+    pub _temp_dir: tempfile::TempDir,
+
     pub config: configs::Config,
 
     pub meta_node: Option<Arc<MetaNode>>,
@@ -113,6 +128,8 @@ impl Drop for MetaSrvTestContext {
 impl MetaSrvTestContext {
     /// Create a new Config for test, with unique port assigned
     pub fn new(id: u64) -> MetaSrvTestContext {
+        let temp_dir = tempfile::tempdir().unwrap();
+
         let config_id = next_port();
 
         let mut config = configs::Config::default();
@@ -128,7 +145,8 @@ impl MetaSrvTestContext {
         config.raft_config.config_id = config_id.to_string();
 
         // Use a unique dir for each test case.
-        config.raft_config.raft_dir = format!("{}-{}", config.raft_config.raft_dir, config_id);
+        config.raft_config.raft_dir =
+            format!("{}/{}/raft_dir", temp_dir.path().display(), config_id);
 
         // By default, create a meta node instead of open an existent one.
         config.raft_config.single = true;
@@ -141,9 +159,6 @@ impl MetaSrvTestContext {
         config.raft_config.raft_advertise_host = "localhost".to_string();
 
         let host = "127.0.0.1";
-
-        // We use a single sled db for all unit test. Every unit test need a unique prefix so that it opens different tree.
-        config.raft_config.sled_tree_prefix = format!("test-{}-", config_id);
 
         {
             let grpc_port = next_port();
@@ -162,6 +177,7 @@ impl MetaSrvTestContext {
             config,
             meta_node: None,
             grpc_srv: None,
+            _temp_dir: temp_dir,
         };
 
         c.rm_raft_dir("new MetaSrvTestContext");
@@ -195,7 +211,6 @@ impl MetaSrvTestContext {
             "xxx",
             None,
             Some(Duration::from_secs(10)),
-            Duration::from_secs(10),
             None,
         )?;
         Ok(client)
@@ -207,7 +222,7 @@ impl MetaSrvTestContext {
         let addr = self.config.raft_config.raft_api_addr().await?;
 
         // retry 3 times until server starts listening.
-        for _ in 0..4 {
+        for _ in 0..3 {
             let client = RaftServiceClient::connect(format!("http://{}", addr)).await;
             match client {
                 Ok(x) => return Ok(x),
@@ -232,6 +247,11 @@ impl MetaSrvTestContext {
         client.forward(req).await?;
         Ok(())
     }
+
+    pub fn drop_meta_node(&mut self) {
+        self.meta_node.take();
+        self.grpc_srv.take();
+    }
 }
 
 /// Build metasrv or metasrv cluster, returns the clients
@@ -245,16 +265,8 @@ impl kvapi::ApiBuilder<Arc<ClientHandle>> for MetaSrvBuilder {
     async fn build(&self) -> Arc<ClientHandle> {
         let (tc, addr) = start_metasrv().await.unwrap();
 
-        let client = MetaGrpcClient::try_create(
-            vec![addr],
-            "root",
-            "xxx",
-            None,
-            None,
-            Duration::from_secs(10),
-            None,
-        )
-        .unwrap();
+        let client =
+            MetaGrpcClient::try_create(vec![addr], "root", "xxx", None, None, None).unwrap();
 
         {
             let mut tcs = self.test_contexts.lock().unwrap();

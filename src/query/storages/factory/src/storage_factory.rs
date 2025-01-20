@@ -14,22 +14,26 @@
 
 use std::sync::Arc;
 
-pub use common_catalog::catalog::StorageDescription;
-use common_config::InnerConfig;
-use common_exception::ErrorCode;
-use common_exception::Result;
-use common_meta_app::schema::TableInfo;
-use common_storages_memory::MemoryTable;
-use common_storages_null::NullTable;
-use common_storages_random::RandomTable;
-use common_storages_view::view_table::ViewTable;
+use dashmap::mapref::one::Ref;
 use dashmap::DashMap;
+pub use databend_common_catalog::catalog::StorageDescription;
+use databend_common_config::InnerConfig;
+use databend_common_exception::ErrorCode;
+use databend_common_exception::Result;
+use databend_common_meta_app::schema::TableInfo;
+use databend_common_storages_delta::DeltaTable;
+use databend_common_storages_iceberg::IcebergTable;
+use databend_common_storages_memory::MemoryTable;
+use databend_common_storages_null::NullTable;
+use databend_common_storages_random::RandomTable;
+use databend_common_storages_stream::stream_table::StreamTable;
+use databend_common_storages_view::view_table::ViewTable;
 
 use crate::fuse::FuseTable;
 use crate::Table;
 
 pub trait StorageCreator: Send + Sync {
-    fn try_create(&self, table_info: TableInfo) -> Result<Box<dyn Table>>;
+    fn try_create(&self, table_info: TableInfo, disable_refresh: bool) -> Result<Box<dyn Table>>;
 }
 
 impl<T> StorageCreator for T
@@ -37,8 +41,16 @@ where
     T: Fn(TableInfo) -> Result<Box<dyn Table>>,
     T: Send + Sync,
 {
-    fn try_create(&self, table_info: TableInfo) -> Result<Box<dyn Table>> {
+    fn try_create(&self, table_info: TableInfo, _need_refresh: bool) -> Result<Box<dyn Table>> {
         self(table_info)
+    }
+}
+
+pub struct FuseTableCreator {}
+
+impl StorageCreator for FuseTableCreator {
+    fn try_create(&self, table_info: TableInfo, disable_refresh: bool) -> Result<Box<dyn Table>> {
+        FuseTable::try_create_ext(table_info, disable_refresh)
     }
 }
 
@@ -86,11 +98,11 @@ impl StorageFactory {
 
         // Register FUSE table engine.
         creators.insert("FUSE".to_string(), Storage {
-            creator: Arc::new(FuseTable::try_create),
+            creator: Arc::new(FuseTableCreator {}),
             descriptor: Arc::new(FuseTable::description),
         });
 
-        // Register View table engine
+        // Register VIEW table engine
         creators.insert("VIEW".to_string(), Storage {
             creator: Arc::new(ViewTable::try_create),
             descriptor: Arc::new(ViewTable::description),
@@ -102,17 +114,45 @@ impl StorageFactory {
             descriptor: Arc::new(RandomTable::description),
         });
 
+        // Register STREAM table engine
+        creators.insert("STREAM".to_string(), Storage {
+            creator: Arc::new(StreamTable::try_create),
+            descriptor: Arc::new(StreamTable::description),
+        });
+
+        // Register ICEBERG table engine
+        creators.insert("ICEBERG".to_string(), Storage {
+            creator: Arc::new(IcebergTable::try_create),
+            descriptor: Arc::new(IcebergTable::description),
+        });
+
+        // Register DELTA table engine
+        creators.insert("DELTA".to_string(), Storage {
+            creator: Arc::new(DeltaTable::try_create),
+            descriptor: Arc::new(DeltaTable::description),
+        });
+
         StorageFactory { storages: creators }
     }
 
-    pub fn get_table(&self, table_info: &TableInfo) -> Result<Arc<dyn Table>> {
-        let engine = table_info.engine().to_uppercase();
-        let factory = self.storages.get(&engine).ok_or_else(|| {
-            ErrorCode::UnknownTableEngine(format!("Unknown table engine {}", engine))
-        })?;
-
-        let table: Arc<dyn Table> = factory.creator.try_create(table_info.clone())?.into();
+    pub fn get_table(
+        &self,
+        table_info: &TableInfo,
+        disable_refresh: bool,
+    ) -> Result<Arc<dyn Table>> {
+        let factory = self.get_storage_factory(table_info)?;
+        let table: Arc<dyn Table> = factory
+            .creator
+            .try_create(table_info.clone(), disable_refresh)?
+            .into();
         Ok(table)
+    }
+
+    fn get_storage_factory(&self, table_info: &TableInfo) -> Result<Ref<String, Storage>> {
+        let engine = table_info.engine().to_uppercase();
+        self.storages.get(&engine).ok_or_else(|| {
+            ErrorCode::UnknownTableEngine(format!("Unknown table engine {}", engine))
+        })
     }
 
     pub fn get_storage_descriptors(&self) -> Vec<StorageDescription> {

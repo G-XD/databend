@@ -12,10 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use common_exception::ErrorCode;
-use common_exception::Result;
-use common_meta_app::principal::UserDefinedFunction;
-use common_meta_types::MatchSeq;
+use databend_common_exception::ErrorCode;
+use databend_common_exception::Result;
+use databend_common_management::udf::UdfApiError;
+use databend_common_management::udf::UdfError;
+use databend_common_meta_app::principal::UserDefinedFunction;
+use databend_common_meta_app::schema::CreateOption;
+use databend_common_meta_app::tenant::Tenant;
+use databend_common_meta_types::MatchSeq;
 
 use crate::UserApiProvider;
 
@@ -25,69 +29,113 @@ impl UserApiProvider {
     #[async_backtrace::framed]
     pub async fn add_udf(
         &self,
-        tenant: &str,
+        tenant: &Tenant,
         info: UserDefinedFunction,
-        if_not_exists: bool,
-    ) -> Result<u64> {
-        let udf_api_client = self.get_udf_api_client(tenant)?;
-        let add_udf = udf_api_client.add_udf(info);
-        match add_udf.await {
-            Ok(res) => Ok(res),
-            Err(e) => {
-                if if_not_exists && e.code() == ErrorCode::UDF_ALREADY_EXISTS {
-                    Ok(u64::MIN)
-                } else {
-                    Err(e)
-                }
-            }
+        create_option: &CreateOption,
+    ) -> Result<()> {
+        if self.get_configured_udf(&info.name).is_some() {
+            return Err(ErrorCode::UdfAlreadyExists(format!(
+                "Built-in UDF `{}` already exists",
+                info.name
+            )));
         }
+
+        let udf_api = self.udf_api(tenant);
+        udf_api.add_udf(info, create_option).await??;
+        Ok(())
     }
 
     // Update a UDF.
     #[async_backtrace::framed]
-    pub async fn update_udf(&self, tenant: &str, info: UserDefinedFunction) -> Result<u64> {
-        let udf_api_client = self.get_udf_api_client(tenant)?;
-        let update_udf = udf_api_client.update_udf(info, MatchSeq::GE(1));
-        match update_udf.await {
-            Ok(res) => Ok(res),
-            Err(e) => Err(e.add_message_back("(while update UDF).")),
+    pub async fn update_udf(&self, tenant: &Tenant, info: UserDefinedFunction) -> Result<u64> {
+        if self.get_configured_udf(&info.name).is_some() {
+            return Err(ErrorCode::UserAlreadyExists(format!(
+                "Built-in UDF `{}` cannot be updated",
+                info.name
+            )));
         }
+
+        let res = self
+            .udf_api(tenant)
+            .update_udf(info, MatchSeq::GE(1))
+            .await?;
+
+        let seq = res?;
+        Ok(seq)
     }
 
     // Get a UDF by name.
     #[async_backtrace::framed]
-    pub async fn get_udf(&self, tenant: &str, udf_name: &str) -> Result<UserDefinedFunction> {
-        let udf_api_client = self.get_udf_api_client(tenant)?;
-        let get_udf = udf_api_client.get_udf(udf_name, MatchSeq::GE(0));
-        Ok(get_udf.await?.data)
+    pub async fn get_udf(
+        &self,
+        tenant: &Tenant,
+        udf_name: &str,
+    ) -> std::result::Result<Option<UserDefinedFunction>, UdfApiError> {
+        if let Some(udf) = self.get_configured_udf(udf_name) {
+            Ok(Some(udf))
+        } else {
+            let seqv = self.udf_api(tenant).get_udf(udf_name).await?;
+            Ok(seqv.map(|x| x.data))
+        }
+    }
+
+    #[async_backtrace::framed]
+    pub async fn exists_udf(&self, tenant: &Tenant, udf_name: &str) -> Result<bool> {
+        let res = self.get_udf(tenant, udf_name).await?;
+        Ok(res.is_some())
     }
 
     // Get all UDFs for the tenant.
     #[async_backtrace::framed]
-    pub async fn get_udfs(&self, tenant: &str) -> Result<Vec<UserDefinedFunction>> {
-        let udf_api_client = self.get_udf_api_client(tenant)?;
-        let get_udfs = udf_api_client.get_udfs();
+    pub async fn list_udf(&self, tenant: &Tenant) -> Result<Vec<UserDefinedFunction>> {
+        let udf_api = self.udf_api(tenant);
 
-        match get_udfs.await {
-            Err(e) => Err(e.add_message_back("(while get UDFs).")),
-            Ok(seq_udfs_info) => Ok(seq_udfs_info),
-        }
+        let mut udfs = udf_api
+            .list_udf()
+            .await
+            .map_err(|e| e.add_message_back("while list UDFs"))?;
+
+        // Extend the existing `udfs` vector with built-in UDFs.
+        udfs.extend(self.get_configured_udfs().into_values());
+
+        Ok(udfs)
     }
 
     // Drop a UDF by name.
     #[async_backtrace::framed]
-    pub async fn drop_udf(&self, tenant: &str, udf_name: &str, if_exists: bool) -> Result<()> {
-        let udf_api_client = self.get_udf_api_client(tenant)?;
-        let drop_udf = udf_api_client.drop_udf(udf_name, MatchSeq::GE(1));
-        match drop_udf.await {
-            Ok(res) => Ok(res),
-            Err(e) => {
-                if if_exists {
-                    Ok(())
-                } else {
-                    Err(e.add_message_back("(while drop UDF)"))
-                }
-            }
+    pub async fn drop_udf(
+        &self,
+        tenant: &Tenant,
+        udf_name: &str,
+        allow_no_change: bool,
+    ) -> std::result::Result<std::result::Result<(), UdfError>, UdfApiError> {
+        if self.get_configured_udf(udf_name).is_some() {
+            return Ok(Err(UdfError::Exists {
+                tenant: tenant.tenant_name().to_string(),
+                name: udf_name.to_string(),
+                reason: "Built-in UDF cannot be dropped".to_string(),
+            }));
         }
+
+        let dropped = self
+            .udf_api(tenant)
+            .drop_udf(udf_name, MatchSeq::GE(1))
+            .await?;
+
+        let drop_result = if dropped.is_none() {
+            if allow_no_change {
+                Ok(())
+            } else {
+                Err(UdfError::NotFound {
+                    tenant: tenant.tenant_name().to_string(),
+                    name: udf_name.to_string(),
+                    context: "while drop_udf".to_string(),
+                })
+            }
+        } else {
+            Ok(())
+        };
+
+        Ok(drop_result)
     }
 }

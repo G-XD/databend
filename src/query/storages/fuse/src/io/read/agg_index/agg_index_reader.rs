@@ -14,22 +14,22 @@
 
 use std::sync::Arc;
 
-use common_catalog::plan::AggIndexInfo;
-use common_catalog::plan::AggIndexMeta;
-use common_catalog::table_context::TableContext;
-use common_exception::Result;
-use common_expression::types::BooleanType;
-use common_expression::types::DataType;
-use common_expression::BlockEntry;
-use common_expression::DataBlock;
-use common_expression::Evaluator;
-use common_expression::Expr;
-use common_expression::FunctionContext;
-use common_expression::Scalar;
-use common_expression::Value;
-use common_functions::BUILTIN_FUNCTIONS;
+use databend_common_catalog::plan::AggIndexInfo;
+use databend_common_catalog::plan::AggIndexMeta;
+use databend_common_catalog::table_context::TableContext;
+use databend_common_exception::Result;
+use databend_common_expression::types::BooleanType;
+use databend_common_expression::types::DataType;
+use databend_common_expression::BlockEntry;
+use databend_common_expression::DataBlock;
+use databend_common_expression::Evaluator;
+use databend_common_expression::Expr;
+use databend_common_expression::FunctionContext;
+use databend_common_expression::Scalar;
+use databend_common_expression::Value;
+use databend_common_functions::BUILTIN_FUNCTIONS;
+use databend_storages_common_table_meta::table::TableCompression;
 use opendal::Operator;
-use storages_common_table_meta::table::TableCompression;
 
 use crate::io::BlockReader;
 
@@ -39,6 +39,7 @@ pub struct AggIndexReader {
 
     pub(super) reader: Arc<BlockReader>,
     pub(super) compression: TableCompression,
+    pub(crate) ctx: Arc<dyn TableContext>,
 
     func_ctx: FunctionContext,
     selection: Vec<(Expr, Option<usize>)>,
@@ -48,6 +49,7 @@ pub struct AggIndexReader {
     actual_table_field_len: usize,
     // If the index is the result of an aggregation query.
     is_agg: bool,
+    num_agg_funcs: usize,
 }
 
 impl AggIndexReader {
@@ -56,13 +58,16 @@ impl AggIndexReader {
         dal: Operator,
         agg: &AggIndexInfo,
         compression: TableCompression,
+        put_cache: bool,
     ) -> Result<Self> {
         let reader = BlockReader::create(
+            ctx.clone(),
             dal,
             agg.schema.clone(),
             agg.projection.clone(),
-            ctx.clone(),
             false,
+            false,
+            put_cache,
         )?;
 
         let func_ctx = ctx.get_function_context()?;
@@ -76,12 +81,14 @@ impl AggIndexReader {
         Ok(Self {
             index_id: agg.index_id,
             reader,
+            ctx,
             func_ctx,
             selection,
             filter,
             actual_table_field_len: agg.actual_table_field_len,
             is_agg: agg.is_agg,
             compression,
+            num_agg_funcs: agg.num_agg_funcs,
         })
     }
 
@@ -126,10 +133,16 @@ impl AggIndexReader {
             }
         }
 
+        let num_evals = output_columns.len() - self.actual_table_field_len;
+
         Ok(DataBlock::new_with_meta(
             output_columns,
             block.num_rows(),
-            Some(AggIndexMeta::create(self.is_agg)),
+            Some(AggIndexMeta::create(
+                self.is_agg,
+                num_evals,
+                self.num_agg_funcs,
+            )),
         ))
     }
 }

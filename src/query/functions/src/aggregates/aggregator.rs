@@ -31,25 +31,33 @@ use super::aggregate_covariance::aggregate_covariance_sample_desc;
 use super::aggregate_min_max_any::aggregate_any_function_desc;
 use super::aggregate_min_max_any::aggregate_max_function_desc;
 use super::aggregate_min_max_any::aggregate_min_function_desc;
+use super::aggregate_mode::aggregate_mode_function_desc;
 use super::aggregate_stddev::aggregate_stddev_pop_function_desc;
 use super::aggregate_stddev::aggregate_stddev_samp_function_desc;
 use super::aggregate_window_funnel::aggregate_window_funnel_function_desc;
 use super::AggregateCountFunction;
 use super::AggregateFunctionFactory;
 use super::AggregateIfCombinator;
-use crate::aggregates::aggregate_array_agg::aggregate_array_agg_function_desc;
-use crate::aggregates::aggregate_array_moving::aggregate_array_moving_avg_function_desc;
-use crate::aggregates::aggregate_array_moving::aggregate_array_moving_sum_function_desc;
-use crate::aggregates::aggregate_kurtosis::aggregate_kurtosis_function_desc;
-use crate::aggregates::aggregate_quantile_cont::aggregate_median_function_desc;
-use crate::aggregates::aggregate_quantile_cont::aggregate_quantile_cont_function_desc;
-use crate::aggregates::aggregate_quantile_disc::aggregate_quantile_disc_function_desc;
-use crate::aggregates::aggregate_quantile_tdigest::aggregate_median_tdigest_function_desc;
-use crate::aggregates::aggregate_quantile_tdigest::aggregate_quantile_tdigest_function_desc;
-use crate::aggregates::aggregate_retention::aggregate_retention_function_desc;
-use crate::aggregates::aggregate_skewness::aggregate_skewness_function_desc;
-use crate::aggregates::aggregate_string_agg::aggregate_string_agg_function_desc;
-use crate::aggregates::aggregate_sum::aggregate_sum_function_desc;
+use crate::aggregates::aggregate_array_agg_function_desc;
+use crate::aggregates::aggregate_array_moving_avg_function_desc;
+use crate::aggregates::aggregate_array_moving_sum_function_desc;
+use crate::aggregates::aggregate_histogram_function_desc;
+use crate::aggregates::aggregate_json_array_agg_function_desc;
+use crate::aggregates::aggregate_json_object_agg_function_desc;
+use crate::aggregates::aggregate_kurtosis_function_desc;
+use crate::aggregates::aggregate_median_function_desc;
+use crate::aggregates::aggregate_median_tdigest_function_desc;
+use crate::aggregates::aggregate_median_tdigest_weighted_function_desc;
+use crate::aggregates::aggregate_quantile_cont_function_desc;
+use crate::aggregates::aggregate_quantile_disc_function_desc;
+use crate::aggregates::aggregate_quantile_tdigest_function_desc;
+use crate::aggregates::aggregate_quantile_tdigest_weighted_function_desc;
+use crate::aggregates::aggregate_range_bound_function_desc;
+use crate::aggregates::aggregate_retention_function_desc;
+use crate::aggregates::aggregate_skewness_function_desc;
+use crate::aggregates::aggregate_st_collect_function_desc;
+use crate::aggregates::aggregate_string_agg_function_desc;
+use crate::aggregates::aggregate_sum_function_desc;
 
 pub struct Aggregators;
 
@@ -71,7 +79,7 @@ impl Aggregators {
         factory.register("covar_pop", aggregate_covariance_population_desc());
         factory.register("stddev_samp", aggregate_stddev_samp_function_desc());
         factory.register("stddev_pop", aggregate_stddev_pop_function_desc());
-        factory.register("stddev", aggregate_stddev_pop_function_desc());
+        factory.register("stddev", aggregate_stddev_samp_function_desc());
         factory.register("std", aggregate_stddev_pop_function_desc());
         factory.register("quantile", aggregate_quantile_disc_function_desc());
         factory.register("quantile_disc", aggregate_quantile_disc_function_desc());
@@ -80,8 +88,16 @@ impl Aggregators {
             "quantile_tdigest",
             aggregate_quantile_tdigest_function_desc(),
         );
+        factory.register(
+            "quantile_tdigest_weighted",
+            aggregate_quantile_tdigest_weighted_function_desc(),
+        );
         factory.register("median", aggregate_median_function_desc());
         factory.register("median_tdigest", aggregate_median_tdigest_function_desc());
+        factory.register(
+            "median_tdigest_weighted",
+            aggregate_median_tdigest_weighted_function_desc(),
+        );
         factory.register("window_funnel", aggregate_window_funnel_function_desc());
         factory.register(
             "approx_count_distinct",
@@ -98,9 +114,13 @@ impl Aggregators {
             "group_array_moving_sum",
             aggregate_array_moving_sum_function_desc(),
         );
+        factory.register("json_array_agg", aggregate_json_array_agg_function_desc());
+        factory.register("json_object_agg", aggregate_json_object_agg_function_desc());
         factory.register("kurtosis", aggregate_kurtosis_function_desc());
         factory.register("skewness", aggregate_skewness_function_desc());
         factory.register("string_agg", aggregate_string_agg_function_desc());
+
+        factory.register("range_bound", aggregate_range_bound_function_desc());
 
         factory.register(
             "bitmap_and_count",
@@ -124,6 +144,12 @@ impl Aggregators {
             "intersect_count",
             aggregate_bitmap_intersect_count_function_desc(),
         );
+
+        factory.register("histogram", aggregate_histogram_function_desc());
+
+        factory.register("mode", aggregate_mode_function_desc());
+
+        factory.register("st_collect", aggregate_st_collect_function_desc());
     }
 
     pub fn register_combinator(factory: &mut AggregateFunctionFactory) {

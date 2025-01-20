@@ -15,33 +15,46 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
 
-use common_base::base::tokio;
-use common_exception::Result;
-use common_grpc::RpcClientConf;
-use common_meta_app::principal::GrantObject;
-use common_meta_app::principal::RoleInfo;
-use common_meta_app::principal::UserPrivilegeSet;
-use common_users::role_util::find_all_related_roles;
-use common_users::RoleCacheManager;
-use common_users::UserApiProvider;
+use databend_common_base::base::tokio;
+use databend_common_config::GlobalConfig;
+use databend_common_config::InnerConfig;
+use databend_common_exception::Result;
+use databend_common_grpc::RpcClientConf;
+use databend_common_meta_app::principal::GrantObject;
+use databend_common_meta_app::principal::RoleInfo;
+use databend_common_meta_app::principal::UserPrivilegeSet;
+use databend_common_meta_app::tenant::Tenant;
+use databend_common_users::role_util::find_all_related_roles;
+use databend_common_users::RoleCacheManager;
+use databend_common_users::UserApiProvider;
 
 pub const CATALOG_DEFAULT: &str = "default";
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn test_role_cache_mgr() -> Result<()> {
+    // Init.
+    let thread_name = std::thread::current().name().unwrap().to_string();
+    databend_common_base::base::GlobalInstance::init_testing(&thread_name);
+
+    // Init with default.
+    {
+        GlobalConfig::init(&InnerConfig::default()).unwrap();
+    }
     let conf = RpcClientConf::default();
-    let user_manager = UserApiProvider::try_create_simple(conf).await?;
+    let tenant = Tenant::new_literal("tenant1");
+
+    let user_manager = UserApiProvider::try_create_simple(conf, &tenant).await?;
     let role_cache_manager = RoleCacheManager::try_create(user_manager.clone())?;
 
     let mut role1 = RoleInfo::new("role1");
     role1.grants.grant_privileges(
         &GrantObject::Database(CATALOG_DEFAULT.to_owned(), "db1".to_string()),
-        UserPrivilegeSet::available_privileges_on_database(),
+        UserPrivilegeSet::available_privileges_on_database(false),
     );
-    user_manager.add_role("tenant1", role1, false).await?;
+    user_manager.add_role(&tenant, role1, false).await?;
 
     let mut roles = role_cache_manager
-        .find_related_roles("tenant1", &["role1".to_string()])
+        .find_related_roles(&tenant, &["role1".to_string()])
         .await?;
     roles.sort_by(|a, b| a.name.cmp(&b.name));
     assert_eq!(roles.len(), 2);

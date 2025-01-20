@@ -13,7 +13,6 @@
 //  limitations under the License.
 
 mod file_format;
-mod user_defined_function;
 mod user_grant;
 mod user_info;
 mod user_privilege;
@@ -21,7 +20,7 @@ mod user_quota;
 
 #[test]
 fn test_bin_commit_version() -> anyhow::Result<()> {
-    let v = &common_meta_types::config::DATABEND_COMMIT_VERSION;
+    let v = &databend_common_meta_types::config::DATABEND_COMMIT_VERSION;
     assert!(v.len() > 0);
     Ok(())
 }

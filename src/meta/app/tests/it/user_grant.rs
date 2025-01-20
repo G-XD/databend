@@ -1,4 +1,4 @@
-// Copyright 2021 Datafuse Labs.
+// Copyright 2021 Datafuse Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,11 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use common_exception::exception::Result;
-use common_meta_app::principal::GrantEntry;
-use common_meta_app::principal::GrantObject;
-use common_meta_app::principal::UserGrantSet;
-use common_meta_app::principal::UserPrivilegeType;
+use databend_common_exception::exception::Result;
+use databend_common_meta_app::principal::GrantEntry;
+use databend_common_meta_app::principal::GrantObject;
+use databend_common_meta_app::principal::UserGrantSet;
+use databend_common_meta_app::principal::UserPrivilegeType;
 use enumflags2::make_bitflags;
 
 #[test]
@@ -77,6 +77,36 @@ fn test_grant_object_contains() -> Result<()> {
             rhs: GrantObject::Database("default".into(), "db1".into()),
             expect: false,
         },
+        Test {
+            lhs: GrantObject::Stage("c".into()),
+            rhs: GrantObject::Stage("c".into()),
+            expect: true,
+        },
+        Test {
+            lhs: GrantObject::Stage("c".into()),
+            rhs: GrantObject::Stage("c".into()),
+            expect: true,
+        },
+        Test {
+            lhs: GrantObject::UDF("c".into()),
+            rhs: GrantObject::UDF("c".into()),
+            expect: true,
+        },
+        Test {
+            lhs: GrantObject::UDF("a".into()),
+            rhs: GrantObject::UDF("c".into()),
+            expect: false,
+        },
+        Test {
+            lhs: GrantObject::Stage("a".into()),
+            rhs: GrantObject::UDF("a".into()),
+            expect: false,
+        },
+        Test {
+            lhs: GrantObject::Stage("a".into()),
+            rhs: GrantObject::Table("default".into(), "db1".into(), "c".into()),
+            expect: false,
+        },
     ];
     for t in tests {
         assert_eq!(
@@ -99,15 +129,15 @@ fn test_user_grant_entry() -> Result<()> {
     );
     assert!(grant.verify_privilege(
         &GrantObject::Database("default".into(), "db1".into()),
-        vec![UserPrivilegeType::Create]
+        UserPrivilegeType::Create
     ));
     assert!(!grant.verify_privilege(
         &GrantObject::Database("default".into(), "db1".into()),
-        vec![UserPrivilegeType::Insert]
+        UserPrivilegeType::Insert
     ));
     assert!(grant.verify_privilege(
         &GrantObject::Database("default".into(), "db2".into()),
-        vec![UserPrivilegeType::Create]
+        UserPrivilegeType::Create
     ));
 
     let grant = GrantEntry::new(
@@ -116,15 +146,15 @@ fn test_user_grant_entry() -> Result<()> {
     );
     assert!(grant.verify_privilege(
         &GrantObject::Table("default".into(), "db1".into(), "table1".into()),
-        vec![UserPrivilegeType::Create]
+        UserPrivilegeType::Create
     ));
     assert!(!grant.verify_privilege(
         &GrantObject::Table("default".into(), "db2".into(), "table1".into()),
-        vec![UserPrivilegeType::Create]
+        UserPrivilegeType::Create
     ));
     assert!(grant.verify_privilege(
         &GrantObject::Database("default".into(), "db1".into()),
-        vec![UserPrivilegeType::Create]
+        UserPrivilegeType::Create
     ));
 
     let grant = GrantEntry::new(
@@ -133,19 +163,19 @@ fn test_user_grant_entry() -> Result<()> {
     );
     assert!(grant.verify_privilege(
         &GrantObject::Table("default".into(), "db1".into(), "table1".into()),
-        vec![UserPrivilegeType::Create]
+        UserPrivilegeType::Create
     ));
     assert!(!grant.verify_privilege(
         &GrantObject::Table("default".into(), "db2".into(), "table1".into()),
-        vec![UserPrivilegeType::Create]
+        UserPrivilegeType::Create
     ));
     assert!(!grant.verify_privilege(
         &GrantObject::Table("default".into(), "db1".into(), "table1".into()),
-        vec![UserPrivilegeType::Insert]
+        UserPrivilegeType::Insert
     ));
     assert!(grant.verify_privilege(
         &GrantObject::Table("default".into(), "db1".into(), "table1".into()),
-        vec![UserPrivilegeType::Create]
+        UserPrivilegeType::Create
     ));
 
     Ok(())
@@ -177,26 +207,32 @@ fn test_user_grant_set() -> Result<()> {
         &GrantObject::Global,
         make_bitflags!(UserPrivilegeType::{Insert}).into(),
     );
+    grants.revoke_privileges(
+        &GrantObject::Global,
+        make_bitflags!(UserPrivilegeType::{Insert}).into(),
+    );
+
     assert_eq!(2, grants.entries().len());
+
     assert!(grants.verify_privilege(
         &GrantObject::Database("default".into(), "db1".into()),
-        vec![UserPrivilegeType::Create]
+        UserPrivilegeType::Create
     ));
     assert!(!grants.verify_privilege(
         &GrantObject::Database("default".into(), "db1".into()),
-        vec![UserPrivilegeType::Select]
+        UserPrivilegeType::Select
     ));
     assert!(grants.verify_privilege(
         &GrantObject::Table("default".into(), "db1".into(), "table1".into()),
-        vec![UserPrivilegeType::Create]
+        UserPrivilegeType::Create
     ));
     assert!(!grants.verify_privilege(
         &GrantObject::Table("default".into(), "db1".into(), "table1".into()),
-        vec![UserPrivilegeType::Insert]
+        UserPrivilegeType::Insert
     ));
     assert!(grants.verify_privilege(
         &GrantObject::Table("default".into(), "db1".into(), "table1".into()),
-        vec![UserPrivilegeType::Select]
+        UserPrivilegeType::Select
     ));
     Ok(())
 }

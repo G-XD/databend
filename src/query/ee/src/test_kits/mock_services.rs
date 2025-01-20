@@ -14,32 +14,31 @@
 
 use std::sync::Arc;
 
-use common_base::base::GlobalInstance;
-use common_config::InnerConfig;
-use common_exception::Result;
-use common_license::license_manager::LicenseManagerWrapper;
+use databend_common_base::base::GlobalInstance;
+use databend_common_config::InnerConfig;
+use databend_common_exception::Result;
+use databend_common_license::license_manager::LicenseManagerSwitch;
 
 use crate::aggregating_index::RealAggregatingIndexHandler;
 use crate::data_mask::RealDatamaskHandler;
+use crate::inverted_index::RealInvertedIndexHandler;
 use crate::license::RealLicenseManager;
 use crate::storages::fuse::operations::RealVacuumHandler;
-use crate::table_lock::RealTableLockHandler;
-use crate::virtual_column::RealVirtualColumnsHandler;
+use crate::stream::RealStreamHandler;
+use crate::virtual_column::RealVirtualColumnHandler;
 
 pub struct MockServices;
 impl MockServices {
     #[async_backtrace::framed]
-    pub async fn init(_config: InnerConfig, public_key: String) -> Result<()> {
-        let rm = RealLicenseManager::new(public_key);
-        let wrapper = LicenseManagerWrapper {
-            manager: Box::new(rm),
-        };
-        GlobalInstance::set(Arc::new(wrapper));
+    pub async fn init(cfg: &InnerConfig, public_key: String) -> Result<()> {
+        let rm = RealLicenseManager::new(cfg.query.tenant_id.tenant_name().to_string(), public_key);
+        GlobalInstance::set(Arc::new(LicenseManagerSwitch::create(Box::new(rm))));
         RealVacuumHandler::init()?;
         RealAggregatingIndexHandler::init()?;
-        RealTableLockHandler::init()?;
         RealDatamaskHandler::init()?;
-        RealVirtualColumnsHandler::init()?;
+        RealVirtualColumnHandler::init()?;
+        RealStreamHandler::init()?;
+        RealInvertedIndexHandler::init()?;
         Ok(())
     }
 }

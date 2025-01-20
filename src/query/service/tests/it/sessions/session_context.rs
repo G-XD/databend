@@ -12,18 +12,17 @@
 //  See the License for the specific language governing permissions and
 //  limitations under the License.
 
-use std::net::SocketAddr;
-
-use common_base::base::tokio;
-use common_exception::Result;
-use common_meta_app::principal::UserInfo;
-use common_settings::Settings;
+use databend_common_base::base::tokio;
+use databend_common_exception::Result;
+use databend_common_meta_app::principal::UserInfo;
+use databend_common_meta_app::tenant::Tenant;
+use databend_common_settings::Settings;
 use databend_query::sessions::SessionContext;
 use databend_query::sessions::SessionType;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_session_context() -> Result<()> {
-    let settings = Settings::create("default".to_string());
+    let settings = Settings::create(Tenant::new_literal("default"));
     let session_ctx = SessionContext::try_create(settings, SessionType::MySQL)?;
 
     // Abort status.
@@ -42,12 +41,11 @@ async fn test_session_context() -> Result<()> {
 
     // Client host.
     {
-        let demo = "127.0.0.1:80";
-        let server: SocketAddr = demo.parse().unwrap();
-        session_ctx.set_client_host(Some(server));
+        let demo = "127.0.0.1";
+        session_ctx.set_client_host(Some(demo.to_string()));
 
         let val = session_ctx.get_client_host();
-        assert_eq!(Some(server), val);
+        assert_eq!(Some(demo), val.as_deref());
     }
 
     // Current user.
@@ -68,6 +66,14 @@ async fn test_session_context() -> Result<()> {
 
         let val = session_ctx.take_io_shutdown_tx();
         assert!(val.is_none());
+    }
+
+    // Warehouse.
+    {
+        session_ctx.set_current_warehouse(Some("wt".to_string()));
+
+        let val = session_ctx.get_current_warehouse().unwrap();
+        assert_eq!("wt".to_string(), val);
     }
 
     Ok(())

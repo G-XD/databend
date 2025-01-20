@@ -19,26 +19,27 @@ use std::ops::BitOr;
 use std::ops::Not;
 use std::sync::Arc;
 
-use common_arrow::arrow::bitmap::Bitmap;
-use common_arrow::arrow::bitmap::MutableBitmap;
-use common_exception::ErrorCode;
-use common_exception::Result;
-use common_exception::Span;
+use chrono_tz::Tz;
+use databend_common_ast::Span;
+use databend_common_column::bitmap::Bitmap;
+use databend_common_column::bitmap::MutableBitmap;
+use databend_common_exception::ErrorCode;
+use databend_common_exception::Result;
+use databend_common_io::GeometryDataType;
 use enum_as_inner::EnumAsInner;
 use itertools::Itertools;
+use jiff::tz::TimeZone;
+use jiff::Zoned;
 use serde::Deserialize;
 use serde::Serialize;
 
-use crate::date_helper::TzLUT;
 use crate::property::Domain;
 use crate::property::FunctionProperty;
 use crate::type_check::try_unify_signature;
 use crate::types::nullable::NullableColumn;
 use crate::types::nullable::NullableDomain;
 use crate::types::*;
-use crate::utils::arrow::constant_bitmap;
 use crate::values::Value;
-use crate::values::ValueRef;
 use crate::Column;
 use crate::ColumnIndex;
 use crate::Expr;
@@ -46,11 +47,12 @@ use crate::FunctionDomain;
 use crate::Scalar;
 
 pub type AutoCastRules<'a> = &'a [(DataType, DataType)];
+
 /// A function to build function depending on the const parameters and the type of arguments (before coercion).
 ///
 /// The first argument is the const parameters and the second argument is the types of arguments.
 pub trait FunctionFactory =
-    Fn(&[usize], &[DataType]) -> Option<Arc<Function>> + Send + Sync + 'static;
+    Fn(&[Scalar], &[DataType]) -> Option<Arc<Function>> + Send + Sync + 'static;
 
 pub struct Function {
     pub signature: FunctionSignature,
@@ -74,7 +76,7 @@ pub enum FunctionEval {
             Box<dyn Fn(&FunctionContext, &[Domain]) -> FunctionDomain<AnyType> + Send + Sync>,
         /// Given a set of arguments, return a single value.
         /// The result must be in the same length as the input arguments if its a column.
-        eval: Box<dyn Fn(&[ValueRef<AnyType>], &mut EvalContext) -> Value<AnyType> + Send + Sync>,
+        eval: Box<dyn Fn(&[Value<AnyType>], &mut EvalContext) -> Value<AnyType> + Send + Sync>,
     },
     /// Set-returning-function that input a scalar and then return a set.
     SRF {
@@ -82,7 +84,7 @@ pub enum FunctionEval {
         /// for each input row, along with the number of rows in each set.
         eval: Box<
             dyn Fn(
-                    &[ValueRef<AnyType>],
+                    &[Value<AnyType>],
                     &mut EvalContext,
                     &mut [usize],
                 ) -> Vec<(Value<AnyType>, usize)>
@@ -92,9 +94,13 @@ pub enum FunctionEval {
     },
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct FunctionContext {
-    pub tz: TzLUT,
+    pub tz: Tz,
+    pub jiff_tz: TimeZone,
+    pub now: Zoned,
+    pub rounding_mode: bool,
+    pub disable_variant_check: bool,
 
     pub openai_api_chat_base_url: String,
     pub openai_api_embedding_base_url: String,
@@ -102,6 +108,34 @@ pub struct FunctionContext {
     pub openai_api_version: String,
     pub openai_api_embedding_model: String,
     pub openai_api_completion_model: String,
+
+    pub geometry_output_format: GeometryDataType,
+    pub parse_datetime_ignore_remainder: bool,
+    pub enable_strict_datetime_parser: bool,
+    pub random_function_seed: bool,
+}
+
+impl Default for FunctionContext {
+    fn default() -> Self {
+        FunctionContext {
+            tz: Tz::UTC,
+            jiff_tz: TimeZone::UTC,
+            now: Default::default(),
+            rounding_mode: false,
+            disable_variant_check: false,
+            openai_api_chat_base_url: "".to_string(),
+            openai_api_embedding_base_url: "".to_string(),
+            openai_api_key: "".to_string(),
+            openai_api_version: "".to_string(),
+            openai_api_embedding_model: "".to_string(),
+            openai_api_completion_model: "".to_string(),
+
+            geometry_output_format: Default::default(),
+            parse_datetime_ignore_remainder: false,
+            enable_strict_datetime_parser: true,
+            random_function_seed: false,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -115,6 +149,7 @@ pub struct EvalContext<'a> {
     /// default value in nullable's inner column.
     pub validity: Option<Bitmap>,
     pub errors: Option<(MutableBitmap, String)>,
+    pub suppress_error: bool,
 }
 
 /// `FunctionID` is a unique identifier for a function in the registry. It's used to
@@ -128,7 +163,7 @@ pub enum FunctionID {
     Factory {
         name: String,
         id: usize,
-        params: Vec<usize>,
+        params: Vec<Scalar>,
         args_type: Vec<DataType>,
     },
 }
@@ -144,7 +179,7 @@ pub struct FunctionRegistry {
 
     /// Default cast rules for all functions.
     pub default_cast_rules: Vec<(DataType, DataType)>,
-    /// Cast rules for specific functions, in addition to default cast rules.
+    /// Cast rules for specific functions, which will override the default cast rules.
     pub additional_cast_rules: HashMap<String, Vec<(DataType, DataType)>>,
     /// The auto rules that should use TRY_CAST instead of CAST.
     pub auto_try_cast_rules: Vec<(DataType, DataType)>,
@@ -153,29 +188,73 @@ pub struct FunctionRegistry {
 }
 
 impl Function {
-    pub fn wrap_nullable(self) -> Self {
-        let (_, eval) = self.eval.into_scalar().unwrap();
-        Self {
-            signature: FunctionSignature {
-                name: self.signature.name.clone(),
-                args_type: self
-                    .signature
-                    .args_type
-                    .iter()
-                    .map(|ty| ty.wrap_nullable())
-                    .collect(),
-                return_type: self.signature.return_type.wrap_nullable(),
-            },
+    pub fn passthrough_nullable(self) -> Self {
+        debug_assert!(!self
+            .signature
+            .args_type
+            .iter()
+            .any(|ty| ty.is_nullable_or_null()));
+
+        let (calc_domain, eval) = self.eval.into_scalar().unwrap();
+
+        let signature = FunctionSignature {
+            name: self.signature.name.clone(),
+            args_type: self
+                .signature
+                .args_type
+                .iter()
+                .map(|ty| ty.wrap_nullable())
+                .collect(),
+            return_type: self.signature.return_type.wrap_nullable(),
+        };
+
+        let new_calc_domain = Box::new(move |ctx: &FunctionContext, domains: &[Domain]| {
+            let mut args_has_null = false;
+            let mut args_domain = Vec::with_capacity(domains.len());
+            for domain in domains {
+                match domain {
+                    Domain::Nullable(NullableDomain {
+                        has_null,
+                        value: Some(value),
+                    }) => {
+                        args_has_null = args_has_null || *has_null;
+                        args_domain.push(value.as_ref().clone());
+                    }
+                    Domain::Nullable(NullableDomain { value: None, .. }) => {
+                        return FunctionDomain::Domain(Domain::Nullable(NullableDomain {
+                            has_null: true,
+                            value: None,
+                        }));
+                    }
+                    _ => unreachable!(),
+                }
+            }
+
+            calc_domain(ctx, &args_domain).map(|result_domain| {
+                let (result_has_null, result_domain) = match result_domain {
+                    Domain::Nullable(NullableDomain { has_null, value }) => (has_null, value),
+                    domain => (false, Some(Box::new(domain))),
+                };
+                Domain::Nullable(NullableDomain {
+                    has_null: args_has_null || result_has_null,
+                    value: result_domain,
+                })
+            })
+        });
+
+        Function {
+            signature,
             eval: FunctionEval::Scalar {
-                calc_domain: Box::new(|_, _| FunctionDomain::Full),
-                eval: Box::new(wrap_nullable(eval)),
+                calc_domain: new_calc_domain,
+                eval: Box::new(passthrough_nullable(eval)),
             },
         }
     }
 
     pub fn error_to_null(self) -> Self {
+        debug_assert!(!self.signature.return_type.is_nullable_or_null());
+
         let mut signature = self.signature;
-        debug_assert!(!signature.return_type.is_nullable_or_null());
         signature.return_type = signature.return_type.wrap_nullable();
 
         let (calc_domain, eval) = self.eval.into_scalar().unwrap();
@@ -190,32 +269,26 @@ impl Function {
                     };
                     FunctionDomain::Domain(NullableType::<AnyType>::upcast_domain(new_domain))
                 }
-                // Here we convert MayThrow to full, this may lose some internal information since it's runtime adpator
                 FunctionDomain::Full | FunctionDomain::MayThrow => FunctionDomain::Full,
             }
         });
-        let new_eval = Box::new(move |val: &[ValueRef<AnyType>], ctx: &mut EvalContext| {
+        let new_eval = Box::new(move |val: &[Value<AnyType>], ctx: &mut EvalContext| {
             let num_rows = ctx.num_rows;
             let output = eval(val, ctx);
             if let Some((validity, _)) = ctx.errors.take() {
                 match output {
                     Value::Scalar(_) => Value::Scalar(Scalar::Null),
                     Value::Column(column) => {
-                        Value::Column(Column::Nullable(Box::new(NullableColumn {
-                            column,
-                            validity: validity.into(),
-                        })))
+                        Value::Column(NullableColumn::new_column(column, validity.into()))
                     }
                 }
             } else {
                 match output {
                     Value::Scalar(scalar) => Value::Scalar(scalar),
-                    Value::Column(column) => {
-                        Value::Column(Column::Nullable(Box::new(NullableColumn {
-                            column,
-                            validity: constant_bitmap(true, num_rows).into(),
-                        })))
-                    }
+                    Value::Column(column) => Value::Column(NullableColumn::new_column(
+                        column,
+                        Bitmap::new_constant(true, num_rows),
+                    )),
                 }
             }
         });
@@ -279,7 +352,7 @@ impl FunctionRegistry {
     pub fn search_candidates<Index: ColumnIndex>(
         &self,
         name: &str,
-        params: &[usize],
+        params: &[Scalar],
         args: &[Expr<Index>],
     ) -> Vec<(FunctionID, Arc<Function>)> {
         let name = name.to_lowercase();
@@ -328,6 +401,7 @@ impl FunctionRegistry {
         candidates
     }
 
+    // note that if additional_cast_rules is not empty, default cast rules will not be used.
     pub fn get_auto_cast_rules(&self, func_name: &str) -> &[(DataType, DataType)] {
         self.additional_cast_rules
             .get(func_name)
@@ -343,12 +417,7 @@ impl FunctionRegistry {
     pub fn get_property(&self, func_name: &str) -> Option<FunctionProperty> {
         let func_name = func_name.to_lowercase();
         if self.contains(&func_name) {
-            Some(
-                self.properties
-                    .get(&func_name.to_lowercase())
-                    .cloned()
-                    .unwrap_or_default(),
-            )
+            Some(self.properties.get(&func_name).cloned().unwrap_or_default())
         } else {
             None
         }
@@ -359,7 +428,7 @@ impl FunctionRegistry {
         let id = self.next_function_id(&name);
         self.funcs
             .entry(name)
-            .or_insert_with(Vec::new)
+            .or_default()
             .push((Arc::new(func), id));
     }
 
@@ -367,7 +436,7 @@ impl FunctionRegistry {
         let id = self.next_function_id(name);
         self.factories
             .entry(name.to_string())
-            .or_insert_with(Vec::new)
+            .or_default()
             .push((Box::new(factory), id));
     }
 
@@ -381,10 +450,10 @@ impl FunctionRegistry {
         &mut self,
         default_cast_rules: impl IntoIterator<Item = (DataType, DataType)>,
     ) {
-        self.default_cast_rules
-            .extend(default_cast_rules.into_iter());
+        self.default_cast_rules.extend(default_cast_rules);
     }
 
+    // Note that, if additional_cast_rules is not empty, the default cast rules will not be used
     pub fn register_additional_cast_rules(
         &mut self,
         fn_name: &str,
@@ -392,8 +461,8 @@ impl FunctionRegistry {
     ) {
         self.additional_cast_rules
             .entry(fn_name.to_string())
-            .or_insert_with(Vec::new)
-            .extend(additional_cast_rules.into_iter());
+            .or_default()
+            .extend(additional_cast_rules);
     }
 
     pub fn register_auto_try_cast_rules(
@@ -479,7 +548,7 @@ impl FunctionID {
         }
     }
 
-    pub fn params(&self) -> &[usize] {
+    pub fn params(&self) -> &[Scalar] {
         match self {
             FunctionID::Builtin { .. } => &[],
             FunctionID::Factory { params, .. } => params.as_slice(),
@@ -487,7 +556,7 @@ impl FunctionID {
     }
 }
 
-impl<'a> EvalContext<'a> {
+impl EvalContext<'_> {
     #[inline]
     pub fn set_error(&mut self, row: usize, error_msg: impl Into<String>) {
         // If the row is NULL, we don't need to set error.
@@ -505,7 +574,7 @@ impl<'a> EvalContext<'a> {
                 valids.set(row, false);
             }
             None => {
-                let mut valids = constant_bitmap(true, self.num_rows.max(1));
+                let mut valids = Bitmap::new_constant(true, self.num_rows.max(1)).make_mut();
                 valids.set(row, false);
                 self.errors = Some((valids, error_msg.into()));
             }
@@ -515,64 +584,82 @@ impl<'a> EvalContext<'a> {
     pub fn render_error(
         &self,
         span: Span,
-        params: &[usize],
+        params: &[Scalar],
         args: &[Value<AnyType>],
         func_name: &str,
+        expr_name: &str,
+        selection: Option<&[u32]>,
     ) -> Result<()> {
+        if self.suppress_error {
+            return Ok(());
+        }
         match &self.errors {
             Some((valids, error)) => {
-                let first_error_row = valids
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, valid)| !valid)
-                    .take(1)
-                    .next()
-                    .unwrap()
-                    .0;
+                let first_error_row = match selection {
+                    None => valids.iter().enumerate().find(|(_, v)| !v).unwrap().0,
+                    Some(selection) if valids.len() == 1 => {
+                        if valids.get(0) || selection.is_empty() {
+                            return Ok(());
+                        }
+
+                        selection.first().map(|x| *x as usize).unwrap()
+                    }
+                    Some(selection) => {
+                        let Some(first_invalid) =
+                            selection.iter().find(|idx| !valids.get(**idx as usize))
+                        else {
+                            return Ok(());
+                        };
+
+                        *first_invalid as usize
+                    }
+                };
+
                 let args = args
                     .iter()
-                    .map(|arg| {
-                        let arg_ref = arg.as_ref();
-                        arg_ref.index(first_error_row).unwrap().to_string()
-                    })
+                    .map(|arg| arg.index(first_error_row).unwrap().to_string())
                     .join(", ");
 
                 let err_msg = if params.is_empty() {
-                    format!("{error} while evaluating function `{func_name}({args})`")
+                    format!(
+                        "{error} while evaluating function `{func_name}({args})` in expr `{expr_name}`"
+                    )
                 } else {
                     format!(
-                        "{error} while evaluating function `{func_name}({params})({args})`",
+                        "{error} while evaluating function `{func_name}({params})({args})` in expr `{expr_name}`",
                         params = params.iter().join(", ")
                     )
                 };
 
-                Err(ErrorCode::Internal(err_msg).set_span(span))
+                Err(ErrorCode::BadArguments(err_msg).set_span(span))
             }
             None => Ok(()),
         }
     }
 }
 
-pub fn wrap_nullable<F>(f: F) -> impl Fn(&[ValueRef<AnyType>], &mut EvalContext) -> Value<AnyType>
-where F: Fn(&[ValueRef<AnyType>], &mut EvalContext) -> Value<AnyType> {
+pub fn passthrough_nullable<F>(
+    f: F,
+) -> impl Fn(&[Value<AnyType>], &mut EvalContext) -> Value<AnyType>
+where F: Fn(&[Value<AnyType>], &mut EvalContext) -> Value<AnyType> {
     move |args, ctx| {
         type T = NullableType<AnyType>;
         type Result = AnyType;
 
         let mut bitmap: Option<MutableBitmap> = None;
-        let mut nonull_args: Vec<ValueRef<Result>> = Vec::with_capacity(args.len());
+        let mut nonull_args: Vec<Value<Result>> = Vec::with_capacity(args.len());
 
         let mut len = 1;
         for arg in args {
             let arg = arg.try_downcast::<T>().unwrap();
             match arg {
-                ValueRef::Scalar(None) => return Value::Scalar(Scalar::Null),
-                ValueRef::Scalar(Some(s)) => {
-                    nonull_args.push(ValueRef::Scalar(s.clone()));
+                Value::Scalar(None) => return Value::Scalar(Scalar::Null),
+                Value::Scalar(Some(s)) => {
+                    nonull_args.push(Value::Scalar(s.clone()));
                 }
-                ValueRef::Column(v) => {
+                Value::Column(v) => {
                     len = v.len();
-                    nonull_args.push(ValueRef::Column(v.column.clone()));
+                    nonull_args.push(Value::Column(v.column.clone()));
                     bitmap = match bitmap {
                         Some(m) => Some(m.bitand(&v.validity)),
                         None => Some(v.validity.clone().make_mut()),
@@ -581,12 +668,12 @@ where F: Fn(&[ValueRef<AnyType>], &mut EvalContext) -> Value<AnyType> {
             }
         }
         let results = f(&nonull_args, ctx);
-        let bitmap = bitmap.unwrap_or_else(|| constant_bitmap(true, len));
+        let bitmap = bitmap.unwrap_or_else(|| Bitmap::new_constant(true, len).make_mut());
         if let Some((error_bitmap, _)) = ctx.errors.as_mut() {
             // If the original value is NULL, we can ignore the error.
             let rhs: Bitmap = bitmap.clone().not().into();
             let res = error_bitmap.clone().bitor(&rhs);
-            if res.unset_bits() == 0 {
+            if res.null_count() == 0 {
                 ctx.errors = None;
             } else {
                 *error_bitmap = res;
@@ -604,18 +691,15 @@ where F: Fn(&[ValueRef<AnyType>], &mut EvalContext) -> Value<AnyType> {
             Value::Column(column) => {
                 let result = match column {
                     Column::Nullable(box nullable_column) => {
-                        let validity = bitmap.into();
-                        let validity =
-                            common_arrow::arrow::bitmap::and(&nullable_column.validity, &validity);
-                        Column::Nullable(Box::new(NullableColumn {
-                            column: nullable_column.column,
-                            validity,
-                        }))
+                        let validity: Bitmap = bitmap.into();
+                        let validity = databend_common_column::bitmap::and(
+                            &nullable_column.validity,
+                            &validity,
+                        );
+
+                        NullableColumn::new_column(nullable_column.column, validity)
                     }
-                    _ => Column::Nullable(Box::new(NullableColumn {
-                        column,
-                        validity: bitmap.into(),
-                    })),
+                    _ => NullableColumn::new_column(column, bitmap.into()),
                 };
                 Value::Column(result)
             }
@@ -624,27 +708,25 @@ where F: Fn(&[ValueRef<AnyType>], &mut EvalContext) -> Value<AnyType> {
 }
 
 pub fn error_to_null<I1: ArgType, O: ArgType>(
-    func: impl for<'a> Fn(ValueRef<'a, I1>, &mut EvalContext) -> Value<O> + Copy + Send + Sync,
-) -> impl for<'a> Fn(ValueRef<'a, I1>, &mut EvalContext) -> Value<NullableType<O>> + Copy + Send + Sync
-{
+    func: impl Fn(Value<I1>, &mut EvalContext) -> Value<O> + Copy + Send + Sync,
+) -> impl Fn(Value<I1>, &mut EvalContext) -> Value<NullableType<O>> + Copy + Send + Sync {
     debug_assert!(!O::data_type().is_nullable_or_null());
     move |val, ctx| {
         let output = func(val, ctx);
         if let Some((validity, _)) = ctx.errors.take() {
             match output {
                 Value::Scalar(_) => Value::Scalar(None),
-                Value::Column(column) => Value::Column(NullableColumn {
-                    column,
-                    validity: validity.into(),
-                }),
+                Value::Column(column) => {
+                    Value::Column(NullableColumn::new(column, validity.into()))
+                }
             }
         } else {
             match output {
                 Value::Scalar(scalar) => Value::Scalar(Some(scalar)),
-                Value::Column(column) => Value::Column(NullableColumn {
+                Value::Column(column) => Value::Column(NullableColumn::new(
                     column,
-                    validity: constant_bitmap(true, ctx.num_rows).into(),
-                }),
+                    Bitmap::new_constant(true, ctx.num_rows),
+                )),
             }
         }
     }

@@ -12,29 +12,50 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::collections::HashMap;
 use std::io::Cursor;
 use std::sync::Arc;
 
 use arrow_schema::Schema as ArrowSchema;
-use common_expression::TableSchema;
-use common_meta_app::principal::StageInfo;
-use common_meta_app::schema::TableInfo;
-use common_storage::StageFileInfo;
-use common_storage::StageFilesInfo;
-use parquet_rs::format::SchemaElement;
-use parquet_rs::schema::types;
-use parquet_rs::schema::types::SchemaDescPtr;
-use parquet_rs::schema::types::SchemaDescriptor;
+use databend_common_base::base::tokio::sync::Mutex;
+use databend_common_expression::ColumnId;
+use databend_common_expression::TableField;
+use databend_common_expression::TableSchema;
+use databend_common_meta_app::principal::StageInfo;
+use databend_common_meta_app::schema::TableInfo;
+use databend_common_storage::StageFileInfo;
+use databend_common_storage::StageFilesInfo;
+use databend_storages_common_table_meta::meta::ColumnStatistics;
+use parquet::file::metadata::ParquetMetaData;
+use parquet::format::SchemaElement;
+use parquet::schema::types;
+use parquet::schema::types::SchemaDescPtr;
+use parquet::schema::types::SchemaDescriptor;
+use parquet::thrift::TSerializable;
 use serde::Deserialize;
 use thrift::protocol::TCompactInputProtocol;
 use thrift::protocol::TCompactOutputProtocol;
 use thrift::protocol::TInputProtocol;
 use thrift::protocol::TListIdentifier;
 use thrift::protocol::TOutputProtocol;
-use thrift::protocol::TSerializable;
 use thrift::protocol::TType;
 
 use crate::plan::datasource::datasource_info::parquet_read_options::ParquetReadOptions;
+
+#[derive(Clone, Debug)]
+pub struct FullParquetMeta {
+    pub location: String,
+    pub size: u64,
+
+    pub meta: Arc<ParquetMetaData>,
+    /// Row group level statistics.
+    ///
+    /// We collect the statistics here to avoid multiple computations of the same parquet meta.
+    ///
+    /// The container is organized as:
+    /// - row_group_level_stats[i][j] is the statistics of the j-th column in the i-th row group of current file.
+    pub row_group_level_stats: Option<Vec<HashMap<ColumnId, ColumnStatistics>>>,
+}
 
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
 pub struct ParquetTableInfo {
@@ -50,6 +71,18 @@ pub struct ParquetTableInfo {
     pub files_to_read: Option<Vec<StageFileInfo>>,
     pub schema_from: String,
     pub compression_ratio: f64,
+    pub leaf_fields: Arc<Vec<TableField>>,
+
+    // These fields are only used in coordinator node of the cluster,
+    // so we don't need to serialize them.
+    #[serde(skip)]
+    pub parquet_metas: Arc<Mutex<Vec<Arc<FullParquetMeta>>>>,
+    #[serde(skip)]
+    pub need_stats_provider: bool,
+    #[serde(skip)]
+    pub max_threads: usize,
+    #[serde(skip)]
+    pub max_memory_usage: u64,
 }
 
 impl ParquetTableInfo {
@@ -103,14 +136,15 @@ mod tests {
     use std::sync::Arc;
 
     use arrow_schema::Schema as ArrowSchema;
-    use common_storage::StageFilesInfo;
-    use parquet_rs::basic::ConvertedType;
-    use parquet_rs::basic::Repetition;
-    use parquet_rs::basic::Type as PhysicalType;
-    use parquet_rs::errors::ParquetError;
-    use parquet_rs::schema::types::SchemaDescPtr;
-    use parquet_rs::schema::types::SchemaDescriptor;
-    use parquet_rs::schema::types::Type;
+    use databend_common_base::base::tokio::sync::Mutex;
+    use databend_common_storage::StageFilesInfo;
+    use parquet::basic::ConvertedType;
+    use parquet::basic::Repetition;
+    use parquet::basic::Type as PhysicalType;
+    use parquet::errors::ParquetError;
+    use parquet::schema::types::SchemaDescPtr;
+    use parquet::schema::types::SchemaDescriptor;
+    use parquet::schema::types::Type;
 
     use super::ParquetTableInfo;
 
@@ -145,16 +179,16 @@ mod tests {
         let list = Type::group_type_builder("records")
             .with_repetition(Repetition::REPEATED)
             .with_converted_type(ConvertedType::LIST)
-            .with_fields(&mut vec![Arc::new(item1), Arc::new(item2), Arc::new(item3)])
+            .with_fields(vec![Arc::new(item1), Arc::new(item2), Arc::new(item3)])
             .build()?;
         let bag = Type::group_type_builder("bag")
             .with_repetition(Repetition::OPTIONAL)
-            .with_fields(&mut vec![Arc::new(list)])
+            .with_fields(vec![Arc::new(list)])
             .build()?;
         fields.push(Arc::new(bag));
 
         let schema = Type::group_type_builder("schema")
-            .with_fields(&mut fields)
+            .with_fields(fields)
             .build()?;
         Ok(Arc::new(SchemaDescriptor::new(Arc::new(schema))))
     }
@@ -172,6 +206,7 @@ mod tests {
                 pattern: None,
             },
             table_info: Default::default(),
+            leaf_fields: Arc::new(vec![]),
             arrow_schema: ArrowSchema {
                 fields: Default::default(),
                 metadata: Default::default(),
@@ -179,6 +214,10 @@ mod tests {
             files_to_read: None,
             schema_from: "".to_string(),
             compression_ratio: 0.0,
+            parquet_metas: Arc::new(Mutex::new(vec![])),
+            need_stats_provider: false,
+            max_threads: 1,
+            max_memory_usage: 10000,
         };
         let s = serde_json::to_string(&info).unwrap();
         let info = serde_json::from_str::<ParquetTableInfo>(&s).unwrap();

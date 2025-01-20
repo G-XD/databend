@@ -16,37 +16,43 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
-use common_base::base::tokio;
-use common_base::base::tokio::sync::mpsc::channel;
-use common_base::base::tokio::sync::mpsc::Receiver;
-use common_base::base::tokio::sync::mpsc::Sender;
-use common_exception::ErrorCode;
-use common_exception::Result;
-use common_expression::DataBlock;
-use common_pipeline_core::pipe::Pipe;
-use common_pipeline_core::pipe::PipeItem;
-use common_pipeline_core::processors::port::InputPort;
-use common_pipeline_core::processors::port::OutputPort;
-use common_pipeline_core::processors::processor::ProcessorPtr;
-use common_pipeline_core::Pipeline;
-use common_pipeline_sinks::SyncSenderSink;
-use common_pipeline_sources::SyncReceiverSource;
+use databend_common_base::base::tokio;
+use databend_common_base::base::tokio::sync::mpsc::channel;
+use databend_common_base::base::tokio::sync::mpsc::Receiver;
+use databend_common_base::base::tokio::sync::mpsc::Sender;
+use databend_common_exception::ErrorCode;
+use databend_common_exception::Result;
+use databend_common_expression::DataBlock;
+use databend_common_pipeline_core::processors::InputPort;
+use databend_common_pipeline_core::processors::OutputPort;
+use databend_common_pipeline_core::processors::ProcessorPtr;
+use databend_common_pipeline_core::ExecutionInfo;
+use databend_common_pipeline_core::Pipe;
+use databend_common_pipeline_core::PipeItem;
+use databend_common_pipeline_core::Pipeline;
+use databend_common_pipeline_sinks::SyncSenderSink;
+use databend_common_pipeline_sources::SyncReceiverSource;
 use databend_query::pipelines::executor::ExecutorSettings;
-use databend_query::pipelines::executor::PipelineExecutor;
+use databend_query::pipelines::executor::QueryPipelineExecutor;
 use databend_query::sessions::QueryContext;
-use databend_query::test_kits::create_query_context;
+use databend_query::test_kits::TestFixture;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn test_always_call_on_finished() -> Result<()> {
+    let fixture = TestFixture::setup().await?;
+
     let settings = ExecutorSettings {
         query_id: Arc::new("".to_string()),
         max_execute_time_in_seconds: Default::default(),
+        enable_queries_executor: false,
+        max_threads: 8,
+        executor_node_id: "".to_string(),
     };
 
     {
         let (called_finished, pipeline) = create_pipeline();
 
-        match PipelineExecutor::create(pipeline, settings.clone()) {
+        match QueryPipelineExecutor::create(pipeline, settings.clone()) {
             Ok(_) => unreachable!(),
             Err(error) => {
                 assert_eq!(error.code(), 1001);
@@ -59,7 +65,7 @@ async fn test_always_call_on_finished() -> Result<()> {
         }
     }
 
-    let (_guard, ctx) = create_query_context().await?;
+    let ctx = fixture.new_query_ctx().await?;
     {
         let (called_finished, mut pipeline) = create_pipeline();
         let (_rx, sink_pipe) = create_sink_pipe(1)?;
@@ -68,7 +74,7 @@ async fn test_always_call_on_finished() -> Result<()> {
         pipeline.add_pipe(sink_pipe);
         pipeline.set_max_threads(1);
 
-        let executor = PipelineExecutor::create(pipeline, settings.clone())?;
+        let executor = QueryPipelineExecutor::create(pipeline, settings.clone())?;
 
         match executor.execute() {
             Ok(_) => unreachable!(),
@@ -76,7 +82,7 @@ async fn test_always_call_on_finished() -> Result<()> {
                 assert_eq!(error.code(), 1001);
                 assert_eq!(
                     error.message().as_str(),
-                    "test failure(while in query pipeline init)"
+                    "test failure\n(while in query pipeline init)"
                 );
                 assert!(!called_finished.load(Ordering::SeqCst));
                 drop(executor);
@@ -94,7 +100,7 @@ fn create_pipeline() -> (Arc<AtomicBool>, Pipeline) {
     pipeline.set_on_init(|| Err(ErrorCode::Internal("test failure")));
     pipeline.set_on_finished({
         let called_finished = called_finished.clone();
-        move |_may_error| {
+        move |_info: &ExecutionInfo| {
             called_finished.fetch_or(true, Ordering::SeqCst);
             Ok(())
         }

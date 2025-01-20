@@ -15,10 +15,15 @@
 use std::fmt::Debug;
 use std::fmt::Display;
 use std::fmt::Formatter;
+use std::time::Duration;
 
+use databend_common_base::base::tokio::time::timeout;
+use databend_common_exception::ErrorCode;
+use databend_common_exception::Result;
 use serde::Deserialize;
 use serde::Serialize;
 
+const DEFAULT_DETECT_REGION_TIMEOUT_SEC: u64 = 10;
 /// Storage params which contains the detailed storage info.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type")]
@@ -27,7 +32,6 @@ pub enum StorageParams {
     Fs(StorageFsConfig),
     Ftp(StorageFtpConfig),
     Gcs(StorageGcsConfig),
-    #[cfg(feature = "storage-hdfs")]
     Hdfs(StorageHdfsConfig),
     Http(StorageHttpConfig),
     Ipfs(StorageIpfsConfig),
@@ -36,9 +40,9 @@ pub enum StorageParams {
     Obs(StorageObsConfig),
     Oss(StorageOssConfig),
     S3(StorageS3Config),
-    Redis(StorageRedisConfig),
     Webhdfs(StorageWebhdfsConfig),
     Cos(StorageCosConfig),
+    Huggingface(StorageHuggingfaceConfig),
 
     /// None means this storage type is none.
     ///
@@ -61,7 +65,6 @@ impl StorageParams {
             StorageParams::Azblob(v) => v.endpoint_url.starts_with("https://"),
             StorageParams::Fs(_) => false,
             StorageParams::Ftp(v) => v.endpoint.starts_with("ftps://"),
-            #[cfg(feature = "storage-hdfs")]
             StorageParams::Hdfs(_) => false,
             StorageParams::Http(v) => v.endpoint_url.starts_with("https://"),
             StorageParams::Ipfs(c) => c.endpoint_url.starts_with("https://"),
@@ -71,9 +74,9 @@ impl StorageParams {
             StorageParams::Oss(v) => v.endpoint_url.starts_with("https://"),
             StorageParams::S3(v) => v.endpoint_url.starts_with("https://"),
             StorageParams::Gcs(v) => v.endpoint_url.starts_with("https://"),
-            StorageParams::Redis(_) => false,
             StorageParams::Webhdfs(v) => v.endpoint_url.starts_with("https://"),
             StorageParams::Cos(v) => v.endpoint_url.starts_with("https://"),
+            StorageParams::Huggingface(_) => true,
             StorageParams::None => false,
         }
     }
@@ -84,7 +87,6 @@ impl StorageParams {
             StorageParams::Azblob(v) => v.root = f(&v.root),
             StorageParams::Fs(v) => v.root = f(&v.root),
             StorageParams::Ftp(v) => v.root = f(&v.root),
-            #[cfg(feature = "storage-hdfs")]
             StorageParams::Hdfs(v) => v.root = f(&v.root),
             StorageParams::Http(_) => {}
             StorageParams::Ipfs(v) => v.root = f(&v.root),
@@ -94,9 +96,9 @@ impl StorageParams {
             StorageParams::Oss(v) => v.root = f(&v.root),
             StorageParams::S3(v) => v.root = f(&v.root),
             StorageParams::Gcs(v) => v.root = f(&v.root),
-            StorageParams::Redis(v) => v.root = f(&v.root),
             StorageParams::Webhdfs(v) => v.root = f(&v.root),
             StorageParams::Cos(v) => v.root = f(&v.root),
+            StorageParams::Huggingface(v) => v.root = f(&v.root),
             StorageParams::None => {}
         };
 
@@ -106,11 +108,56 @@ impl StorageParams {
     pub fn is_fs(&self) -> bool {
         matches!(self, StorageParams::Fs(_))
     }
+
+    /// Whether this storage params need encryption feature to start.
+    pub fn need_encryption_feature(&self) -> bool {
+        match &self {
+            StorageParams::Oss(v) => {
+                !v.server_side_encryption.is_empty() || !v.server_side_encryption_key_id.is_empty()
+            }
+            _ => false,
+        }
+    }
+
+    /// auto_detect is used to do auto detect for some storage params under async context.
+    ///
+    /// - This action should be taken before storage params been passed out.
+    pub async fn auto_detect(self) -> Result<Self> {
+        let sp = match self {
+            StorageParams::S3(mut s3) if s3.region.is_empty() => {
+                // Remove the possible trailing `/` in endpoint.
+                let endpoint = s3.endpoint_url.trim_end_matches('/');
+
+                // Make sure the endpoint contains the scheme.
+                let endpoint = if endpoint.starts_with("http") {
+                    endpoint.to_string()
+                } else {
+                    // Prefix https if endpoint doesn't start with scheme.
+                    format!("https://{}", endpoint)
+                };
+
+                s3.region = timeout(
+                    Duration::from_secs(DEFAULT_DETECT_REGION_TIMEOUT_SEC),
+                    opendal::services::S3::detect_region(&endpoint, &s3.bucket),
+                )
+                .await
+                .map_err(|e| {
+                    ErrorCode::StorageOther(format!("detect region timeout, time used {}", e))
+                })?
+                .unwrap_or_default();
+
+                StorageParams::S3(s3)
+            }
+            v => v,
+        };
+
+        Ok(sp)
+    }
 }
 
 /// StorageParams will be displayed by `{protocol}://{key1=value1},{key2=value2}`
 impl Display for StorageParams {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
         match self {
             StorageParams::Azblob(v) => write!(
                 f,
@@ -126,7 +173,6 @@ impl Display for StorageParams {
                 "gcs | bucket={},root={},endpoint={}",
                 v.bucket, v.root, v.endpoint_url
             ),
-            #[cfg(feature = "storage-hdfs")]
             StorageParams::Hdfs(v) => {
                 write!(f, "hdfs | root={},name_node={}", v.root, v.name_node)
             }
@@ -160,15 +206,15 @@ impl Display for StorageParams {
                     v.bucket, v.root, v.endpoint_url
                 )
             }
-            StorageParams::Redis(v) => {
-                write!(
-                    f,
-                    "redis | db={},root={},endpoint={}",
-                    v.db, v.root, v.endpoint_url
-                )
-            }
             StorageParams::Webhdfs(v) => {
                 write!(f, "webhdfs | root={},endpoint={}", v.root, v.endpoint_url)
+            }
+            StorageParams::Huggingface(v) => {
+                write!(
+                    f,
+                    "huggingface | repo_type={}, repo_id={}, root={}",
+                    v.repo_type, v.repo_id, v.root
+                )
             }
             StorageParams::None => {
                 write!(f, "none",)
@@ -188,7 +234,7 @@ pub struct StorageAzblobConfig {
 }
 
 impl Debug for StorageAzblobConfig {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
         f.debug_struct("StorageAzblobConfig")
             .field("endpoint_url", &self.endpoint_url)
             .field("container", &self.container)
@@ -235,7 +281,7 @@ impl Default for StorageFtpConfig {
 }
 
 impl Debug for StorageFtpConfig {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
         f.debug_struct("StorageFtpConfig")
             .field("endpoint", &self.endpoint)
             .field("root", &self.root)
@@ -268,7 +314,7 @@ impl Default for StorageGcsConfig {
 }
 
 impl Debug for StorageGcsConfig {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
         f.debug_struct("StorageGcsConfig")
             .field("endpoint", &self.endpoint_url)
             .field("bucket", &self.bucket)
@@ -322,8 +368,6 @@ pub struct StorageS3Config {
     pub role_arn: String,
     /// The ExternalId that used for AssumeRole.
     pub external_id: String,
-    /// Allow anonymous access to S3 if credential not loaded.
-    pub allow_anonymous: bool,
 }
 
 impl Default for StorageS3Config {
@@ -341,13 +385,12 @@ impl Default for StorageS3Config {
             enable_virtual_host_style: false,
             role_arn: "".to_string(),
             external_id: "".to_string(),
-            allow_anonymous: false,
         }
     }
 }
 
 impl Debug for StorageS3Config {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
         f.debug_struct("StorageS3Config")
             .field("endpoint_url", &self.endpoint_url)
             .field("region", &self.region)
@@ -364,7 +407,6 @@ impl Debug for StorageS3Config {
             )
             .field("security_token", &mask_string(&self.security_token, 3))
             .field("master_key", &mask_string(&self.master_key, 3))
-            .field("allow_anonymous", &self.allow_anonymous)
             .finish()
     }
 }
@@ -395,7 +437,7 @@ pub struct StorageObsConfig {
 }
 
 impl Debug for StorageObsConfig {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
         f.debug_struct("StorageObsConfig")
             .field("endpoint_url", &self.endpoint_url)
             .field("bucket", &self.bucket)
@@ -418,10 +460,18 @@ pub struct StorageOssConfig {
     pub access_key_id: String,
     pub access_key_secret: String,
     pub root: String,
+    /// Server-side encryption for OSS
+    ///
+    /// Available values: "AES256", "KMS"
+    pub server_side_encryption: String,
+    /// Server-side encryption key id for OSS
+    ///
+    /// Only effective when `server_side_encryption` is "KMS"
+    pub server_side_encryption_key_id: String,
 }
 
 impl Debug for StorageOssConfig {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
         f.debug_struct("StorageOssConfig")
             .field("endpoint_url", &self.endpoint_url)
             .field("presign_endpoint_url", &self.presign_endpoint_url)
@@ -431,6 +481,14 @@ impl Debug for StorageOssConfig {
             .field(
                 "access_key_secret",
                 &mask_string(&self.access_key_secret, 3),
+            )
+            .field(
+                "server_side_encryption",
+                &mask_string(&self.server_side_encryption, 3),
+            )
+            .field(
+                "server_side_encryption_key_id",
+                &mask_string(&self.server_side_encryption_key_id, 3),
             )
             .finish()
     }
@@ -458,38 +516,6 @@ impl Default for StorageMokaConfig {
     }
 }
 
-/// config for Redis Storage Service
-#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct StorageRedisConfig {
-    pub endpoint_url: String,
-    pub username: Option<String>,
-    pub password: Option<String>,
-    pub root: String,
-    pub db: i64,
-    /// TTL in seconds
-    pub default_ttl: Option<i64>,
-}
-
-impl Debug for StorageRedisConfig {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        let mut d = f.debug_struct("StorageRedisConfig");
-
-        d.field("endpoint_url", &self.endpoint_url)
-            .field("db", &self.db)
-            .field("root", &self.root)
-            .field("default_ttl", &self.default_ttl);
-
-        if let Some(username) = &self.username {
-            d.field("username", &mask_string(username, 3));
-        }
-        if let Some(password) = &self.password {
-            d.field("password", &mask_string(password, 3));
-        }
-
-        d.finish()
-    }
-}
-
 /// config for WebHDFS Storage Service
 #[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StorageWebhdfsConfig {
@@ -499,7 +525,7 @@ pub struct StorageWebhdfsConfig {
 }
 
 impl Debug for StorageWebhdfsConfig {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
         let mut ds = f.debug_struct("StorageWebhdfsConfig");
 
         ds.field("endpoint_url", &self.endpoint_url)
@@ -521,7 +547,7 @@ pub struct StorageCosConfig {
 }
 
 impl Debug for StorageCosConfig {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
         let mut ds = f.debug_struct("StorageCosConfig");
 
         ds.field("bucket", &self.bucket);
@@ -529,6 +555,41 @@ impl Debug for StorageCosConfig {
         ds.field("root", &self.root);
         ds.field("secret_id", &mask_string(&self.secret_id, 3));
         ds.field("secret_key", &mask_string(&self.secret_key, 3));
+
+        ds.finish()
+    }
+}
+
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StorageHuggingfaceConfig {
+    /// repo_id for huggingface repo, looks like `opendal/huggingface-testdata`
+    pub repo_id: String,
+    /// repo_type for huggingface repo
+    ///
+    /// available value: `dataset`, `model`
+    /// default value: `dataset`
+    pub repo_type: String,
+    /// revision for huggingface repo
+    ///
+    /// available value: branches, tags or commits in the repo.
+    /// default value: `main`
+    pub revision: String,
+    /// token for huggingface
+    ///
+    /// Only needed for private repo.
+    pub token: String,
+    pub root: String,
+}
+
+impl Debug for StorageHuggingfaceConfig {
+    fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
+        let mut ds = f.debug_struct("StorageHuggingFaceConfig");
+
+        ds.field("repo_id", &self.repo_id);
+        ds.field("repo_type", &self.repo_type);
+        ds.field("revision", &self.revision);
+        ds.field("root", &self.root);
+        ds.field("token", &mask_string(&self.token, 3));
 
         ds.finish()
     }

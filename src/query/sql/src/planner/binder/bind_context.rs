@@ -14,21 +14,25 @@
 
 use std::collections::btree_map;
 use std::collections::BTreeMap;
+use std::collections::HashMap;
+use std::collections::HashSet;
 use std::hash::Hash;
-use std::sync::Arc;
 
-use common_ast::ast::Query;
-use common_ast::ast::TableAlias;
-use common_ast::ast::WindowSpec;
-use common_catalog::plan::InternalColumn;
-use common_exception::ErrorCode;
-use common_exception::Result;
-use common_exception::Span;
-use common_expression::ColumnId;
-use common_expression::DataField;
-use common_expression::DataSchemaRef;
-use common_expression::DataSchemaRefExt;
 use dashmap::DashMap;
+use databend_common_ast::ast::Identifier;
+use databend_common_ast::ast::Query;
+use databend_common_ast::ast::TableAlias;
+use databend_common_ast::ast::WindowSpec;
+use databend_common_ast::Span;
+use databend_common_catalog::plan::InternalColumn;
+use databend_common_catalog::plan::InvertedIndexInfo;
+use databend_common_exception::ErrorCode;
+use databend_common_exception::Result;
+use databend_common_expression::ColumnId;
+use databend_common_expression::DataField;
+use databend_common_expression::DataSchemaRef;
+use databend_common_expression::DataSchemaRefExt;
+use databend_common_expression::TableDataType;
 use enum_as_inner::EnumAsInner;
 use indexmap::IndexMap;
 use itertools::Itertools;
@@ -36,12 +40,10 @@ use itertools::Itertools;
 use super::AggregateInfo;
 use super::INTERNAL_COLUMN_FACTORY;
 use crate::binder::column_binding::ColumnBinding;
-use crate::binder::lambda::LambdaInfo;
+use crate::binder::project_set::SetReturningInfo;
 use crate::binder::window::WindowInfo;
 use crate::binder::ColumnBindingBuilder;
 use crate::normalize_identifier;
-use crate::optimizer::SExpr;
-use crate::optimizer::StatInfo;
 use crate::plans::ScalarExpr;
 use crate::ColumnSet;
 use crate::IndexType;
@@ -56,12 +58,14 @@ pub enum ExprContext {
     WhereClause,
     GroupClaue,
     HavingClause,
+    QualifyClause,
     OrderByClause,
     LimitClause,
 
     InSetReturningFunction,
     InAggregateFunction,
     InLambdaFunction,
+    InAsyncFunction,
 
     #[default]
     Unknown,
@@ -102,6 +106,25 @@ pub enum NameResolutionResult {
     Alias { alias: String, scalar: ScalarExpr },
 }
 
+#[derive(Default, Clone, PartialEq, Eq, Debug)]
+pub struct VirtualColumnContext {
+    /// Whether allow rewrite as virtual column and pushdown.
+    pub allow_pushdown: bool,
+    /// The table indics of the virtual column has been readded,
+    /// used to avoid repeated reading
+    pub table_indices: HashSet<IndexType>,
+    /// Mapping: (table index) -> (derived virtual column indices)
+    /// This is used to add virtual column indices to Scan plan
+    pub virtual_column_indices: HashMap<IndexType, Vec<IndexType>>,
+    /// Mapping: (table index) -> (virtual column names and data types)
+    /// This is used to check whether the virtual column has be created
+    pub virtual_column_names: HashMap<IndexType, HashMap<String, TableDataType>>,
+    /// Mapping: (table index) -> (next virtual column id)
+    /// The is used to generate virtual column id for virtual columns.
+    /// Not a real column id, only used to identify a virtual column.
+    pub next_column_ids: HashMap<IndexType, u32>,
+}
+
 /// `BindContext` stores all the free variables in a query and tracks the context of binding procedure.
 #[derive(Clone, Debug)]
 pub struct BindContext {
@@ -116,12 +139,10 @@ pub struct BindContext {
 
     pub windows: WindowInfo,
 
-    pub lambda_info: LambdaInfo,
+    /// Set-returning functions info in current context.
+    pub srf_info: SetReturningInfo,
 
-    /// If the `BindContext` is created from a CTE, record the cte name
-    pub cte_name: Option<String>,
-
-    pub cte_map_ref: Box<IndexMap<String, CteInfo>>,
+    pub cte_context: CteContext,
 
     /// True if there is aggregation in current context, which means
     /// non-grouping columns cannot be referenced outside aggregation
@@ -133,9 +154,16 @@ pub struct BindContext {
     /// It's used to check if the view has a loop dependency.
     pub view_info: Option<(String, String)>,
 
-    /// Set-returning functions in current context.
-    /// The key is the `Expr::to_string` of the function.
-    pub srfs: DashMap<String, ScalarExpr>,
+    /// True if there is async function in current context, need rewrite.
+    pub have_async_func: bool,
+    /// True if there is udf script in current context, need rewrite.
+    pub have_udf_script: bool,
+    /// True if there is udf server in current context, need rewrite.
+    pub have_udf_server: bool,
+
+    pub inverted_index_map: Box<IndexMap<IndexType, InvertedIndexInfo>>,
+
+    pub virtual_column_context: VirtualColumnContext,
 
     pub expr_context: ExprContext,
 
@@ -146,17 +174,43 @@ pub struct BindContext {
     pub window_definitions: DashMap<String, WindowSpec>,
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct CteContext {
+    /// If the `BindContext` is created from a CTE, record the cte name
+    pub cte_name: Option<String>,
+    pub cte_map: Box<IndexMap<String, CteInfo>>,
+}
+
+impl CteContext {
+    // Merge two `CteContext` into one.
+    pub fn merge(&mut self, other: CteContext) {
+        let mut merged_cte_map = IndexMap::new();
+        for (left_key, left_value) in self.cte_map.iter() {
+            if let Some(right_value) = other.cte_map.get(left_key) {
+                let mut merged_value = left_value.clone();
+                if left_value.columns.is_empty() {
+                    merged_value.columns = right_value.columns.clone()
+                }
+                merged_cte_map.insert(left_key.clone(), merged_value);
+            }
+        }
+        self.cte_map = Box::new(merged_cte_map);
+    }
+
+    // Set cte context to current `BindContext`.
+    pub fn set_cte_context(&mut self, cte_context: CteContext) {
+        self.cte_map = cte_context.cte_map;
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct CteInfo {
     pub columns_alias: Vec<String>,
     pub query: Query,
     pub materialized: bool,
+    pub recursive: bool,
     pub cte_idx: IndexType,
-    // Record how many times this cte is used
-    pub used_count: usize,
-    // If cte is materialized, it has stat_info
-    pub stat_info: Option<Arc<StatInfo>>,
-    // If cte is materialized, save it's columns
+    // If cte is materialized, save its columns
     pub columns: Vec<ColumnBinding>,
 }
 
@@ -168,12 +222,15 @@ impl BindContext {
             bound_internal_columns: BTreeMap::new(),
             aggregate_info: AggregateInfo::default(),
             windows: WindowInfo::default(),
-            lambda_info: LambdaInfo::default(),
-            cte_name: None,
-            cte_map_ref: Box::default(),
+            srf_info: SetReturningInfo::default(),
+            cte_context: CteContext::default(),
             in_grouping: false,
             view_info: None,
-            srfs: DashMap::new(),
+            have_async_func: false,
+            have_udf_script: false,
+            have_udf_server: false,
+            inverted_index_map: Box::default(),
+            virtual_column_context: VirtualColumnContext::default(),
             expr_context: ExprContext::default(),
             planning_agg_index: false,
             window_definitions: DashMap::new(),
@@ -187,12 +244,15 @@ impl BindContext {
             bound_internal_columns: BTreeMap::new(),
             aggregate_info: Default::default(),
             windows: Default::default(),
-            lambda_info: LambdaInfo::default(),
-            cte_name: parent.cte_name,
-            cte_map_ref: parent.cte_map_ref.clone(),
+            srf_info: Default::default(),
+            cte_context: parent.cte_context.clone(),
             in_grouping: false,
             view_info: None,
-            srfs: DashMap::new(),
+            have_async_func: false,
+            have_udf_script: false,
+            have_udf_server: false,
+            inverted_index_map: Box::default(),
+            virtual_column_context: Default::default(),
             expr_context: ExprContext::default(),
             planning_agg_index: false,
             window_definitions: DashMap::new(),
@@ -203,14 +263,8 @@ impl BindContext {
     pub fn replace(&self) -> Self {
         let mut bind_context = BindContext::new();
         bind_context.parent = self.parent.clone();
-        bind_context.cte_name = self.cte_name.clone();
-        bind_context.cte_map_ref = self.cte_map_ref.clone();
+        bind_context.cte_context = self.cte_context.clone();
         bind_context
-    }
-
-    /// Generate a new BindContext and take current BindContext as its parent.
-    pub fn push(self) -> Self {
-        Self::with_parent(Box::new(self))
     }
 
     /// Returns all column bindings in current scope.
@@ -229,27 +283,7 @@ impl BindContext {
         alias: &TableAlias,
         name_resolution_ctx: &NameResolutionContext,
     ) -> Result<()> {
-        for column in self.columns.iter_mut() {
-            column.database_name = None;
-            column.table_name = Some(normalize_identifier(&alias.name, name_resolution_ctx).name);
-        }
-
-        if alias.columns.len() > self.columns.len() {
-            return Err(ErrorCode::SemanticError(format!(
-                "table has {} columns available but {} columns specified",
-                self.columns.len(),
-                alias.columns.len()
-            )));
-        }
-        for (index, column_name) in alias
-            .columns
-            .iter()
-            .map(|ident| normalize_identifier(ident, name_resolution_ctx).name)
-            .enumerate()
-        {
-            self.columns[index].column_name = column_name;
-        }
-        Ok(())
+        apply_alias_for_columns(&mut self.columns, alias, name_resolution_ctx)
     }
 
     /// Try to find a column binding with given table name and column name.
@@ -258,16 +292,29 @@ impl BindContext {
         &self,
         database: Option<&str>,
         table: Option<&str>,
-        column: &str,
-        span: Span,
+        column: &Identifier,
         available_aliases: &[(String, ScalarExpr)],
+        name_resolution_ctx: &NameResolutionContext,
     ) -> Result<NameResolutionResult> {
+        let name = &column.name;
+
+        if name_resolution_ctx.deny_column_reference {
+            let err = if column.is_quoted() {
+                ErrorCode::SemanticError(format!(
+                    "invalid identifier {name}, do you mean '{name}'?"
+                ))
+            } else {
+                ErrorCode::SemanticError(format!("invalid identifier {name}"))
+            };
+            return Err(err.set_span(column.span));
+        }
+
         let mut result = vec![];
         // Lookup parent context to resolve outer reference.
         let mut alias_match_count = 0;
         if self.expr_context.prefer_resolve_alias() {
             for (alias, scalar) in available_aliases {
-                if database.is_none() && table.is_none() && column == alias {
+                if database.is_none() && table.is_none() && name == alias {
                     result.push(NameResolutionResult::Alias {
                         alias: alias.clone(),
                         scalar: scalar.clone(),
@@ -278,14 +325,14 @@ impl BindContext {
             }
 
             if alias_match_count == 0 {
-                self.search_bound_columns_recursively(database, table, column, &mut result);
+                self.search_bound_columns_recursively(database, table, name, &mut result);
             }
         } else {
-            self.search_bound_columns_recursively(database, table, column, &mut result);
+            self.search_bound_columns_recursively(database, table, name, &mut result);
 
             if result.is_empty() {
                 for (alias, scalar) in available_aliases {
-                    if database.is_none() && table.is_none() && column == alias {
+                    if database.is_none() && table.is_none() && name == alias {
                         result.push(NameResolutionResult::Alias {
                             alias: alias.clone(),
                             scalar: scalar.clone(),
@@ -298,12 +345,20 @@ impl BindContext {
 
         if result.len() > 1 && !result.iter().all_equal() {
             return Err(ErrorCode::SemanticError(format!(
-                "column {column} reference or alias is ambiguous, please use another alias name",
-            )));
+                "column {name} reference or alias is ambiguous, please use another alias name",
+            ))
+            .set_span(column.span));
         }
 
         if result.is_empty() {
-            Err(ErrorCode::SemanticError(format!("column {column} doesn't exist")).set_span(span))
+            let err = if column.is_quoted() {
+                ErrorCode::SemanticError(format!(
+                    "column {name} doesn't exist, do you mean '{name}'?"
+                ))
+            } else {
+                ErrorCode::SemanticError(format!("column {name} doesn't exist"))
+            };
+            Err(err.set_span(column.span))
         } else {
             Ok(result.remove(0))
         }
@@ -348,7 +403,6 @@ impl BindContext {
         result: &mut Vec<NameResolutionResult>,
     ) {
         let mut bind_context: &BindContext = self;
-
         loop {
             for column_binding in bind_context.columns.iter() {
                 if Self::match_column_binding(database, table, column, column_binding) {
@@ -500,12 +554,12 @@ impl BindContext {
         }
     }
 
-    // Add internal column binding into `BindContext`
-    // Convert `InternalColumnBinding` to `ColumnBinding`
+    // Add internal column binding into `BindContext` and convert `InternalColumnBinding` to `ColumnBinding`.
     pub fn add_internal_column_binding(
         &mut self,
         column_binding: &InternalColumnBinding,
         metadata: MetadataRef,
+        visible: bool,
     ) -> Result<ColumnBinding> {
         let column_id = column_binding.internal_column.column_id();
         let (table_index, column_index, new) = match self.bound_internal_columns.entry(column_id) {
@@ -526,12 +580,24 @@ impl BindContext {
 
         let metadata = metadata.read();
         let table = metadata.table(table_index);
+        if !table.table().supported_internal_column(column_id) {
+            return Err(ErrorCode::SemanticError(format!(
+                "Unsupported internal column '{}' in table '{}'.",
+                column_binding.internal_column.column_name(),
+                table.table().name()
+            )));
+        }
+
         let column = metadata.column(column_index);
         let column_binding = ColumnBindingBuilder::new(
             column.name(),
             column_index,
             Box::new(column.data_type()),
-            Visibility::Visible,
+            if visible {
+                Visibility::Visible
+            } else {
+                Visibility::InVisible
+            },
         )
         .database_name(Some(table.database().to_string()))
         .table_name(Some(table.name().to_string()))
@@ -544,15 +610,6 @@ impl BindContext {
         }
 
         Ok(column_binding)
-    }
-
-    pub fn add_internal_column_into_expr(&self, s_expr: SExpr) -> SExpr {
-        let bound_internal_columns = &self.bound_internal_columns;
-        let mut s_expr = s_expr;
-        for (table_index, column_index) in bound_internal_columns.values() {
-            s_expr = SExpr::add_internal_column_index(&s_expr, *table_index, *column_index);
-        }
-        s_expr
     }
 
     pub fn column_set(&self) -> ColumnSet {
@@ -568,4 +625,33 @@ impl Default for BindContext {
     fn default() -> Self {
         BindContext::new()
     }
+}
+
+pub fn apply_alias_for_columns(
+    columns: &mut [ColumnBinding],
+    alias: &TableAlias,
+    name_resolution_ctx: &NameResolutionContext,
+) -> Result<()> {
+    for column in columns.iter_mut() {
+        column.database_name = None;
+        column.table_name = Some(normalize_identifier(&alias.name, name_resolution_ctx).name);
+    }
+
+    if alias.columns.len() > columns.len() {
+        return Err(ErrorCode::SemanticError(format!(
+            "table has {} columns available but {} columns specified",
+            columns.len(),
+            alias.columns.len()
+        ))
+        .set_span(alias.name.span));
+    }
+    for (index, column_name) in alias
+        .columns
+        .iter()
+        .map(|ident| normalize_identifier(ident, name_resolution_ctx).name)
+        .enumerate()
+    {
+        columns[index].column_name = column_name;
+    }
+    Ok(())
 }

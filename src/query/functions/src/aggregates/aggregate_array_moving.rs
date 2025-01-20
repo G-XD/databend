@@ -17,65 +17,63 @@ use std::fmt;
 use std::marker::PhantomData;
 use std::sync::Arc;
 
-use common_arrow::arrow::bitmap::Bitmap;
-use common_arrow::arrow::buffer::Buffer;
-use common_exception::ErrorCode;
-use common_exception::Result;
-use common_expression::type_check::check_number;
-use common_expression::types::decimal::*;
-use common_expression::types::number::Number;
-use common_expression::types::ArgType;
-use common_expression::types::DataType;
-use common_expression::types::DecimalDataType;
-use common_expression::types::Float64Type;
-use common_expression::types::Int8Type;
-use common_expression::types::NumberDataType;
-use common_expression::types::NumberType;
-use common_expression::types::ValueType;
-use common_expression::types::F64;
-use common_expression::utils::arithmetics_type::ResultTypeOfUnary;
-use common_expression::with_number_mapped_type;
-use common_expression::Column;
-use common_expression::ColumnBuilder;
-use common_expression::Expr;
-use common_expression::FunctionContext;
-use common_expression::Scalar;
-use common_expression::ScalarRef;
-use common_io::prelude::*;
+use borsh::BorshDeserialize;
+use borsh::BorshSerialize;
+use databend_common_exception::ErrorCode;
+use databend_common_exception::Result;
+use databend_common_expression::type_check::check_number;
+use databend_common_expression::types::decimal::*;
+use databend_common_expression::types::number::Number;
+use databend_common_expression::types::ArgType;
+use databend_common_expression::types::Bitmap;
+use databend_common_expression::types::Buffer;
+use databend_common_expression::types::DataType;
+use databend_common_expression::types::DecimalDataType;
+use databend_common_expression::types::Float64Type;
+use databend_common_expression::types::Int8Type;
+use databend_common_expression::types::NumberDataType;
+use databend_common_expression::types::NumberType;
+use databend_common_expression::types::ValueType;
+use databend_common_expression::types::F64;
+use databend_common_expression::utils::arithmetics_type::ResultTypeOfUnary;
+use databend_common_expression::with_number_mapped_type;
+use databend_common_expression::AggrStateRegistry;
+use databend_common_expression::AggrStateType;
+use databend_common_expression::Column;
+use databend_common_expression::ColumnBuilder;
+use databend_common_expression::Expr;
+use databend_common_expression::FunctionContext;
+use databend_common_expression::InputColumns;
+use databend_common_expression::Scalar;
+use databend_common_expression::ScalarRef;
 use ethnum::i256;
 use num_traits::AsPrimitive;
-use serde::de::DeserializeOwned;
-use serde::Serialize;
 
 use super::aggregate_function::AggregateFunction;
 use super::aggregate_function::AggregateFunctionRef;
 use super::aggregate_function_factory::AggregateFunctionDescription;
+use super::borsh_deserialize_state;
+use super::borsh_serialize_state;
 use super::StateAddr;
 use crate::aggregates::aggregate_sum::SumState;
 use crate::aggregates::assert_unary_arguments;
 use crate::aggregates::assert_variadic_params;
+use crate::aggregates::AggrState;
+use crate::aggregates::AggrStateLoc;
 use crate::BUILTIN_FUNCTIONS;
 
-#[derive(Default, Debug)]
-pub struct NumberArrayMovingSumState<T: Number, TSum: Number> {
+#[derive(Default, Debug, BorshDeserialize, BorshSerialize)]
+pub struct NumberArrayMovingSumState<T, TSum> {
     values: Vec<T>,
+    #[borsh(skip)]
     _t: PhantomData<TSum>,
 }
 
 impl<T, TSum> SumState for NumberArrayMovingSumState<T, TSum>
 where
-    T: Number + AsPrimitive<TSum> + Serialize + DeserializeOwned,
+    T: Number + AsPrimitive<TSum> + BorshSerialize + BorshDeserialize,
     TSum: Number + AsPrimitive<f64> + std::ops::AddAssign + std::ops::SubAssign,
 {
-    fn serialize(&self, writer: &mut Vec<u8>) -> Result<()> {
-        serialize_into_buf(writer, &self.values)
-    }
-
-    fn deserialize(&mut self, reader: &mut &[u8]) -> Result<()> {
-        self.values = deserialize_from_slice(reader)?;
-        Ok(())
-    }
-
     fn accumulate_row(&mut self, column: &Column, row: usize) -> Result<()> {
         let buffer = match column {
             Column::Null { .. } => {
@@ -120,7 +118,7 @@ where
         Ok(())
     }
 
-    fn accumulate_keys(places: &[StateAddr], offset: usize, columns: &Column) -> Result<()> {
+    fn accumulate_keys(places: &[StateAddr], loc: &[AggrStateLoc], columns: &Column) -> Result<()> {
         let buffer = match columns {
             Column::Null { len } => Buffer::from(vec![T::default(); *len]),
             Column::Nullable(box nullable_column) => {
@@ -129,15 +127,14 @@ where
             _ => NumberType::<T>::try_downcast_column(columns).unwrap(),
         };
         buffer.iter().zip(places.iter()).for_each(|(c, place)| {
-            let place = place.next(offset);
-            let state = place.get::<Self>();
+            let state = AggrState::new(*place, loc).get::<Self>();
             state.values.push(*c);
         });
         Ok(())
     }
 
     #[inline(always)]
-    fn merge(&mut self, other: &mut Self) -> Result<()> {
+    fn merge(&mut self, other: &Self) -> Result<()> {
         self.values.extend_from_slice(&other.values);
         Ok(())
     }
@@ -200,16 +197,16 @@ where
     }
 }
 
-#[derive(Default)]
-pub struct DecimalArrayMovingSumState<T: Decimal> {
+#[derive(Default, BorshDeserialize, BorshSerialize)]
+pub struct DecimalArrayMovingSumState<T> {
     pub values: Vec<T>,
 }
 
 impl<T> DecimalArrayMovingSumState<T>
 where T: Decimal
         + std::ops::AddAssign
-        + Serialize
-        + DeserializeOwned
+        + BorshSerialize
+        + BorshDeserialize
         + Copy
         + Clone
         + std::fmt::Debug
@@ -217,11 +214,12 @@ where T: Decimal
 {
     #[inline]
     pub fn check_over_flow(&self, value: T) -> Result<()> {
-        if value > T::max_of_max_precision() {
+        if value > T::MAX || value < T::MIN {
             return Err(ErrorCode::Overflow(format!(
-                "Decimal overflow: {} > {}",
+                "Decimal overflow: {} not in [{}, {}]",
                 value,
-                T::max_of_max_precision()
+                T::MIN,
+                T::MAX,
             )));
         }
         Ok(())
@@ -232,22 +230,13 @@ impl<T> SumState for DecimalArrayMovingSumState<T>
 where T: Decimal
         + std::ops::AddAssign
         + std::ops::SubAssign
-        + Serialize
-        + DeserializeOwned
+        + BorshSerialize
+        + BorshDeserialize
         + Copy
         + Clone
         + std::fmt::Debug
         + std::cmp::PartialOrd
 {
-    fn serialize(&self, writer: &mut Vec<u8>) -> Result<()> {
-        serialize_into_buf(writer, &self.values)
-    }
-
-    fn deserialize(&mut self, reader: &mut &[u8]) -> Result<()> {
-        self.values = deserialize_from_slice(reader)?;
-        Ok(())
-    }
-
     fn accumulate_row(&mut self, column: &Column, row: usize) -> Result<()> {
         let buffer = match column {
             Column::Null { .. } => {
@@ -295,7 +284,7 @@ where T: Decimal
         Ok(())
     }
 
-    fn accumulate_keys(places: &[StateAddr], offset: usize, columns: &Column) -> Result<()> {
+    fn accumulate_keys(places: &[StateAddr], loc: &[AggrStateLoc], columns: &Column) -> Result<()> {
         let buffer = match columns {
             Column::Null { len } => Buffer::from(vec![T::default(); *len]),
             Column::Nullable(box nullable_column) => {
@@ -304,15 +293,14 @@ where T: Decimal
             _ => T::try_downcast_column(columns).unwrap().0,
         };
         buffer.iter().zip(places.iter()).for_each(|(c, place)| {
-            let place = place.next(offset);
-            let state = place.get::<Self>();
+            let state = AggrState::new(*place, loc).get::<Self>();
             state.values.push(*c);
         });
         Ok(())
     }
 
     #[inline(always)]
-    fn merge(&mut self, other: &mut Self) -> Result<()> {
+    fn merge(&mut self, other: &Self) -> Result<()> {
         self.values.extend_from_slice(&other.values);
         Ok(())
     }
@@ -371,14 +359,14 @@ where T: Decimal
             }
             let avg_val = match sum
                 .checked_mul(T::e(scale_add as u32))
-                .and_then(|v| v.checked_div(T::from_u64(window_size as u64)))
+                .and_then(|v| v.checked_div(T::from_i128(window_size as u64)))
             {
                 Some(value) => value,
                 None => {
                     return Err(ErrorCode::Overflow(format!(
-                        "Decimal overflow: {} > (precision: {})",
+                        "Decimal overflow: {} mul {}",
                         sum,
-                        T::max_of_max_precision()
+                        T::e(scale_add as u32)
                     )));
                 }
             };
@@ -417,18 +405,18 @@ where State: SumState
         Ok(self.return_type.clone())
     }
 
-    fn init_state(&self, place: StateAddr) {
-        place.write(|| State::default());
+    fn init_state(&self, place: AggrState) {
+        place.write(State::default);
     }
 
-    fn state_layout(&self) -> Layout {
-        Layout::new::<State>()
+    fn register_state(&self, registry: &mut AggrStateRegistry) {
+        registry.register(AggrStateType::Custom(Layout::new::<State>()));
     }
 
     fn accumulate(
         &self,
-        place: StateAddr,
-        columns: &[Column],
+        place: AggrState,
+        columns: InputColumns,
         validity: Option<&Bitmap>,
         _input_rows: usize,
     ) -> Result<()> {
@@ -439,35 +427,37 @@ where State: SumState
     fn accumulate_keys(
         &self,
         places: &[StateAddr],
-        offset: usize,
-        columns: &[Column],
+        loc: &[AggrStateLoc],
+        columns: InputColumns,
         _input_rows: usize,
     ) -> Result<()> {
-        State::accumulate_keys(places, offset, &columns[0])
+        State::accumulate_keys(places, loc, &columns[0])
     }
 
-    fn accumulate_row(&self, place: StateAddr, columns: &[Column], row: usize) -> Result<()> {
+    fn accumulate_row(&self, place: AggrState, columns: InputColumns, row: usize) -> Result<()> {
         let state = place.get::<State>();
         state.accumulate_row(&columns[0], row)
     }
 
-    fn serialize(&self, place: StateAddr, writer: &mut Vec<u8>) -> Result<()> {
+    fn serialize(&self, place: AggrState, writer: &mut Vec<u8>) -> Result<()> {
         let state = place.get::<State>();
-        state.serialize(writer)
+        borsh_serialize_state(writer, state)
     }
 
-    fn deserialize(&self, place: StateAddr, reader: &mut &[u8]) -> Result<()> {
+    fn merge(&self, place: AggrState, reader: &mut &[u8]) -> Result<()> {
         let state = place.get::<State>();
-        state.deserialize(reader)
+        let rhs: State = borsh_deserialize_state(reader)?;
+
+        state.merge(&rhs)
     }
 
-    fn merge(&self, place: StateAddr, rhs: StateAddr) -> Result<()> {
-        let rhs = rhs.get::<State>();
+    fn merge_states(&self, place: AggrState, rhs: AggrState) -> Result<()> {
         let state = place.get::<State>();
-        state.merge(rhs)
+        let other = rhs.get::<State>();
+        state.merge(other)
     }
 
-    fn merge_result(&self, place: StateAddr, builder: &mut ColumnBuilder) -> Result<()> {
+    fn merge_result(&self, place: AggrState, builder: &mut ColumnBuilder) -> Result<()> {
         let state = place.get::<State>();
         state.merge_avg_result(builder, 0_u64, self.scale_add, &self.window_size)
     }
@@ -476,7 +466,7 @@ where State: SumState
         true
     }
 
-    unsafe fn drop_state(&self, place: StateAddr) {
+    unsafe fn drop_state(&self, place: AggrState) {
         let state = place.get::<State>();
         std::ptr::drop_in_place(state);
     }
@@ -498,18 +488,13 @@ where State: SumState
         scale_add: u8,
     ) -> Result<AggregateFunctionRef> {
         let window_size = if params.len() == 1 {
-            let window_size: u64 = check_number(
+            let window_size = check_number::<_, u64>(
                 None,
                 &FunctionContext::default(),
-                &Expr::<usize>::Cast {
+                &Expr::<usize>::Constant {
                     span: None,
-                    is_try: false,
-                    expr: Box::new(Expr::Constant {
-                        span: None,
-                        scalar: params[0].clone(),
-                        data_type: params[0].as_ref().infer_data_type(),
-                    }),
-                    dest_type: DataType::Number(NumberDataType::UInt64),
+                    scalar: params[0].clone(),
+                    data_type: params[0].as_ref().infer_data_type(),
                 },
                 &BUILTIN_FUNCTIONS,
             )?;
@@ -614,18 +599,18 @@ where State: SumState
         Ok(self.return_type.clone())
     }
 
-    fn init_state(&self, place: StateAddr) {
-        place.write(|| State::default());
+    fn init_state(&self, place: AggrState) {
+        place.write(State::default);
     }
 
-    fn state_layout(&self) -> Layout {
-        Layout::new::<State>()
+    fn register_state(&self, registry: &mut AggrStateRegistry) {
+        registry.register(AggrStateType::Custom(Layout::new::<State>()));
     }
 
     fn accumulate(
         &self,
-        place: StateAddr,
-        columns: &[Column],
+        place: AggrState,
+        columns: InputColumns,
         validity: Option<&Bitmap>,
         _input_rows: usize,
     ) -> Result<()> {
@@ -636,35 +621,37 @@ where State: SumState
     fn accumulate_keys(
         &self,
         places: &[StateAddr],
-        offset: usize,
-        columns: &[Column],
+        loc: &[AggrStateLoc],
+        columns: InputColumns,
         _input_rows: usize,
     ) -> Result<()> {
-        State::accumulate_keys(places, offset, &columns[0])
+        State::accumulate_keys(places, loc, &columns[0])
     }
 
-    fn accumulate_row(&self, place: StateAddr, columns: &[Column], row: usize) -> Result<()> {
+    fn accumulate_row(&self, place: AggrState, columns: InputColumns, row: usize) -> Result<()> {
         let state = place.get::<State>();
         state.accumulate_row(&columns[0], row)
     }
 
-    fn serialize(&self, place: StateAddr, writer: &mut Vec<u8>) -> Result<()> {
+    fn serialize(&self, place: AggrState, writer: &mut Vec<u8>) -> Result<()> {
         let state = place.get::<State>();
-        state.serialize(writer)
+        borsh_serialize_state(writer, state)
     }
 
-    fn deserialize(&self, place: StateAddr, reader: &mut &[u8]) -> Result<()> {
+    fn merge(&self, place: AggrState, reader: &mut &[u8]) -> Result<()> {
         let state = place.get::<State>();
-        state.deserialize(reader)
+        let rhs: State = borsh_deserialize_state(reader)?;
+
+        state.merge(&rhs)
     }
 
-    fn merge(&self, place: StateAddr, rhs: StateAddr) -> Result<()> {
-        let rhs = rhs.get::<State>();
+    fn merge_states(&self, place: AggrState, rhs: AggrState) -> Result<()> {
         let state = place.get::<State>();
-        state.merge(rhs)
+        let other = rhs.get::<State>();
+        state.merge(other)
     }
 
-    fn merge_result(&self, place: StateAddr, builder: &mut ColumnBuilder) -> Result<()> {
+    fn merge_result(&self, place: AggrState, builder: &mut ColumnBuilder) -> Result<()> {
         let state = place.get::<State>();
         state.merge_result(builder, &self.window_size)
     }
@@ -673,7 +660,7 @@ where State: SumState
         true
     }
 
-    unsafe fn drop_state(&self, place: StateAddr) {
+    unsafe fn drop_state(&self, place: AggrState) {
         let state = place.get::<State>();
         std::ptr::drop_in_place(state);
     }
@@ -694,18 +681,13 @@ where State: SumState
         return_type: DataType,
     ) -> Result<AggregateFunctionRef> {
         let window_size = if params.len() == 1 {
-            let window_size: u64 = check_number(
+            let window_size = check_number::<_, u64>(
                 None,
                 &FunctionContext::default(),
-                &Expr::<usize>::Cast {
+                &Expr::<usize>::Constant {
                     span: None,
-                    is_try: false,
-                    expr: Box::new(Expr::Constant {
-                        span: None,
-                        scalar: params[0].clone(),
-                        data_type: params[0].as_ref().infer_data_type(),
-                    }),
-                    dest_type: DataType::Number(NumberDataType::UInt64),
+                    scalar: params[0].clone(),
+                    data_type: params[0].as_ref().infer_data_type(),
                 },
                 &BUILTIN_FUNCTIONS,
             )?;

@@ -1,4 +1,4 @@
-// Copyright 2021 Datafuse Labs.
+// Copyright 2021 Datafuse Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,14 +14,14 @@
 
 //! Test metasrv SchemaApi by writing to leader and then reading from a follower.
 
-use common_meta_api::SchemaApiTestSuite;
+use databend_common_meta_api::SchemaApiTestSuite;
 use test_harness::test;
 
 use crate::testing::meta_service_test_harness;
 use crate::tests::service::start_metasrv_cluster;
 
 #[test(harness = meta_service_test_harness)]
-#[minitrace::trace]
+#[fastrace::trace]
 async fn test_meta_api_database_create_get_drop() -> anyhow::Result<()> {
     let tcs = start_metasrv_cluster(&[0, 1]).await?;
 
@@ -34,7 +34,7 @@ async fn test_meta_api_database_create_get_drop() -> anyhow::Result<()> {
 }
 
 #[test(harness = meta_service_test_harness)]
-#[minitrace::trace]
+#[fastrace::trace]
 async fn test_meta_api_list_database() -> anyhow::Result<()> {
     let tcs = start_metasrv_cluster(&[0, 1]).await?;
 
@@ -47,7 +47,7 @@ async fn test_meta_api_list_database() -> anyhow::Result<()> {
 }
 
 #[test(harness = meta_service_test_harness)]
-#[minitrace::trace]
+#[fastrace::trace]
 async fn test_meta_api_table_create_get_drop() -> anyhow::Result<()> {
     let tcs = start_metasrv_cluster(&[0, 1]).await?;
 
@@ -59,7 +59,7 @@ async fn test_meta_api_table_create_get_drop() -> anyhow::Result<()> {
 }
 
 #[test(harness = meta_service_test_harness)]
-#[minitrace::trace]
+#[fastrace::trace]
 async fn test_meta_api_list_table() -> anyhow::Result<()> {
     let tcs = start_metasrv_cluster(&[0, 1]).await?;
 

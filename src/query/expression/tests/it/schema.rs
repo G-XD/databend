@@ -14,14 +14,14 @@
 
 use std::collections::BTreeMap;
 
-use common_exception::Result;
-use common_expression::create_test_complex_schema;
-use common_expression::types::NumberDataType;
-use common_expression::ColumnId;
-use common_expression::Scalar;
-use common_expression::TableDataType;
-use common_expression::TableField;
-use common_expression::TableSchema;
+use databend_common_exception::Result;
+use databend_common_expression::create_test_complex_schema;
+use databend_common_expression::types::NumberDataType;
+use databend_common_expression::ColumnId;
+use databend_common_expression::Scalar;
+use databend_common_expression::TableDataType;
+use databend_common_expression::TableField;
+use databend_common_expression::TableSchema;
 use pretty_assertions::assert_eq;
 
 #[test]
@@ -33,6 +33,13 @@ fn test_project_schema_from_tuple() -> Result<()> {
     let b = TableDataType::Tuple {
         fields_name: vec!["b1".to_string(), "b2".to_string()],
         fields_type: vec![b1.clone(), TableDataType::Number(NumberDataType::Int64)],
+    };
+    let d = TableDataType::Tuple {
+        fields_name: vec!["d1".to_string(), "d2".to_string()],
+        fields_type: vec![
+            TableDataType::Number(NumberDataType::Int64),
+            TableDataType::Number(NumberDataType::Int64),
+        ],
     };
     let fields = vec![
         TableField::new("a", TableDataType::Number(NumberDataType::UInt64)),
@@ -73,11 +80,11 @@ fn test_project_schema_from_tuple() -> Result<()> {
                 (1, "b:b1:b11"),
                 (2, "b:b1:b12"),
                 (3, "b:b2"),
-                (1, "b11"),
-                (2, "b12"),
-                (1, "b11"),
-                (2, "b12"),
-                (3, "b2"),
+                (1, "b:b1:b11"),
+                (2, "b:b1:b12"),
+                (1, "b:b1:b11"),
+                (2, "b:b1:b12"),
+                (3, "b:b2"),
             ];
             let leaf_fields = project_schema.leaf_fields();
             for (i, leaf_field) in leaf_fields.iter().enumerate() {
@@ -134,8 +141,44 @@ fn test_project_schema_from_tuple() -> Result<()> {
             TableField::new_from_column_id("b:b1:b11", TableDataType::Boolean, 5),
             TableField::new_from_column_id("b:b1:b12", TableDataType::String, 6),
             TableField::new_from_column_id("b:b2", TableDataType::Number(NumberDataType::Int64), 7),
+            TableField::new_from_column_id("b:b1", b1.clone(), 5),
+            TableField::new_from_column_id("b", b.clone(), 5),
+        ];
+        let project_schema = schema.inner_project(&path_indices);
+
+        for (i, field) in project_schema.fields().iter().enumerate() {
+            assert_eq!(*field, expect_fields[i]);
+        }
+        assert_eq!(project_schema.next_column_id(), schema.next_column_id());
+    }
+
+    // add column
+    {
+        schema.add_columns(&[TableField::new("d", d.clone())])?;
+
+        let mut path_indices = BTreeMap::new();
+        path_indices.insert(0, vec![0]);
+        path_indices.insert(1, vec![1]);
+        path_indices.insert(2, vec![2, 0, 0]);
+        path_indices.insert(3, vec![2, 0, 1]);
+        path_indices.insert(4, vec![2, 1]);
+        path_indices.insert(5, vec![2, 0]);
+        path_indices.insert(6, vec![2]);
+        path_indices.insert(7, vec![3, 0]);
+        path_indices.insert(8, vec![3, 1]);
+        path_indices.insert(9, vec![3]);
+
+        let expect_fields = vec![
+            TableField::new_from_column_id("a", TableDataType::Number(NumberDataType::UInt64), 0),
+            TableField::new_from_column_id("c", TableDataType::Number(NumberDataType::UInt64), 4),
+            TableField::new_from_column_id("b:b1:b11", TableDataType::Boolean, 5),
+            TableField::new_from_column_id("b:b1:b12", TableDataType::String, 6),
+            TableField::new_from_column_id("b:b2", TableDataType::Number(NumberDataType::Int64), 7),
             TableField::new_from_column_id("b:b1", b1, 5),
             TableField::new_from_column_id("b", b, 5),
+            TableField::new_from_column_id("d:d1", TableDataType::Number(NumberDataType::Int64), 8),
+            TableField::new_from_column_id("d:d2", TableDataType::Number(NumberDataType::Int64), 9),
+            TableField::new_from_column_id("d", d, 8),
         ];
         let project_schema = schema.inner_project(&path_indices);
 
@@ -163,8 +206,8 @@ fn test_schema_from_simple_type() -> Result<()> {
     assert_eq!(schema.next_column_id(), 3);
 
     let leaf_fields = schema.leaf_fields();
-    let leaf_field_names = vec!["a", "b", "c"];
-    let leaf_column_ids = vec![0, 1, 2];
+    let leaf_field_names = ["a", "b", "c"];
+    let leaf_column_ids = [0, 1, 2];
     for (i, field) in leaf_fields.iter().enumerate() {
         assert_eq!(field.name(), leaf_field_names[i]);
         assert_eq!(field.column_id(), leaf_column_ids[i]);
@@ -200,35 +243,32 @@ fn test_field_leaf_default_values() -> Result<()> {
     let schema = TableSchema::new(fields);
 
     let default_values = vec![
-        Scalar::Number(common_expression::types::number::NumberScalar::UInt64(1)),
+        Scalar::Number(databend_common_expression::types::number::NumberScalar::UInt64(1)),
         Scalar::Tuple(vec![
             Scalar::Tuple(vec![
                 Scalar::Boolean(true),
-                Scalar::String(vec!['a', 'b'].iter().map(|c| *c as u8).collect::<Vec<_>>()),
+                Scalar::String("ab".to_string()),
             ]),
-            Scalar::Number(common_expression::types::number::NumberScalar::Int64(2)),
+            Scalar::Number(databend_common_expression::types::number::NumberScalar::Int64(2)),
         ]),
-        Scalar::Number(common_expression::types::number::NumberScalar::UInt64(10)),
+        Scalar::Number(databend_common_expression::types::number::NumberScalar::UInt64(10)),
     ];
 
     let leaf_default_values = schema.field_leaf_default_values(&default_values);
     let expected_leaf_default_values: Vec<(ColumnId, Scalar)> = vec![
         (
             0,
-            Scalar::Number(common_expression::types::number::NumberScalar::UInt64(1)),
+            Scalar::Number(databend_common_expression::types::number::NumberScalar::UInt64(1)),
         ),
         (1, Scalar::Boolean(true)),
-        (
-            2,
-            Scalar::String(vec!['a', 'b'].iter().map(|c| *c as u8).collect::<Vec<_>>()),
-        ),
+        (2, Scalar::String("ab".to_string())),
         (
             3,
-            Scalar::Number(common_expression::types::number::NumberScalar::Int64(2)),
+            Scalar::Number(databend_common_expression::types::number::NumberScalar::Int64(2)),
         ),
         (
             4,
-            Scalar::Number(common_expression::types::number::NumberScalar::UInt64(10)),
+            Scalar::Number(databend_common_expression::types::number::NumberScalar::UInt64(10)),
         ),
     ];
     expected_leaf_default_values
@@ -257,26 +297,45 @@ fn test_schema_from_struct() -> Result<()> {
 
     let expected_fields = vec![
         ("u64", TableDataType::Number(NumberDataType::UInt64)),
-        ("0", TableDataType::Number(NumberDataType::UInt64)),
-        ("1", TableDataType::Number(NumberDataType::UInt64)),
-        ("1:0", TableDataType::Number(NumberDataType::UInt64)),
-        ("0", TableDataType::Number(NumberDataType::UInt64)),
-        ("1", TableDataType::Number(NumberDataType::UInt64)),
         (
-            "nullarray",
-            TableDataType::Nullable(Box::new(TableDataType::Array(Box::new(
-                TableDataType::Number(NumberDataType::UInt64),
-            )))),
+            "tuplearray:\"0\":\"0\"",
+            TableDataType::Number(NumberDataType::UInt64),
         ),
-        ("key", TableDataType::Number(NumberDataType::UInt64)),
-        ("value", TableDataType::String),
+        (
+            "tuplearray:\"0\":\"1\"",
+            TableDataType::Number(NumberDataType::UInt64),
+        ),
+        (
+            "tuplearray:\"1\":0",
+            TableDataType::Number(NumberDataType::UInt64),
+        ),
+        (
+            "arraytuple:0:\"0\"",
+            TableDataType::Number(NumberDataType::UInt64),
+        ),
+        (
+            "arraytuple:0:\"1\"",
+            TableDataType::Number(NumberDataType::UInt64),
+        ),
+        ("nullarray:0", TableDataType::Number(NumberDataType::UInt64)),
+        (
+            "maparray:key",
+            TableDataType::Number(NumberDataType::UInt64),
+        ),
+        ("maparray:value", TableDataType::String),
         (
             "nullu64",
             TableDataType::Nullable(Box::new(TableDataType::Number(NumberDataType::UInt64))),
         ),
         ("u64array:0", TableDataType::Number(NumberDataType::UInt64)),
-        ("a", TableDataType::Number(NumberDataType::Int32)),
-        ("b", TableDataType::Number(NumberDataType::Int32)),
+        (
+            "tuplesimple:a",
+            TableDataType::Number(NumberDataType::Int32),
+        ),
+        (
+            "tuplesimple:b",
+            TableDataType::Number(NumberDataType::Int32),
+        ),
     ];
 
     for (i, field) in leaf_fields.iter().enumerate() {
@@ -335,18 +394,18 @@ fn test_schema_from_struct() -> Result<()> {
     {
         let expected_column_id_field = vec![
             (0, "u64"),
-            (1, "0"),
-            (2, "1"),
-            (3, "1:0"),
-            (4, "0"),
-            (5, "1"),
-            (6, "nullarray"),
-            (7, "key"),
-            (8, "value"),
+            (1, "tuplearray:\"0\":\"0\""),
+            (2, "tuplearray:\"0\":\"1\""),
+            (3, "tuplearray:\"1\":0"),
+            (4, "arraytuple:0:\"0\""),
+            (5, "arraytuple:0:\"1\""),
+            (6, "nullarray:0"),
+            (7, "maparray:key"),
+            (8, "maparray:value"),
             (9, "nullu64"),
             (10, "u64array:0"),
-            (11, "a"),
-            (12, "b"),
+            (11, "tuplesimple:a"),
+            (12, "tuplesimple:b"),
         ];
         let leaf_fields = schema.leaf_fields();
         for (i, leaf_field) in leaf_fields.iter().enumerate() {
@@ -458,12 +517,12 @@ fn test_schema_modify_field() -> Result<()> {
 
     // check leaf fields
     {
-        let expected_column_id_field = vec![
+        let expected_column_id_field = [
             (0, "a"),
             (2, "c"),
-            (3, "0"),
-            (4, "1"),
-            (5, "1"),
+            (3, "s:\"0\":\"0\""),
+            (4, "s:\"0\":\"1\""),
+            (5, "s:\"1\""),
             (6, "ary:0:0"),
         ];
         let leaf_fields = schema.leaf_fields();
@@ -579,4 +638,25 @@ fn test_leaf_columns_of() -> Result<()> {
     assert_eq!(schema.leaf_columns_of(&"d".to_string()), vec![5, 6]);
     assert_eq!(schema.leaf_columns_of(&"e".to_string()), vec![7]);
     Ok(())
+}
+
+#[test]
+fn test_geography_as_arrow() {
+    use databend_common_expression::types::binary::BinaryColumnBuilder;
+    use databend_common_expression::types::geography::GeographyColumn;
+    use databend_common_expression::Column;
+    use databend_common_io::wkb::make_point;
+
+    let mut builder = BinaryColumnBuilder::with_capacity(3, 0);
+    builder.put_slice(&make_point(1.0, 2.0));
+    builder.commit_row();
+    builder.put_slice(&make_point(2.0, 3.0));
+    builder.commit_row();
+    builder.put_slice(&make_point(4.0, 5.0));
+    builder.commit_row();
+    let col = Column::Geography(GeographyColumn(builder.build()));
+    let data_type = col.data_type();
+    let arr = col.clone().into_arrow_rs();
+    let got = Column::from_arrow_rs(arr, &data_type).unwrap();
+    assert_eq!(col, got)
 }

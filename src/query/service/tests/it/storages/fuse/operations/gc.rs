@@ -16,29 +16,26 @@ use std::sync::Arc;
 
 use chrono::Duration;
 use chrono::Utc;
-use common_base::base::tokio;
-use common_catalog::table_context::TableContext;
-use common_exception::Result;
-use common_storages_fuse::io::MetaWriter;
-use common_storages_fuse::FuseTable;
-use databend_query::test_kits::table_test_fixture::append_sample_data;
-use databend_query::test_kits::table_test_fixture::check_data_dir;
-use databend_query::test_kits::table_test_fixture::TestFixture;
-use databend_query::test_kits::utils::generate_segments;
-use databend_query::test_kits::utils::generate_snapshot_with_segments;
-use databend_query::test_kits::utils::generate_snapshots;
-use storages_common_table_meta::meta::Location;
-use storages_common_table_meta::meta::TableSnapshot;
-use storages_common_table_meta::meta::Versioned;
+use databend_common_base::base::tokio;
+use databend_common_catalog::table_context::TableContext;
+use databend_common_exception::Result;
+use databend_common_storages_fuse::io::MetaWriter;
+use databend_common_storages_fuse::FuseTable;
+use databend_query::test_kits::*;
+use databend_storages_common_table_meta::meta::Location;
+use databend_storages_common_table_meta::meta::TableSnapshot;
+use databend_storages_common_table_meta::meta::Versioned;
 use uuid::Uuid;
 
 use crate::storages::fuse::operations::mutation::compact_segment;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_fuse_purge_normal_case() -> Result<()> {
-    let fixture = TestFixture::new().await;
-    let ctx = fixture.ctx();
+    let fixture = TestFixture::setup().await?;
+    fixture.create_default_database().await?;
     fixture.create_default_table().await?;
+
+    let ctx = fixture.new_query_ctx().await?;
 
     // ingests some test data
     append_sample_data(1, &fixture).await?;
@@ -66,14 +63,17 @@ async fn test_fuse_purge_normal_case() -> Result<()> {
         None,
     )
     .await?;
+
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_fuse_purge_normal_orphan_snapshot() -> Result<()> {
-    let fixture = TestFixture::new().await;
-    let ctx = fixture.ctx();
+    let fixture = TestFixture::setup().await?;
+    fixture.create_default_database().await?;
     fixture.create_default_table().await?;
+
+    let ctx = fixture.new_query_ctx().await?;
 
     // ingests some test data
     append_sample_data(1, &fixture).await?;
@@ -91,7 +91,7 @@ async fn test_fuse_purge_normal_orphan_snapshot() -> Result<()> {
             .snapshot_location_from_uuid(&orphan_snapshot_id, TableSnapshot::VERSION)?;
         // orphan_snapshot is created by using `from_previous`, which guarantees
         // that the timestamp of snapshot returned is larger than `current_snapshot`'s.
-        let orphan_snapshot = TableSnapshot::from_previous(current_snapshot.as_ref());
+        let orphan_snapshot = TableSnapshot::from_previous(current_snapshot.as_ref(), None);
         orphan_snapshot
             .write_meta(&operator, &orphan_snapshot_location)
             .await?;
@@ -121,6 +121,7 @@ async fn test_fuse_purge_normal_orphan_snapshot() -> Result<()> {
         None,
     )
     .await?;
+
     Ok(())
 }
 
@@ -173,9 +174,11 @@ async fn test_fuse_purge_orphan_retention() -> Result<()> {
     //  - 3 segments left: seg_c, seg_2, seg_1
     //  - 3 blocks left: block_c, block_2, block_1
 
-    let fixture = TestFixture::new().await;
-    let ctx = fixture.ctx();
+    let fixture = TestFixture::setup().await?;
+    fixture.create_default_database().await?;
     fixture.create_default_table().await?;
+
+    let ctx = fixture.new_query_ctx().await?;
 
     // 1. prepare `S_1`
     let number_of_block = 1;
@@ -241,15 +244,18 @@ async fn test_fuse_purge_orphan_retention() -> Result<()> {
         None,
     )
     .await?;
+
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_fuse_purge_older_version() -> Result<()> {
-    let fixture = TestFixture::new().await;
+    let fixture = TestFixture::setup().await?;
+    fixture.create_default_database().await?;
     fixture.create_normal_table().await?;
+
     generate_snapshots(&fixture).await?;
-    let ctx = fixture.ctx();
+    let ctx = fixture.new_query_ctx().await?;
     let table_ctx: Arc<dyn TableContext> = ctx.clone();
     let now = Utc::now();
 
@@ -259,9 +265,9 @@ async fn test_fuse_purge_older_version() -> Result<()> {
         let fuse_table = FuseTable::try_from_table(latest_table.as_ref())?;
         let snapshot_files = fuse_table.list_snapshot_files().await?;
         let time_point = now - Duration::hours(12);
-        let snapshot_loc = fuse_table.snapshot_loc().await?.unwrap();
+        let snapshot_loc = fuse_table.snapshot_loc().unwrap();
         let table = fuse_table
-            .navigate_to_time_point(snapshot_loc, time_point)
+            .navigate_to_time_point(snapshot_loc, time_point, ctx.clone().get_abort_checker())
             .await?;
         let keep_last_snapshot = true;
         table

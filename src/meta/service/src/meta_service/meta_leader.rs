@@ -14,39 +14,46 @@
 
 use std::collections::BTreeSet;
 
-use common_base::base::tokio::sync::RwLockReadGuard;
-use common_meta_kvapi::kvapi::KVApi;
-use common_meta_raft_store::sm_v002::SMV002;
-use common_meta_sled_store::openraft::ChangeMembers;
-use common_meta_stoerr::MetaStorageError;
-use common_meta_types::AppliedState;
-use common_meta_types::ClientWriteError;
-use common_meta_types::Cmd;
-use common_meta_types::LogEntry;
-use common_meta_types::MembershipNode;
-use common_meta_types::MetaDataError;
-use common_meta_types::MetaDataReadError;
-use common_meta_types::MetaOperationError;
-use common_meta_types::Node;
-use common_meta_types::NodeId;
-use common_meta_types::RaftError;
-use common_meta_types::SeqV;
-use common_metrics::counter::Count;
-use log::as_debug;
+use anyerror::AnyError;
+use databend_common_base::base::tokio::sync::RwLockReadGuard;
+use databend_common_meta_client::MetaGrpcReadReq;
+use databend_common_meta_kvapi::kvapi::KVApi;
+use databend_common_meta_raft_store::sm_v003::SMV003;
+use databend_common_meta_sled_store::openraft::ChangeMembers;
+use databend_common_meta_stoerr::MetaStorageError;
+use databend_common_meta_types::protobuf::StreamItem;
+use databend_common_meta_types::raft_types::ClientWriteError;
+use databend_common_meta_types::raft_types::MembershipNode;
+use databend_common_meta_types::raft_types::NodeId;
+use databend_common_meta_types::raft_types::RaftError;
+use databend_common_meta_types::seq_value::SeqV;
+use databend_common_meta_types::AppliedState;
+use databend_common_meta_types::Cmd;
+use databend_common_meta_types::LogEntry;
+use databend_common_meta_types::MetaDataError;
+use databend_common_meta_types::MetaDataReadError;
+use databend_common_meta_types::MetaOperationError;
+use databend_common_meta_types::Node;
+use databend_common_metrics::count::Count;
+use futures::StreamExt;
+use futures::TryStreamExt;
 use log::debug;
 use log::info;
 use maplit::btreemap;
 use maplit::btreeset;
+use tonic::codegen::BoxStream;
+use tonic::Status;
 
 use crate::message::ForwardRequest;
 use crate::message::ForwardRequestBody;
 use crate::message::ForwardResponse;
 use crate::message::JoinRequest;
 use crate::message::LeaveRequest;
-use crate::meta_service::raftmeta::MetaRaft;
+use crate::meta_service::meta_node::MetaRaft;
 use crate::meta_service::MetaNode;
 use crate::metrics::server_metrics;
 use crate::metrics::ProposalPending;
+use crate::request_handling::Handler;
 use crate::store::RaftStore;
 
 /// The container of APIs of the leader in a meta service cluster.
@@ -58,20 +65,14 @@ pub struct MetaLeader<'a> {
     raft: &'a MetaRaft,
 }
 
-impl<'a> MetaLeader<'a> {
-    pub fn new(meta_node: &'a MetaNode) -> MetaLeader {
-        MetaLeader {
-            sto: &meta_node.sto,
-            raft: &meta_node.raft,
-        }
-    }
-
-    #[minitrace::trace]
-    pub async fn handle_request(
+#[async_trait::async_trait]
+impl Handler<ForwardRequestBody> for MetaLeader<'_> {
+    #[fastrace::trace]
+    async fn handle(
         &self,
-        req: ForwardRequest,
+        req: ForwardRequest<ForwardRequestBody>,
     ) -> Result<ForwardResponse, MetaOperationError> {
-        debug!(req = as_debug!(&req), target = req.forward_to_leader; "handle_forwardable_req");
+        debug!(req :? =(&req), target = req.forward_to_leader; "handle_forwardable_req");
 
         match req.body {
             ForwardRequestBody::Ping => Ok(ForwardResponse::Pong),
@@ -106,6 +107,70 @@ impl<'a> MetaLeader<'a> {
             }
         }
     }
+}
+
+#[async_trait::async_trait]
+impl Handler<MetaGrpcReadReq> for MetaLeader<'_> {
+    #[fastrace::trace]
+    async fn handle(
+        &self,
+        req: ForwardRequest<MetaGrpcReadReq>,
+    ) -> Result<BoxStream<StreamItem>, MetaOperationError> {
+        debug!(req :? =(&req); "handle(MetaGrpcReadReq)");
+
+        let sm = self.get_state_machine().await;
+        let kv_api = sm.kv_api();
+
+        match req.body {
+            MetaGrpcReadReq::GetKV(req) => {
+                // safe unwrap(): Infallible
+                let got = kv_api.get_kv(&req.key).await.unwrap();
+
+                let item = StreamItem::from((req.key.clone(), got));
+                let strm = futures::stream::iter([Ok(item)]);
+
+                Ok(strm.boxed())
+            }
+
+            MetaGrpcReadReq::MGetKV(req) => {
+                // safe unwrap(): Infallible
+                let values = kv_api.mget_kv(&req.keys).await.unwrap();
+
+                let kv_iter = req
+                    .keys
+                    .clone()
+                    .into_iter()
+                    .zip(values)
+                    .map(|(k, v)| Ok(StreamItem::from((k, v))));
+
+                let strm = futures::stream::iter(kv_iter);
+
+                Ok(strm.boxed())
+            }
+
+            MetaGrpcReadReq::ListKV(req) => {
+                let strm =
+                    kv_api.list_kv(&req.prefix).await.map_err(|e| {
+                        MetaOperationError::DataError(MetaDataError::ReadError(
+                            MetaDataReadError::new("list_kv", &req.prefix, &e),
+                        ))
+                    })?;
+
+                let strm = strm.map_err(|e| Status::internal(e.to_string()));
+
+                Ok(strm.boxed())
+            }
+        }
+    }
+}
+
+impl<'a> MetaLeader<'a> {
+    pub fn new(meta_node: &'a MetaNode) -> MetaLeader<'a> {
+        MetaLeader {
+            sto: &meta_node.raft_store,
+            raft: &meta_node.raft,
+        }
+    }
 
     /// Join a new node to the cluster.
     ///
@@ -113,7 +178,7 @@ impl<'a> MetaLeader<'a> {
     /// - Adds the node to membership to let it become a voter.
     ///
     /// If the node is already in cluster membership, it still returns Ok.
-    #[minitrace::trace]
+    #[fastrace::trace]
     pub async fn join(&self, req: JoinRequest) -> Result<(), RaftError<ClientWriteError>> {
         let node_id = req.node_id;
         let endpoint = req.endpoint;
@@ -154,9 +219,19 @@ impl<'a> MetaLeader<'a> {
     /// - Remove the node from cluster.
     ///
     /// If the node is not in cluster membership, it still returns Ok.
-    #[minitrace::trace]
+    #[fastrace::trace]
     pub async fn leave(&self, req: LeaveRequest) -> Result<(), MetaOperationError> {
         let node_id = req.node_id;
+
+        if node_id == self.sto.id {
+            return Err(MetaOperationError::DataError(MetaDataError::ReadError(
+                MetaDataReadError::new(
+                    "leave",
+                    format!("can not leave id={} via itself", node_id),
+                    &AnyError::error("leave-via-self"),
+                ),
+            )));
+        }
 
         let can_res = self
             .can_leave(node_id)
@@ -187,7 +262,7 @@ impl<'a> MetaLeader<'a> {
     /// Write a log through local raft node and return the states before and after applying the log.
     ///
     /// If the raft node is not a leader, it returns MetaRaftError::ForwardToLeader.
-    #[minitrace::trace]
+    #[fastrace::trace]
     pub async fn write(
         &self,
         mut entry: LogEntry,
@@ -223,7 +298,7 @@ impl<'a> MetaLeader<'a> {
     async fn can_leave(&self, id: NodeId) -> Result<Result<(), String>, MetaStorageError> {
         let membership = {
             let sm = self.get_state_machine().await;
-            sm.last_membership_ref().membership().clone()
+            sm.sys_data_ref().last_membership_ref().membership().clone()
         };
         info!("check can_leave: id: {}, membership: {:?}", id, membership);
 
@@ -239,7 +314,7 @@ impl<'a> MetaLeader<'a> {
         Ok(Ok(()))
     }
 
-    async fn get_state_machine(&self) -> RwLockReadGuard<'_, SMV002> {
+    async fn get_state_machine(&self) -> RwLockReadGuard<'_, SMV003> {
         self.sto.state_machine.read().await
     }
 }

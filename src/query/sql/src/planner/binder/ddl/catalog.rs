@@ -13,28 +13,34 @@
 // limitations under the License.
 
 use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::fmt::Write;
+use std::sync::Arc;
 
 use chrono::Utc;
-use common_ast::ast::CreateCatalogStmt;
-use common_ast::ast::DropCatalogStmt;
-use common_ast::ast::ShowCatalogsStmt;
-use common_ast::ast::ShowCreateCatalogStmt;
-use common_ast::ast::ShowLimit;
-use common_ast::ast::UriLocation;
-use common_exception::ErrorCode;
-use common_exception::Result;
-use common_expression::types::DataType;
-use common_expression::DataField;
-use common_expression::DataSchemaRefExt;
-use common_meta_app::schema::CatalogMeta;
-use common_meta_app::schema::CatalogOption;
-use common_meta_app::schema::CatalogType;
-use common_meta_app::schema::HiveCatalogOption;
-use common_meta_app::schema::IcebergCatalogOption;
-use url::Url;
+use databend_common_ast::ast::CreateCatalogStmt;
+use databend_common_ast::ast::DropCatalogStmt;
+use databend_common_ast::ast::ShowCatalogsStmt;
+use databend_common_ast::ast::ShowCreateCatalogStmt;
+use databend_common_ast::ast::ShowLimit;
+use databend_common_ast::ast::UriLocation;
+use databend_common_catalog::table_context::TableContext;
+use databend_common_exception::ErrorCode;
+use databend_common_exception::Result;
+use databend_common_expression::types::DataType;
+use databend_common_expression::DataField;
+use databend_common_expression::DataSchemaRefExt;
+use databend_common_meta_app::schema::CatalogMeta;
+use databend_common_meta_app::schema::CatalogOption;
+use databend_common_meta_app::schema::CatalogType;
+use databend_common_meta_app::schema::HiveCatalogOption;
+use databend_common_meta_app::schema::IcebergCatalogOption;
+use databend_common_meta_app::schema::IcebergGlueCatalogOption;
+use databend_common_meta_app::schema::IcebergHmsCatalogOption;
+use databend_common_meta_app::schema::IcebergRestCatalogOption;
+use databend_common_meta_app::storage::StorageParams;
 
-use crate::binder::parse_uri_location;
+use crate::binder::parse_storage_params_from_uri;
 use crate::normalize_identifier;
 use crate::plans::CreateCatalogPlan;
 use crate::plans::DropCatalogPlan;
@@ -101,7 +107,9 @@ impl Binder {
 
         let tenant = self.ctx.get_tenant();
 
-        let meta = self.try_create_meta_from_options(*catalog_type, options)?;
+        let meta = self
+            .try_create_meta_from_options(&self.ctx, catalog_type.clone().into(), options)
+            .await?;
 
         Ok(Plan::CreateCatalog(Box::new(CreateCatalogPlan {
             if_not_exists: *if_not_exists,
@@ -126,8 +134,9 @@ impl Binder {
         })))
     }
 
-    fn try_create_meta_from_options(
+    async fn try_create_meta_from_options(
         &self,
+        ctx: &Arc<dyn TableContext>,
         catalog_type: CatalogType,
         options: &BTreeMap<String, String>,
     ) -> Result<CatalogMeta> {
@@ -140,74 +149,22 @@ impl Binder {
                 ));
             }
             CatalogType::Hive => {
-                if !cfg!(feature = "hive") {
-                    return Err(ErrorCode::CatalogNotSupported(
-                        "Hive catalog support is not enabled in your databend-query distribution."
-                            .to_string(),
-                    ));
-                }
-                let address = options
-                    .get("address")
-                    .ok_or_else(|| ErrorCode::InvalidArgument("expected field: ADDRESS"))?;
+                let mut options = options.clone();
+
+                // Remove address and url to avoid unexpected field error in uri location.
+                let address = options.remove("metastore_address").ok_or_else(|| {
+                    ErrorCode::InvalidArgument("expected field: METASTORE_ADDRESS")
+                })?;
+
+                let sp = parse_hive_catalog_url(ctx, options).await?;
 
                 CatalogOption::Hive(HiveCatalogOption {
-                    address: address.to_string(),
+                    address,
+                    storage_params: sp.map(Box::new),
                 })
             }
             CatalogType::Iceberg => {
-                let mut catalog_options = options.clone();
-
-                // the uri should in the same schema as in stages
-                let uri = catalog_options
-                    .remove("url") // has to be removed, or UriLocation will complain about unknown field.
-                    .ok_or_else(|| ErrorCode::InvalidArgument("expected field: URL"))?;
-
-                // create a uri location
-                let mut location = if let Some(path) = uri.strip_prefix("fs://") {
-                    UriLocation::new(
-                        "fs".to_string(),
-                        "".to_string(),
-                        path.to_string(),
-                        "".to_string(),
-                        catalog_options,
-                    )
-                } else {
-                    let parsed = Url::parse(&uri).map_err(|err| {
-                        ErrorCode::InvalidArgument(format!("expected valid URL: {:?}", err))
-                    })?;
-                    let name = parsed
-                        .host_str()
-                        .map(|hostname| {
-                            if let Some(port) = parsed.port() {
-                                format!("{}:{}", hostname, port)
-                            } else {
-                                hostname.to_string()
-                            }
-                        })
-                        .ok_or_else(|| {
-                            ErrorCode::InvalidArgument("expected valid URI: no hostname section")
-                        })?;
-
-                    let path = if parsed.path().is_empty() {
-                        "/".to_string()
-                    } else {
-                        parsed.path().to_string()
-                    };
-
-                    UriLocation::new(
-                        parsed.scheme().to_string(),
-                        name,
-                        path,
-                        "".to_string(),
-                        catalog_options,
-                    )
-                };
-
-                let (sp, _) = parse_uri_location(&mut location)?;
-
-                let opt = IcebergCatalogOption {
-                    storage_params: Box::new(sp),
-                };
+                let opt = parse_iceberg_rest_catalog(options.clone())?;
                 CatalogOption::Iceberg(opt)
             }
         };
@@ -217,4 +174,77 @@ impl Binder {
             created_on: Utc::now(),
         })
     }
+}
+
+async fn parse_hive_catalog_url(
+    ctx: &Arc<dyn TableContext>,
+    options: BTreeMap<String, String>,
+) -> Result<Option<StorageParams>> {
+    // Make sure options has been lower cases.
+    let mut options = options
+        .into_iter()
+        .map(|(k, v)| (k.to_lowercase(), v))
+        .collect::<BTreeMap<_, _>>();
+
+    // has to be removed, or UriLocation will complain about unknown field
+    let uri = if let Some(v) = options.remove("url") {
+        v
+    } else {
+        return Ok(None);
+    };
+
+    let mut location = UriLocation::from_uri(uri, options)?;
+    let sp = parse_storage_params_from_uri(
+        &mut location,
+        Some(ctx.as_ref()),
+        "when create Hive Catalog",
+    )
+    .await?;
+
+    Ok(Some(sp))
+}
+
+fn parse_iceberg_rest_catalog(
+    mut options: BTreeMap<String, String>,
+) -> Result<IcebergCatalogOption> {
+    let typ = options
+        .remove("type")
+        .ok_or_else(|| ErrorCode::InvalidArgument("type for iceberg catalog is not specified"))?
+        .to_lowercase();
+
+    let address = options
+        .remove("address")
+        .ok_or_else(|| ErrorCode::InvalidArgument("address for iceberg catalog is not specified"))?
+        .to_string();
+
+    let warehouse = options
+        .remove("warehouse")
+        .ok_or_else(|| {
+            ErrorCode::InvalidArgument("warehouse for iceberg catalog is not specified")
+        })?
+        .to_string();
+
+    let option = match typ.as_str() {
+        "rest" => IcebergCatalogOption::Rest(IcebergRestCatalogOption {
+            uri: address,
+            warehouse,
+            props: HashMap::from_iter(options),
+        }),
+        "hive" => IcebergCatalogOption::Hms(IcebergHmsCatalogOption {
+            address,
+            warehouse,
+            props: HashMap::from_iter(options),
+        }),
+        "glue" => IcebergCatalogOption::Glue(IcebergGlueCatalogOption {
+            warehouse,
+            props: HashMap::from_iter(options),
+        }),
+        v => {
+            return Err(ErrorCode::InvalidArgument(format!(
+                "iceberg catalog with type {v} is not supported"
+            )));
+        }
+    };
+
+    Ok(option)
 }

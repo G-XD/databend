@@ -14,8 +14,9 @@
 
 use std::sync::Arc;
 
-use common_exception::Result;
+use databend_common_exception::Result;
 
+use crate::optimizer::extract::Matcher;
 use crate::optimizer::rule::Rule;
 use crate::optimizer::rule::TransformResult;
 use crate::optimizer::RuleID;
@@ -23,14 +24,13 @@ use crate::optimizer::SExpr;
 use crate::plans::Join;
 use crate::plans::JoinType;
 use crate::plans::Operator;
-use crate::plans::PatternPlan;
 use crate::plans::RelOp;
 
 /// Rule to apply commutativity of join operator.
 /// In opposite to RuleCommuteJoin, this rule only applies to base tables.
 pub struct RuleCommuteJoinBaseTable {
     id: RuleID,
-    patterns: Vec<SExpr>,
+    matchers: Vec<Matcher>,
 }
 
 impl RuleCommuteJoinBaseTable {
@@ -41,16 +41,10 @@ impl RuleCommuteJoinBaseTable {
             // LogicalJoin
             // | \
             // *  *
-            patterns: vec![SExpr::create_binary(
-                Arc::new(
-                    PatternPlan {
-                        plan_type: RelOp::Join,
-                    }
-                    .into(),
-                ),
-                Arc::new(SExpr::create_pattern_leaf()),
-                Arc::new(SExpr::create_pattern_leaf()),
-            )],
+            matchers: vec![Matcher::MatchOp {
+                op_type: RelOp::Join,
+                children: vec![Matcher::Leaf, Matcher::Leaf],
+            }],
         }
     }
 }
@@ -83,8 +77,10 @@ impl Rule for RuleCommuteJoinBaseTable {
             | JoinType::RightAnti
             | JoinType::LeftMark => {
                 // Swap the join conditions side
-                (join.left_conditions, join.right_conditions) =
-                    (join.right_conditions, join.left_conditions);
+                for condition in join.equi_conditions.iter_mut() {
+                    (condition.left, condition.right) =
+                        (condition.right.clone(), condition.left.clone());
+                }
                 join.join_type = join.join_type.opposite();
                 let mut result = SExpr::create_binary(
                     Arc::new(join.into()),
@@ -104,10 +100,9 @@ impl Rule for RuleCommuteJoinBaseTable {
         Ok(())
     }
 
-    fn patterns(&self) -> &Vec<SExpr> {
-        &self.patterns
+    fn matchers(&self) -> &[Matcher] {
+        &self.matchers
     }
-
     fn transformation(&self) -> bool {
         false
     }

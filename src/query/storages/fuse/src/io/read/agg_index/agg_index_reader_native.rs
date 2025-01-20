@@ -14,39 +14,47 @@
 
 use std::sync::Arc;
 
-use common_arrow::arrow::chunk::Chunk;
-use common_arrow::native::read as nread;
-use common_exception::Result;
-use common_expression::DataBlock;
+use databend_common_exception::Result;
+use databend_common_expression::DataBlock;
+use databend_common_native::read as nread;
+use databend_storages_common_table_meta::meta::ColumnMeta;
 use log::debug;
-use storages_common_table_meta::meta::ColumnMeta;
 
 use super::AggIndexReader;
-use crate::io::BlockReader;
 use crate::io::NativeSourceData;
-use crate::FusePartInfo;
+use crate::FuseBlockPartInfo;
 
 impl AggIndexReader {
     pub fn sync_read_native_data(&self, loc: &str) -> Option<NativeSourceData> {
-        match self.reader.operator.blocking().reader(loc) {
-            Ok(mut reader) => {
+        match self.reader.operator.blocking().stat(loc) {
+            Ok(meta) => {
+                let mut reader = self
+                    .reader
+                    .operator
+                    .blocking()
+                    .reader(loc)
+                    .ok()?
+                    .into_std_read(0..meta.content_length())
+                    .ok()?;
                 let metadata = nread::reader::read_meta(&mut reader)
                     .inspect_err(|e| {
                         debug!("Read aggregating index `{loc}`'s metadata failed: {e}")
                     })
                     .ok()?;
                 let num_rows = metadata[0].pages.iter().map(|p| p.num_values).sum();
-                debug_assert!(
-                    metadata
-                        .iter()
-                        .all(|c| c.pages.iter().map(|p| p.num_values).sum::<u64>() == num_rows)
-                );
+                debug_assert!(metadata.iter().all(|c| c
+                    .pages
+                    .iter()
+                    .map(|p| p.num_values)
+                    .sum::<u64>()
+                    == num_rows));
+
                 let columns_meta = metadata
                     .into_iter()
                     .enumerate()
                     .map(|(i, c)| (i as u32, ColumnMeta::Native(c)))
                     .collect();
-                let part = FusePartInfo::create(
+                let part = FuseBlockPartInfo::create(
                     loc.to_string(),
                     num_rows,
                     columns_meta,
@@ -58,7 +66,7 @@ impl AggIndexReader {
                 );
                 let res = self
                     .reader
-                    .sync_read_native_columns_data(part)
+                    .sync_read_native_columns_data(&part, &None)
                     .inspect_err(|e| debug!("Read aggregating index `{loc}` failed: {e}"))
                     .ok()?;
                 Some(res)
@@ -75,30 +83,33 @@ impl AggIndexReader {
     }
 
     pub async fn read_native_data(&self, loc: &str) -> Option<NativeSourceData> {
-        match self.reader.operator.reader(loc).await {
-            Ok(mut reader) => {
-                let metadata = nread::reader::read_meta_async(&mut reader, None)
-                    .await
-                    .inspect_err(|e| {
-                        debug!("Read aggregating index `{loc}`'s metadata failed: {e}")
-                    })
-                    .ok()?;
+        match self.reader.operator.stat(loc).await {
+            Ok(meta) => {
+                let reader = self.reader.operator.reader(loc).await.ok()?;
+                let (metadata, _) =
+                    nread::reader::read_meta_async(reader, meta.content_length() as usize)
+                        .await
+                        .inspect_err(|e| {
+                            debug!("Read aggregating index `{loc}`'s metadata failed: {e}")
+                        })
+                        .ok()?;
                 if metadata.is_empty() {
                     debug!("Aggregating index `{loc}` is empty");
                     return None;
                 }
                 let num_rows = metadata[0].pages.iter().map(|p| p.num_values).sum();
-                debug_assert!(
-                    metadata
-                        .iter()
-                        .all(|c| c.pages.iter().map(|p| p.num_values).sum::<u64>() == num_rows)
-                );
+                debug_assert!(metadata.iter().all(|c| c
+                    .pages
+                    .iter()
+                    .map(|p| p.num_values)
+                    .sum::<u64>()
+                    == num_rows));
                 let columns_meta = metadata
                     .into_iter()
                     .enumerate()
                     .map(|(i, c)| (i as u32, ColumnMeta::Native(c)))
                     .collect();
-                let part = FusePartInfo::create(
+                let part = FuseBlockPartInfo::create(
                     loc.to_string(),
                     num_rows,
                     columns_meta,
@@ -110,7 +121,7 @@ impl AggIndexReader {
                 );
                 let res = self
                     .reader
-                    .async_read_native_columns_data(part)
+                    .async_read_native_columns_data(&part, &self.ctx, &None)
                     .await
                     .inspect_err(|e| debug!("Read aggregating index `{loc}` failed: {e}"))
                     .ok()?;
@@ -129,15 +140,10 @@ impl AggIndexReader {
 
     pub fn deserialize_native_data(&self, data: &mut NativeSourceData) -> Result<DataBlock> {
         let mut all_columns_arrays = vec![];
-        for (index, column_node) in self.reader.project_column_nodes.iter().enumerate() {
-            let column_leaves = column_node
-                .leaf_indices
-                .iter()
-                .map(|i| self.reader.parquet_schema_descriptor.columns()[*i].clone())
-                .collect::<Vec<_>>();
 
+        for (index, column_node) in self.reader.project_column_nodes.iter().enumerate() {
             let readers = data.remove(&index).unwrap();
-            let array_iter = BlockReader::build_array_iter(column_node, column_leaves, readers)?;
+            let array_iter = self.reader.build_column_iter(column_node, readers)?;
             let arrays = array_iter.map(|a| Ok(a?)).collect::<Result<Vec<_>>>()?;
             all_columns_arrays.push(arrays);
         }
@@ -146,21 +152,18 @@ impl AggIndexReader {
                 self.reader.data_schema(),
             )));
         }
-        debug_assert!(
-            all_columns_arrays
-                .iter()
-                .all(|a| a.len() == all_columns_arrays[0].len())
-        );
+        debug_assert!(all_columns_arrays
+            .iter()
+            .all(|a| a.len() == all_columns_arrays[0].len()));
         let page_num = all_columns_arrays[0].len();
         let mut blocks = Vec::with_capacity(page_num);
 
         for i in 0..page_num {
-            let mut arrays = Vec::with_capacity(all_columns_arrays.len());
-            for array in all_columns_arrays.iter() {
-                arrays.push(array[i].clone());
+            let mut columns = Vec::with_capacity(all_columns_arrays.len());
+            for cs in all_columns_arrays.iter() {
+                columns.push(cs[i].clone());
             }
-            let chunk = Chunk::new(arrays);
-            let block = DataBlock::from_arrow_chunk(&chunk, &self.reader.data_schema())?;
+            let block = DataBlock::new_from_columns(columns);
             blocks.push(block);
         }
         let block = DataBlock::concat(&blocks)?;

@@ -12,21 +12,26 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::any::type_name;
+use std::fmt::Write;
 use std::sync::Arc;
 
-use common_base::dump_backtrace;
-use common_catalog::table::Table;
-use common_catalog::table_context::TableContext;
-use common_exception::Result;
-use common_expression::types::StringType;
-use common_expression::DataBlock;
-use common_expression::FromData;
-use common_expression::TableDataType;
-use common_expression::TableField;
-use common_expression::TableSchemaRefExt;
-use common_meta_app::schema::TableIdent;
-use common_meta_app::schema::TableInfo;
-use common_meta_app::schema::TableMeta;
+use databend_common_base::get_all_tasks;
+use databend_common_base::runtime::Runtime;
+use databend_common_catalog::table::DistributionLevel;
+use databend_common_catalog::table::Table;
+use databend_common_catalog::table_context::TableContext;
+use databend_common_exception::Result;
+use databend_common_expression::types::StringType;
+use databend_common_expression::DataBlock;
+use databend_common_expression::FromData;
+use databend_common_expression::TableDataType;
+use databend_common_expression::TableField;
+use databend_common_expression::TableSchemaRefExt;
+use databend_common_meta_app::schema::TableIdent;
+use databend_common_meta_app::schema::TableInfo;
+use databend_common_meta_app::schema::TableMeta;
+use regex::Captures;
 
 use crate::SyncOneBlockSystemTable;
 use crate::SyncSystemTable;
@@ -40,7 +45,7 @@ impl SyncSystemTable for BacktraceTable {
     const NAME: &'static str = "system.backtrace";
 
     // Allow distributed query.
-    const IS_LOCAL: bool = false;
+    const DISTRIBUTION_LEVEL: DistributionLevel = DistributionLevel::Warehouse;
 
     fn get_table_info(&self) -> &TableInfo {
         &self.table_info
@@ -48,16 +53,67 @@ impl SyncSystemTable for BacktraceTable {
 
     fn get_full_data(&self, ctx: Arc<dyn TableContext>) -> Result<DataBlock> {
         let local_node = ctx.get_cluster().local_id.clone();
-        let stack = dump_backtrace(false);
+        let (tasks, polling_tasks) = get_all_tasks(false);
+        let tasks_size = tasks.len() + polling_tasks.len();
 
-        let mut nodes: Vec<Vec<u8>> = Vec::with_capacity(1);
-        let mut stacks: Vec<Vec<u8>> = Vec::with_capacity(1);
+        let mut nodes: Vec<String> = Vec::with_capacity(tasks_size);
+        let mut queries_id: Vec<String> = Vec::with_capacity(tasks_size);
+        let mut queries_status: Vec<String> = Vec::with_capacity(tasks_size);
+        let mut stacks: Vec<String> = Vec::with_capacity(tasks_size);
+        let regex = regex::Regex::new("<(.+) as .+>").unwrap();
 
-        nodes.push(local_node.into_bytes());
-        stacks.push(stack.into_bytes());
+        for (status, mut tasks) in [
+            ("PENDING".to_string(), tasks),
+            ("RUNNING".to_string(), polling_tasks),
+        ] {
+            tasks.sort_by(|l, r| Ord::cmp(&l.stack_frames.len(), &r.stack_frames.len()));
+
+            for item in tasks.into_iter().rev() {
+                let mut query_id = String::from("Global");
+
+                let mut stack_frames = String::new();
+                let mut frames_iter = item.stack_frames.into_iter();
+
+                if let Some(mut frame) = frames_iter.next() {
+                    let matcher = "╼ Running query ";
+                    if let Some(_pos) = frame.find(matcher) {
+                        let task_matcher = " spawn task";
+                        if let Some(pos) = frame.find(task_matcher) {
+                            query_id = frame[matcher.len()..pos].to_string();
+
+                            frame = format!(
+                                "╼ {}::spawn{}",
+                                type_name::<Runtime>(),
+                                &frame[pos + task_matcher.len()..]
+                            );
+                        }
+                    } else if let Some(_pos) = frame.find("╼ Global spawn task") {
+                        let replaced = format!("{}::spawn", type_name::<Runtime>());
+                        frame = frame.replace("╼ Global spawn task", &replaced)
+                    }
+
+                    writeln!(stack_frames, "{}", frame).unwrap();
+                }
+
+                for mut frame in frames_iter {
+                    frame = frame.replace("::{{closure}}", "");
+                    let frame = regex
+                        .replace(&frame, |caps: &Captures| caps[1].to_string())
+                        .to_string();
+                    writeln!(stack_frames, "{}", frame).unwrap();
+                }
+
+                nodes.push(local_node.clone());
+                stacks.push(stack_frames);
+                queries_id.push(query_id);
+                queries_status.push(status.clone());
+            }
+        }
 
         Ok(DataBlock::new_from_columns(vec![
             StringType::from_data(nodes),
+            StringType::from_data(queries_id),
+            StringType::from_data(queries_status),
             StringType::from_data(stacks),
         ]))
     }
@@ -67,6 +123,8 @@ impl BacktraceTable {
     pub fn create(table_id: u64) -> Arc<dyn Table> {
         let schema = TableSchemaRefExt::create(vec![
             TableField::new("node", TableDataType::String),
+            TableField::new("query_id", TableDataType::String),
+            TableField::new("status", TableDataType::String),
             TableField::new("stack", TableDataType::String),
         ]);
 

@@ -12,19 +12,24 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use common_exception::Result;
-use common_meta_app::principal::UserIdentity;
-use common_meta_app::principal::UserInfo;
-use common_meta_types::MatchSeq;
-use common_meta_types::SeqV;
+use databend_common_exception::Result;
+use databend_common_meta_app::principal::UserIdentity;
+use databend_common_meta_app::principal::UserInfo;
+use databend_common_meta_app::schema::CreateOption;
+use databend_common_meta_kvapi::kvapi::ListKVReply;
+use databend_common_meta_types::seq_value::SeqV;
+use databend_common_meta_types::MatchSeq;
 
 #[async_trait::async_trait]
 pub trait UserApi: Sync + Send {
-    async fn add_user(&self, user_info: UserInfo) -> Result<u64>;
+    async fn add_user(&self, user_info: UserInfo, create_option: &CreateOption) -> Result<()>;
 
     async fn get_user(&self, user: UserIdentity, seq: MatchSeq) -> Result<SeqV<UserInfo>>;
 
     async fn get_users(&self) -> Result<Vec<SeqV<UserInfo>>>;
+
+    /// Just get user count in meta
+    async fn get_raw_users(&self) -> Result<ListKVReply>;
 
     /// General user's grants update.
     ///

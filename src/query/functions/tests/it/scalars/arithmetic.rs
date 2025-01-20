@@ -14,11 +14,11 @@
 
 use std::io::Write;
 
-use common_expression::types::decimal::DecimalColumn;
-use common_expression::types::decimal::DecimalSize;
-use common_expression::types::number::*;
-use common_expression::Column;
-use common_expression::FromData;
+use databend_common_expression::types::decimal::DecimalColumn;
+use databend_common_expression::types::decimal::DecimalSize;
+use databend_common_expression::types::number::*;
+use databend_common_expression::Column;
+use databend_common_expression::FromData;
 use ethnum::i256;
 use goldenfile::Mint;
 
@@ -62,9 +62,11 @@ fn test_arithmetic() {
                 },
             )),
         ),
+        ("g", Int64Type::from_data(vec![i64::MAX, i64::MIN, 0])),
     ];
     test_add(file, columns);
     test_minus(file, columns);
+    test_unary_minus(file, columns);
     test_mul(file, columns);
     test_div(file, columns);
     test_intdiv(file, columns);
@@ -104,12 +106,23 @@ fn test_minus(file: &mut impl Write, columns: &[(&str, Column)]) {
     run_ast(file, "c - 0.5", columns);
     run_ast(file, "c - b", columns);
     run_ast(file, "c - d", columns);
-    run_ast(file, "-c", columns);
     run_ast(file, "c - e", columns);
     run_ast(file, "d - e", columns);
     run_ast(file, "d2 - e", columns);
     run_ast(file, "d2 - f", columns);
     run_ast(file, "e - f", columns);
+}
+
+fn test_unary_minus(file: &mut impl Write, columns: &[(&str, Column)]) {
+    run_ast(file, "-a", columns);
+    run_ast(file, "-a2", columns);
+    run_ast(file, "-b", columns);
+    run_ast(file, "-c", columns);
+    run_ast(file, "-d", columns);
+    run_ast(file, "-d2", columns);
+    run_ast(file, "-e", columns);
+    run_ast(file, "-f", columns);
+    run_ast(file, "-g", columns);
 }
 
 fn test_mul(file: &mut impl Write, columns: &[(&str, Column)]) {
@@ -124,6 +137,8 @@ fn test_mul(file: &mut impl Write, columns: &[(&str, Column)]) {
     run_ast(file, "d2 * e", columns);
     run_ast(file, "d2 * f", columns);
     run_ast(file, "e * f", columns);
+    run_ast(file, "e * e", columns);
+    run_ast(file, "f * f", columns);
     run_ast(file, "e * 0.5", columns);
 }
 
@@ -205,6 +220,7 @@ fn test_factorial(file: &mut impl Write, columns: &[(&str, Column)]) {
     run_ast(file, "a!", columns);
     run_ast(file, "b!", columns);
     run_ast(file, "12!", columns);
+    run_ast(file, "30!", columns);
 }
 
 fn test_abs(file: &mut impl Write, columns: &[(&str, Column)]) {

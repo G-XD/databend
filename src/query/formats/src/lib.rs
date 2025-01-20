@@ -14,8 +14,11 @@
 
 #![allow(clippy::uninlined_format_args)]
 #![feature(box_patterns)]
-#![feature(cursor_remaining)]
+#![feature(cursor_split)]
 
+extern crate core;
+
+mod binary;
 mod clickhouse;
 mod common_settings;
 mod delimiter;
@@ -31,4 +34,5 @@ pub use file_format_type::parse_timezone;
 pub use file_format_type::FileFormatOptionsExt;
 pub use file_format_type::FileFormatTypeExt;
 
-use crate::common_settings::CommonSettings;
+pub use crate::common_settings::InputCommonSettings;
+pub use crate::common_settings::OutputCommonSettings;

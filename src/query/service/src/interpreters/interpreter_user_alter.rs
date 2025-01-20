@@ -14,9 +14,9 @@
 
 use std::sync::Arc;
 
-use common_exception::Result;
-use common_sql::plans::AlterUserPlan;
-use common_users::UserApiProvider;
+use databend_common_exception::Result;
+use databend_common_sql::plans::AlterUserPlan;
+use databend_common_users::UserApiProvider;
 use log::debug;
 
 use crate::interpreters::Interpreter;
@@ -42,7 +42,11 @@ impl Interpreter for AlterUserInterpreter {
         "AlterUserInterpreter"
     }
 
-    #[minitrace::trace]
+    fn is_ddl(&self) -> bool {
+        true
+    }
+
+    #[fastrace::trace]
     #[async_backtrace::framed]
     async fn execute2(&self) -> Result<PipelineBuildResult> {
         debug!("ctx.id" = self.ctx.get_id().as_str(); "alter_user_execute");

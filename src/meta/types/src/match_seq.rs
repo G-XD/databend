@@ -18,13 +18,14 @@ use std::fmt::Formatter;
 use serde::Deserialize;
 use serde::Serialize;
 
+use crate::protobuf as pb;
+use crate::seq_value::SeqV;
 use crate::ConflictSeq;
-use crate::SeqV;
 
 /// Describes what `seq` an operation must match to take effect.
 /// Every value written to meta data has a unique `seq` bound.
 /// Any conditioned or non-conditioned write operation can be done through the corresponding MatchSeq.
-#[derive(Serialize, Deserialize, Debug, Copy, Clone, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Copy, Clone, PartialEq, Eq, deepsize::DeepSizeOf)]
 pub enum MatchSeq {
     // TODO(xp): remove Any, it is equivalent to GE(0)
     /// Any value is acceptable, i.e. does not check seq at all.
@@ -41,7 +42,7 @@ pub enum MatchSeq {
 }
 
 impl Display for MatchSeq {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
         match self {
             MatchSeq::Any => {
                 write!(f, "is any value")
@@ -63,6 +64,13 @@ pub trait MatchSeqExt<T> {
 
 impl<U> MatchSeqExt<&Option<SeqV<U>>> for MatchSeq {
     fn match_seq(&self, sv: &Option<SeqV<U>>) -> Result<(), ConflictSeq> {
+        let seq = sv.as_ref().map_or(0, |sv| sv.seq);
+        self.match_seq(seq)
+    }
+}
+
+impl MatchSeqExt<&Option<pb::SeqV>> for MatchSeq {
+    fn match_seq(&self, sv: &Option<pb::SeqV>) -> Result<(), ConflictSeq> {
         let seq = sv.as_ref().map_or(0, |sv| sv.seq);
         self.match_seq(seq)
     }
@@ -92,10 +100,10 @@ impl MatchSeqExt<u64> for MatchSeq {
 #[cfg(test)]
 mod tests {
 
+    use crate::seq_value::SeqV;
     use crate::ConflictSeq;
     use crate::MatchSeq;
     use crate::MatchSeqExt;
-    use crate::SeqV;
 
     #[derive(serde::Serialize)]
     struct Foo {

@@ -16,10 +16,10 @@ use std::time::Duration;
 
 use chrono::DateTime;
 use chrono::Utc;
-use common_meta_app as mt;
-use common_meta_app::background::ManualTriggerParams;
-use common_meta_app::schema::TableStatistics;
-use common_protos::pb;
+use databend_common_meta_app as mt;
+use databend_common_meta_app::background::ManualTriggerParams;
+use databend_common_meta_app::schema::TableStatistics;
+use databend_common_protos::pb;
 use num::FromPrimitive;
 
 use crate::reader_check_msg;
@@ -42,12 +42,10 @@ impl FromToProto for mt::background::BackgroundTaskInfo {
             last_updated: p
                 .last_updated
                 .and_then(|t| DateTime::<Utc>::from_pb(t).ok()),
-            task_type: FromPrimitive::from_i32(p.task_type).ok_or_else(|| Incompatible {
-                reason: format!("invalid TaskType: {}", p.task_type),
-            })?,
-            task_state: FromPrimitive::from_i32(p.task_state).ok_or_else(|| Incompatible {
-                reason: format!("invalid TaskState: {}", p.task_state),
-            })?,
+            task_type: FromPrimitive::from_i32(p.task_type)
+                .ok_or_else(|| Incompatible::new(format!("invalid TaskType: {}", p.task_type)))?,
+            task_state: FromPrimitive::from_i32(p.task_state)
+                .ok_or_else(|| Incompatible::new(format!("invalid TaskState: {}", p.task_state)))?,
             message: p.message,
             compaction_task_stats: p
                 .compaction_task_stats
@@ -59,7 +57,7 @@ impl FromToProto for mt::background::BackgroundTaskInfo {
                 .manual_trigger
                 .and_then(|t| ManualTriggerParams::from_pb(t).ok()),
             creator: match p.creator {
-                Some(c) => Some(mt::background::BackgroundJobIdent::from_pb(c)?),
+                Some(c) => Some(mt::background::task_creator::BackgroundTaskCreator::from_pb(c)?),
                 None => None,
             },
             created_at: DateTime::<Utc>::from_pb(p.created_at)?,
@@ -102,11 +100,9 @@ impl FromToProto for mt::background::CompactionStats {
             table_id: p.table_id,
             before_compaction_stats: p
                 .before_compaction_stats
-                .clone()
                 .and_then(|t| TableStatistics::from_pb(t).ok()),
             after_compaction_stats: p
                 .after_compaction_stats
-                .clone()
                 .and_then(|t| TableStatistics::from_pb(t).ok()),
             total_compaction_time: p
                 .total_compaction_time_secs
@@ -151,30 +147,6 @@ impl FromToProto for mt::background::VacuumStats {
         let p = pb::VacuumStats {
             ver: VER,
             min_reader_ver: MIN_READER_VER,
-        };
-        Ok(p)
-    }
-}
-
-impl FromToProto for mt::background::BackgroundTaskIdent {
-    type PB = pb::BackgroundTaskIdent;
-    fn get_pb_ver(p: &Self::PB) -> u64 {
-        p.ver
-    }
-    fn from_pb(p: Self::PB) -> Result<Self, Incompatible>
-    where Self: Sized {
-        reader_check_msg(p.ver, p.min_reader_ver)?;
-        Ok(Self {
-            tenant: p.tenant.to_string(),
-            task_id: p.task_id,
-        })
-    }
-    fn to_pb(&self) -> Result<Self::PB, Incompatible> {
-        let p = pb::BackgroundTaskIdent {
-            ver: VER,
-            min_reader_ver: MIN_READER_VER,
-            tenant: self.tenant.clone(),
-            task_id: self.task_id.clone(),
         };
         Ok(p)
     }

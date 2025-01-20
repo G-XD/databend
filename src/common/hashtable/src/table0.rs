@@ -16,6 +16,8 @@ use std::alloc::Allocator;
 use std::intrinsics::assume;
 use std::mem::MaybeUninit;
 
+use databend_common_base::runtime::drop_guard;
+
 use super::container::Container;
 use super::traits::EntryMutRefLike;
 use super::traits::EntryRefLike;
@@ -343,15 +345,17 @@ where
     A: Allocator + Clone,
 {
     fn drop(&mut self) {
-        if std::mem::needs_drop::<V>() && !self.dropped {
-            unsafe {
-                for entry in self.entries.as_mut() {
-                    if !entry.is_zero() {
-                        std::ptr::drop_in_place(entry.get_mut());
+        drop_guard(move || {
+            if std::mem::needs_drop::<V>() && !self.dropped {
+                unsafe {
+                    for entry in self.entries.as_mut() {
+                        if !entry.is_zero() {
+                            std::ptr::drop_in_place(entry.get_mut());
+                        }
                     }
                 }
             }
-        }
+        })
     }
 }
 
@@ -420,7 +424,7 @@ impl<'a, K: Keyable, V: 'a> EntryRefLike for &'a Entry<K, V> {
     }
 }
 
-impl<'a, K: Keyable, V> EntryMutRefLike for &'a mut Entry<K, V> {
+impl<K: Keyable, V> EntryMutRefLike for &mut Entry<K, V> {
     type Key = K;
     type Value = V;
 

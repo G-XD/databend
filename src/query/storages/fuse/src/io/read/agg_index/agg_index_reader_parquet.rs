@@ -12,56 +12,34 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::HashMap;
-use std::sync::Arc;
-
-use common_arrow::arrow::io::parquet::read as pread;
-use common_arrow::parquet::metadata::RowGroupMetaData;
-use common_catalog::plan::PartInfoPtr;
-use common_exception::Result;
-use common_expression::DataBlock;
+use databend_common_catalog::plan::PartInfoPtr;
+use databend_common_exception::Result;
+use databend_common_expression::DataBlock;
+use databend_common_storage::parquet_rs::read_metadata_sync;
+use databend_common_storage::read_metadata_async;
+use databend_storages_common_io::ReadSettings;
 use log::debug;
-use storages_common_table_meta::meta::ColumnMeta;
-use storages_common_table_meta::meta::SingleColumnMeta;
 
 use super::AggIndexReader;
-use crate::io::ReadSettings;
-use crate::io::UncompressedBuffer;
-use crate::FusePartInfo;
-use crate::MergeIOReadResult;
+use crate::io::read::utils::build_columns_meta;
+use crate::BlockReadResult;
+use crate::FuseBlockPartInfo;
 
 impl AggIndexReader {
-    fn build_columns_meta(row_group: &RowGroupMetaData) -> HashMap<u32, ColumnMeta> {
-        let mut columns_meta = HashMap::with_capacity(row_group.columns().len());
-        for (index, c) in row_group.columns().iter().enumerate() {
-            let (offset, len) = c.byte_range();
-            columns_meta.insert(
-                index as u32,
-                ColumnMeta::Parquet(SingleColumnMeta {
-                    offset,
-                    len,
-                    num_values: c.num_values() as u64,
-                }),
-            );
-        }
-        columns_meta
-    }
     pub fn sync_read_parquet_data_by_merge_io(
         &self,
         read_settings: &ReadSettings,
         loc: &str,
-    ) -> Option<(PartInfoPtr, MergeIOReadResult)> {
-        match self.reader.operator.blocking().reader(loc) {
-            Ok(mut reader) => {
-                let metadata = pread::read_metadata(&mut reader)
-                    .inspect_err(|e| {
-                        debug!("Read aggregating index `{loc}`'s metadata failed: {e}")
-                    })
-                    .ok()?;
-                debug_assert_eq!(metadata.row_groups.len(), 1);
-                let row_group = &metadata.row_groups[0];
-                let columns_meta = Self::build_columns_meta(row_group);
-                let part = FusePartInfo::create(
+    ) -> Option<(PartInfoPtr, BlockReadResult)> {
+        let op = self.reader.operator.blocking();
+        match op.stat(loc) {
+            Ok(_meta) => {
+                let metadata = read_metadata_sync(loc, &self.reader.operator, None).ok()?;
+                debug_assert_eq!(metadata.num_row_groups(), 1);
+                let row_group = &metadata.row_groups()[0];
+                let columns_meta = build_columns_meta(row_group);
+
+                let part = FuseBlockPartInfo::create(
                     loc.to_string(),
                     row_group.num_rows() as u64,
                     columns_meta,
@@ -73,7 +51,7 @@ impl AggIndexReader {
                 );
                 let res = self
                     .reader
-                    .sync_read_columns_data_by_merge_io(read_settings, part.clone())
+                    .sync_read_columns_data_by_merge_io(read_settings, &part, &None)
                     .inspect_err(|e| debug!("Read aggregating index `{loc}` failed: {e}"))
                     .ok()?;
                 Some((part, res))
@@ -93,25 +71,22 @@ impl AggIndexReader {
         &self,
         read_settings: &ReadSettings,
         loc: &str,
-    ) -> Option<(PartInfoPtr, MergeIOReadResult)> {
-        match self.reader.operator.reader(loc).await {
-            Ok(mut reader) => {
-                let metadata = pread::read_metadata_async(&mut reader)
+    ) -> Option<(PartInfoPtr, BlockReadResult)> {
+        match self.reader.operator.stat(loc).await {
+            Ok(_meta) => {
+                let metadata = read_metadata_async(loc, &self.reader.operator, None)
                     .await
-                    .inspect_err(|e| {
-                        debug!("Read aggregating index `{loc}`'s metadata failed: {e}")
-                    })
                     .ok()?;
-                debug_assert_eq!(metadata.row_groups.len(), 1);
-                let row_group = &metadata.row_groups[0];
-                let columns_meta = Self::build_columns_meta(row_group);
+                debug_assert_eq!(metadata.num_row_groups(), 1);
+                let row_group = &metadata.row_groups()[0];
+                let columns_meta = build_columns_meta(row_group);
                 let res = self
                     .reader
-                    .read_columns_data_by_merge_io(read_settings, loc, &columns_meta)
+                    .read_columns_data_by_merge_io(read_settings, loc, &columns_meta, &None)
                     .await
                     .inspect_err(|e| debug!("Read aggregating index `{loc}` failed: {e}"))
                     .ok()?;
-                let part = FusePartInfo::create(
+                let part = FuseBlockPartInfo::create(
                     loc.to_string(),
                     row_group.num_rows() as u64,
                     columns_meta,
@@ -137,18 +112,16 @@ impl AggIndexReader {
     pub fn deserialize_parquet_data(
         &self,
         part: PartInfoPtr,
-        data: MergeIOReadResult,
-        buffer: Arc<UncompressedBuffer>,
+        data: BlockReadResult,
     ) -> Result<DataBlock> {
         let columns_chunks = data.columns_chunks()?;
-        let part = FusePartInfo::from_part(&part)?;
-        let block = self.reader.deserialize_parquet_chunks_with_buffer(
-            &part.location,
+        let part = FuseBlockPartInfo::from_part(&part)?;
+        let block = self.reader.deserialize_parquet_chunks(
             part.nums_rows,
-            &part.compression,
             &part.columns_meta,
             columns_chunks,
-            Some(buffer),
+            &part.compression,
+            &part.location,
         )?;
 
         self.apply_agg_info(block)

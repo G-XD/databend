@@ -14,17 +14,16 @@
 
 use std::sync::Arc;
 
-use common_exception::ErrorCode;
-use common_exception::Result;
-use common_expression::types::StringType;
-use common_expression::DataBlock;
-use common_expression::DataSchemaRef;
-use common_expression::FromData;
-use common_license::license::Feature;
-use common_license::license_manager::get_license_manager;
-use common_sql::plans::DescDatamaskPolicyPlan;
-use common_users::UserApiProvider;
-use data_mask_feature::get_datamask_handler;
+use databend_common_exception::ErrorCode;
+use databend_common_exception::Result;
+use databend_common_expression::types::StringType;
+use databend_common_expression::DataBlock;
+use databend_common_expression::FromData;
+use databend_common_license::license::Feature;
+use databend_common_license::license_manager::LicenseManagerSwitch;
+use databend_common_sql::plans::DescDatamaskPolicyPlan;
+use databend_common_users::UserApiProvider;
+use databend_enterprise_data_mask_feature::get_datamask_handler;
 use log::warn;
 
 use crate::interpreters::Interpreter;
@@ -49,37 +48,33 @@ impl Interpreter for DescDataMaskInterpreter {
         "DescDataMaskInterpreter"
     }
 
-    fn schema(&self) -> DataSchemaRef {
-        self.plan.schema()
+    fn is_ddl(&self) -> bool {
+        false
     }
 
     #[async_backtrace::framed]
     async fn execute2(&self) -> Result<PipelineBuildResult> {
-        let license_manager = get_license_manager();
-        license_manager.manager.check_enterprise_enabled(
-            &self.ctx.get_settings(),
-            self.ctx.get_tenant(),
-            Feature::DataMask,
-        )?;
+        LicenseManagerSwitch::instance()
+            .check_enterprise_enabled(self.ctx.get_license_key(), Feature::DataMask)?;
         let meta_api = UserApiProvider::instance().get_meta_store_client();
         let handler = get_datamask_handler();
         let policy = handler
-            .get_data_mask(meta_api, self.ctx.get_tenant(), self.plan.name.clone())
+            .get_data_mask(meta_api, &self.ctx.get_tenant(), self.plan.name.clone())
             .await;
 
         let policy = match policy {
             Ok(policy) => policy,
             Err(err) => {
                 warn!("DescDataMaskInterpreter err: {}", err);
-                if err.code() != ErrorCode::UnknownDatamask("").code() {
+                if err.code() != ErrorCode::UNKNOWN_DATAMASK {
                     return Err(err);
                 }
                 return Ok(PipelineBuildResult::create());
             }
         };
 
-        let name: Vec<Vec<u8>> = vec![self.plan.name.as_bytes().to_vec()];
-        let create_on: Vec<Vec<u8>> = vec![policy.create_on.to_string().as_bytes().to_vec()];
+        let name: Vec<String> = vec![self.plan.name.clone()];
+        let create_on: Vec<String> = vec![policy.create_on.to_string().clone()];
         let args = format!(
             "({})",
             policy
@@ -90,12 +85,12 @@ impl Interpreter for DescDataMaskInterpreter {
                 .collect::<Vec<_>>()
                 .join(",")
         );
-        let signature: Vec<Vec<u8>> = vec![args.as_bytes().to_vec()];
-        let return_type = vec![policy.return_type.as_bytes().to_vec()];
-        let body = vec![policy.body.as_bytes().to_vec()];
+        let signature: Vec<String> = vec![args.clone()];
+        let return_type = vec![policy.return_type.clone()];
+        let body = vec![policy.body.clone()];
         let comment = vec![match policy.comment {
-            Some(comment) => comment.as_bytes().to_vec(),
-            None => "".to_string().as_bytes().to_vec(),
+            Some(comment) => comment.clone(),
+            None => "".to_string().clone(),
         }];
 
         let blocks = vec![DataBlock::new_from_columns(vec![

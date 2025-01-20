@@ -1,5 +1,5 @@
 [package]
-name = "common-grpc"
+name = "databend-common-grpc"
 version = { workspace = true }
 authors = { workspace = true }
 license = { workspace = true }
@@ -8,27 +8,27 @@ edition = { workspace = true }
 
 [lib]
 doctest = false
-test = false
+test = true
 
-[dependencies] # In alphabetical order
-# Workspace dependencies
-common-base = { path = "../base" }
-common-exception = { path = "../exception" }
+[dependencies]
+databend-common-base = { workspace = true }
+databend-common-exception = { workspace = true }
 
-# GitHub dependencies
-
-# Crates.io dependencies
 anyerror = { workspace = true }
-hyper = "0.14.20"
-jwt-simple = "0.11.0"
+hickory-resolver = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+jwt-simple = { workspace = true }
 log = { workspace = true }
-once_cell = "1.15.0"
 serde = { workspace = true }
 thiserror = { workspace = true }
 tonic = { workspace = true }
-trust-dns-resolver = { version = "0.22.0", features = ["system-config"] }
+tower-service = { workspace = true }
 
 [build-dependencies]
 
 [features]
 mocks = []
+
+[lints]
+workspace = true

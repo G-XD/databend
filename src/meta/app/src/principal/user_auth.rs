@@ -14,8 +14,8 @@
 
 use std::str::FromStr;
 
-use common_exception::ErrorCode;
-use common_exception::Result;
+use databend_common_exception::ErrorCode;
+use databend_common_exception::Result;
 use sha2::Digest;
 use sha2::Sha256;
 
@@ -32,15 +32,16 @@ pub enum AuthType {
     JWT,
 }
 
-impl std::str::FromStr for AuthType {
+impl FromStr for AuthType {
     type Err = ErrorCode;
+
     fn from_str(s: &str) -> Result<Self> {
         match s {
             SHA256_PASSWORD_STR => Ok(AuthType::Sha256Password),
             DOUBLE_SHA1_PASSWORD_STR => Ok(AuthType::DoubleSha1Password),
             NO_PASSWORD_STR => Ok(AuthType::NoPassword),
             JWT_AUTH_STR => Ok(AuthType::JWT),
-            _ => Err(ErrorCode::InvalidAuthInfo(AuthType::bad_auth_types(s))),
+            _ => Err(ErrorCode::AuthenticateFailure(AuthType::bad_auth_types(s))),
         }
     }
 }
@@ -56,7 +57,7 @@ impl AuthType {
     }
 
     fn bad_auth_types(s: &str) -> String {
-        let all = vec![
+        let all = [
             NO_PASSWORD_STR,
             SHA256_PASSWORD_STR,
             DOUBLE_SHA1_PASSWORD_STR,
@@ -79,6 +80,17 @@ impl AuthType {
     }
 }
 
+impl From<databend_common_ast::ast::AuthType> for AuthType {
+    fn from(t: databend_common_ast::ast::AuthType) -> Self {
+        match t {
+            databend_common_ast::ast::AuthType::NoPassword => AuthType::NoPassword,
+            databend_common_ast::ast::AuthType::Sha256Password => AuthType::Sha256Password,
+            databend_common_ast::ast::AuthType::DoubleSha1Password => AuthType::DoubleSha1Password,
+            databend_common_ast::ast::AuthType::JWT => AuthType::JWT,
+        }
+    }
+}
+
 #[derive(
     serde::Serialize, serde::Deserialize, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Default,
 )]
@@ -88,6 +100,7 @@ pub enum AuthInfo {
     Password {
         hash_value: Vec<u8>,
         hash_method: PasswordHashMethod,
+        need_change: bool,
     },
     JWT,
 }
@@ -103,7 +116,11 @@ fn double_sha1(v: &[u8]) -> [u8; 20] {
 }
 
 impl AuthInfo {
-    pub fn new(auth_type: AuthType, auth_string: &Option<String>) -> Result<AuthInfo> {
+    pub fn new(
+        auth_type: AuthType,
+        auth_string: &Option<String>,
+        need_change: bool,
+    ) -> Result<AuthInfo> {
         match auth_type {
             AuthType::NoPassword => Ok(AuthInfo::None),
             AuthType::JWT => Ok(AuthInfo::JWT),
@@ -113,9 +130,10 @@ impl AuthInfo {
                     Ok(AuthInfo::Password {
                         hash_value: method.hash(p.as_bytes()),
                         hash_method: method,
+                        need_change,
                     })
                 }
-                None => Err(ErrorCode::InvalidAuthInfo("need password".to_string())),
+                None => Err(ErrorCode::AuthenticateFailure("need password".to_string())),
             },
         }
     }
@@ -127,13 +145,33 @@ impl AuthInfo {
             .map(|s| AuthType::from_str(&s))
             .transpose()?
             .unwrap_or(default);
-        AuthInfo::new(auth_type, auth_string)
+        AuthInfo::new(auth_type, auth_string, false)
     }
 
-    pub fn create2(auth_type: &Option<AuthType>, auth_string: &Option<String>) -> Result<AuthInfo> {
+    pub fn create2(
+        auth_type: &Option<AuthType>,
+        auth_string: &Option<String>,
+        need_change: bool,
+    ) -> Result<AuthInfo> {
         let default = AuthType::DoubleSha1Password;
         let auth_type = auth_type.clone().unwrap_or(default);
-        AuthInfo::new(auth_type, auth_string)
+        AuthInfo::new(auth_type, auth_string, need_change)
+    }
+
+    // create `AuthInfo` and only modify `need_change` field.
+    pub fn create_with_need_change(&self, need_change: bool) -> AuthInfo {
+        match self {
+            AuthInfo::Password {
+                hash_value,
+                hash_method,
+                ..
+            } => AuthInfo::Password {
+                hash_value: hash_value.clone(),
+                hash_method: *hash_method,
+                need_change,
+            },
+            _ => self.clone(),
+        }
     }
 
     pub fn alter(
@@ -147,31 +185,37 @@ impl AuthInfo {
             .map(|s| AuthType::from_str(&s))
             .transpose()?
             .unwrap_or(old_auth_type);
-        AuthInfo::new(new_auth_type, auth_string)
+        AuthInfo::new(new_auth_type, auth_string, false)
     }
 
     pub fn alter2(
         &self,
         auth_type: &Option<AuthType>,
         auth_string: &Option<String>,
+        need_change: bool,
     ) -> Result<AuthInfo> {
         let old_auth_type = self.get_type();
         let new_auth_type = auth_type.clone().unwrap_or(old_auth_type);
 
-        AuthInfo::new(new_auth_type, auth_string)
+        AuthInfo::new(new_auth_type, auth_string, need_change)
     }
 
     pub fn get_type(&self) -> AuthType {
         match self {
             AuthInfo::None => AuthType::NoPassword,
             AuthInfo::JWT => AuthType::JWT,
-            AuthInfo::Password {
-                hash_value: _,
-                hash_method: t,
-            } => match t {
+            AuthInfo::Password { hash_method: t, .. } => match t {
                 PasswordHashMethod::Sha256 => AuthType::Sha256Password,
                 PasswordHashMethod::DoubleSha1 => AuthType::DoubleSha1Password,
             },
+        }
+    }
+
+    pub fn get_need_change(&self) -> bool {
+        match self {
+            AuthInfo::None => false,
+            AuthInfo::JWT => false,
+            AuthInfo::Password { need_change, .. } => *need_change,
         }
     }
 
@@ -180,6 +224,7 @@ impl AuthInfo {
             AuthInfo::Password {
                 hash_value: p,
                 hash_method: t,
+                ..
             } => t.to_string(p),
             AuthInfo::None | AuthInfo::JWT => "".to_string(),
         }
@@ -190,6 +235,7 @@ impl AuthInfo {
             AuthInfo::Password {
                 hash_value: p,
                 hash_method: _,
+                ..
             } => Some(p.to_vec()),
             _ => None,
         }
@@ -200,6 +246,7 @@ impl AuthInfo {
             AuthInfo::Password {
                 hash_value: _,
                 hash_method: t,
+                ..
             } => Some(*t),
             _ => None,
         }
@@ -228,6 +275,7 @@ impl AuthInfo {
             AuthInfo::Password {
                 hash_value: p,
                 hash_method: t,
+                ..
             } => match t {
                 PasswordHashMethod::DoubleSha1 => {
                     let password_sha1 = AuthInfo::restore_sha1_mysql(salt, password_input, p)?;

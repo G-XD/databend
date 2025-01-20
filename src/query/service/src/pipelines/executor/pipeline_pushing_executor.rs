@@ -18,20 +18,24 @@ use std::sync::mpsc::Receiver;
 use std::sync::mpsc::SyncSender;
 use std::sync::Arc;
 
-use common_exception::ErrorCode;
-use common_exception::Result;
-use common_expression::DataBlock;
-use common_pipeline_sources::SyncSource;
-use common_pipeline_sources::SyncSourcer;
+use databend_common_base::runtime::drop_guard;
+use databend_common_base::runtime::Thread;
+use databend_common_exception::ErrorCode;
+use databend_common_exception::Result;
+use databend_common_expression::DataBlock;
+use databend_common_pipeline_core::Pipeline;
+use databend_common_pipeline_core::SourcePipeBuilder;
+use databend_common_pipeline_sources::SyncSource;
+use databend_common_pipeline_sources::SyncSourcer;
+use fastrace::func_path;
+use fastrace::prelude::*;
 use log::warn;
 use parking_lot::Mutex;
 
 use crate::pipelines::executor::ExecutorSettings;
 use crate::pipelines::executor::PipelineExecutor;
-use crate::pipelines::processors::port::OutputPort;
-use crate::pipelines::processors::processor::ProcessorPtr;
-use crate::pipelines::Pipeline;
-use crate::pipelines::SourcePipeBuilder;
+use crate::pipelines::processors::OutputPort;
+use crate::pipelines::processors::ProcessorPtr;
 use crate::sessions::QueryContext;
 
 struct State {
@@ -98,19 +102,22 @@ impl PipelinePushingExecutor {
         Ok(PipelinePushingExecutor {
             state,
             sender,
-            executor,
+            executor: Arc::new(executor),
         })
     }
 
+    #[fastrace::trace]
     pub fn start(&mut self) {
         let state = self.state.clone();
         let threads_executor = self.executor.clone();
         let thread_function = Self::thread_function(state, threads_executor);
-        std::thread::spawn(thread_function);
+        Thread::spawn(thread_function);
     }
 
     fn thread_function(state: Arc<State>, executor: Arc<PipelineExecutor>) -> impl Fn() {
+        let span = Span::enter_with_local_parent(func_path!());
         move || {
+            let _g = span.set_local_parent();
             if let Err(cause) = executor.execute() {
                 state.has_throw_error.store(true, Ordering::Release);
                 std::sync::atomic::fence(Ordering::Acquire);
@@ -158,15 +165,17 @@ impl PipelinePushingExecutor {
 
 impl Drop for PipelinePushingExecutor {
     fn drop(&mut self) {
-        if !self.state.finished.load(Ordering::Relaxed)
-            && !self.state.has_throw_error.load(Ordering::Relaxed)
-        {
-            self.finish(None);
-        }
+        drop_guard(move || {
+            if !self.state.finished.load(Ordering::Relaxed)
+                && !self.state.has_throw_error.load(Ordering::Relaxed)
+            {
+                self.finish(None);
+            }
 
-        if let Err(cause) = self.sender.send(None) {
-            warn!("Executor send last data is failure {:?}", cause);
-        }
+            if let Err(cause) = self.sender.send(None) {
+                warn!("Executor send last data is failure {:?}", cause);
+            }
+        })
     }
 }
 

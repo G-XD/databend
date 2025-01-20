@@ -14,34 +14,29 @@
 
 use std::collections::HashMap;
 
-use common_exception::ErrorCode;
-use common_exception::Result;
-use common_expression::type_check::check;
-use common_expression::types::DataType;
-use common_expression::ColumnIndex;
-use common_expression::DataSchema;
-use common_expression::Expr;
-use common_expression::RawExpr;
-use common_functions::BUILTIN_FUNCTIONS;
+use databend_common_exception::ErrorCode;
+use databend_common_exception::Result;
+use databend_common_expression::type_check;
+use databend_common_expression::types::DataType;
+use databend_common_expression::ColumnIndex;
+use databend_common_expression::DataSchema;
+use databend_common_expression::Expr;
+use databend_common_expression::RawExpr;
+use databend_common_functions::BUILTIN_FUNCTIONS;
 
-use crate::binder::ColumnBindingBuilder;
+use crate::binder::DummyColumnType;
 use crate::plans::ScalarExpr;
 use crate::ColumnBinding;
 use crate::ColumnEntry;
 use crate::IndexType;
 use crate::Metadata;
-use crate::Visibility;
 
-pub trait LoweringContext {
-    type ColumnID: ColumnIndex;
-
-    fn resolve_column_type(&self, column_id: &Self::ColumnID) -> Result<DataType>;
+pub trait TypeProvider<ColumnID: ColumnIndex> {
+    fn get_type(&self, column_id: &ColumnID) -> Result<DataType>;
 }
 
-impl LoweringContext for Metadata {
-    type ColumnID = IndexType;
-
-    fn resolve_column_type(&self, column_id: &Self::ColumnID) -> Result<DataType> {
+impl TypeProvider<IndexType> for Metadata {
+    fn get_type(&self, column_id: &IndexType) -> Result<DataType> {
         let column_entry = self.column(*column_id);
         match column_entry {
             ColumnEntry::BaseTableColumn(column) => Ok(DataType::from(&column.data_type)),
@@ -52,21 +47,28 @@ impl LoweringContext for Metadata {
     }
 }
 
-impl LoweringContext for DataSchema {
-    type ColumnID = IndexType;
+impl TypeProvider<ColumnBinding> for Metadata {
+    fn get_type(&self, column_id: &ColumnBinding) -> Result<DataType> {
+        self.get_type(&column_id.index)
+    }
+}
 
-    fn resolve_column_type(&self, column_id: &Self::ColumnID) -> Result<DataType> {
+impl TypeProvider<IndexType> for DataSchema {
+    fn get_type(&self, column_id: &IndexType) -> Result<DataType> {
         let column = self.field_with_name(&column_id.to_string())?;
         Ok(column.data_type().clone())
     }
 }
 
-impl<Index> LoweringContext for HashMap<Index, DataType>
-where Index: ColumnIndex
-{
-    type ColumnID = Index;
+impl TypeProvider<String> for DataSchema {
+    fn get_type(&self, column_name: &String) -> Result<DataType> {
+        let column = self.field_with_name(column_name)?;
+        Ok(column.data_type().clone())
+    }
+}
 
-    fn resolve_column_type(&self, column_id: &Self::ColumnID) -> Result<DataType> {
+impl<ColumnID: ColumnIndex> TypeProvider<ColumnID> for HashMap<ColumnID, DataType> {
+    fn get_type(&self, column_id: &ColumnID) -> Result<DataType> {
         self.get(column_id).cloned().ok_or_else(|| {
             ErrorCode::Internal(format!(
                 "Logical error: can not find column {:?}",
@@ -76,10 +78,10 @@ where Index: ColumnIndex
     }
 }
 
-fn resolve_column_type<C: LoweringContext>(
-    raw_expr: &RawExpr<C::ColumnID>,
-    context: &C,
-) -> Result<RawExpr<C::ColumnID>> {
+fn update_column_type<ColumnID: ColumnIndex, TP: TypeProvider<ColumnID>>(
+    raw_expr: &RawExpr<ColumnID>,
+    type_provider: &TP,
+) -> Result<RawExpr<ColumnID>> {
     match raw_expr {
         RawExpr::ColumnRef {
             span,
@@ -87,7 +89,7 @@ fn resolve_column_type<C: LoweringContext>(
             display_name,
             ..
         } => {
-            let data_type = context.resolve_column_type(id)?;
+            let data_type = type_provider.get_type(id)?;
             Ok(RawExpr::ColumnRef {
                 id: id.clone(),
                 span: *span,
@@ -95,6 +97,7 @@ fn resolve_column_type<C: LoweringContext>(
                 data_type,
             })
         }
+        RawExpr::Constant { .. } => Ok(raw_expr.clone()),
         RawExpr::Cast {
             span,
             is_try,
@@ -103,7 +106,7 @@ fn resolve_column_type<C: LoweringContext>(
         } => Ok(RawExpr::Cast {
             span: *span,
             is_try: *is_try,
-            expr: Box::new(resolve_column_type(expr, context)?),
+            expr: Box::new(update_column_type(expr, type_provider)?),
             dest_type: dest_type.clone(),
         }),
         RawExpr::FunctionCall {
@@ -114,7 +117,7 @@ fn resolve_column_type<C: LoweringContext>(
         } => {
             let args = args
                 .iter()
-                .map(|arg| resolve_column_type(arg, context))
+                .map(|arg| update_column_type(arg, type_provider))
                 .collect::<Result<Vec<_>>>()?;
             Ok(RawExpr::FunctionCall {
                 span: *span,
@@ -123,53 +126,53 @@ fn resolve_column_type<C: LoweringContext>(
                 args,
             })
         }
-        RawExpr::Constant { .. } => Ok(raw_expr.clone()),
+        RawExpr::LambdaFunctionCall {
+            span,
+            name,
+            args,
+            lambda_expr,
+            lambda_display,
+            return_type,
+        } => {
+            let args = args
+                .iter()
+                .map(|arg| update_column_type(arg, type_provider))
+                .collect::<Result<Vec<_>>>()?;
+            Ok(RawExpr::LambdaFunctionCall {
+                span: *span,
+                name: name.clone(),
+                args,
+                lambda_expr: lambda_expr.clone(),
+                lambda_display: lambda_display.clone(),
+                return_type: return_type.clone(),
+            })
+        }
     }
 }
 
 pub trait TypeCheck<Index: ColumnIndex> {
     /// Resolve data type with `LoweringContext` and perform type check.
-    fn resolve_and_check(
-        &self,
-        ctx: &impl LoweringContext<ColumnID = Index>,
-    ) -> Result<Expr<Index>>;
-
-    /// Perform type check without resolving data type.
-    fn type_check(&self) -> Result<Expr<Index>>;
+    fn type_check(&self, ctx: &impl TypeProvider<Index>) -> Result<Expr<Index>>;
 }
 
-impl<Index: ColumnIndex> TypeCheck<Index> for RawExpr<Index> {
-    fn resolve_and_check(
-        &self,
-        resolver: &impl LoweringContext<ColumnID = Index>,
-    ) -> Result<Expr<Index>> {
-        let raw_expr = resolve_column_type(self, resolver)?;
-        check(&raw_expr, &BUILTIN_FUNCTIONS)
-    }
-
-    fn type_check(&self) -> Result<Expr<Index>> {
-        check(self, &BUILTIN_FUNCTIONS)
+impl<ColumnID: ColumnIndex> TypeCheck<ColumnID> for RawExpr<ColumnID> {
+    fn type_check(&self, type_provider: &impl TypeProvider<ColumnID>) -> Result<Expr<ColumnID>> {
+        let raw_expr = update_column_type(self, type_provider)?;
+        type_check::check(&raw_expr, &BUILTIN_FUNCTIONS)
     }
 }
 
 impl TypeCheck<IndexType> for ScalarExpr {
-    fn resolve_and_check(
-        &self,
-        resolver: &impl LoweringContext<ColumnID = IndexType>,
-    ) -> Result<Expr<IndexType>> {
+    fn type_check(&self, type_provider: &impl TypeProvider<IndexType>) -> Result<Expr<IndexType>> {
         let raw_expr = self.as_raw_expr().project_column_ref(|col| col.index);
-        raw_expr.resolve_and_check(resolver)
-    }
-
-    fn type_check(&self) -> Result<Expr<IndexType>> {
-        let raw_expr = self.as_raw_expr().project_column_ref(|col| col.index);
-        raw_expr.type_check()
+        raw_expr.type_check(type_provider)
     }
 }
 
 impl ScalarExpr {
     /// Lowering `Scalar` into `RawExpr` to utilize with `common_expression::types::type_check`.
     /// Specific variants will be replaced with a `RawExpr::ColumnRef` with a dummy name.
+    #[recursive::recursive]
     pub fn as_raw_expr(&self) -> RawExpr<ColumnBinding> {
         match self {
             ScalarExpr::BoundColumnRef(column_ref) => RawExpr::ColumnRef {
@@ -193,39 +196,31 @@ impl ScalarExpr {
             },
             ScalarExpr::WindowFunction(win) => RawExpr::ColumnRef {
                 span: None,
-                id: ColumnBindingBuilder::new(
+                id: ColumnBinding::new_dummy_column(
                     win.display_name.clone(),
-                    usize::MAX,
                     Box::new(win.func.return_type()),
-                    Visibility::Visible,
-                )
-                .build(),
+                    DummyColumnType::WindowFunction,
+                ),
                 data_type: win.func.return_type(),
                 display_name: win.display_name.clone(),
             },
             ScalarExpr::AggregateFunction(agg) => RawExpr::ColumnRef {
                 span: None,
-                id: ColumnBindingBuilder::new(
+                id: ColumnBinding::new_dummy_column(
                     agg.display_name.clone(),
-                    usize::MAX,
                     Box::new((*agg.return_type).clone()),
-                    Visibility::Visible,
-                )
-                .build(),
+                    DummyColumnType::AggregateFunction,
+                ),
                 data_type: (*agg.return_type).clone(),
                 display_name: agg.display_name.clone(),
             },
-            ScalarExpr::LambdaFunction(func) => RawExpr::ColumnRef {
+            ScalarExpr::LambdaFunction(func) => RawExpr::LambdaFunctionCall {
                 span: None,
-                id: ColumnBindingBuilder::new(
-                    func.display_name.clone(),
-                    usize::MAX,
-                    Box::new((*func.return_type).clone()),
-                    Visibility::Visible,
-                )
-                .build(),
-                data_type: (*func.return_type).clone(),
-                display_name: func.display_name.clone(),
+                name: func.func_name.clone(),
+                args: func.args.iter().map(ScalarExpr::as_raw_expr).collect(),
+                lambda_expr: (*func.lambda_expr).clone(),
+                lambda_display: func.lambda_display.clone(),
+                return_type: (*func.return_type).clone(),
             },
             ScalarExpr::FunctionCall(func) => RawExpr::FunctionCall {
                 span: func.span,
@@ -241,24 +236,59 @@ impl ScalarExpr {
             },
             ScalarExpr::SubqueryExpr(subquery) => RawExpr::ColumnRef {
                 span: subquery.span,
-                id: new_dummy_column(subquery.data_type()),
+                id: ColumnBinding::new_dummy_column(
+                    "DUMMY_SUBQUERY".to_string(),
+                    Box::new(subquery.data_type()),
+                    DummyColumnType::Subquery,
+                ),
                 data_type: subquery.data_type(),
-                display_name: "DUMMY".to_string(),
+                display_name: "DUMMY_SUBQUERY".to_string(),
+            },
+            ScalarExpr::UDFCall(udf) => RawExpr::ColumnRef {
+                span: None,
+                id: ColumnBinding::new_dummy_column(
+                    udf.display_name.clone(),
+                    Box::new((*udf.return_type).clone()),
+                    DummyColumnType::UDF,
+                ),
+                data_type: (*udf.return_type).clone(),
+                display_name: udf.display_name.clone(),
+            },
+
+            ScalarExpr::UDFLambdaCall(udf) => {
+                let scalar = &udf.scalar;
+                scalar.as_raw_expr()
+            }
+
+            ScalarExpr::UDAFCall(udaf) => RawExpr::ColumnRef {
+                span: None,
+                id: ColumnBinding::new_dummy_column(
+                    udaf.display_name.clone(),
+                    Box::new(udaf.return_type.as_ref().clone()),
+                    DummyColumnType::UDF,
+                ),
+                data_type: udaf.return_type.as_ref().clone(),
+                display_name: udaf.display_name.clone(),
+            },
+
+            ScalarExpr::AsyncFunctionCall(async_func) => RawExpr::ColumnRef {
+                span: None,
+                id: ColumnBinding::new_dummy_column(
+                    async_func.display_name.clone(),
+                    Box::new(async_func.return_type.as_ref().clone()),
+                    DummyColumnType::AsyncFunction,
+                ),
+                data_type: async_func.return_type.as_ref().clone(),
+                display_name: async_func.display_name.clone(),
             },
         }
     }
 
     pub fn as_expr(&self) -> Result<Expr<ColumnBinding>> {
-        self.as_raw_expr().type_check()
+        type_check::check(&self.as_raw_expr(), &BUILTIN_FUNCTIONS)
     }
-}
 
-fn new_dummy_column(data_type: DataType) -> ColumnBinding {
-    ColumnBindingBuilder::new(
-        "DUMMY".to_string(),
-        usize::MAX,
-        Box::new(data_type),
-        Visibility::Visible,
-    )
-    .build()
+    pub fn is_column_ref(&self) -> bool {
+        matches!(self, ScalarExpr::BoundColumnRef(_))
+    }
 }

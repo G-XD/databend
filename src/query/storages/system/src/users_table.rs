@@ -14,21 +14,24 @@
 
 use std::sync::Arc;
 
-use common_catalog::plan::PushDownInfo;
-use common_catalog::table::Table;
-use common_catalog::table_context::TableContext;
-use common_exception::Result;
-use common_expression::types::StringType;
-use common_expression::utils::FromData;
-use common_expression::DataBlock;
-use common_expression::TableDataType;
-use common_expression::TableField;
-use common_expression::TableSchemaRefExt;
-use common_meta_app::schema::TableIdent;
-use common_meta_app::schema::TableInfo;
-use common_meta_app::schema::TableMeta;
-use common_users::UserApiProvider;
-use common_users::BUILTIN_ROLE_ACCOUNT_ADMIN;
+use databend_common_catalog::plan::PushDownInfo;
+use databend_common_catalog::table::Table;
+use databend_common_catalog::table_context::TableContext;
+use databend_common_exception::Result;
+use databend_common_expression::types::BooleanType;
+use databend_common_expression::types::StringType;
+use databend_common_expression::types::TimestampType;
+use databend_common_expression::utils::FromData;
+use databend_common_expression::DataBlock;
+use databend_common_expression::TableDataType;
+use databend_common_expression::TableField;
+use databend_common_expression::TableSchemaRefExt;
+use databend_common_meta_app::schema::TableIdent;
+use databend_common_meta_app::schema::TableInfo;
+use databend_common_meta_app::schema::TableMeta;
+use databend_common_users::UserApiProvider;
+use databend_common_users::BUILTIN_ROLE_ACCOUNT_ADMIN;
+use itertools::Itertools;
 
 use crate::table::AsyncOneBlockSystemTable;
 use crate::table::AsyncSystemTable;
@@ -54,62 +57,113 @@ impl AsyncSystemTable for UsersTable {
         let tenant = ctx.get_tenant();
         let users = UserApiProvider::instance().get_users(&tenant).await?;
 
-        let mut names: Vec<Vec<u8>> = users.iter().map(|x| x.name.as_bytes().to_vec()).collect();
-        let mut hostnames: Vec<Vec<u8>> = users
+        let mut names: Vec<String> = users.iter().map(|x| x.name.clone()).collect();
+        let mut hostnames: Vec<String> = users.iter().map(|x| x.hostname.clone()).collect();
+        let mut auth_types: Vec<String> = users
             .iter()
-            .map(|x| x.hostname.as_bytes().to_vec())
+            .map(|x| x.auth_info.get_type().to_str().to_string())
             .collect();
-        let mut auth_types: Vec<Vec<u8>> = users
+        let mut default_roles: Vec<String> = users
             .iter()
-            .map(|x| x.auth_info.get_type().to_str().as_bytes().to_vec())
+            .map(|x| x.option.default_role().cloned().unwrap_or_default())
             .collect();
-        let mut auth_strings: Vec<Vec<u8>> = users
+        let mut is_configureds: Vec<String> = vec!["NO".to_string(); users.len()];
+        let mut disableds: Vec<bool> = users
             .iter()
-            .map(|x| x.auth_info.get_auth_string().as_bytes().to_vec())
+            .map(|x| x.option.disabled().cloned().unwrap_or_default())
             .collect();
-        let mut default_roles: Vec<Vec<u8>> = users
+        let mut roles: Vec<String> = users
             .iter()
-            .map(|x| {
-                x.option
-                    .default_role()
-                    .cloned()
-                    .unwrap_or_default()
-                    .as_bytes()
-                    .to_vec()
-            })
+            .map(|user| user.grants.roles().iter().sorted().join(", ").to_string())
             .collect();
-        let mut is_configureds: Vec<Vec<u8>> = vec!["NO".as_bytes().to_vec(); users.len()];
+        let mut network_policies: Vec<Option<String>> = users
+            .iter()
+            .map(|x| x.option.network_policy().cloned())
+            .collect();
+        let mut password_policies: Vec<Option<String>> = users
+            .iter()
+            .map(|x| x.option.password_policy().cloned())
+            .collect();
+        let mut must_change_passwords: Vec<Option<bool>> = users
+            .iter()
+            .map(|x| x.option.must_change_password().cloned())
+            .collect();
+        let mut created_on: Vec<Option<i64>> = users
+            .iter()
+            .map(|user| Some(user.created_on.timestamp_micros()))
+            .collect();
+        let mut update_on: Vec<Option<i64>> = users
+            .iter()
+            .map(|user| Some(user.update_on.timestamp_micros()))
+            .collect();
 
         let configured_users = UserApiProvider::instance().get_configured_users();
         for (name, auth_info) in configured_users {
-            names.push(name.as_bytes().to_vec());
-            hostnames.push("%".as_bytes().to_vec());
-            auth_types.push(auth_info.get_type().to_str().as_bytes().to_vec());
-            auth_strings.push(auth_info.get_auth_string().as_bytes().to_vec());
-            default_roles.push(BUILTIN_ROLE_ACCOUNT_ADMIN.as_bytes().to_vec());
-            is_configureds.push("YES".as_bytes().to_vec());
+            names.push(name.clone());
+            hostnames.push("%".to_string());
+            auth_types.push(auth_info.get_type().to_str().to_string());
+            default_roles.push(BUILTIN_ROLE_ACCOUNT_ADMIN.to_string());
+            is_configureds.push("YES".to_string());
+            disableds.push(false);
+            roles.push(BUILTIN_ROLE_ACCOUNT_ADMIN.to_string());
+            network_policies.push(None);
+            password_policies.push(None);
+            must_change_passwords.push(None);
+            created_on.push(None);
+            update_on.push(None);
         }
 
+        // please note that do NOT display the auth_string field in the result, because there're risks of
+        // password leak. even though it's been hashed, it's still not a good thing.
         Ok(DataBlock::new_from_columns(vec![
             StringType::from_data(names),
             StringType::from_data(hostnames),
             StringType::from_data(auth_types),
-            StringType::from_data(auth_strings),
             StringType::from_data(default_roles),
             StringType::from_data(is_configureds),
+            BooleanType::from_data(disableds),
+            StringType::from_data(roles),
+            StringType::from_opt_data(network_policies),
+            StringType::from_opt_data(password_policies),
+            BooleanType::from_opt_data(must_change_passwords),
+            TimestampType::from_opt_data(created_on),
+            TimestampType::from_opt_data(update_on),
         ]))
     }
 }
 
 impl UsersTable {
     pub fn create(table_id: u64) -> Arc<dyn Table> {
+        // QUERY show user is rewrite to `SELECT name, hostname, auth_type, is_configured FROM system.users ORDER BY name`
+        // If users table column has been modified, need to check the show user query.
         let schema = TableSchemaRefExt::create(vec![
             TableField::new("name", TableDataType::String),
             TableField::new("hostname", TableDataType::String),
             TableField::new("auth_type", TableDataType::String),
-            TableField::new("auth_string", TableDataType::String),
             TableField::new("default_role", TableDataType::String),
             TableField::new("is_configured", TableDataType::String),
+            TableField::new("disabled", TableDataType::Boolean),
+            TableField::new("roles", TableDataType::String),
+            TableField::new(
+                "network_policy",
+                TableDataType::Nullable(Box::new(TableDataType::String)),
+            ),
+            TableField::new(
+                "password_policy",
+                TableDataType::Nullable(Box::new(TableDataType::String)),
+            ),
+            TableField::new(
+                "must_change_password",
+                TableDataType::Nullable(Box::new(TableDataType::Boolean)),
+            ),
+            TableField::new(
+                "created_on",
+                TableDataType::Nullable(Box::new(TableDataType::Timestamp)),
+            ),
+            TableField::new(
+                "update_on",
+                TableDataType::Nullable(Box::new(TableDataType::Timestamp)),
+            ),
         ]);
 
         let table_info = TableInfo {

@@ -14,18 +14,17 @@
 
 use std::sync::Arc;
 
-use common_exception::Result;
+use databend_common_exception::Result;
 
+use crate::optimizer::extract::Matcher;
 use crate::optimizer::rule::Rule;
 use crate::optimizer::rule::TransformResult;
 use crate::optimizer::RelExpr;
 use crate::optimizer::RuleID;
 use crate::optimizer::SExpr;
 use crate::plans::Filter;
-use crate::plans::PatternPlan;
 use crate::plans::ProjectSet;
 use crate::plans::RelOp;
-use crate::plans::RelOp::Pattern;
 
 /// Input:   Filter
 ///           \
@@ -50,32 +49,20 @@ use crate::plans::RelOp::Pattern;
 ///                *
 pub struct RulePushDownFilterProjectSet {
     id: RuleID,
-    patterns: Vec<SExpr>,
+    matchers: Vec<Matcher>,
 }
 
 impl RulePushDownFilterProjectSet {
     pub fn new() -> Self {
         Self {
             id: RuleID::PushDownFilterProjectSet,
-            patterns: vec![SExpr::create_unary(
-                Arc::new(
-                    PatternPlan {
-                        plan_type: RelOp::Filter,
-                    }
-                    .into(),
-                ),
-                Arc::new(SExpr::create_unary(
-                    Arc::new(
-                        PatternPlan {
-                            plan_type: RelOp::ProjectSet,
-                        }
-                        .into(),
-                    ),
-                    Arc::new(SExpr::create_leaf(Arc::new(
-                        PatternPlan { plan_type: Pattern }.into(),
-                    ))),
-                )),
-            )],
+            matchers: vec![Matcher::MatchOp {
+                op_type: RelOp::Filter,
+                children: vec![Matcher::MatchOp {
+                    op_type: RelOp::ProjectSet,
+                    children: vec![Matcher::Leaf],
+                }],
+            }],
         }
     }
 }
@@ -104,7 +91,6 @@ impl Rule for RulePushDownFilterProjectSet {
         if !pushed_down_predicates.is_empty() {
             let pushed_down_filter = Filter {
                 predicates: pushed_down_predicates,
-                is_having: filter.is_having,
             };
             let mut result = if remaining_predicates.is_empty() {
                 SExpr::create_unary(
@@ -117,7 +103,6 @@ impl Rule for RulePushDownFilterProjectSet {
             } else {
                 let remaining_filter = Filter {
                     predicates: remaining_predicates,
-                    is_having: filter.is_having,
                 };
                 SExpr::create_unary(
                     Arc::new(remaining_filter.into()),
@@ -136,7 +121,7 @@ impl Rule for RulePushDownFilterProjectSet {
         Ok(())
     }
 
-    fn patterns(&self) -> &Vec<SExpr> {
-        &self.patterns
+    fn matchers(&self) -> &[Matcher] {
+        &self.matchers
     }
 }

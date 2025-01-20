@@ -1,4 +1,4 @@
-// Copyright 2021 Datafuse Labs.
+// Copyright 2021 Datafuse Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,8 +14,8 @@
 
 use std::io::Write;
 
-use common_expression::types::*;
-use common_expression::FromData;
+use databend_common_expression::types::*;
+use databend_common_expression::FromData;
 use goldenfile::Mint;
 
 use super::run_ast;
@@ -40,6 +40,7 @@ fn test_eq(file: &mut impl Write) {
     run_ast(file, "null=null", &[]);
     run_ast(file, "1=2", &[]);
     run_ast(file, "1.0=1", &[]);
+    run_ast(file, "2.222>2.11", &[]);
     run_ast(file, "true=null", &[]);
     run_ast(file, "true=false", &[]);
     run_ast(file, "false=false", &[]);
@@ -51,6 +52,11 @@ fn test_eq(file: &mut impl Write) {
     run_ast(file, "(1, 'a') = (1, 'a')", &[]);
     run_ast(file, "(1, 'a') = (1, 'b')", &[]);
     run_ast(file, "today()='2020-01-01'", &[]);
+    run_ast(
+        file,
+        "to_interval('1 hour')=to_interval('3600 seconds')",
+        &[],
+    );
     run_ast(
         file,
         "to_timestamp(-315360000000000)=to_timestamp(-100)",
@@ -118,6 +124,11 @@ fn test_noteq(file: &mut impl Write) {
     run_ast(file, "(1, 'a') != (1, 'b')", &[]);
     run_ast(
         file,
+        "to_interval('1 hour')!=to_interval('3600 seconds')",
+        &[],
+    );
+    run_ast(
+        file,
         "to_timestamp(-315360000000000)!=to_timestamp(-100)",
         &[],
     );
@@ -162,6 +173,7 @@ fn test_lt(file: &mut impl Write) {
     run_ast(file, "(1, 'b') < (1, 'a')", &[]);
     run_ast(file, "(1, 'a') < (1, 'b')", &[]);
     run_ast(file, "(1, 'a') < (2, 'a')", &[]);
+    run_ast(file, "to_interval('29 days')<to_interval('1 month')", &[]);
     run_ast(
         file,
         "to_timestamp(-315360000000000)<to_timestamp(-100)",
@@ -211,6 +223,7 @@ fn test_lte(file: &mut impl Write) {
     run_ast(file, "(1, 'a') <= (1, 'b')", &[]);
     run_ast(file, "(1, 'a') <= (2, 'a')", &[]);
     run_ast(file, "parse_json('null') <= parse_json('null')", &[]);
+    run_ast(file, "to_interval('29 days')<=to_interval('1 month')", &[]);
     run_ast(
         file,
         "to_timestamp(-315360000000000)<=to_timestamp(-100)",
@@ -255,6 +268,7 @@ fn test_gt(file: &mut impl Write) {
     run_ast(file, "(1, 'b') > (1, 'a')", &[]);
     run_ast(file, "(1, 'a') > (1, 'b')", &[]);
     run_ast(file, "(1, 'a') > (2, 'a')", &[]);
+    run_ast(file, "to_interval('29 days')>to_interval('1 month')", &[]);
     run_ast(
         file,
         "to_timestamp(-315360000000000)>to_timestamp(-100)",
@@ -294,6 +308,8 @@ fn test_gt(file: &mut impl Write) {
     ];
     run_ast(file, "parse_json(lhs) > parse_json(rhs)", &table);
     run_ast(file, "lhs > rhs", &table);
+    let table = [("col", StringType::from_data(vec![r#"bcd"#, r#"efg"#]))];
+    run_ast(file, "col > 'efg'", &table);
 }
 
 fn test_gte(file: &mut impl Write) {
@@ -308,6 +324,7 @@ fn test_gte(file: &mut impl Write) {
     run_ast(file, "(1, 'b') >= (1, 'a')", &[]);
     run_ast(file, "(1, 'a') >= (1, 'b')", &[]);
     run_ast(file, "(1, 'a') >= (2, 'a')", &[]);
+    run_ast(file, "to_interval('29 days')>=to_interval('1 month')", &[]);
     run_ast(
         file,
         "to_timestamp(-315360000000000)>=to_timestamp(-100)",
@@ -362,6 +379,7 @@ fn test_like(file: &mut impl Write) {
     )];
     run_ast(file, "lhs like 'a%'", &columns);
     run_ast(file, "lhs like 'b%'", &columns);
+    run_ast(file, "lhs like 'ab%'", &columns);
     run_ast(file, "lhs like 'c'", &columns);
 
     let columns = [

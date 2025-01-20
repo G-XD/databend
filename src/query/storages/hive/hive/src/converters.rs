@@ -15,23 +15,24 @@
 use std::sync::Arc;
 
 use chrono::Utc;
-use common_exception::Result;
-use common_expression::types::decimal::DecimalSize;
-use common_expression::types::DecimalDataType;
-use common_expression::TableDataType;
-use common_expression::TableField;
-use common_expression::TableSchema;
-use common_hive_meta_store as hms;
-use common_meta_app::schema::DatabaseIdent;
-use common_meta_app::schema::DatabaseInfo;
-use common_meta_app::schema::DatabaseMeta;
-use common_meta_app::schema::DatabaseNameIdent;
-use common_meta_app::schema::TableIdent;
-use common_meta_app::schema::TableInfo;
-use common_meta_app::schema::TableMeta;
-use common_sql::resolve_type_name_by_str;
+use databend_common_exception::Result;
+use databend_common_expression::types::decimal::DecimalSize;
+use databend_common_expression::types::DecimalDataType;
+use databend_common_expression::TableDataType;
+use databend_common_expression::TableField;
+use databend_common_expression::TableSchema;
+use databend_common_meta_app::schema::database_name_ident::DatabaseNameIdent;
+use databend_common_meta_app::schema::CatalogInfo;
+use databend_common_meta_app::schema::DatabaseInfo;
+use databend_common_meta_app::schema::DatabaseMeta;
+use databend_common_meta_app::schema::TableIdent;
+use databend_common_meta_app::schema::TableInfo;
+use databend_common_meta_app::schema::TableMeta;
+use databend_common_meta_app::storage::StorageParams;
+use databend_common_meta_app::tenant::Tenant;
+use databend_common_sql::resolve_type_name_by_str;
+use hive_metastore as hms;
 
-use crate::hive_catalog::HIVE_CATALOG;
 use crate::hive_database::HiveDatabase;
 use crate::hive_database::HIVE_DATABASE_ENGINE;
 use crate::hive_table::HIVE_TABLE_ENGINE;
@@ -41,30 +42,31 @@ use crate::hive_table_options::HiveTableOptions;
 impl From<hms::Database> for HiveDatabase {
     fn from(hms_database: hms::Database) -> Self {
         HiveDatabase {
-            database_info: DatabaseInfo {
-                ident: DatabaseIdent { db_id: 0, seq: 0 },
-                name_ident: DatabaseNameIdent {
-                    tenant: "TODO".to_owned(),
-                    db_name: hms_database.name.unwrap_or_default(),
-                },
-                meta: DatabaseMeta {
+            database_info: DatabaseInfo::without_id_seq(
+                DatabaseNameIdent::new(
+                    Tenant::new_literal("dummy"),
+                    hms_database.name.unwrap_or_default().to_string(),
+                ),
+                DatabaseMeta {
                     engine: HIVE_DATABASE_ENGINE.to_owned(),
                     created_on: Utc::now(),
                     ..Default::default()
                 },
-            },
+            ),
         }
     }
 }
 
 pub fn try_into_table_info(
+    catalog_info: Arc<CatalogInfo>,
+    sp: Option<StorageParams>,
     hms_table: hms::Table,
     fields: Vec<hms::FieldSchema>,
 ) -> Result<TableInfo> {
     let partition_keys = if let Some(partitions) = &hms_table.partition_keys {
         let r = partitions
             .iter()
-            .filter_map(|field| field.name.clone())
+            .filter_map(|field| field.name.clone().map(|v| v.to_string()))
             .collect();
         Some(r)
     } else {
@@ -88,9 +90,9 @@ pub fn try_into_table_info(
 
     let meta = TableMeta {
         schema,
-        catalog: HIVE_CATALOG.to_string(),
         engine: HIVE_TABLE_ENGINE.to_owned(),
         engine_options: table_options.into(),
+        storage_params: sp,
         created_on: Utc::now(),
         ..Default::default()
     };
@@ -107,8 +109,9 @@ pub fn try_into_table_info(
             seq: 0,
         },
         desc: real_name,
-        name: hms_table.table_name.unwrap_or_default(),
+        name: hms_table.table_name.unwrap_or_default().to_string(),
         meta,
+        catalog_info,
         ..Default::default()
     };
 
@@ -119,9 +122,9 @@ fn try_into_schema(hive_fields: Vec<hms::FieldSchema>) -> Result<TableSchema> {
     let mut fields = Vec::new();
     for field in hive_fields {
         let name = field.name.unwrap_or_default();
-        let type_name = field.type_.unwrap_or_default();
+        let type_name = field.r#type.unwrap_or_default();
 
-        let table_type = try_from_filed_type_name(type_name)?;
+        let table_type = try_from_field_type_name(type_name)?;
         let table_type = table_type.wrap_nullable();
         let field = TableField::new(&name, table_type);
         fields.push(field);
@@ -129,7 +132,7 @@ fn try_into_schema(hive_fields: Vec<hms::FieldSchema>) -> Result<TableSchema> {
     Ok(TableSchema::new(fields))
 }
 
-fn try_from_filed_type_name(type_name: impl AsRef<str>) -> Result<TableDataType> {
+fn try_from_field_type_name(type_name: impl AsRef<str>) -> Result<TableDataType> {
     let name = type_name.as_ref().to_uppercase();
     // TODO more mappings goes here
     // https://cwiki.apache.org/confluence/display/Hive/LanguageManual+Types
@@ -138,7 +141,7 @@ fn try_from_filed_type_name(type_name: impl AsRef<str>) -> Result<TableDataType>
         Ok(TableDataType::String)
     } else if name.starts_with("ARRAY<") {
         let sub_type = &name["ARRAY<".len()..name.len() - 1];
-        let sub_type = try_from_filed_type_name(sub_type)?;
+        let sub_type = try_from_field_type_name(sub_type)?;
         Ok(TableDataType::Array(Box::new(sub_type.wrap_nullable())))
     } else {
         match name.as_str() {
@@ -148,7 +151,7 @@ fn try_from_filed_type_name(type_name: impl AsRef<str>) -> Result<TableDataType>
                     scale: 0,
                 },
             ))),
-            _ => resolve_type_name_by_str(name.as_str()),
+            _ => resolve_type_name_by_str(name.as_str(), false),
         }
     }
 }

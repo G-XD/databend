@@ -17,19 +17,19 @@ use std::io::Read;
 use std::string::String;
 use std::time::Duration;
 
-use common_base::base::tokio;
-use common_base::base::tokio::time::Instant;
-use common_base::base::Stoppable;
-use common_meta_types::Node;
+use databend_common_base::base::tokio;
+use databend_common_base::base::tokio::time::Instant;
+use databend_common_base::base::Stoppable;
+use databend_common_meta_types::Node;
 use databend_meta::api::http::v1::cluster_state::nodes_handler;
 use databend_meta::api::http::v1::cluster_state::status_handler;
 use databend_meta::api::HttpService;
 use databend_meta::meta_service::MetaNode;
+use http::Method;
+use http::StatusCode;
+use http::Uri;
 use log::info;
 use poem::get;
-use poem::http::Method;
-use poem::http::StatusCode;
-use poem::http::Uri;
 use poem::Endpoint;
 use poem::EndpointExt;
 use poem::Request;
@@ -46,7 +46,7 @@ use crate::tests::tls_constants::TEST_SERVER_KEY;
 
 /// Test http API "/cluster/nodes"
 #[test(harness = meta_service_test_harness)]
-#[minitrace::trace]
+#[fastrace::trace]
 async fn test_cluster_nodes() -> anyhow::Result<()> {
     let tc0 = MetaSrvTestContext::new(0);
     let mut tc1 = MetaSrvTestContext::new(1);
@@ -86,7 +86,7 @@ async fn test_cluster_nodes() -> anyhow::Result<()> {
 }
 
 #[test(harness = meta_service_test_harness)]
-#[minitrace::trace]
+#[fastrace::trace]
 async fn test_cluster_state() -> anyhow::Result<()> {
     let tc0 = MetaSrvTestContext::new(0);
     let mut tc1 = MetaSrvTestContext::new(1);
@@ -132,7 +132,7 @@ async fn test_cluster_state() -> anyhow::Result<()> {
 }
 
 #[test(harness = meta_service_test_harness)]
-#[minitrace::trace]
+#[fastrace::trace]
 async fn test_http_service_cluster_state() -> anyhow::Result<()> {
     let addr_str = "127.0.0.1:30003";
 

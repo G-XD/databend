@@ -15,24 +15,24 @@ name = "databend"
 crate-type = ["cdylib"]
 
 [dependencies]
-pyo3 = { version = "0.19.1", features = ["extension-module", "abi3", "abi3-py37"] }
-uuid = { version = "1.1.2" }
-# Workspace dependencies
-arrow = { version = "43.0.0", features = ["pyarrow"] }
-arrow-schema = "43.0.0"
-
-common-config = { path = "../query/config" }
-common-exception = { path = "../common/exception" }
-common-expression = { path = "../query/expression" }
-common-license = { path = "../common/license" }
-common-meta-app = { path = "../meta/app" }
-common-meta-embedded = { path = "../meta/embedded" }
-databend-query = { path = "../query/service", features = [
+arrow = { workspace = true, features = ["pyarrow"] }
+arrow-schema = { workspace = true }
+ctor = { workspace = true }
+databend-common-config = { workspace = true }
+databend-common-exception = { workspace = true }
+databend-common-expression = { workspace = true }
+databend-common-license = { workspace = true }
+databend-common-meta-app = { workspace = true }
+databend-common-meta-embedded = { workspace = true }
+databend-common-users = { workspace = true }
+databend-query = { workspace = true, features = [
     "simd",
     "disable_initial_exec_tls",
 ], default-features = false }
+pyo3 = { version = "0.20", features = ["extension-module", "abi3", "abi3-py37"] }
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "sync"] }
+tokio-stream = { workspace = true }
+uuid = { workspace = true }
 
-# # Crates.io dependencies
-ctor = "0.1.26"
-tokio = { version = "1.24", features = ["macros", "rt", "rt-multi-thread", "sync"] }
-tokio-stream = "0.1.10"
+[lints]
+workspace = true

@@ -12,18 +12,20 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use common_expression::DataSchemaRef;
-use common_meta_app::schema::CreateDatabaseReq;
-use common_meta_app::schema::DatabaseMeta;
-use common_meta_app::schema::DatabaseNameIdent;
-use common_meta_app::schema::DropDatabaseReq;
-use common_meta_app::schema::UndropDatabaseReq;
+use databend_common_expression::DataSchemaRef;
+use databend_common_meta_app::schema::database_name_ident::DatabaseNameIdent;
+use databend_common_meta_app::schema::CreateDatabaseReq;
+use databend_common_meta_app::schema::CreateOption;
+use databend_common_meta_app::schema::DatabaseMeta;
+use databend_common_meta_app::schema::DropDatabaseReq;
+use databend_common_meta_app::schema::UndropDatabaseReq;
+use databend_common_meta_app::tenant::Tenant;
 
 /// Create.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CreateDatabasePlan {
-    pub if_not_exists: bool,
-    pub tenant: String,
+    pub create_option: CreateOption,
+    pub tenant: Tenant,
     pub catalog: String,
     pub database: String,
     pub meta: DatabaseMeta,
@@ -32,11 +34,8 @@ pub struct CreateDatabasePlan {
 impl From<CreateDatabasePlan> for CreateDatabaseReq {
     fn from(p: CreateDatabasePlan) -> Self {
         CreateDatabaseReq {
-            if_not_exists: p.if_not_exists,
-            name_ident: DatabaseNameIdent {
-                tenant: p.tenant,
-                db_name: p.database,
-            },
+            create_option: p.create_option,
+            name_ident: DatabaseNameIdent::new(&p.tenant, &p.database),
             meta: p.meta,
         }
     }
@@ -45,11 +44,8 @@ impl From<CreateDatabasePlan> for CreateDatabaseReq {
 impl From<&CreateDatabasePlan> for CreateDatabaseReq {
     fn from(p: &CreateDatabasePlan) -> Self {
         CreateDatabaseReq {
-            if_not_exists: p.if_not_exists,
-            name_ident: DatabaseNameIdent {
-                tenant: p.tenant.clone(),
-                db_name: p.database.clone(),
-            },
+            create_option: p.create_option,
+            name_ident: DatabaseNameIdent::new(&p.tenant, &p.database),
             meta: p.meta.clone(),
         }
     }
@@ -59,7 +55,7 @@ impl From<&CreateDatabasePlan> for CreateDatabaseReq {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DropDatabasePlan {
     pub if_exists: bool,
-    pub tenant: String,
+    pub tenant: Tenant,
     pub catalog: String,
     pub database: String,
 }
@@ -68,10 +64,7 @@ impl From<DropDatabasePlan> for DropDatabaseReq {
     fn from(p: DropDatabasePlan) -> Self {
         DropDatabaseReq {
             if_exists: p.if_exists,
-            name_ident: DatabaseNameIdent {
-                tenant: p.tenant,
-                db_name: p.database,
-            },
+            name_ident: DatabaseNameIdent::new(&p.tenant, &p.database),
         }
     }
 }
@@ -80,10 +73,7 @@ impl From<&DropDatabasePlan> for DropDatabaseReq {
     fn from(p: &DropDatabasePlan) -> Self {
         DropDatabaseReq {
             if_exists: p.if_exists,
-            name_ident: DatabaseNameIdent {
-                tenant: p.tenant.clone(),
-                db_name: p.database.clone(),
-            },
+            name_ident: DatabaseNameIdent::new(&p.tenant, &p.database),
         }
     }
 }
@@ -91,7 +81,7 @@ impl From<&DropDatabasePlan> for DropDatabaseReq {
 /// Rename.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RenameDatabasePlan {
-    pub tenant: String,
+    pub tenant: Tenant,
     pub entities: Vec<RenameDatabaseEntity>,
 }
 
@@ -106,7 +96,7 @@ pub struct RenameDatabaseEntity {
 /// Undrop.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UndropDatabasePlan {
-    pub tenant: String,
+    pub tenant: Tenant,
     pub catalog: String,
     pub database: String,
 }
@@ -114,10 +104,7 @@ pub struct UndropDatabasePlan {
 impl From<UndropDatabasePlan> for UndropDatabaseReq {
     fn from(p: UndropDatabasePlan) -> Self {
         UndropDatabaseReq {
-            name_ident: DatabaseNameIdent {
-                tenant: p.tenant,
-                db_name: p.database,
-            },
+            name_ident: DatabaseNameIdent::new(&p.tenant, &p.database),
         }
     }
 }

@@ -15,13 +15,12 @@
 use std::any::Any;
 use std::sync::Arc;
 
-use common_exception::ErrorCode;
-use common_exception::Result;
-use common_expression::DataBlock;
+use databend_common_exception::Result;
+use databend_common_expression::DataBlock;
 
-use crate::pipelines::processors::port::InputPort;
-use crate::pipelines::processors::port::OutputPort;
-use crate::pipelines::processors::processor::Event;
+use crate::pipelines::processors::Event;
+use crate::pipelines::processors::InputPort;
+use crate::pipelines::processors::OutputPort;
 use crate::pipelines::processors::Processor;
 
 pub struct TransformLimit;
@@ -34,7 +33,6 @@ impl TransformLimit {
         output: Arc<OutputPort>,
     ) -> Result<Box<dyn Processor>> {
         match (limit, offset) {
-            (None, 0) => Err(ErrorCode::Internal("It's a bug")),
             (Some(_), 0) => OnlyLimitTransform::create(input, output, limit, offset),
             (None, _) => OnlyOffsetTransform::create(input, output, limit, offset),
             (Some(_), _) => OffsetAndLimitTransform::create(input, output, limit, offset),

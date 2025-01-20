@@ -15,9 +15,9 @@
 use std::collections::HashMap;
 use std::fmt::Write;
 
-use common_exception::ErrorCode;
-use common_exception::Result;
-use common_exception::Span;
+use databend_common_ast::Span;
+use databend_common_exception::ErrorCode;
+use databend_common_exception::Result;
 use itertools::Itertools;
 
 use crate::cast_scalar;
@@ -31,17 +31,19 @@ use crate::types::decimal::MAX_DECIMAL256_PRECISION;
 use crate::types::DataType;
 use crate::types::DecimalDataType;
 use crate::types::Number;
+use crate::types::NumberScalar;
 use crate::AutoCastRules;
 use crate::ColumnIndex;
 use crate::ConstantFolder;
 use crate::FunctionContext;
 use crate::Scalar;
 
+#[recursive::recursive]
 pub fn check<Index: ColumnIndex>(
-    ast: &RawExpr<Index>,
+    expr: &RawExpr<Index>,
     fn_registry: &FunctionRegistry,
 ) -> Result<Expr<Index>> {
-    match ast {
+    match expr {
         RawExpr::Constant { span, scalar } => Ok(Expr::Constant {
             span: *span,
             scalar: scalar.clone(),
@@ -73,7 +75,7 @@ pub fn check<Index: ColumnIndex>(
             args,
             params,
         } => {
-            let args_expr: Vec<_> = args
+            let mut args_expr: Vec<_> = args
                 .iter()
                 .map(|arg| check(arg, fn_registry))
                 .try_collect()?;
@@ -82,41 +84,26 @@ pub fn check<Index: ColumnIndex>(
             // c:int16 = 12456 will be resolve as `to_int32(c) == to_int32(12456)`
             // This may hurt the bloom filter, we should try cast to literal as the datatype of column
             if name == "eq" && args_expr.len() == 2 {
-                match args_expr.as_slice() {
-                    [
-                        e,
-                        Expr::Constant {
-                            span,
-                            scalar,
-                            data_type: src_ty,
-                        },
-                    ]
-                    | [
-                        Expr::Constant {
-                            span,
-                            scalar,
-                            data_type: src_ty,
-                        },
-                        e,
-                    ] => {
-                        let src_ty = src_ty.remove_nullable();
+                match args_expr.as_mut_slice() {
+                    [e, Expr::Constant {
+                        span,
+                        scalar,
+                        data_type,
+                    }]
+                    | [Expr::Constant {
+                        span,
+                        scalar,
+                        data_type,
+                    }, e] => {
+                        let src_ty = data_type.remove_nullable();
                         let dest_ty = e.data_type().remove_nullable();
 
                         if dest_ty.is_integer() && src_ty.is_integer() {
-                            if let Ok(scalar) =
+                            if let Ok(casted_scalar) =
                                 cast_scalar(*span, scalar.clone(), dest_ty, fn_registry)
                             {
-                                return check_function(
-                                    *span,
-                                    name,
-                                    params,
-                                    &[e.clone(), Expr::Constant {
-                                        span: *span,
-                                        data_type: scalar.as_ref().infer_data_type(),
-                                        scalar,
-                                    }],
-                                    fn_registry,
-                                );
+                                *scalar = casted_scalar;
+                                *data_type = scalar.as_ref().infer_data_type();
                             }
                         }
                     }
@@ -125,6 +112,28 @@ pub fn check<Index: ColumnIndex>(
             }
 
             check_function(*span, name, params, &args_expr, fn_registry)
+        }
+        RawExpr::LambdaFunctionCall {
+            span,
+            name,
+            args,
+            lambda_expr,
+            lambda_display,
+            return_type,
+        } => {
+            let args: Vec<_> = args
+                .iter()
+                .map(|arg| check(arg, fn_registry))
+                .try_collect()?;
+
+            Ok(Expr::LambdaFunctionCall {
+                span: *span,
+                name: name.clone(),
+                args,
+                lambda_expr: lambda_expr.clone(),
+                lambda_display: lambda_display.clone(),
+                return_type: return_type.clone(),
+            })
         }
     }
 }
@@ -153,9 +162,12 @@ pub fn check_cast<Index: ColumnIndex>(
         })
     } else {
         // fast path to eval function for cast
-        if let Some(cast_fn) = get_simple_cast_function(is_try, dest_type) {
+        if let Some(cast_fn) = get_simple_cast_function(is_try, expr.data_type(), dest_type) {
             let params = if let DataType::Decimal(ty) = dest_type {
-                vec![ty.precision() as usize, ty.scale() as usize]
+                vec![
+                    Scalar::Number(NumberScalar::Int64(ty.precision() as _)),
+                    Scalar::Number(NumberScalar::Int64(ty.scale() as _)),
+                ]
             } else {
                 vec![]
             };
@@ -169,6 +181,15 @@ pub fn check_cast<Index: ColumnIndex>(
             }
         }
 
+        if !can_cast_to(expr.data_type(), dest_type) {
+            return Err(ErrorCode::BadArguments(format!(
+                "unable to cast type `{}` to type `{}`",
+                expr.data_type(),
+                dest_type,
+            ))
+            .set_span(span));
+        }
+
         Ok(Expr::Cast {
             span,
             is_try,
@@ -178,6 +199,7 @@ pub fn check_cast<Index: ColumnIndex>(
     }
 }
 
+#[recursive::recursive]
 pub fn wrap_nullable_for_try_cast(span: Span, ty: &DataType) -> Result<DataType> {
     match ty {
         DataType::Null => Err(ErrorCode::from_string_no_backtrace(
@@ -204,7 +226,8 @@ pub fn check_number<Index: ColumnIndex, T: Number>(
     expr: &Expr<Index>,
     fn_registry: &FunctionRegistry,
 ) -> Result<T> {
-    let (expr, _) = if expr.data_type() != &DataType::Number(T::data_type()) {
+    let origin_ty = expr.data_type();
+    let (expr, _) = if origin_ty != &DataType::Number(T::data_type()) {
         ConstantFolder::fold(
             &Expr::Cast {
                 span,
@@ -224,31 +247,32 @@ pub fn check_number<Index: ColumnIndex, T: Number>(
             scalar: Scalar::Number(num),
             ..
         } => T::try_downcast_scalar(&num).ok_or_else(|| {
-            ErrorCode::InvalidArgument(format!(
-                "Expect {}, but got {}",
-                T::data_type(),
-                expr.data_type()
-            ))
-            .set_span(span)
+            ErrorCode::InvalidArgument(format!("Expect {}, but got {}", T::data_type(), origin_ty))
+                .set_span(span)
         }),
-        _ => Err(ErrorCode::InvalidArgument(format!(
-            "Expect {}, but got {}",
-            T::data_type(),
-            expr.data_type()
-        ))
-        .set_span(span)),
+        _ => Err(ErrorCode::InvalidArgument("Need constant number").set_span(span)),
     }
 }
 
+#[recursive::recursive]
 pub fn check_function<Index: ColumnIndex>(
     span: Span,
     name: &str,
-    params: &[usize],
+    params: &[Scalar],
     args: &[Expr<Index>],
     fn_registry: &FunctionRegistry,
 ) -> Result<Expr<Index>> {
     if let Some(original_fn_name) = fn_registry.aliases.get(name) {
         return check_function(span, original_fn_name, params, args, fn_registry);
+    }
+
+    // to_string('a')
+    if params.is_empty() && name.starts_with("to_") && args.len() == 1 {
+        let type_name = args[0].data_type().remove_nullable();
+        match get_simple_cast_function(false, &type_name, &type_name) {
+            Some(n) if name.eq_ignore_ascii_case(&n) => return Ok(args[0].clone()),
+            _ => {}
+        }
     }
 
     let candidates = fn_registry.search_candidates(name, params, args);
@@ -295,20 +319,21 @@ pub fn check_function<Index: ColumnIndex>(
 
     let mut msg = if params.is_empty() {
         format!(
-            "no overload satisfies `{name}({})`",
+            "no function matches signature `{name}({})`, you might need to add explicit type casts.",
             args.iter()
                 .map(|arg| arg.data_type().to_string())
                 .join(", ")
         )
     } else {
         format!(
-            "no overload satisfies `{name}({})({})`",
+            "no function matches signature `{name}({})({})`, you might need to add explicit type casts.",
             params.iter().join(", "),
             args.iter()
                 .map(|arg| arg.data_type().to_string())
                 .join(", ")
         )
     };
+
     if !candidates.is_empty() {
         let candidates_sig: Vec<_> = candidates
             .iter()
@@ -317,16 +342,23 @@ pub fn check_function<Index: ColumnIndex>(
 
         let max_len = candidates_sig.iter().map(|s| s.len()).max().unwrap_or(0);
 
+        let candidates_len = candidates_sig.len();
+        let take_len = candidates_len.min(3);
         let candidates_fail_reason = candidates_sig
             .into_iter()
+            .take(3)
             .zip(fail_reasons)
             .map(|(sig, err)| format!("  {sig:<max_len$}  : {}", err.message()))
             .join("\n");
 
+        let shorten_msg = if candidates_len > take_len {
+            format!("\n... and {} more", candidates_len - take_len)
+        } else {
+            "".to_string()
+        };
         write!(
             &mut msg,
-            "\n\nhas tried possible overloads:\n{}",
-            candidates_fail_reason
+            "\n\ncandidate functions:\n{candidates_fail_reason}{shorten_msg}",
         )
         .unwrap();
     };
@@ -371,7 +403,10 @@ impl Substitution {
             DataType::Generic(idx) => self.0.get(idx).cloned().ok_or_else(|| {
                 ErrorCode::from_string_no_backtrace(format!("unbound generic type `T{idx}`"))
             }),
-            DataType::Nullable(box ty) => Ok(DataType::Nullable(Box::new(self.apply(ty)?))),
+            DataType::Nullable(box ty) => {
+                let inner_ty = self.apply(ty)?;
+                Ok(inner_ty.wrap_nullable())
+            }
             DataType::Array(box ty) => Ok(DataType::Array(Box::new(self.apply(ty)?))),
             DataType::Map(box ty) => {
                 let inner_ty = self.apply(ty)?;
@@ -411,7 +446,6 @@ pub fn try_check_function<Index: ColumnIndex>(
             check_cast(arg.span(), is_try, arg.clone(), &sig_type, fn_registry)
         })
         .collect::<Result<Vec<_>>>()?;
-
     let return_type = subst.apply(&sig.return_type)?;
     assert!(!return_type.has_nested_nullable());
 
@@ -423,13 +457,11 @@ pub fn try_check_function<Index: ColumnIndex>(
         .map(|max_generic_idx| {
             (0..max_generic_idx + 1)
                 .map(|idx| {
-                    subst
-                        .0
-                        .get(&idx)
-                        .cloned()
-                        .ok_or(ErrorCode::from_string_no_backtrace(format!(
+                    subst.0.get(&idx).cloned().ok_or_else(|| {
+                        ErrorCode::from_string_no_backtrace(format!(
                             "unable to resolve generic T{idx}"
-                        )))
+                        ))
+                    })
                 })
                 .collect::<Result<Vec<_>>>()
         })
@@ -511,6 +543,34 @@ pub fn unify(
     }
 }
 
+fn can_cast_to(src_ty: &DataType, dest_ty: &DataType) -> bool {
+    match (src_ty, dest_ty) {
+        (src_ty, dest_ty) if src_ty == dest_ty => true,
+
+        (DataType::Null, _)
+        | (DataType::EmptyArray, DataType::Array(_))
+        | (DataType::EmptyMap, DataType::Map(_))
+        | (DataType::Variant, DataType::Array(_))
+        | (DataType::Variant, DataType::Map(_)) => true,
+
+        (DataType::Tuple(fields_src_ty), DataType::Tuple(fields_dest_ty))
+            if fields_src_ty.len() == fields_dest_ty.len() =>
+        {
+            true
+        }
+
+        (DataType::Nullable(box inner_src_ty), DataType::Nullable(box inner_dest_ty))
+        | (DataType::Nullable(box inner_src_ty), inner_dest_ty)
+        | (inner_src_ty, DataType::Nullable(box inner_dest_ty))
+        | (DataType::Array(box inner_src_ty), DataType::Array(box inner_dest_ty))
+        | (DataType::Map(box inner_src_ty), DataType::Map(box inner_dest_ty)) => {
+            can_cast_to(inner_src_ty, inner_dest_ty)
+        }
+
+        (src_ty, dest_ty) => get_simple_cast_function(false, src_ty, dest_ty).is_some(),
+    }
+}
+
 pub fn can_auto_cast_to(
     src_ty: &DataType,
     dest_ty: &DataType,
@@ -541,13 +601,12 @@ pub fn can_auto_cast_to(
             }
             (_, _) => unreachable!(),
         },
-        (DataType::Tuple(src_tys), DataType::Tuple(dest_tys))
-            if src_tys.len() == dest_tys.len() =>
-        {
-            src_tys
-                .iter()
-                .zip(dest_tys)
-                .all(|(src_ty, dest_ty)| can_auto_cast_to(src_ty, dest_ty, auto_cast_rules))
+        (DataType::Tuple(src_tys), DataType::Tuple(dest_tys)) => {
+            src_tys.len() == dest_tys.len()
+                && src_tys
+                    .iter()
+                    .zip(dest_tys)
+                    .all(|(src_ty, dest_ty)| can_auto_cast_to(src_ty, dest_ty, auto_cast_rules))
         }
         (DataType::String, DataType::Decimal(_)) => true,
         (DataType::Decimal(x), DataType::Decimal(y)) => {
@@ -560,7 +619,8 @@ pub fn can_auto_cast_to(
             properties.scale <= d.scale()
                 && properties.precision - properties.scale <= d.leading_digits()
         }
-        (DataType::Decimal(_), DataType::Number(n)) if n.is_float() => true,
+        // Only available for decimal --> f64, otherwise `sqrt(1234.56789)` will have signature: `sqrt(1234.56789::Float32)`
+        (DataType::Decimal(_), DataType::Number(n)) if n.is_float64() => true,
         _ => false,
     }
 }
@@ -664,9 +724,18 @@ pub fn common_super_type(
     }
 }
 
-pub fn get_simple_cast_function(is_try: bool, dest_type: &DataType) -> Option<String> {
+pub fn get_simple_cast_function(
+    is_try: bool,
+    src_type: &DataType,
+    dest_type: &DataType,
+) -> Option<String> {
     let function_name = if dest_type.is_decimal() {
         "to_decimal".to_owned()
+    } else if src_type.remove_nullable() == DataType::String
+        && dest_type.remove_nullable() == DataType::Variant
+    {
+        // parse JSON string to variant instead of cast
+        "parse_json".to_owned()
     } else {
         format!("to_{}", dest_type.to_string().to_lowercase())
     };
@@ -680,6 +749,7 @@ pub fn get_simple_cast_function(is_try: bool, dest_type: &DataType) -> Option<St
 }
 
 pub const ALL_SIMPLE_CAST_FUNCTIONS: &[&str] = &[
+    "to_binary",
     "to_string",
     "to_uint8",
     "to_uint16",
@@ -692,10 +762,14 @@ pub const ALL_SIMPLE_CAST_FUNCTIONS: &[&str] = &[
     "to_float32",
     "to_float64",
     "to_timestamp",
+    "to_interval",
     "to_date",
     "to_variant",
     "to_boolean",
     "to_decimal",
+    "to_bitmap",
+    "to_geometry",
+    "parse_json",
 ];
 
 pub fn is_simple_cast_function(name: &str) -> bool {

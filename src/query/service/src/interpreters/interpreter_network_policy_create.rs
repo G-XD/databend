@@ -15,10 +15,10 @@
 use std::sync::Arc;
 
 use chrono::Utc;
-use common_exception::Result;
-use common_meta_app::principal::NetworkPolicy;
-use common_sql::plans::CreateNetworkPolicyPlan;
-use common_users::UserApiProvider;
+use databend_common_exception::Result;
+use databend_common_meta_app::principal::NetworkPolicy;
+use databend_common_sql::plans::CreateNetworkPolicyPlan;
+use databend_common_users::UserApiProvider;
 use log::debug;
 
 use crate::interpreters::Interpreter;
@@ -44,7 +44,11 @@ impl Interpreter for CreateNetworkPolicyInterpreter {
         "CreateNetworkPolicyInterpreter"
     }
 
-    #[minitrace::trace]
+    fn is_ddl(&self) -> bool {
+        true
+    }
+
+    #[fastrace::trace]
     #[async_backtrace::framed]
     async fn execute2(&self) -> Result<PipelineBuildResult> {
         debug!("ctx.id" = self.ctx.get_id().as_str(); "create_network_policy_execute");
@@ -62,7 +66,7 @@ impl Interpreter for CreateNetworkPolicyInterpreter {
             update_on: None,
         };
         user_mgr
-            .add_network_policy(&tenant, network_policy, plan.if_not_exists)
+            .add_network_policy(&tenant, network_policy, &plan.create_option)
             .await?;
 
         Ok(PipelineBuildResult::create())

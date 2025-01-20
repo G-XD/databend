@@ -14,44 +14,50 @@
 
 use std::collections::HashSet;
 
-use common_base::base::tokio;
-use common_catalog::plan::InternalColumn;
-use common_catalog::plan::InternalColumnMeta;
-use common_catalog::plan::Partitions;
-use common_exception::Result;
-use common_expression::DataBlock;
-use common_sql::binder::INTERNAL_COLUMN_FACTORY;
-use common_sql::Planner;
-use common_storages_fuse::io::MetaReaders;
-use common_storages_fuse::FuseTable;
+use databend_common_base::base::tokio;
+use databend_common_catalog::plan::InternalColumn;
+use databend_common_catalog::plan::InternalColumnMeta;
+use databend_common_catalog::plan::Partitions;
+use databend_common_exception::Result;
+use databend_common_expression::DataBlock;
+use databend_common_expression::BLOCK_NAME_COL_NAME;
+use databend_common_expression::ROW_ID_COL_NAME;
+use databend_common_expression::SEGMENT_NAME_COL_NAME;
+use databend_common_expression::SNAPSHOT_NAME_COL_NAME;
+use databend_common_sql::binder::INTERNAL_COLUMN_FACTORY;
+use databend_common_sql::Planner;
+use databend_common_storages_fuse::io::MetaReaders;
+use databend_common_storages_fuse::FuseBlockPartInfo;
+use databend_common_storages_fuse::FuseTable;
 use databend_query::interpreters::InterpreterFactory;
-use databend_query::storages::fuse::fuse_part::FusePartInfo;
-use databend_query::test_kits::table_test_fixture::execute_query;
-use databend_query::test_kits::table_test_fixture::TestFixture;
+use databend_query::test_kits::*;
+use databend_storages_common_cache::LoadParams;
+use databend_storages_common_table_meta::meta::SegmentInfo;
+use databend_storages_common_table_meta::meta::TableSnapshot;
+use databend_storages_common_table_meta::meta::Versioned;
+use databend_storages_common_table_meta::table::OPT_KEY_SNAPSHOT_LOCATION;
 use futures::TryStreamExt;
-use storages_common_cache::LoadParams;
-use storages_common_table_meta::meta::SegmentInfo;
-use storages_common_table_meta::meta::TableSnapshot;
-use storages_common_table_meta::meta::Versioned;
-use storages_common_table_meta::table::OPT_KEY_SNAPSHOT_LOCATION;
 
 fn expected_data_block(
     parts: &Partitions,
     internal_columns: &Vec<InternalColumn>,
 ) -> Result<Vec<DataBlock>> {
-    let mut data_blocks = Vec::new();
+    let mut data_blocks = Vec::with_capacity(parts.partitions.len());
     for part in &parts.partitions {
-        let fuse_part = FusePartInfo::from_part(part)?;
+        let fuse_part = FuseBlockPartInfo::from_part(part)?;
         let num_rows = fuse_part.nums_rows;
         let block_meta = fuse_part.block_meta_index.as_ref().unwrap();
-        let mut columns = Vec::new();
+        let mut columns = Vec::with_capacity(internal_columns.len());
         let internal_column_meta = InternalColumnMeta {
             segment_idx: block_meta.segment_idx,
             block_id: block_meta.block_id,
             block_location: block_meta.block_location.clone(),
             segment_location: block_meta.segment_location.clone(),
-            snapshot_location: block_meta.snapshot_location.clone().unwrap(),
+            snapshot_location: block_meta.snapshot_location.clone(),
             offsets: None,
+            base_block_ids: None,
+            inner: None,
+            matched_rows: block_meta.matched_rows.clone(),
         };
         for internal_column in internal_columns {
             let column = internal_column.generate_column_values(&internal_column_meta, num_rows);
@@ -65,8 +71,8 @@ fn expected_data_block(
 }
 
 fn check_data_block(expected: Vec<DataBlock>, blocks: Vec<DataBlock>) -> Result<()> {
-    let expected_data_block = DataBlock::concat(&expected)?.convert_to_full();
-    let data_block = DataBlock::concat(&blocks)?.convert_to_full();
+    let expected_data_block = DataBlock::concat(&expected)?.consume_convert_to_full();
+    let data_block = DataBlock::concat(&blocks)?.consume_convert_to_full();
 
     for (expected_column, column) in expected_data_block
         .columns()
@@ -116,7 +122,7 @@ async fn check_partitions(parts: &Partitions, fixture: &TestFixture) -> Result<(
             put_cache: false,
         };
         let compact_segment_info = compact_segment_reader.read(&params).await?;
-        let segment_info = SegmentInfo::try_from(compact_segment_info.as_ref())?;
+        let segment_info = SegmentInfo::try_from(compact_segment_info)?;
 
         for block in &segment_info.blocks {
             block_name.insert(block.location.0.clone());
@@ -124,7 +130,7 @@ async fn check_partitions(parts: &Partitions, fixture: &TestFixture) -> Result<(
     }
 
     for part in &parts.partitions {
-        let fuse_part = FusePartInfo::from_part(part)?;
+        let fuse_part = FuseBlockPartInfo::from_part(part)?;
         let block_meta = fuse_part.block_meta_index.as_ref().unwrap();
         assert_eq!(
             block_meta.snapshot_location.clone().unwrap(),
@@ -139,24 +145,25 @@ async fn check_partitions(parts: &Partitions, fixture: &TestFixture) -> Result<(
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_internal_column() -> Result<()> {
-    let fixture = TestFixture::new().await;
+    let fixture = TestFixture::setup().await?;
     let db = fixture.default_db_name();
     let tbl = fixture.default_table_name();
-    let ctx = fixture.ctx();
+    let ctx = fixture.new_query_ctx().await?;
+    fixture.create_default_database().await?;
     fixture.create_default_table().await?;
 
     let internal_columns = vec![
         INTERNAL_COLUMN_FACTORY
-            .get_internal_column("_row_id")
+            .get_internal_column(ROW_ID_COL_NAME)
             .unwrap(),
         INTERNAL_COLUMN_FACTORY
-            .get_internal_column("_snapshot_name")
+            .get_internal_column(SNAPSHOT_NAME_COL_NAME)
             .unwrap(),
         INTERNAL_COLUMN_FACTORY
-            .get_internal_column("_segment_name")
+            .get_internal_column(SEGMENT_NAME_COL_NAME)
             .unwrap(),
         INTERNAL_COLUMN_FACTORY
-            .get_internal_column("_block_name")
+            .get_internal_column(BLOCK_NAME_COL_NAME)
             .unwrap(),
     ];
 
@@ -177,7 +184,7 @@ async fn test_internal_column() -> Result<()> {
         "select _row_id,_snapshot_name,_segment_name,_block_name from {}.{} order by _row_id",
         db, tbl
     );
-    let res = execute_query(ctx.clone(), &query).await?;
+    let res = fixture.execute_query(&query).await?;
     let blocks = res.try_collect::<Vec<DataBlock>>().await?;
 
     let table = fixture.latest_default_table().await?;
@@ -187,18 +194,22 @@ async fn test_internal_column() -> Result<()> {
     check_data_block(expected, blocks)?;
 
     // do compact
+    // ctx.evict_table_from_cache(&catalog, &db, &tbl)?;
     let query = format!("optimize table {db}.{tbl} compact");
+    let ctx = fixture.new_query_ctx().await?;
     let mut planner = Planner::new(ctx.clone());
     let (plan, _) = planner.plan_sql(&query).await?;
     let interpreter = InterpreterFactory::get(ctx.clone(), &plan).await?;
     let data_stream = interpreter.execute(ctx.clone()).await?;
     let _ = data_stream.try_collect::<Vec<_>>().await;
 
+    let ctx = fixture.new_query_ctx().await?;
+    // ctx.evict_table_from_cache(&catalog, &db, &tbl)?;
     let query = format!(
         "select _row_id,_snapshot_name,_segment_name,_block_name from {}.{} order by _row_id",
         db, tbl
     );
-    let res = execute_query(ctx.clone(), &query).await?;
+    let res = fixture.execute_query(&query).await?;
     let blocks = res.try_collect::<Vec<DataBlock>>().await?;
 
     let table = fixture.latest_default_table().await?;

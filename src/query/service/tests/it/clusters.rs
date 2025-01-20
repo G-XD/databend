@@ -1,4 +1,4 @@
-// Copyright 2021 Datafuse Labs.
+// Copyright 2021 Datafuse Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,18 +12,36 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use common_base::base::tokio;
-use common_exception::Result;
+use databend_common_base::base::tokio;
+use databend_common_exception::Result;
 use databend_query::clusters::ClusterDiscovery;
 use databend_query::clusters::ClusterHelper;
-use databend_query::test_kits::ConfigBuilder;
-use databend_query::test_kits::TestGlobalServices;
+use databend_query::test_kits::*;
 use pretty_assertions::assert_eq;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn test_empty_cluster_discovery() -> Result<()> {
+    let _guard = TestFixture::setup().await?;
+
+    let config = ConfigBuilder::create().build();
+
+    let metastore = ClusterDiscovery::create_meta_client(&config).await?;
+    let cluster_discovery = ClusterDiscovery::try_create(&config, metastore.clone()).await?;
+
+    let discover_cluster = cluster_discovery.discover(&config).await?;
+
+    let discover_cluster_nodes = discover_cluster.get_nodes();
+    assert_eq!(discover_cluster_nodes.len(), 0);
+    assert!(discover_cluster.is_empty());
+    assert!(!discover_cluster.unassign);
+
+    Ok(())
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn test_single_cluster_discovery() -> Result<()> {
     let config = ConfigBuilder::create().build();
-    let _guard = TestGlobalServices::setup(config.clone()).await?;
+    let _fixture = TestFixture::setup_with_config(&config).await?;
 
     let discover_cluster = ClusterDiscovery::instance().discover(&config).await?;
 
@@ -31,11 +49,14 @@ async fn test_single_cluster_discovery() -> Result<()> {
     assert_eq!(discover_cluster_nodes.len(), 1);
     assert!(discover_cluster.is_empty());
     assert!(discover_cluster.is_local(&discover_cluster_nodes[0]));
+
     Ok(())
 }
 
 #[tokio::test(flavor = "current_thread")]
 async fn test_remove_invalid_nodes() -> Result<()> {
+    let _guard = TestFixture::setup().await?;
+
     let config_1 = ConfigBuilder::create()
         .query_flight_address("invalid_address_1")
         .build();

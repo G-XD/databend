@@ -96,7 +96,7 @@
 //!   includes a network sub error: `MetaNetworkError`.
 //!
 //! - `MetaNetworkError` is only returned with remote meta-store service: when sending a request to
-//! a remote meta-store service.
+//!    a remote meta-store service.
 //!
 //! - `MetaApiError` is only returned with remote meta-store service: it is all of the errors that
 //!   could occur when a meta-store service handling a request.
@@ -147,3 +147,7 @@ pub mod meta_network_errors;
 pub mod meta_raft_errors;
 pub mod meta_startup_errors;
 pub mod rpc_errors;
+
+mod incomplete_stream;
+
+pub use incomplete_stream::IncompleteStream;

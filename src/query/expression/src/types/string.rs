@@ -12,21 +12,21 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::iter::once;
+use std::cmp::Ordering;
 use std::ops::Range;
 
-use common_arrow::arrow::buffer::Buffer;
-use common_arrow::arrow::trusted_len::TrustedLen;
-use serde::Deserialize;
-use serde::Serialize;
+use databend_common_column::binview::BinaryViewColumnBuilder;
+use databend_common_column::binview::BinaryViewColumnIter;
+use databend_common_column::binview::Utf8ViewColumn;
+use databend_common_exception::Result;
 
-use super::SimpleDomain;
 use crate::property::Domain;
+use crate::types::binary::BinaryColumn;
 use crate::types::ArgType;
 use crate::types::DataType;
+use crate::types::DecimalSize;
 use crate::types::GenericMap;
 use crate::types::ValueType;
-use crate::utils::arrow::buffer_into_mut;
 use crate::values::Column;
 use crate::values::Scalar;
 use crate::ColumnBuilder;
@@ -36,23 +36,23 @@ use crate::ScalarRef;
 pub struct StringType;
 
 impl ValueType for StringType {
-    type Scalar = Vec<u8>;
-    type ScalarRef<'a> = &'a [u8];
+    type Scalar = String;
+    type ScalarRef<'a> = &'a str;
     type Column = StringColumn;
     type Domain = StringDomain;
     type ColumnIterator<'a> = StringIterator<'a>;
     type ColumnBuilder = StringColumnBuilder;
 
     #[inline]
-    fn upcast_gat<'short, 'long: 'short>(long: &'long [u8]) -> &'short [u8] {
+    fn upcast_gat<'short, 'long: 'short>(long: &'long str) -> &'short str {
         long
     }
 
-    fn to_owned_scalar<'a>(scalar: Self::ScalarRef<'a>) -> Self::Scalar {
-        scalar.to_vec()
+    fn to_owned_scalar(scalar: Self::ScalarRef<'_>) -> Self::Scalar {
+        scalar.to_string()
     }
 
-    fn to_scalar_ref<'a>(scalar: &'a Self::Scalar) -> Self::ScalarRef<'a> {
+    fn to_scalar_ref(scalar: &Self::Scalar) -> Self::ScalarRef<'_> {
         scalar
     }
 
@@ -60,21 +60,33 @@ impl ValueType for StringType {
         scalar.as_string().cloned()
     }
 
-    fn try_downcast_column<'a>(col: &'a Column) -> Option<Self::Column> {
+    fn try_downcast_column(col: &Column) -> Option<Self::Column> {
         col.as_string().cloned()
     }
 
     fn try_downcast_domain(domain: &Domain) -> Option<Self::Domain> {
-        domain.as_string().map(StringDomain::clone)
+        domain.as_string().cloned()
     }
 
-    fn try_downcast_builder<'a>(
-        builder: &'a mut ColumnBuilder,
-    ) -> Option<&'a mut Self::ColumnBuilder> {
+    fn try_downcast_builder(builder: &mut ColumnBuilder) -> Option<&mut Self::ColumnBuilder> {
         match builder {
-            crate::ColumnBuilder::String(builder) => Some(builder),
+            ColumnBuilder::String(builder) => Some(builder),
             _ => None,
         }
+    }
+
+    fn try_downcast_owned_builder(builder: ColumnBuilder) -> Option<Self::ColumnBuilder> {
+        match builder {
+            ColumnBuilder::String(builder) => Some(builder),
+            _ => None,
+        }
+    }
+
+    fn try_upcast_column_builder(
+        builder: Self::ColumnBuilder,
+        _decimal_size: Option<DecimalSize>,
+    ) -> Option<ColumnBuilder> {
+        Some(ColumnBuilder::String(builder))
     }
 
     fn upcast_scalar(scalar: Self::Scalar) -> Scalar {
@@ -89,26 +101,24 @@ impl ValueType for StringType {
         Domain::String(domain)
     }
 
-    fn column_len<'a>(col: &'a Self::Column) -> usize {
+    fn column_len(col: &Self::Column) -> usize {
         col.len()
     }
 
-    fn index_column<'a>(col: &'a Self::Column, index: usize) -> Option<Self::ScalarRef<'a>> {
+    fn index_column(col: &Self::Column, index: usize) -> Option<Self::ScalarRef<'_>> {
         col.index(index)
     }
 
-    unsafe fn index_column_unchecked<'a>(
-        col: &'a Self::Column,
-        index: usize,
-    ) -> Self::ScalarRef<'a> {
-        col.index_unchecked(index)
+    #[inline]
+    unsafe fn index_column_unchecked(col: &Self::Column, index: usize) -> Self::ScalarRef<'_> {
+        col.value_unchecked(index)
     }
 
-    fn slice_column<'a>(col: &'a Self::Column, range: Range<usize>) -> Self::Column {
-        col.slice(range)
+    fn slice_column(col: &Self::Column, range: Range<usize>) -> Self::Column {
+        col.clone().sliced(range.start, range.end - range.start)
     }
 
-    fn iter_column<'a>(col: &'a Self::Column) -> Self::ColumnIterator<'a> {
+    fn iter_column(col: &Self::Column) -> Self::ColumnIterator<'_> {
         col.iter()
     }
 
@@ -121,12 +131,15 @@ impl ValueType for StringType {
     }
 
     fn push_item(builder: &mut Self::ColumnBuilder, item: Self::ScalarRef<'_>) {
-        builder.put_slice(item);
-        builder.commit_row();
+        builder.put_and_commit(item);
+    }
+
+    fn push_item_repeat(builder: &mut Self::ColumnBuilder, item: Self::ScalarRef<'_>, n: usize) {
+        builder.push_repeat(item, n);
     }
 
     fn push_default(builder: &mut Self::ColumnBuilder) {
-        builder.commit_row();
+        builder.put_and_commit("");
     }
 
     fn append_column(builder: &mut Self::ColumnBuilder, other_builder: &Self::Column) {
@@ -141,12 +154,47 @@ impl ValueType for StringType {
         builder.build_scalar()
     }
 
-    fn scalar_memory_size<'a>(scalar: &Self::ScalarRef<'a>) -> usize {
+    fn scalar_memory_size(scalar: &Self::ScalarRef<'_>) -> usize {
         scalar.len()
     }
 
     fn column_memory_size(col: &Self::Column) -> usize {
-        col.data().len() + col.offsets().len() * 8
+        col.memory_size()
+    }
+
+    #[inline(always)]
+    fn compare(left: Self::ScalarRef<'_>, right: Self::ScalarRef<'_>) -> Ordering {
+        left.cmp(right)
+    }
+
+    #[inline(always)]
+    fn equal(left: Self::ScalarRef<'_>, right: Self::ScalarRef<'_>) -> bool {
+        left == right
+    }
+
+    #[inline(always)]
+    fn not_equal(left: Self::ScalarRef<'_>, right: Self::ScalarRef<'_>) -> bool {
+        left != right
+    }
+
+    #[inline(always)]
+    fn greater_than(left: Self::ScalarRef<'_>, right: Self::ScalarRef<'_>) -> bool {
+        left > right
+    }
+
+    #[inline(always)]
+    fn greater_than_equal(left: Self::ScalarRef<'_>, right: Self::ScalarRef<'_>) -> bool {
+        left >= right
+    }
+
+    #[inline(always)]
+    fn less_than(left: Self::ScalarRef<'_>, right: Self::ScalarRef<'_>) -> bool {
+        left < right
+    }
+
+    #[inline(always)]
+    fn less_than_equal(left: Self::ScalarRef<'_>, right: Self::ScalarRef<'_>) -> bool {
+        left <= right
     }
 }
 
@@ -157,302 +205,168 @@ impl ArgType for StringType {
 
     fn full_domain() -> Self::Domain {
         StringDomain {
-            min: vec![],
+            min: "".to_string(),
             max: None,
         }
     }
 
     fn create_builder(capacity: usize, _: &GenericMap) -> Self::ColumnBuilder {
-        StringColumnBuilder::with_capacity(capacity, 0)
+        StringColumnBuilder::with_capacity(capacity)
     }
 }
 
-#[derive(Clone, PartialEq)]
-pub struct StringColumn {
-    data: Buffer<u8>,
-    offsets: Buffer<u64>,
-}
+pub type StringColumn = Utf8ViewColumn;
+pub type StringIterator<'a> = BinaryViewColumnIter<'a, str>;
 
-impl StringColumn {
-    pub fn new(data: Buffer<u8>, offsets: Buffer<u64>) -> Self {
-        debug_assert!({ offsets.windows(2).all(|w| w[0] <= w[1]) });
-        StringColumn { data, offsets }
-    }
+type Utf8ViewColumnBuilder = BinaryViewColumnBuilder<str>;
 
-    pub fn len(&self) -> usize {
-        self.offsets.len() - 1
-    }
-
-    pub fn data(&self) -> &Buffer<u8> {
-        &self.data
-    }
-
-    pub fn offsets(&self) -> &Buffer<u64> {
-        &self.offsets
-    }
-
-    pub fn memory_size(&self) -> usize {
-        let offsets = self.offsets.as_slice();
-        let len = offsets.len();
-        len * 8 + (offsets[len - 1] - offsets[0]) as usize
-    }
-
-    pub fn index(&self, index: usize) -> Option<&[u8]> {
-        if index + 1 < self.offsets.len() {
-            Some(&self.data[(self.offsets[index] as usize)..(self.offsets[index + 1] as usize)])
-        } else {
-            None
-        }
-    }
-
-    /// # Safety
-    ///
-    /// Calling this method with an out-of-bounds index is *[undefined behavior]*
-    pub unsafe fn index_unchecked(&self, index: usize) -> &[u8] {
-        &self.data[(self.offsets[index] as usize)..(self.offsets[index + 1] as usize)]
-    }
-
-    pub fn slice(&self, range: Range<usize>) -> Self {
-        let offsets = self
-            .offsets
-            .clone()
-            .sliced(range.start, range.end - range.start + 1);
-        StringColumn {
-            data: self.data.clone(),
-            offsets,
-        }
-    }
-
-    pub fn iter(&self) -> StringIterator {
-        StringIterator {
-            data: &self.data,
-            offsets: self.offsets.windows(2),
-        }
-    }
-}
-
-pub struct StringIterator<'a> {
-    data: &'a [u8],
-    offsets: std::slice::Windows<'a, u64>,
-}
-
-impl<'a> Iterator for StringIterator<'a> {
-    type Item = &'a [u8];
-
-    fn next(&mut self) -> Option<Self::Item> {
-        self.offsets
-            .next()
-            .map(|range| &self.data[(range[0] as usize)..(range[1] as usize)])
-    }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        self.offsets.size_hint()
-    }
-}
-
-unsafe impl<'a> TrustedLen for StringIterator<'a> {}
-unsafe impl<'a> std::iter::TrustedLen for StringIterator<'a> {}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct StringColumnBuilder {
-    // if the StringColumnBuilder is created with `data_capacity`, need_estimated is false
-    pub need_estimated: bool,
-    pub data: Vec<u8>,
-    pub offsets: Vec<u64>,
+    pub data: Utf8ViewColumnBuilder,
+    pub row_buffer: Vec<u8>,
 }
 
 impl StringColumnBuilder {
-    pub fn with_capacity(len: usize, data_capacity: usize) -> Self {
-        let mut offsets = Vec::with_capacity(len + 1);
-        offsets.push(0);
+    pub fn with_capacity(len: usize) -> Self {
+        let data = Utf8ViewColumnBuilder::with_capacity(len);
         StringColumnBuilder {
-            need_estimated: data_capacity == 0 && len > 0,
-            data: Vec::with_capacity(data_capacity),
-            offsets,
+            data,
+            row_buffer: Vec::new(),
         }
     }
 
     pub fn from_column(col: StringColumn) -> Self {
+        let data = col.make_mut();
         StringColumnBuilder {
-            need_estimated: col.data.is_empty(),
-            data: buffer_into_mut(col.data),
-            offsets: col.offsets.to_vec(),
+            data,
+            row_buffer: Vec::new(),
         }
     }
 
-    pub fn from_data(data: Vec<u8>, offsets: Vec<u64>) -> Self {
-        StringColumnBuilder {
-            need_estimated: false,
+    pub fn try_from_bin_column(col: BinaryColumn) -> Result<Self> {
+        let data = Utf8ViewColumnBuilder::try_from_bin_column(col)?;
+        Ok(StringColumnBuilder {
             data,
-            offsets,
+            row_buffer: Vec::new(),
+        })
+    }
+
+    pub fn repeat(scalar: &str, n: usize) -> Self {
+        let mut data = Utf8ViewColumnBuilder::with_capacity(n);
+        data.extend_constant(n, scalar);
+        StringColumnBuilder {
+            data,
+            row_buffer: Vec::new(),
         }
     }
 
-    pub fn repeat(scalar: &[u8], n: usize) -> Self {
-        let len = scalar.len();
-        let mut data = Vec::with_capacity(len * n);
-        for _ in 0..n {
-            data.extend_from_slice(scalar);
-        }
-        let offsets = once(0)
-            .chain((0..n).map(|i| (len * (i + 1)) as u64))
-            .collect();
+    pub fn repeat_default(n: usize) -> Self {
+        let mut data = Utf8ViewColumnBuilder::with_capacity(n);
+        data.extend_constant(n, "");
         StringColumnBuilder {
             data,
-            offsets,
-            need_estimated: false,
+            row_buffer: Vec::new(),
         }
     }
 
     pub fn len(&self) -> usize {
-        self.offsets.len() - 1
+        self.data.len()
     }
 
-    pub fn put_u8(&mut self, item: u8) {
-        self.data.push(item);
+    pub fn memory_size(&self) -> usize {
+        self.data.total_buffer_len
     }
 
     pub fn put_char(&mut self, item: char) {
-        self.data
-            .extend_from_slice(item.encode_utf8(&mut [0; 4]).as_bytes());
+        match item.len_utf8() {
+            1 => self.row_buffer.push(item as u8),
+            _ => self
+                .row_buffer
+                .extend_from_slice(item.encode_utf8(&mut [0; 4]).as_bytes()),
+        }
     }
 
     #[inline]
     pub fn put_str(&mut self, item: &str) {
-        self.data.extend_from_slice(item.as_bytes());
+        self.row_buffer.extend_from_slice(item.as_bytes());
+    }
+
+    #[inline]
+    pub fn put_and_commit<V: AsRef<str>>(&mut self, item: V) {
+        self.data.push_value(item);
     }
 
     #[inline]
     pub fn put_slice(&mut self, item: &[u8]) {
-        self.data.extend_from_slice(item);
+        self.row_buffer.extend_from_slice(item);
     }
 
     pub fn put_char_iter(&mut self, iter: impl Iterator<Item = char>) {
         for c in iter {
-            let mut buf = [0; 4];
-            let result = c.encode_utf8(&mut buf);
-            self.data.extend_from_slice(result.as_bytes());
+            self.put_char(c);
         }
-    }
-
-    pub fn put(&mut self, item: &[u8]) {
-        self.data.extend_from_slice(item);
     }
 
     #[inline]
     pub fn commit_row(&mut self) {
-        self.offsets.push(self.data.len() as u64);
-
-        if self.need_estimated
-            && self.offsets.len() - 1 == 64
-            && self.offsets.len() < self.offsets.capacity()
-        {
-            let bytes_per_row = self.data.len() / 64 + 1;
-            let bytes_estimate = bytes_per_row * self.offsets.capacity();
-
-            const MAX_HINT_SIZE: usize = 1_000_000_000;
-            // if we are more than 10% over the capacity, we reserve more
-            if bytes_estimate < MAX_HINT_SIZE
-                && bytes_estimate as f64 > self.data.capacity() as f64 * 1.10f64
-            {
-                self.data.reserve(bytes_estimate - self.data.capacity());
-            }
-        }
+        debug_assert!(std::str::from_utf8(&self.row_buffer).is_ok());
+        let str = unsafe { std::str::from_utf8_unchecked(&self.row_buffer) };
+        self.data.push_value(str);
+        self.row_buffer.clear();
     }
 
     pub fn append_column(&mut self, other: &StringColumn) {
-        // the first offset of other column may not be zero
-        let other_start = *other.offsets.first().unwrap();
-        let other_last = *other.offsets.last().unwrap();
-        let start = self.offsets.last().cloned().unwrap();
-        self.data
-            .extend_from_slice(&other.data[(other_start as usize)..(other_last as usize)]);
-        self.offsets.extend(
-            other
-                .offsets
-                .iter()
-                .skip(1)
-                .map(|offset| start + offset - other_start),
-        );
+        self.data.extend_values(other.iter());
     }
 
     pub fn build(self) -> StringColumn {
-        StringColumn::new(self.data.into(), self.offsets.into())
+        self.data.into()
     }
 
-    pub fn build_scalar(self) -> Vec<u8> {
-        assert_eq!(self.offsets.len(), 2);
-        self.data[(self.offsets[0] as usize)..(self.offsets[1] as usize)].to_vec()
-    }
+    pub fn build_scalar(self) -> String {
+        assert_eq!(self.len(), 1);
 
-    #[inline]
-    pub fn may_resize(&self, add_size: usize) -> bool {
-        self.data.len() + add_size > self.data.capacity()
+        self.data.values()[0].to_string()
     }
 
     /// # Safety
     ///
     /// Calling this method with an out-of-bounds index is *[undefined behavior]*
-    pub unsafe fn index_unchecked(&self, row: usize) -> &[u8] {
-        let start = *self.offsets.get_unchecked(row) as usize;
-        let end = *self.offsets.get_unchecked(row + 1) as usize;
-        // soundness: the invariant of the struct
-        self.data.get_unchecked(start..end)
+    pub unsafe fn index_unchecked(&self, row: usize) -> &str {
+        self.data.value_unchecked(row)
     }
 
-    pub fn pop(&mut self) -> Option<Vec<u8>> {
-        if self.len() > 0 {
-            let index = self.len() - 1;
-            let start = unsafe { *self.offsets.get_unchecked(index) as usize };
-            self.offsets.pop();
-            let val = self.data.split_off(start);
-            Some(val)
-        } else {
-            None
-        }
+    pub fn push_repeat(&mut self, item: &str, n: usize) {
+        self.data.extend_constant(n, item);
+    }
+
+    pub fn pop(&mut self) -> Option<String> {
+        self.data.pop()
     }
 }
 
-impl<'a> FromIterator<&'a [u8]> for StringColumnBuilder {
-    fn from_iter<T: IntoIterator<Item = &'a [u8]>>(iter: T) -> Self {
+impl<'a> FromIterator<&'a str> for StringColumnBuilder {
+    fn from_iter<T: IntoIterator<Item = &'a str>>(iter: T) -> Self {
         let iter = iter.into_iter();
-        let mut builder = StringColumnBuilder::with_capacity(iter.size_hint().0, 0);
+        let mut builder = StringColumnBuilder::with_capacity(iter.size_hint().0);
         for item in iter {
-            builder.put_slice(item);
-            builder.commit_row();
+            builder.put_and_commit(item);
         }
         builder
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StringDomain {
-    pub min: Vec<u8>,
-    // max value is None for full domain
-    pub max: Option<Vec<u8>>,
+impl PartialEq for StringColumnBuilder {
+    fn eq(&self, other: &Self) -> bool {
+        self.data.iter().eq(other.data.iter())
+    }
 }
 
-impl StringDomain {
-    pub fn unify(&self, other: &Self) -> (SimpleDomain<Vec<u8>>, SimpleDomain<Vec<u8>>) {
-        let mut max_size = self.min.len().max(other.min.len());
-        if let Some(max) = &self.max {
-            max_size = max_size.max(max.len());
-        }
-        if let Some(max) = &other.max {
-            max_size = max_size.max(max.len());
-        }
+impl Eq for StringColumnBuilder {}
 
-        let max_value = vec![255; max_size + 1];
-
-        (
-            SimpleDomain {
-                min: self.min.clone(),
-                max: self.max.clone().unwrap_or_else(|| max_value.clone()),
-            },
-            SimpleDomain {
-                min: other.min.clone(),
-                max: other.max.clone().unwrap_or_else(|| max_value.clone()),
-            },
-        )
-    }
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StringDomain {
+    pub min: String,
+    // max value is None for full domain
+    pub max: Option<String>,
 }

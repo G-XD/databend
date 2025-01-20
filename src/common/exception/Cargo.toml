@@ -1,5 +1,5 @@
 [package]
-name = "common-exception"
+name = "databend-common-exception"
 version = { workspace = true }
 authors = { workspace = true }
 license = { workspace = true }
@@ -8,26 +8,37 @@ edition = { workspace = true }
 
 [lib]
 doctest = false
-test = false
+test = true
 
-[dependencies] # In alphabetical order
-common-arrow = { path = "../arrow" }
-common-meta-stoerr = { path = "../../meta/stoerr" }
-common-meta-types = { path = "../../meta/types" }
-
-# GitHub dependencies
-# TODO: Use the version from crates.io once
-# https://github.com/brendanzab/codespan/pull/331 is released.
-codespan-reporting = { git = "https://github.com/brendanzab/codespan", rev = "c84116f5" }
+[dependencies]
+databend-common-ast = { workspace = true }
 
 anyhow = { workspace = true }
-backtrace = "0.3.67"
-bincode = { version = "2.0.0-rc.1", features = ["serde", "std", "alloc"] }
-http = "0.2"
+arrow-flight = { workspace = true }
+arrow-schema = { workspace = true }
+backtrace = { workspace = true, features = ["std", "serialize-serde"] }
+bincode = { workspace = true }
+cidr = { workspace = true }
+geozero = { workspace = true }
+gimli = { workspace = true }
+http = { workspace = true }
+hyper = { workspace = true }
+libc = { workspace = true }
+object = { workspace = true }
+once_cell = { workspace = true }
 opendal = { workspace = true }
-paste = "1.0.9"
+parquet = { workspace = true }
+paste = { workspace = true }
 prost = { workspace = true }
+redis = { workspace = true }
+reqwest = { workspace = true }
+rustc-demangle = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sqlx = { workspace = true }
+tantivy = { workspace = true }
 thiserror = { workspace = true }
 tonic = { workspace = true }
+
+[lints]
+workspace = true

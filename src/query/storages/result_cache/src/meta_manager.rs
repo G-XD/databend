@@ -13,15 +13,16 @@
 // limitations under the License.
 
 use std::sync::Arc;
+use std::time::Duration;
 
-use common_exception::Result;
-use common_meta_kvapi::kvapi::KVApi;
-use common_meta_store::MetaStore;
-use common_meta_types::KVMeta;
-use common_meta_types::MatchSeq;
-use common_meta_types::Operation;
-use common_meta_types::SeqV;
-use common_meta_types::UpsertKV;
+use databend_common_exception::Result;
+use databend_common_meta_kvapi::kvapi::KVApi;
+use databend_common_meta_store::MetaStore;
+use databend_common_meta_types::seq_value::SeqV;
+use databend_common_meta_types::MatchSeq;
+use databend_common_meta_types::MetaSpec;
+use databend_common_meta_types::Operation;
+use databend_common_meta_types::UpsertKV;
 
 use crate::common::ResultCacheValue;
 
@@ -41,7 +42,7 @@ impl ResultCacheMetaManager {
         key: String,
         value: ResultCacheValue,
         seq: MatchSeq,
-        expire_at: u64,
+        ttl: Duration,
     ) -> Result<()> {
         let value = serde_json::to_vec(&value)?;
         let _ = self
@@ -50,9 +51,7 @@ impl ResultCacheMetaManager {
                 key,
                 seq,
                 value: Operation::Update(value),
-                value_meta: Some(KVMeta {
-                    expire_at: Some(expire_at),
-                }),
+                value_meta: Some(MetaSpec::new_ttl(ttl)),
             })
             .await?;
         Ok(())

@@ -14,22 +14,21 @@
 
 use std::sync::Arc;
 
-use common_expression::types::boolean::BooleanDomain;
-use common_expression::types::nullable::NullableColumn;
-use common_expression::types::nullable::NullableDomain;
-use common_expression::types::BooleanType;
-use common_expression::types::DataType;
-use common_expression::types::GenericType;
-use common_expression::types::NullType;
-use common_expression::types::NullableType;
-use common_expression::Domain;
-use common_expression::Function;
-use common_expression::FunctionDomain;
-use common_expression::FunctionEval;
-use common_expression::FunctionRegistry;
-use common_expression::FunctionSignature;
-use common_expression::Value;
-use common_expression::ValueRef;
+use databend_common_expression::types::boolean::BooleanDomain;
+use databend_common_expression::types::nullable::NullableColumn;
+use databend_common_expression::types::nullable::NullableDomain;
+use databend_common_expression::types::BooleanType;
+use databend_common_expression::types::DataType;
+use databend_common_expression::types::GenericType;
+use databend_common_expression::types::NullType;
+use databend_common_expression::types::NullableType;
+use databend_common_expression::Domain;
+use databend_common_expression::Function;
+use databend_common_expression::FunctionDomain;
+use databend_common_expression::FunctionEval;
+use databend_common_expression::FunctionRegistry;
+use databend_common_expression::FunctionSignature;
+use databend_common_expression::Value;
 
 pub fn register(registry: &mut FunctionRegistry) {
     registry.register_function_factory("if", |_, args_type| {
@@ -122,12 +121,24 @@ pub fn register(registry: &mut FunctionRegistry) {
             })
         },
         |arg, _| match &arg {
-            ValueRef::Column(NullableColumn { validity, .. }) => {
+            Value::Column(NullableColumn { validity, .. }) => {
                 let bitmap = validity.clone();
                 Value::Column(bitmap)
             }
-            ValueRef::Scalar(None) => Value::Scalar(false),
-            ValueRef::Scalar(Some(_)) => Value::Scalar(true),
+            Value::Scalar(None) => Value::Scalar(false),
+            Value::Scalar(Some(_)) => Value::Scalar(true),
+        },
+    );
+
+    registry.register_1_arg_core::<GenericType<0>, BooleanType, _, _>(
+        "is_not_error",
+        |_, _| FunctionDomain::Full,
+        |arg, ctx| match ctx.errors.take() {
+            Some((bitmap, _)) => match arg {
+                Value::Column(_) => Value::Column(bitmap.into()),
+                Value::Scalar(_) => Value::Scalar(bitmap.get(0)),
+            },
+            None => Value::Scalar(true),
         },
     );
 }

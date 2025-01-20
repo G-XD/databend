@@ -16,8 +16,12 @@ use std::sync::atomic::AtomicPtr;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
-use common_exception::Result;
-use common_expression::DataBlock;
+use databend_common_base::runtime::drop_guard;
+use databend_common_base::runtime::profile::Profile;
+use databend_common_base::runtime::profile::ProfileStatisticsName;
+use databend_common_base::runtime::ThreadTracker;
+use databend_common_exception::Result;
+use databend_common_expression::DataBlock;
 
 use crate::processors::UpdateTrigger;
 use crate::unsafe_cell_wrap::UnSafeCellWrap;
@@ -40,13 +44,13 @@ unsafe impl Send for SharedStatus {}
 
 impl Drop for SharedStatus {
     fn drop(&mut self) {
-        unsafe {
+        drop_guard(move || unsafe {
             let address = self.swap(std::ptr::null_mut(), 0, HAS_DATA);
 
             if !address.is_null() {
                 drop(Box::from_raw(address));
             }
-        }
+        })
     }
 }
 
@@ -116,7 +120,7 @@ impl SharedStatus {
 
     #[inline(always)]
     pub fn get_flags(&self) -> usize {
-        self.data.load(Ordering::Relaxed) as usize & FLAGS_MASK
+        self.data.load(Ordering::SeqCst) as usize & FLAGS_MASK
     }
 }
 
@@ -154,6 +158,10 @@ impl InputPort {
         ((flags & IS_FINISHED) == IS_FINISHED) && ((flags & HAS_DATA) == 0)
     }
 
+    pub fn is_need_data(&self) -> bool {
+        self.shared.get_flags() & NEED_DATA != 0
+    }
+
     #[inline(always)]
     pub fn set_need_data(&self) {
         unsafe {
@@ -181,7 +189,15 @@ impl InputPort {
             let unset_flags = HAS_DATA | NEED_DATA;
             match self.shared.swap(std::ptr::null_mut(), 0, unset_flags) {
                 address if address.is_null() => None,
-                address => Some((*Box::from_raw(address)).0),
+                address => {
+                    let data_block = (*Box::from_raw(address)).0;
+
+                    if let Ok(data_block) = &data_block {
+                        ThreadTracker::movein_memory(data_block.memory_size() as i64);
+                    }
+
+                    Some(data_block)
+                }
             }
         }
     }
@@ -202,6 +218,7 @@ impl InputPort {
 }
 
 pub struct OutputPort {
+    record_profile: UnSafeCellWrap<bool>,
     shared: UnSafeCellWrap<Arc<SharedStatus>>,
     update_trigger: UnSafeCellWrap<*mut UpdateTrigger>,
 }
@@ -209,6 +226,7 @@ pub struct OutputPort {
 impl OutputPort {
     pub fn create() -> Arc<OutputPort> {
         Arc::new(OutputPort {
+            record_profile: UnSafeCellWrap::create(false),
             shared: UnSafeCellWrap::create(SharedStatus::create()),
             update_trigger: UnSafeCellWrap::create(std::ptr::null_mut()),
         })
@@ -218,6 +236,21 @@ impl OutputPort {
     pub fn push_data(&self, data: Result<DataBlock>) {
         unsafe {
             UpdateTrigger::update_output(&self.update_trigger);
+
+            if let Ok(data_block) = &data {
+                ThreadTracker::moveout_memory(data_block.memory_size() as i64);
+
+                if *self.record_profile {
+                    Profile::record_usize_profile(
+                        ProfileStatisticsName::OutputRows,
+                        data_block.num_rows(),
+                    );
+                    Profile::record_usize_profile(
+                        ProfileStatisticsName::OutputBytes,
+                        data_block.memory_size(),
+                    );
+                }
+            }
 
             let data = Box::into_raw(Box::new(SharedData(data)));
             self.shared.swap(data, HAS_DATA, HAS_DATA);
@@ -240,6 +273,14 @@ impl OutputPort {
         (self.shared.get_flags() & IS_FINISHED) != 0
     }
 
+    pub fn has_data(&self) -> bool {
+        (self.shared.get_flags() & HAS_DATA) != 0
+    }
+
+    pub fn is_need_data(&self) -> bool {
+        (self.shared.get_flags() & NEED_DATA) != 0
+    }
+
     #[inline(always)]
     pub fn can_push(&self) -> bool {
         let flags = self.shared.get_flags();
@@ -258,6 +299,13 @@ impl OutputPort {
     /// Method is thread unsafe and require thread safe call
     pub unsafe fn set_trigger(&self, update_trigger: *mut UpdateTrigger) {
         self.update_trigger.set_value(update_trigger)
+    }
+
+    /// # Safety
+    ///
+    /// Method is thread unsafe and require thread safe call
+    pub unsafe fn record_profile(&self) {
+        self.record_profile.set_value(true);
     }
 }
 

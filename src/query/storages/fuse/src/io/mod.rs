@@ -12,36 +12,43 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-mod files;
 mod locations;
 pub mod read;
 mod segments;
 mod snapshots;
 mod write;
 
-pub use files::Files;
 pub use locations::TableMetaLocationGenerator;
 pub use read::AggIndexReader;
+pub use read::BlockReadResult;
 pub use read::BlockReader;
 pub use read::BloomBlockFilterReader;
 pub use read::CompactSegmentInfoReader;
-pub use read::MergeIOReadResult;
+pub use read::InvertedIndexReader;
 pub use read::MetaReaders;
 pub use read::NativeReaderExt;
 pub use read::NativeSourceData;
-pub use read::ReadSettings;
 pub use read::SnapshotHistoryReader;
 pub use read::TableSnapshotReader;
-pub use read::UncompressedBuffer;
+pub use read::VirtualBlockReadResult;
+pub use read::VirtualColumnReader;
 pub use segments::SegmentsIO;
 pub use segments::SerializedSegment;
 pub use snapshots::SnapshotLiteExtended;
 pub use snapshots::SnapshotsIO;
+pub(crate) use write::block_to_inverted_index;
+pub(crate) use write::create_index_schema;
+pub(crate) use write::create_inverted_index_builders;
+pub(crate) use write::create_tokenizer_manager;
 pub use write::serialize_block;
 pub use write::write_data;
 pub use write::BlockBuilder;
 pub use write::BlockSerialization;
+pub use write::BlockWriter;
+pub use write::BloomIndexBuilder;
+pub use write::BloomIndexState;
 pub use write::CachedMetaWriter;
+pub use write::InvertedIndexBuilder;
+pub use write::InvertedIndexWriter;
 pub use write::MetaWriter;
-pub use write::SegmentWriter;
 pub use write::WriteSettings;

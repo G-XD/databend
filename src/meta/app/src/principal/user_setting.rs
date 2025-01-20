@@ -14,8 +14,8 @@
 
 use core::fmt;
 
-use common_exception::ErrorCode;
-use common_exception::Result;
+use databend_common_exception::ErrorCode;
+use databend_common_exception::Result;
 use serde::Deserialize;
 use serde::Deserializer;
 use serde::Serialize;
@@ -61,10 +61,10 @@ impl UserSettingValue {
         }
     }
 
-    pub fn as_string(&self) -> Result<String> {
+    pub fn as_string(&self) -> String {
         match self {
-            UserSettingValue::String(v) => Ok(v.to_owned()),
-            UserSettingValue::UInt64(v) => Ok(format!("{}", v)),
+            UserSettingValue::String(v) => v.to_owned(),
+            UserSettingValue::UInt64(v) => format!("{}", v),
         }
     }
 }
@@ -79,7 +79,7 @@ impl fmt::Display for UserSettingValue {
 }
 
 impl fmt::Debug for UserSettingValue {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
             UserSettingValue::UInt64(v) => write!(f, "{}", v),
             UserSettingValue::String(_) => write!(f, "{}", self),

@@ -16,34 +16,14 @@ use std::time::Duration;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
-use common_config::GlobalConfig;
-use common_exception::ErrorCode;
-use common_metrics::label_counter_with_val_and_labels;
-use common_metrics::label_histogram_with_val;
+use databend_common_config::GlobalConfig;
+use databend_common_exception::ErrorCode;
+use databend_common_metrics::interpreter::*;
 
 use crate::sessions::QueryContext;
 use crate::sessions::TableContext;
 
 pub struct InterpreterMetrics;
-
-const QUERY_START: &str = "query_start";
-const QUERY_ERROR: &str = "query_error";
-const QUERY_SUCCESS: &str = "query_success";
-const QUERY_FAILED: &str = "query_failed";
-
-const QUERY_DURATION_MS: &str = "query_duration_ms";
-const QUERY_WRITE_ROWS: &str = "query_write_rows";
-const QUERY_WRITE_BYTES: &str = "query_write_bytes";
-const QUERY_WRITE_IO_BYTES: &str = "query_write_io_bytes";
-const QUERY_WRITE_IO_BYTES_COST_MS: &str = "query_write_io_bytes_cost_ms";
-const QUERY_SCAN_ROWS: &str = "query_scan_rows";
-const QUERY_SCAN_BYTES: &str = "query_scan_bytes";
-const QUERY_SCAN_IO_BYTES: &str = "query_scan_io_bytes";
-const QUERY_SCAN_IO_BYTES_COST_MS: &str = "query_scan_io_bytes_cost_ms";
-const QUERY_SCAN_PARTITIONS: &str = "query_scan_partitions";
-const QUERY_TOTAL_PARTITIONS: &str = "query_total_partitions";
-const QUERY_RESULT_ROWS: &str = "query_result_rows";
-const QUERY_RESULT_BYTES: &str = "query_result_bytes";
 
 const LABEL_HANDLER: &str = "handler";
 const LABEL_KIND: &str = "kind";
@@ -54,14 +34,14 @@ const LABEL_CODE: &str = "code";
 impl InterpreterMetrics {
     fn common_labels(ctx: &QueryContext) -> Vec<(&'static str, String)> {
         let handler_type = ctx.get_current_session().get_type().to_string();
-        let query_kind = ctx.get_query_kind();
+        let query_kind = ctx.get_query_kind().to_string();
         let tenant_id = ctx.get_tenant();
         let cluster_id = GlobalConfig::instance().query.cluster_id.clone();
 
         vec![
             (LABEL_HANDLER, handler_type),
             (LABEL_KIND, query_kind),
-            (LABEL_TENANT, tenant_id),
+            (LABEL_TENANT, tenant_id.tenant_name().to_string()),
             (LABEL_CLUSTER, cluster_id),
         ]
     }
@@ -89,39 +69,50 @@ impl InterpreterMetrics {
         let result_rows = ctx.get_result_progress_value().rows as u64;
         let result_bytes = ctx.get_result_progress_value().bytes as u64;
 
-        label_histogram_with_val(QUERY_DURATION_MS, labels, query_duration_ms);
+        QUERY_DURATION_MS
+            .get_or_create(labels)
+            .observe(query_duration_ms);
 
-        label_counter_with_val_and_labels(QUERY_WRITE_ROWS, labels, written_rows);
-        label_counter_with_val_and_labels(QUERY_WRITE_BYTES, labels, written_bytes);
-        label_counter_with_val_and_labels(QUERY_WRITE_IO_BYTES, labels, written_io_bytes);
+        QUERY_WRITE_ROWS.get_or_create(labels).inc_by(written_rows);
+        QUERY_WRITE_BYTES
+            .get_or_create(labels)
+            .inc_by(written_bytes);
+        QUERY_WRITE_IO_BYTES
+            .get_or_create(labels)
+            .inc_by(written_io_bytes);
+
         if written_io_bytes_cost_ms > 0 {
-            label_histogram_with_val(
-                QUERY_WRITE_IO_BYTES_COST_MS,
-                labels,
-                written_io_bytes_cost_ms as f64,
-            );
+            QUERY_WRITE_IO_BYTES_COST_MS
+                .get_or_create(labels)
+                .observe(written_io_bytes_cost_ms as f64);
         }
 
-        label_counter_with_val_and_labels(QUERY_SCAN_ROWS, labels, scan_rows);
-        label_counter_with_val_and_labels(QUERY_SCAN_BYTES, labels, scan_bytes);
-        label_counter_with_val_and_labels(QUERY_SCAN_IO_BYTES, labels, scan_io_bytes);
+        QUERY_SCAN_ROWS.get_or_create(labels).inc_by(scan_rows);
+        QUERY_SCAN_BYTES.get_or_create(labels).inc_by(scan_bytes);
+        QUERY_SCAN_IO_BYTES
+            .get_or_create(labels)
+            .inc_by(scan_io_bytes);
         if scan_io_bytes_cost_ms > 0 {
-            label_histogram_with_val(
-                QUERY_SCAN_IO_BYTES_COST_MS,
-                labels,
-                scan_io_bytes_cost_ms as f64,
-            );
+            QUERY_SCAN_IO_BYTES_COST_MS
+                .get_or_create(labels)
+                .observe(scan_io_bytes_cost_ms as f64);
         }
 
-        label_counter_with_val_and_labels(QUERY_SCAN_PARTITIONS, labels, scan_partitions);
-        label_counter_with_val_and_labels(QUERY_TOTAL_PARTITIONS, labels, total_partitions);
-        label_counter_with_val_and_labels(QUERY_RESULT_ROWS, labels, result_rows);
-        label_counter_with_val_and_labels(QUERY_RESULT_BYTES, labels, result_bytes);
+        QUERY_SCAN_PARTITIONS
+            .get_or_create(labels)
+            .inc_by(scan_partitions);
+        QUERY_TOTAL_PARTITIONS
+            .get_or_create(labels)
+            .inc_by(total_partitions);
+        QUERY_RESULT_ROWS.get_or_create(labels).inc_by(result_rows);
+        QUERY_RESULT_BYTES
+            .get_or_create(labels)
+            .inc_by(result_bytes);
     }
 
     pub fn record_query_start(ctx: &QueryContext) {
         let labels = Self::common_labels(ctx);
-        label_counter_with_val_and_labels(QUERY_START, &labels, 1);
+        QUERY_START.get_or_create(&labels).inc();
     }
 
     pub fn record_query_finished(ctx: &QueryContext, err: Option<ErrorCode>) {
@@ -129,18 +120,13 @@ impl InterpreterMetrics {
         Self::record_query_detail(ctx, &labels);
         match err {
             None => {
-                label_counter_with_val_and_labels(QUERY_SUCCESS, &labels, 1);
+                QUERY_SUCCESS.get_or_create(&labels).inc();
             }
             Some(err) => {
                 labels.push((LABEL_CODE, err.code().to_string()));
-                label_counter_with_val_and_labels(QUERY_FAILED, &labels, 1);
+                QUERY_FAILED.get_or_create(&labels).inc();
             }
         };
-    }
-
-    pub fn record_query_error(ctx: &QueryContext) {
-        let labels = Self::common_labels(ctx);
-        label_counter_with_val_and_labels(QUERY_ERROR, &labels, 1);
     }
 }
 

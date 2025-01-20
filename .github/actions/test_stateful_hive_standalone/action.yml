@@ -1,25 +1,9 @@
 name: "(hive) Test Stateful Standalone"
 description: "(hive) Running stateful tests in standalone mode"
-inputs:
-  target:
-    description: ""
-    required: true
-    default: "x86_64-unknown-linux-gnu"
 runs:
   using: "composite"
   steps:
-    - name: Download artifact
-      uses: ./.github/actions/artifact_download
-      with:
-        sha: ${{ github.sha }}
-        target: ${{ inputs.target }}
-        category: hive
-
-    - name: Checkout java env
-      uses: actions/setup-java@v3
-      with:
-        distribution: temurin
-        java-version: "11"
+    - uses: ./.github/actions/setup_test
 
     # hive cluster setup
     - name: Hive Cluster Setup

@@ -68,7 +68,9 @@ message TableMeta {
   DataSchema schema = 1;
 
   // Table catalog.
-  string catalog = 10;
+  //
+  // We don't need to store catalog in table meta anymore.
+  reserved 10;
 
   // Table engine.
   string engine = 6;
@@ -80,13 +82,13 @@ message TableMeta {
   map<string, string> options = 5;
 
   // Keys to sort rows in table.
-  optional string default_cluster_key = 9;
+  optional string cluster_key = 9;
 
   // The vector of cluster keys.
   repeated string cluster_keys = 4;
 
-  // The default cluster keys id.
-  optional uint32 default_cluster_key_id = 8;
+  // A sequential number that uniquely identifies changes to the cluster key.
+  optional uint32 cluster_key_seq = 8;
 
   // The time table created.
   string created_on = 20;
@@ -111,9 +113,35 @@ message TableMeta {
 
   optional string part_prefix = 27;
 
-  repeated uint64 shared_by = 28; 
+  repeated uint64 shared_by = 28;
 
   map<string, string> column_mask_policy = 29;
+
+  // Now the owner is stored independently in the meta. Prefix with __fd_object_owners
+  // optional Ownership owner = 30;
+  reserved 30;
+
+  map<string, TableIndex> indexes = 31;
+}
+
+message TableIndex {
+  uint64 ver = 100;
+  uint64 min_reader_ver = 101;
+
+  string name = 1;
+  repeated uint32 column_ids = 2;
+
+  // if true, index will create after data written to databend,
+  // no need execute refresh index manually.
+  bool sync_creation = 3;
+
+  // if the index columns or options change,
+  // the index data needs to be regenerated,
+  // version is used to identify each change.
+  string version = 4;
+
+  // index options specify the index configs, like tokenizer.
+  map<string, string> options = 5;
 }
 
 // Save table name id list history.

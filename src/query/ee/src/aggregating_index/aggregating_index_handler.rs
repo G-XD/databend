@@ -14,19 +14,18 @@
 
 use std::sync::Arc;
 
-use aggregating_index::AggregatingIndexHandler;
-use aggregating_index::AggregatingIndexHandlerWrapper;
-use common_base::base::GlobalInstance;
-use common_catalog::catalog::Catalog;
-use common_exception::Result;
-use common_meta_app::schema::CreateIndexReply;
-use common_meta_app::schema::CreateIndexReq;
-use common_meta_app::schema::DropIndexReply;
-use common_meta_app::schema::DropIndexReq;
-use common_meta_app::schema::GetIndexReply;
-use common_meta_app::schema::GetIndexReq;
-use common_meta_app::schema::UpdateIndexReply;
-use common_meta_app::schema::UpdateIndexReq;
+use databend_common_base::base::GlobalInstance;
+use databend_common_catalog::catalog::Catalog;
+use databend_common_exception::Result;
+use databend_common_meta_app::schema::CreateIndexReply;
+use databend_common_meta_app::schema::CreateIndexReq;
+use databend_common_meta_app::schema::DropIndexReq;
+use databend_common_meta_app::schema::GetIndexReply;
+use databend_common_meta_app::schema::GetIndexReq;
+use databend_common_meta_app::schema::UpdateIndexReply;
+use databend_common_meta_app::schema::UpdateIndexReq;
+use databend_enterprise_aggregating_index::AggregatingIndexHandler;
+use databend_enterprise_aggregating_index::AggregatingIndexHandlerWrapper;
 
 pub struct RealAggregatingIndexHandler {}
 
@@ -42,11 +41,7 @@ impl AggregatingIndexHandler for RealAggregatingIndexHandler {
     }
 
     #[async_backtrace::framed]
-    async fn do_drop_index(
-        &self,
-        catalog: Arc<dyn Catalog>,
-        req: DropIndexReq,
-    ) -> Result<DropIndexReply> {
+    async fn do_drop_index(&self, catalog: Arc<dyn Catalog>, req: DropIndexReq) -> Result<()> {
         catalog.drop_index(req).await
     }
 

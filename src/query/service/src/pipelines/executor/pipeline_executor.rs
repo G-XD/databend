@@ -12,294 +12,222 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 use std::time::Instant;
 
-use common_base::base::tokio;
-use common_base::base::tokio::sync::Notify;
-use common_base::runtime::catch_unwind;
-use common_base::runtime::GlobalIORuntime;
-use common_base::runtime::Runtime;
-use common_base::runtime::Thread;
-use common_base::runtime::ThreadJoinHandle;
-use common_base::runtime::TrySpawn;
-use common_exception::ErrorCode;
-use common_exception::Result;
-use futures::future::select;
+use databend_common_base::base::WatchNotify;
+use databend_common_base::runtime::catch_unwind;
+use databend_common_base::runtime::defer;
+use databend_common_base::runtime::GlobalIORuntime;
+use databend_common_base::runtime::TrySpawn;
+use databend_common_exception::ErrorCode;
+use databend_common_exception::Result;
+use databend_common_pipeline_core::ExecutionInfo;
+use databend_common_pipeline_core::FinishedCallbackChain;
+use databend_common_pipeline_core::LockGuard;
+use databend_common_pipeline_core::Pipeline;
+use databend_common_pipeline_core::PlanProfile;
+use futures_util::future::select;
 use futures_util::future::Either;
 use log::info;
-use log::warn;
-use log::LevelFilter;
+use parking_lot::Condvar;
 use parking_lot::Mutex;
-use petgraph::matrix_graph::Zero;
 
-use crate::pipelines::executor::executor_condvar::WorkersCondvar;
-use crate::pipelines::executor::executor_graph::RunningGraph;
-use crate::pipelines::executor::executor_graph::ScheduleQueue;
-use crate::pipelines::executor::executor_tasks::ExecutorTasksQueue;
-use crate::pipelines::executor::executor_worker_context::ExecutorWorkerContext;
 use crate::pipelines::executor::ExecutorSettings;
-use crate::pipelines::pipeline::Pipeline;
+use crate::pipelines::executor::GlobalQueriesExecutor;
+use crate::pipelines::executor::QueryPipelineExecutor;
+use crate::pipelines::executor::RunningGraph;
 
 pub type InitCallback = Box<dyn FnOnce() -> Result<()> + Send + Sync + 'static>;
 
-pub type FinishedCallback =
-    Box<dyn FnOnce(&Option<ErrorCode>) -> Result<()> + Send + Sync + 'static>;
-
-pub struct PipelineExecutor {
-    threads_num: usize,
-    graph: RunningGraph,
-    workers_condvar: Arc<WorkersCondvar>,
-    pub async_runtime: Arc<Runtime>,
-    pub global_tasks_queue: Arc<ExecutorTasksQueue>,
-    on_init_callback: Mutex<Option<InitCallback>>,
-    on_finished_callback: Mutex<Option<FinishedCallback>>,
+pub struct QueryWrapper {
+    graph: Arc<RunningGraph>,
     settings: ExecutorSettings,
-    finished_notify: Arc<Notify>,
-    finished_error: Mutex<Option<ErrorCode>>,
+    on_init_callback: Mutex<Option<InitCallback>>,
+    on_finished_chain: Mutex<FinishedCallbackChain>,
+    #[allow(unused)]
+    lock_guards: Vec<Arc<LockGuard>>,
+    finish_condvar_wait: Arc<(Mutex<bool>, Condvar)>,
+    finished_notify: Arc<WatchNotify>,
+}
+
+pub enum PipelineExecutor {
+    QueryPipelineExecutor(Arc<QueryPipelineExecutor>),
+    QueriesPipelineExecutor(QueryWrapper),
 }
 
 impl PipelineExecutor {
-    pub fn create(
-        mut pipeline: Pipeline,
-        settings: ExecutorSettings,
-    ) -> Result<Arc<PipelineExecutor>> {
-        let threads_num = pipeline.get_max_threads();
+    pub fn create(mut pipeline: Pipeline, settings: ExecutorSettings) -> Result<Self> {
+        if !settings.enable_queries_executor {
+            Ok(PipelineExecutor::QueryPipelineExecutor(
+                QueryPipelineExecutor::create(pipeline, settings)?,
+            ))
+        } else {
+            let on_init_callback = Some(pipeline.take_on_init());
+            let on_finished_chain = pipeline.take_on_finished();
 
-        if threads_num.is_zero() {
-            return Err(ErrorCode::Internal(
-                "Pipeline max threads cannot equals zero.",
-            ));
-        }
+            let finish_condvar = Arc::new((Mutex::new(false), Condvar::new()));
 
-        let on_init_callback = pipeline.take_on_init();
-        let on_finished_callback = pipeline.take_on_finished();
+            let lock_guards = pipeline.take_lock_guards();
 
-        match RunningGraph::create(pipeline) {
-            Err(cause) => {
-                let _ = on_finished_callback(&Some(cause.clone()));
-                Err(cause)
-            }
-            Ok(running_graph) => Self::try_create(
-                running_graph,
-                threads_num,
-                Mutex::new(Some(on_init_callback)),
-                Mutex::new(Some(on_finished_callback)),
+            let graph = RunningGraph::create(
+                pipeline,
+                1,
+                settings.query_id.clone(),
+                Some(finish_condvar.clone()),
+            )?;
+
+            Ok(PipelineExecutor::QueriesPipelineExecutor(QueryWrapper {
+                graph,
                 settings,
-            ),
+                on_init_callback: Mutex::new(on_init_callback),
+                on_finished_chain: Mutex::new(on_finished_chain),
+                lock_guards,
+                finish_condvar_wait: finish_condvar,
+                finished_notify: Arc::new(WatchNotify::new()),
+            }))
         }
     }
 
     pub fn from_pipelines(
         mut pipelines: Vec<Pipeline>,
         settings: ExecutorSettings,
-    ) -> Result<Arc<PipelineExecutor>> {
-        if pipelines.is_empty() {
-            return Err(ErrorCode::Internal("Executor Pipelines is empty."));
-        }
+    ) -> Result<Self> {
+        if !settings.enable_queries_executor {
+            Ok(PipelineExecutor::QueryPipelineExecutor(
+                QueryPipelineExecutor::from_pipelines(pipelines, settings)?,
+            ))
+        } else {
+            let on_init_callback = {
+                let pipelines_callback = pipelines
+                    .iter_mut()
+                    .map(|x| x.take_on_init())
+                    .collect::<Vec<_>>();
 
-        let threads_num = pipelines
-            .iter()
-            .map(|x| x.get_max_threads())
-            .max()
-            .unwrap_or(0);
-
-        if threads_num.is_zero() {
-            return Err(ErrorCode::Internal(
-                "Pipeline max threads cannot equals zero.",
-            ));
-        }
-
-        let on_init_callback = {
-            let pipelines_callback = pipelines
-                .iter_mut()
-                .map(|x| x.take_on_init())
-                .collect::<Vec<_>>();
-
-            pipelines_callback.into_iter().reduce(|left, right| {
-                Box::new(move || {
-                    left()?;
-                    right()
+                pipelines_callback.into_iter().reduce(|left, right| {
+                    Box::new(move || {
+                        left()?;
+                        right()
+                    })
                 })
-            })
-        };
+            };
 
-        let on_finished_callback = {
-            let pipelines_callback = pipelines
-                .iter_mut()
-                .map(|x| x.take_on_finished())
-                .collect::<Vec<_>>();
+            let mut on_finished_chain = FinishedCallbackChain::create();
 
-            pipelines_callback.into_iter().reduce(|left, right| {
-                Box::new(move |arg| {
-                    left(arg)?;
-                    right(arg)
-                })
-            })
-        };
-
-        match RunningGraph::from_pipelines(pipelines) {
-            Err(cause) => {
-                if let Some(on_finished_callback) = on_finished_callback {
-                    let _ = on_finished_callback(&Some(cause.clone()));
-                }
-
-                Err(cause)
+            for pipeline in &mut pipelines {
+                on_finished_chain.extend(pipeline.take_on_finished());
             }
-            Ok(running_graph) => Self::try_create(
-                running_graph,
-                threads_num,
-                Mutex::new(on_init_callback),
-                Mutex::new(on_finished_callback),
+
+            let finish_condvar = Arc::new((Mutex::new(false), Condvar::new()));
+
+            let lock_guards = pipelines
+                .iter_mut()
+                .flat_map(|x| x.take_lock_guards())
+                .collect::<Vec<_>>();
+
+            let graph = RunningGraph::from_pipelines(
+                pipelines,
+                1,
+                settings.query_id.clone(),
+                Some(finish_condvar.clone()),
+            )?;
+
+            Ok(PipelineExecutor::QueriesPipelineExecutor(QueryWrapper {
+                graph,
                 settings,
-            ),
+                on_init_callback: Mutex::new(on_init_callback),
+                on_finished_chain: Mutex::new(on_finished_chain),
+                lock_guards,
+                finish_condvar_wait: finish_condvar,
+                finished_notify: Arc::new(WatchNotify::new()),
+            }))
         }
     }
 
-    fn try_create(
-        graph: RunningGraph,
-        threads_num: usize,
-        on_init_callback: Mutex<Option<InitCallback>>,
-        on_finished_callback: Mutex<Option<FinishedCallback>>,
-        settings: ExecutorSettings,
-    ) -> Result<Arc<PipelineExecutor>> {
-        let workers_condvar = WorkersCondvar::create(threads_num);
-        let global_tasks_queue = ExecutorTasksQueue::create(threads_num);
-
-        Ok(Arc::new(PipelineExecutor {
-            graph,
-            threads_num,
-            workers_condvar,
-            global_tasks_queue,
-            on_init_callback,
-            on_finished_callback,
-            async_runtime: GlobalIORuntime::instance(),
-            settings,
-            finished_error: Mutex::new(None),
-            finished_notify: Arc::new(Notify::new()),
-        }))
-    }
-
-    fn on_finished(&self, error: &Option<ErrorCode>) -> Result<()> {
-        let mut guard = self.on_finished_callback.lock();
-        if let Some(on_finished_callback) = guard.take() {
-            drop(guard);
-            catch_unwind(move || on_finished_callback(error))??;
-        }
-        Ok(())
-    }
-
-    pub fn finish(&self, cause: Option<ErrorCode>) {
-        if let Some(cause) = cause {
-            let mut finished_error = self.finished_error.lock();
-
-            // We only save the cause of the first error.
-            if finished_error.is_none() {
-                *finished_error = Some(cause);
-            }
-        }
-
-        self.global_tasks_queue.finish(self.workers_condvar.clone());
-        self.graph.interrupt_running_nodes();
-        self.finished_notify.notify_waiters();
-    }
-
-    pub fn is_finished(&self) -> bool {
-        self.global_tasks_queue.is_finished()
-    }
-
-    pub fn execute(self: &Arc<Self>) -> Result<()> {
-        self.init()?;
-
-        self.start_executor_daemon()?;
-
-        let mut thread_join_handles = self.execute_threads(self.threads_num);
-
-        while let Some(join_handle) = thread_join_handles.pop() {
-            let thread_res = join_handle.join().flatten();
-
-            {
-                let finished_error_guard = self.finished_error.lock();
-                if let Some(error) = finished_error_guard.as_ref() {
-                    let may_error = Some(error.clone());
-                    drop(finished_error_guard);
-
-                    self.on_finished(&may_error)?;
-                    return Err(may_error.unwrap());
+    fn init(on_init_callback: &Mutex<Option<InitCallback>>, query_id: &Arc<String>) -> Result<()> {
+        // TODO: the on init callback cannot be killed.
+        {
+            let instant = Instant::now();
+            let mut guard = on_init_callback.lock();
+            if let Some(callback) = guard.take() {
+                drop(guard);
+                if let Err(cause) = Result::flatten(catch_unwind(callback)) {
+                    return Err(cause.add_message_back("(while in query pipeline init)"));
                 }
             }
 
-            // We will ignore the abort query error, because returned by finished_error if abort query.
-            if matches!(&thread_res, Err(error) if error.code() != ErrorCode::ABORTED_QUERY) {
-                let may_error = Some(thread_res.unwrap_err());
-                self.on_finished(&may_error)?;
-                return Err(may_error.unwrap());
-            }
+            info!(
+                "Init pipeline successfully, query_id: {:?}, elapsed: {:?}",
+                query_id,
+                instant.elapsed()
+            );
         }
-
-        self.on_finished(&None)?;
         Ok(())
     }
 
-    fn init(self: &Arc<Self>) -> Result<()> {
-        unsafe {
-            // TODO: the on init callback cannot be killed.
-            {
-                let instant = Instant::now();
-                let mut guard = self.on_init_callback.lock();
-                if let Some(callback) = guard.take() {
-                    drop(guard);
-                    if let Err(cause) = Result::flatten(catch_unwind(callback)) {
-                        return Err(cause.add_message_back("(while in query pipeline init)"));
+    pub fn execute(&self) -> Result<()> {
+        let instants = Instant::now();
+        let _guard = defer(move || {
+            info!(
+                "Pipeline executor finished, elapsed: {:?}",
+                instants.elapsed()
+            );
+        });
+        match self {
+            PipelineExecutor::QueryPipelineExecutor(executor) => executor.execute(),
+            PipelineExecutor::QueriesPipelineExecutor(query_wrapper) => {
+                Self::init(
+                    &query_wrapper.on_init_callback,
+                    &query_wrapper.settings.query_id,
+                )?;
+                GlobalQueriesExecutor::instance().send_graph(query_wrapper.graph.clone())?;
+                Self::start_executor_daemon(
+                    query_wrapper,
+                    query_wrapper.settings.max_execute_time_in_seconds,
+                )?;
+                let (lock, cvar) = &*query_wrapper.finish_condvar_wait;
+                let mut finished = lock.lock();
+                if !*finished {
+                    cvar.wait(&mut finished);
+                }
+
+                query_wrapper.finished_notify.notify_waiters();
+
+                let may_error = query_wrapper.graph.get_error();
+                match may_error {
+                    None => {
+                        let mut finished_chain = query_wrapper.on_finished_chain.lock();
+                        let info = ExecutionInfo::create(Ok(()), self.fetch_profiling(true));
+                        finished_chain.apply(info)
+                    }
+                    Some(cause) => {
+                        let mut finished_chain = query_wrapper.on_finished_chain.lock();
+                        let profiling = self.fetch_profiling(true);
+                        let info = ExecutionInfo::create(Err(cause.clone()), profiling);
+                        finished_chain.apply(info).and_then(|_| Err(cause))
                     }
                 }
-
-                info!(
-                    "Init pipeline successfully, query_id: {:?}, elapsed: {:?}",
-                    self.settings.query_id,
-                    instant.elapsed()
-                );
             }
-
-            let mut init_schedule_queue = self.graph.init_schedule_queue(self.threads_num)?;
-
-            let mut wakeup_worker_id = 0;
-            while let Some(proc) = init_schedule_queue.async_queue.pop_front() {
-                ScheduleQueue::schedule_async_task(
-                    proc.clone(),
-                    self.settings.query_id.clone(),
-                    self,
-                    wakeup_worker_id,
-                    self.workers_condvar.clone(),
-                    self.global_tasks_queue.clone(),
-                );
-                wakeup_worker_id += 1;
-
-                if wakeup_worker_id == self.threads_num {
-                    wakeup_worker_id = 0;
-                }
-            }
-
-            let sync_queue = std::mem::take(&mut init_schedule_queue.sync_queue);
-            self.global_tasks_queue.init_sync_tasks(sync_queue);
-            Ok(())
         }
     }
 
-    fn start_executor_daemon(self: &Arc<Self>) -> Result<()> {
-        if !self.settings.max_execute_time_in_seconds.is_zero() {
-            // NOTE(wake ref): When runtime scheduling is blocked, holding executor strong ref may cause the executor can not stop.
-            let this = Arc::downgrade(self);
-            let max_execute_time_in_seconds = self.settings.max_execute_time_in_seconds;
-            let finished_notify = self.finished_notify.clone();
-            self.async_runtime.spawn(async move {
+    fn start_executor_daemon(
+        query_wrapper: &QueryWrapper,
+        max_execute_time_in_seconds: Duration,
+    ) -> Result<()> {
+        if !max_execute_time_in_seconds.is_zero() {
+            let this_graph = Arc::downgrade(&query_wrapper.graph);
+            let finished_notify = query_wrapper.finished_notify.clone();
+            GlobalIORuntime::instance().spawn(async move {
                 let finished_future = Box::pin(finished_notify.notified());
                 let max_execute_future = Box::pin(tokio::time::sleep(max_execute_time_in_seconds));
                 if let Either::Left(_) = select(max_execute_future, finished_future).await {
-                    if let Some(executor) = this.upgrade() {
-                        executor.finish(Some(ErrorCode::AbortedQuery(
+                    if let Some(graph) = this_graph.upgrade() {
+                        graph.should_finish(Err(ErrorCode::AbortedQuery(
                             "Aborted query, because the execution time exceeds the maximum execution time limit",
-                        )));
+                        ))).expect("exceed max execute time, but cannot send error message");
                     }
                 }
             });
@@ -308,103 +236,63 @@ impl PipelineExecutor {
         Ok(())
     }
 
-    fn execute_threads(self: &Arc<Self>, threads: usize) -> Vec<ThreadJoinHandle<Result<()>>> {
-        let mut thread_join_handles = Vec::with_capacity(threads);
-
-        for thread_num in 0..threads {
-            let this = self.clone();
-            #[allow(unused_mut)]
-            let mut name = Some(format!("PipelineExecutor-{}", thread_num));
-
-            #[cfg(debug_assertions)]
-            {
-                // We need to pass the thread name in the unit test, because the thread name is the test name
-                if matches!(std::env::var("UNIT_TEST"), Ok(var_value) if var_value == "TRUE") {
-                    if let Some(cur_thread_name) = std::thread::current().name() {
-                        name = Some(cur_thread_name.to_string());
-                    }
+    pub fn finish<C>(&self, cause: Option<ErrorCode<C>>) {
+        match self {
+            PipelineExecutor::QueryPipelineExecutor(executor) => executor.finish(cause),
+            PipelineExecutor::QueriesPipelineExecutor(query_wrapper) => match cause {
+                Some(may_error) => {
+                    query_wrapper
+                        .graph
+                        .should_finish(Err(may_error))
+                        .expect("executor cannot send error message");
                 }
-            }
-
-            thread_join_handles.push(Thread::named_spawn(name, move || unsafe {
-                let this_clone = this.clone();
-                let try_result = catch_unwind(move || -> Result<()> {
-                    match this_clone.execute_single_thread(thread_num) {
-                        Ok(_) => Ok(()),
-                        Err(cause) => {
-                            if log::max_level() == LevelFilter::Trace {
-                                Err(cause.add_message_back(format!(
-                                    " (while in processor thread {})",
-                                    thread_num
-                                )))
-                            } else {
-                                Err(cause)
-                            }
-                        }
-                    }
-                });
-
-                // finish the pipeline executor when has error or panic
-                if let Err(cause) = try_result.flatten() {
-                    this.finish(Some(cause));
+                None => {
+                    query_wrapper
+                        .graph
+                        .should_finish::<()>(Ok(()))
+                        .expect("executor cannot send error message");
                 }
-
-                Ok(())
-            }));
+            },
         }
-        thread_join_handles
     }
 
-    /// # Safety
-    ///
-    /// Method is thread unsafe and require thread safe call
-    pub unsafe fn execute_single_thread(&self, thread_num: usize) -> Result<()> {
-        let workers_condvar = self.workers_condvar.clone();
-        let mut context = ExecutorWorkerContext::create(
-            thread_num,
-            workers_condvar,
-            self.settings.query_id.clone(),
-        );
-
-        while !self.global_tasks_queue.is_finished() {
-            // When there are not enough tasks, the thread will be blocked, so we need loop check.
-            while !self.global_tasks_queue.is_finished() && !context.has_task() {
-                self.global_tasks_queue.steal_task_to_context(&mut context);
-            }
-
-            while !self.global_tasks_queue.is_finished() && context.has_task() {
-                if let Some(executed_pid) = context.execute_task()? {
-                    // Not scheduled graph if pipeline is finished.
-                    if !self.global_tasks_queue.is_finished() {
-                        // We immediately schedule the processor again.
-                        let schedule_queue = self.graph.schedule_queue(executed_pid)?;
-                        schedule_queue.schedule(&self.global_tasks_queue, &mut context, self);
-                    }
-                }
+    pub fn is_finished(&self) -> bool {
+        match self {
+            PipelineExecutor::QueryPipelineExecutor(executor) => executor.is_finished(),
+            PipelineExecutor::QueriesPipelineExecutor(query_wrapper) => {
+                query_wrapper.graph.is_should_finish()
             }
         }
-
-        Ok(())
     }
 
     pub fn format_graph_nodes(&self) -> String {
-        self.graph.format_graph_nodes()
+        match self {
+            PipelineExecutor::QueryPipelineExecutor(executor) => executor.format_graph_nodes(),
+            PipelineExecutor::QueriesPipelineExecutor(v) => v.graph.format_graph_nodes(),
+        }
     }
-}
 
-impl Drop for PipelineExecutor {
-    fn drop(&mut self) {
-        self.finish(None);
+    pub fn fetch_profiling(&self, collect_metrics: bool) -> HashMap<u32, PlanProfile> {
+        match self {
+            PipelineExecutor::QueryPipelineExecutor(executor) => {
+                executor.fetch_plans_profile(collect_metrics)
+            }
+            PipelineExecutor::QueriesPipelineExecutor(v) => match collect_metrics {
+                true => v
+                    .graph
+                    .fetch_profiling(Some(v.settings.executor_node_id.clone())),
+                false => v.graph.fetch_profiling(None),
+            },
+        }
+    }
 
-        let mut guard = self.on_finished_callback.lock();
-        if let Some(on_finished_callback) = guard.take() {
-            drop(guard);
-            let cause = match self.finished_error.lock().as_ref() {
-                Some(cause) => cause.clone(),
-                None => ErrorCode::Internal("Pipeline illegal state: not successfully shutdown."),
-            };
-            if let Err(cause) = catch_unwind(move || on_finished_callback(&Some(cause))).flatten() {
-                warn!("Pipeline executor shutdown failure, {:?}", cause);
+    pub fn change_priority(&self, priority: u8) {
+        match self {
+            PipelineExecutor::QueryPipelineExecutor(_) => {
+                unreachable!("Logic error, cannot change priority for QueryPipelineExecutor")
+            }
+            PipelineExecutor::QueriesPipelineExecutor(query_wrapper) => {
+                query_wrapper.graph.change_priority(priority as u64);
             }
         }
     }

@@ -12,15 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use common_exception::Result;
-use common_expression::types::number::NumberScalar;
-use common_expression::types::NumberDataType;
-use common_expression::ColumnBuilder;
-use common_expression::Scalar;
-use common_expression::TableDataType;
-use common_expression::TableField;
-use common_expression::TableSchemaRef;
-use common_expression::TableSchemaRefExt;
+use databend_common_exception::Result;
+use databend_common_expression::types::number::NumberScalar;
+use databend_common_expression::types::NumberDataType;
+use databend_common_expression::ColumnBuilder;
+use databend_common_expression::Scalar;
+use databend_common_expression::TableDataType;
+use databend_common_expression::TableField;
+use databend_common_expression::TableSchemaRef;
+use databend_common_expression::TableSchemaRefExt;
 
 use crate::SystemLogElement;
 use crate::SystemLogQueue;
@@ -32,7 +32,6 @@ pub struct ClusteringHistoryLogElement {
     pub end_time: i64,
     pub database: String,
     pub table: String,
-    pub block_count: u64,
     pub byte_size: u64,
     pub row_count: u64,
 }
@@ -46,7 +45,6 @@ impl SystemLogElement for ClusteringHistoryLogElement {
             TableField::new("end_time", TableDataType::Timestamp),
             TableField::new("database", TableDataType::String),
             TableField::new("table", TableDataType::String),
-            TableField::new("block_count", TableDataType::Number(NumberDataType::UInt64)),
             TableField::new("byte_size", TableDataType::Number(NumberDataType::UInt64)),
             TableField::new("row_count", TableDataType::Number(NumberDataType::UInt64)),
         ])
@@ -65,15 +63,11 @@ impl SystemLogElement for ClusteringHistoryLogElement {
         columns
             .next()
             .unwrap()
-            .push(Scalar::String(self.database.as_bytes().to_vec()).as_ref());
+            .push(Scalar::String(self.database.clone()).as_ref());
         columns
             .next()
             .unwrap()
-            .push(Scalar::String(self.table.as_bytes().to_vec()).as_ref());
-        columns
-            .next()
-            .unwrap()
-            .push(Scalar::Number(NumberScalar::UInt64(self.block_count)).as_ref());
+            .push(Scalar::String(self.table.clone()).as_ref());
         columns
             .next()
             .unwrap()

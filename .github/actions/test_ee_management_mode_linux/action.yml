@@ -1,0 +1,11 @@
+name: "Test ee management mode"
+description: "Running stateless tests in management mode"
+runs:
+  using: "composite"
+  steps:
+    - uses: ./.github/actions/setup_test
+
+    - name: Run Stateful Tests with Standalone mode
+      shell: bash
+      run: |
+        ./scripts/ci/ci-run-ee-tests-management-mode.sh

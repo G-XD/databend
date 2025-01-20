@@ -14,8 +14,10 @@
 
 use std::string::FromUtf8Error;
 
-use common_exception::ErrorCode;
-use common_exception::Result;
+use databend_common_exception::ErrorCode;
+use databend_common_exception::Result;
+use regex::Regex;
+use unicode_segmentation::UnicodeSegmentation;
 
 /// Function that escapes special characters in a string.
 ///
@@ -28,7 +30,7 @@ use common_exception::Result;
 /// let new_key = escape_for_key(&key);
 /// assert_eq!(Ok("data_bend%21%21".to_string()), new_key);
 /// ```
-pub fn escape_for_key(key: &str) -> Result<String, FromUtf8Error> {
+pub fn escape_for_key(key: &str) -> std::result::Result<String, FromUtf8Error> {
     let mut new_key = Vec::with_capacity(key.len());
 
     fn hex(num: u8) -> u8 {
@@ -62,7 +64,7 @@ pub fn escape_for_key(key: &str) -> Result<String, FromUtf8Error> {
 /// let original_key = unescape_for_key(&key);
 /// assert_eq!(Ok("data_bend!!".to_string()), original_key);
 /// ```
-pub fn unescape_for_key(key: &str) -> Result<String, FromUtf8Error> {
+pub fn unescape_for_key(key: &str) -> std::result::Result<String, FromUtf8Error> {
     let mut new_key = Vec::with_capacity(key.len());
 
     fn unhex(num: u8) -> u8 {
@@ -114,6 +116,16 @@ pub fn unescape_string(escape_str: &str) -> Result<String> {
         .map_err(|e| ErrorCode::Internal(format!("unescape:{} error:{:?}", escape_str, e)))
 }
 
+pub fn format_byte_size(bytes: usize) -> String {
+    if bytes == 0 {
+        "0".to_string()
+    } else if bytes < 1024 {
+        "< 1 KiB".to_string()
+    } else {
+        convert_byte_size(bytes as f64)
+    }
+}
+
 pub fn convert_byte_size(num: f64) -> String {
     let negative = if num.is_sign_positive() { "" } else { "-" };
     let num = num.abs();
@@ -161,4 +173,48 @@ pub fn convert_number_size(num: f64) -> String {
         * 1_f64;
     let unit = units[exponent as usize];
     format!("{}{}{}", negative, pretty_bytes, unit)
+}
+
+/// Mask the connection info in the sql.
+pub fn mask_connection_info(sql: &str) -> String {
+    let mut masked_sql = sql.to_string();
+
+    // Regular expression to find the CONNECTION block
+    let re_connection = Regex::new(r"CONNECTION\s*=\s*\([^)]+\)").unwrap();
+
+    // Replace the entire CONNECTION block with 'CONNECTION = (***masked***)'
+    masked_sql = re_connection
+        .replace_all(&masked_sql, "CONNECTION = (***masked***)")
+        .to_string();
+
+    masked_sql
+}
+
+/// Maximum length of the SQL query to be displayed or log.
+/// If the query exceeds this length and starts with keywords,
+/// it will be truncated and appended with the remaining length.
+pub fn short_sql(sql: String, max_length: u64) -> String {
+    let keywords = ["INSERT"];
+
+    fn starts_with_any(query: &str, keywords: &[&str]) -> bool {
+        keywords
+            .iter()
+            .any(|&keyword| query.to_uppercase().starts_with(keyword))
+    }
+
+    let query = sql.trim_start();
+
+    // Graphemes represent user-perceived characters, which might be composed
+    // of multiple Unicode code points.
+    // This ensures that we handle complex characters like emojis or
+    // accented characters properly.
+    if query.graphemes(true).count() > max_length as usize && starts_with_any(query, &keywords) {
+        let truncated: String = query.graphemes(true).take(max_length as usize).collect();
+        let original_length = query.graphemes(true).count();
+        let remaining_length = original_length.saturating_sub(max_length as usize);
+        // Append the remaining length indicator
+        truncated + &format!("...[{} more characters]", remaining_length)
+    } else {
+        query.to_string()
+    }
 }

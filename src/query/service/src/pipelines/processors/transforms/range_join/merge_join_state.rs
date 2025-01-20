@@ -12,20 +12,20 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use common_exception::Result;
-use common_expression::types::DataType;
-use common_expression::types::NumberDataType;
-use common_expression::types::NumberScalar;
-use common_expression::DataBlock;
-use common_expression::ScalarRef;
-use common_expression::SortColumnDescription;
-use common_functions::BUILTIN_FUNCTIONS;
+use databend_common_exception::Result;
+use databend_common_expression::types::DataType;
+use databend_common_expression::types::NumberDataType;
+use databend_common_expression::types::NumberScalar;
+use databend_common_expression::DataBlock;
+use databend_common_expression::ScalarRef;
+use databend_common_expression::SortColumnDescription;
+use databend_common_functions::BUILTIN_FUNCTIONS;
 
-use crate::pipelines::processors::transforms::range_join::ie_join_util::filter_block;
-use crate::pipelines::processors::transforms::RangeJoinState;
+use crate::pipelines::processors::transforms::range_join::filter_block;
+use crate::pipelines::processors::transforms::range_join::RangeJoinState;
 
 impl RangeJoinState {
-    pub fn merge_join(&self, task_id: usize) -> Result<Vec<DataBlock>> {
+    pub fn range_join(&self, task_id: usize) -> Result<Vec<DataBlock>> {
         let tasks = self.tasks.read();
         let (left_idx, right_idx) = tasks[task_id];
         let left_sorted_blocks = self.left_sorted_blocks.read();
@@ -42,7 +42,7 @@ impl RangeJoinState {
             None,
         )?;
 
-        // Start to execute merge join algo
+        // Start to execute range join algo
         let left_len = left_sorted_block.num_rows();
         let right_len = right_sort_block.num_rows();
 
@@ -118,8 +118,11 @@ impl RangeJoinState {
                     for res in right_buffer.iter() {
                         indices.push((0u32, *res as u32, 1usize));
                     }
-                    let right_result_block =
-                        DataBlock::take_blocks(&[&right_table[right_idx]], &indices, indices.len());
+                    let right_result_block = DataBlock::take_blocks(
+                        &right_table[right_idx..right_idx + 1],
+                        &indices,
+                        indices.len(),
+                    );
                     // Merge left_result_block and right_result_block
                     for col in right_result_block.columns() {
                         left_result_block.add_column(col.clone());
@@ -137,37 +140,27 @@ impl RangeJoinState {
         Ok(result_blocks)
     }
 
-    // Used by merge join
-    fn sort_descriptions(&self, left: bool) -> Vec<SortColumnDescription> {
+    // Used by range join
+    fn sort_descriptions(&self, _: bool) -> Vec<SortColumnDescription> {
         let op = &self.conditions[0].operator;
         let asc = match op.as_str() {
             "gt" | "gte" => false,
             "lt" | "lte" => true,
             _ => unreachable!(),
         };
-        let is_nullable = if left {
-            self.conditions[0]
-                .left_expr
-                .as_expr(&BUILTIN_FUNCTIONS)
-                .data_type()
-                .is_nullable()
-        } else {
-            self.conditions[0]
-                .right_expr
-                .as_expr(&BUILTIN_FUNCTIONS)
-                .data_type()
-                .is_nullable()
-        };
         vec![SortColumnDescription {
             offset: 0,
             asc,
             nulls_first: true,
-            is_nullable,
         }]
     }
 }
 
 fn compare_scalar(left: &ScalarRef, right: &ScalarRef, op: &str) -> bool {
+    if left.is_null() || right.is_null() {
+        return false;
+    }
+
     match op {
         "gte" => left.cmp(right) != std::cmp::Ordering::Less,
         "gt" => left.cmp(right) == std::cmp::Ordering::Greater,

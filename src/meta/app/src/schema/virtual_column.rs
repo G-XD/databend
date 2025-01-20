@@ -18,134 +18,82 @@ use std::fmt::Formatter;
 
 use chrono::DateTime;
 use chrono::Utc;
-use common_meta_types::MetaId;
+use databend_common_expression::TableDataType;
+use databend_common_meta_types::MetaId;
 
-#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, Eq, PartialEq, Default)]
-pub struct VirtualColumnNameIdent {
-    pub tenant: String,
-    pub table_id: u64,
-}
-
-impl VirtualColumnNameIdent {
-    pub fn new(tenant: impl Into<String>, table_id: impl Into<u64>) -> VirtualColumnNameIdent {
-        VirtualColumnNameIdent {
-            tenant: tenant.into(),
-            table_id: table_id.into(),
-        }
-    }
-
-    pub fn table_id(&self) -> u64 {
-        self.table_id
-    }
-}
-
-impl Display for VirtualColumnNameIdent {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        write!(f, "'{}'/{}", self.tenant, self.table_id)
-    }
-}
+use super::CreateOption;
+use crate::schema::virtual_column_ident::VirtualColumnIdent;
+use crate::tenant::Tenant;
+use crate::tenant::ToTenant;
 
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug, Eq, PartialEq)]
 pub struct VirtualColumnMeta {
     pub table_id: MetaId,
 
-    pub virtual_columns: Vec<String>,
+    pub virtual_columns: Vec<(String, TableDataType)>,
     pub created_on: DateTime<Utc>,
     pub updated_on: Option<DateTime<Utc>>,
 }
 
-#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CreateVirtualColumnReq {
-    pub name_ident: VirtualColumnNameIdent,
-    pub virtual_columns: Vec<String>,
+    pub create_option: CreateOption,
+    pub name_ident: VirtualColumnIdent,
+    pub virtual_columns: Vec<(String, TableDataType)>,
 }
 
 impl Display for CreateVirtualColumnReq {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         write!(
             f,
             "create_virtual_column ({:?}) for {}",
-            self.virtual_columns, self.name_ident
+            self.virtual_columns,
+            self.name_ident.display()
         )
     }
 }
 
-#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, Eq, PartialEq)]
-pub struct CreateVirtualColumnReply {}
-
-#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UpdateVirtualColumnReq {
-    pub name_ident: VirtualColumnNameIdent,
-    pub virtual_columns: Vec<String>,
+    pub if_exists: bool,
+    pub name_ident: VirtualColumnIdent,
+    pub virtual_columns: Vec<(String, TableDataType)>,
 }
 
 impl Display for UpdateVirtualColumnReq {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         write!(
             f,
             "update_virtual_column ({:?}) for {}",
-            self.virtual_columns, self.name_ident
+            self.virtual_columns,
+            self.name_ident.display()
         )
     }
 }
 
-#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, Eq, PartialEq)]
-pub struct UpdateVirtualColumnReply {}
-
-#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DropVirtualColumnReq {
-    pub name_ident: VirtualColumnNameIdent,
+    pub if_exists: bool,
+    pub name_ident: VirtualColumnIdent,
 }
 
 impl Display for DropVirtualColumnReq {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "drop_virtual_column for {}", self.name_ident)
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+        write!(f, "drop_virtual_column for {}", self.name_ident.display())
     }
 }
 
-#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
-pub struct DropVirtualColumnReply {}
-
-#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ListVirtualColumnsReq {
-    pub tenant: String,
+    pub tenant: Tenant,
     pub table_id: Option<MetaId>,
 }
 
 impl ListVirtualColumnsReq {
-    pub fn new(tenant: impl Into<String>, table_id: Option<MetaId>) -> ListVirtualColumnsReq {
+    pub fn new(tenant: impl ToTenant, table_id: Option<MetaId>) -> ListVirtualColumnsReq {
         ListVirtualColumnsReq {
-            tenant: tenant.into(),
+            tenant: tenant.to_tenant(),
             table_id,
-        }
-    }
-}
-
-mod kvapi_key_impl {
-    use common_meta_kvapi::kvapi;
-
-    use crate::schema::VirtualColumnNameIdent;
-    use crate::schema::PREFIX_VIRTUAL_COLUMN;
-
-    /// <prefix>/<tenant>/<table_id>
-    impl kvapi::Key for VirtualColumnNameIdent {
-        const PREFIX: &'static str = PREFIX_VIRTUAL_COLUMN;
-
-        fn to_string_key(&self) -> String {
-            kvapi::KeyBuilder::new_prefixed(Self::PREFIX)
-                .push_str(&self.tenant)
-                .push_u64(self.table_id)
-                .done()
-        }
-
-        fn from_str_key(s: &str) -> Result<Self, kvapi::KeyError> {
-            let mut p = kvapi::KeyParser::new_prefixed(s, Self::PREFIX)?;
-
-            let tenant = p.next_str()?;
-            let table_id = p.next_u64()?;
-            p.done()?;
-
-            Ok(VirtualColumnNameIdent { tenant, table_id })
         }
     }
 }

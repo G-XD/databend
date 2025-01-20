@@ -13,9 +13,9 @@
 // limitations under the License.
 
 use cidr::Ipv4Cidr;
-use common_ast::ast::*;
-use common_exception::ErrorCode;
-use common_exception::Result;
+use databend_common_ast::ast::*;
+use databend_common_exception::ErrorCode;
+use databend_common_exception::Result;
 
 use crate::binder::Binder;
 use crate::plans::AlterNetworkPolicyPlan;
@@ -32,7 +32,7 @@ impl Binder {
         stmt: &CreateNetworkPolicyStmt,
     ) -> Result<Plan> {
         let CreateNetworkPolicyStmt {
-            if_not_exists,
+            create_option,
             name,
             allowed_ip_list,
             blocked_ip_list,
@@ -59,8 +59,9 @@ impl Binder {
         }
 
         let tenant = self.ctx.get_tenant();
+
         let plan = CreateNetworkPolicyPlan {
-            if_not_exists: *if_not_exists,
+            create_option: create_option.clone().into(),
             tenant,
             name: name.to_string(),
             allowed_ip_list: allowed_ip_list.clone(),
@@ -105,6 +106,7 @@ impl Binder {
         }
 
         let tenant = self.ctx.get_tenant();
+
         let plan = AlterNetworkPolicyPlan {
             if_exists: *if_exists,
             tenant,
@@ -124,6 +126,7 @@ impl Binder {
         let DropNetworkPolicyStmt { if_exists, name } = stmt;
 
         let tenant = self.ctx.get_tenant();
+
         let plan = DropNetworkPolicyPlan {
             if_exists: *if_exists,
             tenant,

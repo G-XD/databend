@@ -15,17 +15,15 @@ SELECT AVG(3), AVG(NULL)
 ----
 3.0 NULL
 
-statement error 1001
+query FT
 SELECT AVG(3::SMALLINT), AVG(NULL::SMALLINT)
+----
+3.0 NULL
 
-statement error 1001
+query FT
 SELECT AVG(3::DOUBLE), AVG(NULL::DOUBLE)
-
-statement error 1005
-CREATE SEQUENCE seq
-
-statement error 1008
-SELECT AVG(nextval('seq'))
+----
+3.0 NULL
 
 statement ok
 drop table if exists integers

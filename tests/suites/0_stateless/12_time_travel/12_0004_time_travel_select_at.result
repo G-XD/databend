@@ -3,7 +3,9 @@ latest snapshot should contain 3 rows
 3
 counting the data set of first insertion, which should contain 2 rows
 2
-planner_v2: counting the data set of first insertion, which should contain 2 rows
+counting the data set of first insertion, which should contain 2 rows
 2
-planner_v2: counting the data set of first insertion by timestamp, which should contains 2 rows
+counting the data set of first insertion by timestamp, which should contains 2 rows
+2
+counting the data set of first insertion by offset, which should contains 2 rows
 2

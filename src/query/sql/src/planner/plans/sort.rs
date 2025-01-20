@@ -14,9 +14,10 @@
 
 use std::sync::Arc;
 
-use common_catalog::table_context::TableContext;
-use common_exception::Result;
+use databend_common_catalog::table_context::TableContext;
+use databend_common_exception::Result;
 
+use super::WindowPartition;
 use crate::optimizer::Distribution;
 use crate::optimizer::PhysicalProperty;
 use crate::optimizer::RelExpr;
@@ -25,6 +26,7 @@ use crate::optimizer::RequiredProperty;
 use crate::optimizer::StatInfo;
 use crate::plans::Operator;
 use crate::plans::RelOp;
+use crate::ColumnSet;
 use crate::IndexType;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -33,11 +35,35 @@ pub struct Sort {
     pub limit: Option<usize>,
 
     /// If the sort plan is after the exchange plan.
-    pub after_exchange: bool,
+    /// It's [None] if the sorting plan is in single node mode.
+    pub after_exchange: Option<bool>,
 
     /// The columns needed by the plan after the sort plan.
     /// It's used to build a projection operation before building the sort operator.
     pub pre_projection: Option<Vec<IndexType>>,
+
+    /// If sort is for window clause, we need the input to exchange by partitions
+    pub window_partition: Option<WindowPartition>,
+}
+
+impl Sort {
+    pub fn used_columns(&self) -> ColumnSet {
+        self.items.iter().map(|item| item.index).collect()
+    }
+
+    pub fn sort_items_exclude_partition(&self) -> Vec<SortItem> {
+        self.items
+            .iter()
+            .filter(|item| match &self.window_partition {
+                Some(window) => !window
+                    .partition_by
+                    .iter()
+                    .any(|partition| partition.index == item.index),
+                None => true,
+            })
+            .cloned()
+            .collect()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -53,26 +79,111 @@ impl Operator for Sort {
     }
 
     fn derive_physical_prop(&self, rel_expr: &RelExpr) -> Result<PhysicalProperty> {
-        rel_expr.derive_physical_prop_child(0)
+        let input_physical_prop = rel_expr.derive_physical_prop_child(0)?;
+        if input_physical_prop.distribution == Distribution::Serial {
+            return Ok(input_physical_prop);
+        }
+        let Some(window) = &self.window_partition else {
+            return Ok(input_physical_prop);
+        };
+
+        let partition_by = window
+            .partition_by
+            .iter()
+            .map(|s| s.scalar.clone())
+            .collect();
+        Ok(PhysicalProperty {
+            distribution: Distribution::Hash(partition_by),
+        })
     }
 
     fn compute_required_prop_child(
         &self,
         _ctx: Arc<dyn TableContext>,
-        _rel_expr: &RelExpr,
+        rel_expr: &RelExpr,
         _child_index: usize,
         required: &RequiredProperty,
     ) -> Result<RequiredProperty> {
         let mut required = required.clone();
         required.distribution = Distribution::Serial;
+
+        let Some(window) = &self.window_partition else {
+            return Ok(required);
+        };
+
+        let child_physical_prop = rel_expr.derive_physical_prop_child(0)?;
+        // Can't merge to shuffle
+        if child_physical_prop.distribution == Distribution::Serial {
+            return Ok(required);
+        }
+
+        let partition_by = window
+            .partition_by
+            .iter()
+            .map(|s| s.scalar.clone())
+            .collect();
+        required.distribution = Distribution::Hash(partition_by);
+
         Ok(required)
     }
 
-    fn derive_relational_prop(&self, rel_expr: &RelExpr) -> Result<Arc<RelationalProperty>> {
-        rel_expr.derive_relational_prop_child(0)
+    fn compute_required_prop_children(
+        &self,
+        _ctx: Arc<dyn TableContext>,
+        rel_expr: &RelExpr,
+        required: &RequiredProperty,
+    ) -> Result<Vec<Vec<RequiredProperty>>> {
+        let mut required = required.clone();
+        required.distribution = Distribution::Serial;
+
+        let Some(window) = &self.window_partition else {
+            return Ok(vec![vec![required]]);
+        };
+
+        // Can't merge to shuffle
+        let child_physical_prop = rel_expr.derive_physical_prop_child(0)?;
+        if child_physical_prop.distribution == Distribution::Serial {
+            return Ok(vec![vec![required]]);
+        }
+
+        let partition_by = window
+            .partition_by
+            .iter()
+            .map(|s| s.scalar.clone())
+            .collect();
+
+        required.distribution = Distribution::Hash(partition_by);
+        Ok(vec![vec![required]])
     }
 
-    fn derive_cardinality(&self, rel_expr: &RelExpr) -> Result<Arc<StatInfo>> {
+    fn derive_relational_prop(&self, rel_expr: &RelExpr) -> Result<Arc<RelationalProperty>> {
+        let input_prop = rel_expr.derive_relational_prop_child(0)?;
+
+        let output_columns = input_prop.output_columns.clone();
+        let outer_columns = input_prop.outer_columns.clone();
+        let used_columns = input_prop.used_columns.clone();
+
+        // Derive orderings
+        let orderings = self.items.clone();
+
+        let (orderings, partition_orderings) = match &self.window_partition {
+            Some(window) => (
+                vec![],
+                Some((window.partition_by.clone(), orderings.clone())),
+            ),
+            None => (self.items.clone(), None),
+        };
+
+        Ok(Arc::new(RelationalProperty {
+            output_columns,
+            outer_columns,
+            used_columns,
+            orderings,
+            partition_orderings,
+        }))
+    }
+
+    fn derive_stats(&self, rel_expr: &RelExpr) -> Result<Arc<StatInfo>> {
         rel_expr.derive_cardinality_child(0)
     }
 }

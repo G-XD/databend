@@ -15,14 +15,13 @@
 use std::fmt::Write;
 use std::sync::Arc;
 
-use common_exception::Result;
-use common_expression::types::DataType;
-use common_expression::BlockEntry;
-use common_expression::DataBlock;
-use common_expression::DataSchemaRef;
-use common_expression::Scalar;
-use common_expression::Value;
-use common_sql::plans::ShowCreateDatabasePlan;
+use databend_common_exception::Result;
+use databend_common_expression::types::DataType;
+use databend_common_expression::BlockEntry;
+use databend_common_expression::DataBlock;
+use databend_common_expression::Scalar;
+use databend_common_expression::Value;
+use databend_common_sql::plans::ShowCreateDatabasePlan;
 
 use crate::interpreters::Interpreter;
 use crate::pipelines::PipelineBuildResult;
@@ -46,17 +45,15 @@ impl Interpreter for ShowCreateDatabaseInterpreter {
         "ShowCreateDatabaseInterpreter"
     }
 
-    fn schema(&self) -> DataSchemaRef {
-        self.plan.schema()
+    fn is_ddl(&self) -> bool {
+        false
     }
 
     #[async_backtrace::framed]
     async fn execute2(&self) -> Result<PipelineBuildResult> {
         let tenant = self.ctx.get_tenant();
         let catalog = self.ctx.get_catalog(&self.plan.catalog).await?;
-        let db = catalog
-            .get_database(tenant.as_str(), &self.plan.database)
-            .await?;
+        let db = catalog.get_database(&tenant, &self.plan.database).await?;
         let name = db.name();
         let mut info = format!("CREATE DATABASE `{}`", name);
         if !db.engine().is_empty() {
@@ -79,11 +76,11 @@ impl Interpreter for ShowCreateDatabaseInterpreter {
             vec![
                 BlockEntry::new(
                     DataType::String,
-                    Value::Scalar(Scalar::String(name.as_bytes().to_vec())),
+                    Value::Scalar(Scalar::String(name.to_string())),
                 ),
                 BlockEntry::new(
                     DataType::String,
-                    Value::Scalar(Scalar::String(info.as_bytes().to_vec())),
+                    Value::Scalar(Scalar::String(info.clone())),
                 ),
             ],
             1,

@@ -15,10 +15,10 @@
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use common_base::base::ProgressValues;
-pub use common_catalog::table_context::ProcessInfo;
-use common_catalog::table_context::ProcessInfoState;
-use common_storage::StorageMetrics;
+use databend_common_base::base::ProgressValues;
+pub use databend_common_catalog::table_context::ProcessInfo;
+use databend_common_catalog::table_context::ProcessInfoState;
+use databend_common_storage::StorageMetrics;
 
 use crate::sessions::Session;
 use crate::sessions::SessionContext;
@@ -26,11 +26,12 @@ use crate::sessions::SessionType;
 
 impl Session {
     pub fn process_info(self: &Arc<Self>) -> ProcessInfo {
-        let session_ctx = self.session_ctx.clone();
-        self.to_process_info(&session_ctx)
+        self.to_process_info()
     }
 
-    fn to_process_info(self: &Arc<Self>, session_ctx: &SessionContext) -> ProcessInfo {
+    fn to_process_info(self: &Arc<Self>) -> ProcessInfo {
+        let session_ctx = self.session_ctx.as_ref();
+
         let mut memory_usage = 0;
 
         let shared_query_context = &session_ctx.get_query_context_shared();
@@ -58,6 +59,7 @@ impl Session {
             status_info: shared_query_context
                 .as_ref()
                 .map(|qry_ctx| qry_ctx.get_status_info()),
+            current_query_id: self.get_current_query_id(),
         }
     }
 

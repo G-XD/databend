@@ -15,14 +15,16 @@
 use std::borrow::Borrow;
 use std::collections::HashMap;
 
-use common_expression::BlockThresholds;
-use common_expression::ColumnId;
-use common_expression::Scalar;
-use storages_common_table_meta::meta::BlockMeta;
-use storages_common_table_meta::meta::ClusterStatistics;
-use storages_common_table_meta::meta::ColumnStatistics;
-use storages_common_table_meta::meta::Statistics;
-use storages_common_table_meta::meta::StatisticsOfColumns;
+use databend_common_expression::BlockThresholds;
+use databend_common_expression::ColumnId;
+use databend_common_expression::Scalar;
+use databend_storages_common_table_meta::meta::BlockMeta;
+use databend_storages_common_table_meta::meta::ClusterStatistics;
+use databend_storages_common_table_meta::meta::ColumnStatistics;
+use databend_storages_common_table_meta::meta::Statistics;
+use databend_storages_common_table_meta::meta::StatisticsOfColumns;
+
+use crate::table_functions::cmp_with_null;
 
 pub fn reduce_block_statistics<T: Borrow<StatisticsOfColumns>>(
     stats_of_columns: &[T],
@@ -108,27 +110,32 @@ pub fn reduce_cluster_statistics<T: Borrow<Option<ClusterStatistics>>>(
         }
     }
 
-    let min = min_stats.into_iter().min_by(|x, y| x.cmp(y)).unwrap();
-    let max = max_stats.into_iter().max_by(|x, y| x.cmp(y)).unwrap();
+    let min = min_stats
+        .into_iter()
+        .min_by(|x, y| x.iter().cmp_by(y.iter(), cmp_with_null))
+        .unwrap();
+    let max = max_stats
+        .into_iter()
+        .max_by(|x, y| x.iter().cmp_by(y.iter(), cmp_with_null))
+        .unwrap();
     let level = levels.into_iter().max().unwrap_or(0);
 
     Some(ClusterStatistics::new(
         cluster_key_id,
-        min,
-        max,
+        min.clone(),
+        max.clone(),
         level,
         None,
     ))
 }
 
 pub fn merge_statistics(
-    l: &Statistics,
+    mut l: Statistics,
     r: &Statistics,
     default_cluster_key_id: Option<u32>,
 ) -> Statistics {
-    let mut new = l.clone();
-    merge_statistics_mut(&mut new, r, default_cluster_key_id);
-    new
+    merge_statistics_mut(&mut l, r, default_cluster_key_id);
+    l
 }
 
 pub fn merge_statistics_mut(
@@ -203,7 +210,10 @@ pub fn reduce_block_metas<T: Borrow<BlockMeta>>(
         uncompressed_byte_size += b.block_size;
         compressed_byte_size += b.file_size;
         index_size += b.bloom_filter_index_size;
-        if thresholds.check_large_enough(b.row_count as usize, b.block_size as usize) {
+        index_size += b.inverted_index_size.unwrap_or_default();
+        if thresholds.check_large_enough(b.row_count as usize, b.block_size as usize)
+            || b.cluster_stats.as_ref().is_some_and(|v| v.level != 0)
+        {
             perfect_block_count += 1;
         }
         col_stats.push(&b.col_stats);

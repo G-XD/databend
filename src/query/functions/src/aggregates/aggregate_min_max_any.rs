@@ -12,21 +12,21 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::alloc::Layout;
-use std::fmt;
 use std::marker::PhantomData;
 use std::sync::Arc;
 
-use common_arrow::arrow::bitmap::Bitmap;
-use common_exception::ErrorCode;
-use common_exception::Result;
-use common_expression::types::decimal::*;
-use common_expression::types::number::*;
-use common_expression::types::*;
-use common_expression::with_number_mapped_type;
-use common_expression::Column;
-use common_expression::ColumnBuilder;
-use common_expression::Scalar;
+use boolean::TrueIdxIter;
+use borsh::BorshDeserialize;
+use borsh::BorshSerialize;
+use databend_common_exception::ErrorCode;
+use databend_common_exception::Result;
+use databend_common_expression::types::decimal::*;
+use databend_common_expression::types::number::*;
+use databend_common_expression::types::Bitmap;
+use databend_common_expression::types::*;
+use databend_common_expression::with_number_mapped_type;
+use databend_common_expression::Scalar;
+use databend_common_expression::SELECTIVITY_THRESHOLD;
 use ethnum::i256;
 
 use super::aggregate_function_factory::AggregateFunctionDescription;
@@ -35,149 +35,237 @@ use super::aggregate_scalar_state::ChangeIf;
 use super::aggregate_scalar_state::CmpAny;
 use super::aggregate_scalar_state::CmpMax;
 use super::aggregate_scalar_state::CmpMin;
-use super::aggregate_scalar_state::ScalarState;
-use super::aggregate_scalar_state::ScalarStateFunc;
 use super::aggregate_scalar_state::TYPE_ANY;
 use super::aggregate_scalar_state::TYPE_MAX;
 use super::aggregate_scalar_state::TYPE_MIN;
-use super::StateAddr;
+use super::AggregateUnaryFunction;
+use super::FunctionData;
+use super::UnaryState;
+use crate::aggregates::aggregate_min_max_any_decimal::MinMaxAnyDecimalState;
 use crate::aggregates::assert_unary_arguments;
 use crate::aggregates::AggregateFunction;
 use crate::with_compare_mapped_type;
-use crate::with_simple_no_number_mapped_type;
+use crate::with_simple_no_number_no_string_mapped_type;
 
-#[derive(Clone)]
-pub struct AggregateMinMaxAnyFunction<T, C, State> {
-    display_name: String,
-    data_type: DataType,
-    need_drop: bool,
-    _t: PhantomData<T>,
+#[derive(BorshSerialize, BorshDeserialize)]
+pub struct MinMaxStringState<C>
+where C: ChangeIf<StringType>
+{
+    pub value: Option<String>,
+    #[borsh(skip)]
     _c: PhantomData<C>,
-    _state: PhantomData<State>,
 }
 
-impl<T, C, State> AggregateFunction for AggregateMinMaxAnyFunction<T, C, State>
-where
-    T: ValueType + Send + Sync,
-    C: ChangeIf<T> + Default,
-    State: ScalarStateFunc<T>,
+impl<C> Default for MinMaxStringState<C>
+where C: ChangeIf<StringType> + Default
 {
-    fn name(&self) -> &str {
-        "AggregateMinMaxAnyFunction"
-    }
-
-    fn return_type(&self) -> Result<DataType> {
-        Ok(self.data_type.clone())
-    }
-
-    fn init_state(&self, place: StateAddr) {
-        place.write(|| State::new());
-    }
-
-    fn state_layout(&self) -> Layout {
-        Layout::new::<State>()
-    }
-
-    fn accumulate(
-        &self,
-        place: StateAddr,
-        columns: &[Column],
-        validity: Option<&Bitmap>,
-        _input_rows: usize,
-    ) -> Result<()> {
-        let column = T::try_downcast_column(&columns[0]).unwrap();
-        let state = place.get::<State>();
-        state.add_batch(&column, validity)
-    }
-
-    fn accumulate_keys(
-        &self,
-        places: &[StateAddr],
-        offset: usize,
-        columns: &[Column],
-        _input_rows: usize,
-    ) -> Result<()> {
-        let column = T::try_downcast_column(&columns[0]).unwrap();
-        let column_iter = T::iter_column(&column);
-        column_iter.zip(places.iter()).for_each(|(v, place)| {
-            let addr = place.next(offset);
-            let state = addr.get::<State>();
-            state.add(Some(v.clone()))
-        });
-        Ok(())
-    }
-
-    fn accumulate_row(&self, place: StateAddr, columns: &[Column], row: usize) -> Result<()> {
-        let column = T::try_downcast_column(&columns[0]).unwrap();
-        let v = T::index_column(&column, row);
-        let state = place.get::<State>();
-        state.add(v);
-        Ok(())
-    }
-
-    fn serialize(&self, place: StateAddr, writer: &mut Vec<u8>) -> Result<()> {
-        let state = place.get::<State>();
-        state.serialize(writer)
-    }
-
-    fn deserialize(&self, place: StateAddr, reader: &mut &[u8]) -> Result<()> {
-        let state = place.get::<State>();
-        state.deserialize(reader)
-    }
-
-    fn merge(&self, place: StateAddr, rhs: StateAddr) -> Result<()> {
-        let rhs = rhs.get::<State>();
-        let state = place.get::<State>();
-        state.merge(rhs)
-    }
-
-    fn merge_result(&self, place: StateAddr, builder: &mut ColumnBuilder) -> Result<()> {
-        let state = place.get::<State>();
-        state.merge_result(builder)
-    }
-
-    fn need_manual_drop_state(&self) -> bool {
-        self.need_drop
-    }
-
-    unsafe fn drop_state(&self, place: StateAddr) {
-        let state = place.get::<State>();
-        std::ptr::drop_in_place(state);
-    }
-}
-
-impl<T, C, State> fmt::Display for AggregateMinMaxAnyFunction<T, C, State> {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "{}", self.display_name)
-    }
-}
-
-impl<T, C, State> AggregateMinMaxAnyFunction<T, C, State>
-where
-    T: ValueType + Send + Sync,
-    C: ChangeIf<T> + Default,
-    State: ScalarStateFunc<T>,
-{
-    pub fn try_create(
-        display_name: &str,
-        return_type: DataType,
-        need_drop: bool,
-    ) -> Result<Arc<dyn AggregateFunction>> {
-        let func = AggregateMinMaxAnyFunction::<T, C, State> {
-            display_name: display_name.to_string(),
-            data_type: return_type,
-            need_drop,
-            _t: PhantomData,
+    fn default() -> Self {
+        Self {
+            value: None,
             _c: PhantomData,
-            _state: PhantomData,
-        };
-        Ok(Arc::new(func))
+        }
+    }
+}
+
+impl<C> UnaryState<StringType, StringType> for MinMaxStringState<C>
+where C: ChangeIf<StringType> + Default
+{
+    fn add(
+        &mut self,
+        other: <StringType as ValueType>::ScalarRef<'_>,
+        _function_data: Option<&dyn FunctionData>,
+    ) -> Result<()> {
+        match &self.value {
+            Some(v) => {
+                if C::change_if(&StringType::to_scalar_ref(v), &other) {
+                    self.value = Some(StringType::to_owned_scalar(other));
+                }
+            }
+            None => {
+                self.value = Some(StringType::to_owned_scalar(other));
+            }
+        }
+        Ok(())
+    }
+
+    fn add_batch(
+        &mut self,
+        other: StringColumn,
+        validity: Option<&Bitmap>,
+        function_data: Option<&dyn FunctionData>,
+    ) -> Result<()> {
+        let column_len = StringType::column_len(&other);
+        if column_len == 0 {
+            return Ok(());
+        }
+
+        let column_iter = 0..other.len();
+        if let Some(validity) = validity {
+            if validity.null_count() == column_len {
+                return Ok(());
+            }
+            let v = column_iter
+                .zip(validity)
+                .filter(|(_, valid)| *valid)
+                .map(|(idx, _)| idx)
+                .reduce(|l, r| {
+                    if !C::change_if_ordering(StringColumn::compare(&other, l, &other, r)) {
+                        l
+                    } else {
+                        r
+                    }
+                });
+            if let Some(v) = v {
+                let _ = self.add(other.index(v).unwrap(), function_data);
+            }
+        } else {
+            let v = column_iter.reduce(|l, r| {
+                if !C::change_if_ordering(StringColumn::compare(&other, l, &other, r)) {
+                    l
+                } else {
+                    r
+                }
+            });
+            if let Some(v) = v {
+                let _ = self.add(other.index(v).unwrap(), function_data);
+            }
+        }
+        Ok(())
+    }
+
+    fn merge(&mut self, rhs: &Self) -> Result<()> {
+        if let Some(v) = &rhs.value {
+            self.add(v.as_str(), None)?;
+        }
+        Ok(())
+    }
+
+    fn merge_result(
+        &mut self,
+        builder: &mut <StringType as ValueType>::ColumnBuilder,
+        _function_data: Option<&dyn FunctionData>,
+    ) -> Result<()> {
+        if let Some(v) = &self.value {
+            StringType::push_item(builder, v.as_str());
+        } else {
+            StringType::push_default(builder);
+        }
+        Ok(())
+    }
+}
+
+#[derive(BorshSerialize, BorshDeserialize)]
+pub struct MinMaxAnyState<T, C>
+where
+    T: ValueType,
+    T::Scalar: BorshSerialize + BorshDeserialize,
+{
+    pub value: Option<T::Scalar>,
+    #[borsh(skip)]
+    _c: PhantomData<C>,
+}
+
+impl<T, C> Default for MinMaxAnyState<T, C>
+where
+    T: Send + Sync + ValueType,
+    T::Scalar: BorshSerialize + BorshDeserialize + Send + Sync,
+    C: ChangeIf<T> + Default,
+{
+    fn default() -> Self {
+        Self {
+            value: None,
+            _c: PhantomData,
+        }
+    }
+}
+
+impl<T, C> UnaryState<T, T> for MinMaxAnyState<T, C>
+where
+    T: ValueType + Send + Sync,
+    T::Scalar: BorshSerialize + BorshDeserialize + Send + Sync,
+    C: ChangeIf<T> + Default,
+{
+    fn add(
+        &mut self,
+        other: T::ScalarRef<'_>,
+        _function_data: Option<&dyn FunctionData>,
+    ) -> Result<()> {
+        match &self.value {
+            Some(v) => {
+                if C::change_if(&T::to_scalar_ref(v), &other) {
+                    self.value = Some(T::to_owned_scalar(other));
+                }
+            }
+            None => {
+                self.value = Some(T::to_owned_scalar(other));
+            }
+        }
+        Ok(())
+    }
+
+    fn add_batch(
+        &mut self,
+        other: T::Column,
+        validity: Option<&Bitmap>,
+        function_data: Option<&dyn FunctionData>,
+    ) -> Result<()> {
+        let column_len = T::column_len(&other);
+        if column_len == 0 {
+            return Ok(());
+        }
+
+        let column_iter = T::iter_column(&other);
+        if let Some(v) = validity {
+            if v.true_count() as f64 / v.len() as f64 >= SELECTIVITY_THRESHOLD {
+                let value = column_iter
+                    .zip(v.iter())
+                    .filter(|(_, v)| *v)
+                    .map(|(v, _)| v)
+                    .reduce(|l, r| if !C::change_if(&l, &r) { l } else { r });
+
+                if let Some(value) = value {
+                    self.add(value, function_data)?;
+                }
+            } else {
+                for idx in TrueIdxIter::new(v.len(), Some(v)) {
+                    let v = unsafe { T::index_column_unchecked(&other, idx) };
+                    self.add(v, function_data)?;
+                }
+            };
+        } else {
+            let v = column_iter.reduce(|l, r| if !C::change_if(&l, &r) { l } else { r });
+            if let Some(v) = v {
+                self.add(v, function_data)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn merge(&mut self, rhs: &Self) -> Result<()> {
+        if let Some(v) = &rhs.value {
+            self.add(T::to_scalar_ref(v), None)?;
+        }
+        Ok(())
+    }
+
+    fn merge_result(
+        &mut self,
+        builder: &mut T::ColumnBuilder,
+        _function_data: Option<&dyn FunctionData>,
+    ) -> Result<()> {
+        if let Some(v) = &self.value {
+            T::push_item(builder, T::to_scalar_ref(v));
+        } else {
+            T::push_default(builder);
+        }
+
+        Ok(())
     }
 }
 
 pub fn try_create_aggregate_min_max_any_function<const CMP_TYPE: u8>(
     display_name: &str,
-    _params: Vec<Scalar>,
+    params: Vec<Scalar>,
     argument_types: Vec<DataType>,
 ) -> Result<Arc<dyn AggregateFunction>> {
     assert_unary_arguments(display_name, argument_types.len())?;
@@ -191,23 +279,42 @@ pub fn try_create_aggregate_min_max_any_function<const CMP_TYPE: u8>(
 
     with_compare_mapped_type!(|CMP| match CMP_TYPE {
         CMP => {
-            with_simple_no_number_mapped_type!(|T| match data_type {
+            with_simple_no_number_no_string_mapped_type!(|T| match data_type {
                 DataType::T => {
-                    type State = ScalarState<T, CMP>;
-                    AggregateMinMaxAnyFunction::<T, CMP, State>::try_create(
+                    let return_type = data_type.clone();
+                    let func = AggregateUnaryFunction::<MinMaxAnyState<T, CMP>, T, T>::try_create(
                         display_name,
+                        return_type,
+                        params,
                         data_type,
-                        need_drop,
                     )
+                    .with_need_drop(need_drop);
+
+                    Ok(Arc::new(func))
+                }
+                DataType::String => {
+                    let return_type = data_type.clone();
+                    let func = AggregateUnaryFunction::<
+                        MinMaxStringState<CMP>,
+                        StringType,
+                        StringType,
+                    >::try_create(
+                        display_name, return_type, params, data_type
+                    )
+                    .with_need_drop(need_drop);
+
+                    Ok(Arc::new(func))
                 }
                 DataType::Number(num_type) => {
                     with_number_mapped_type!(|NUM| match num_type {
                         NumberDataType::NUM => {
-                            type State = ScalarState<NumberType<NUM>, CMP>;
-                            AggregateMinMaxAnyFunction::<NumberType<NUM>, CMP, State>::try_create(
-                                display_name,
-                                data_type,
-                                need_drop,
+                            let return_type = data_type.clone();
+                            AggregateUnaryFunction::<
+                                MinMaxAnyState<NumberType<NUM>, CMP>,
+                                NumberType<NUM>,
+                                NumberType<NUM>,
+                            >::try_create_unary(
+                                display_name, return_type, params, data_type
                             )
                         }
                     })
@@ -217,11 +324,13 @@ pub fn try_create_aggregate_min_max_any_function<const CMP_TYPE: u8>(
                         precision: s.precision,
                         scale: s.scale,
                     };
-                    type State = ScalarState<DecimalType<i128>, CMP>;
-                    AggregateMinMaxAnyFunction::<DecimalType<i128>, CMP, State>::try_create(
-                        display_name,
-                        DataType::Decimal(DecimalDataType::from_size(decimal_size)?),
-                        need_drop,
+                    let return_type = DataType::Decimal(DecimalDataType::from_size(decimal_size)?);
+                    AggregateUnaryFunction::<
+                        MinMaxAnyDecimalState<DecimalType<i128>, CMP>,
+                        DecimalType<i128>,
+                        DecimalType<i128>,
+                    >::try_create_unary(
+                        display_name, return_type, params, data_type
                     )
                 }
                 DataType::Decimal(DecimalDataType::Decimal256(s)) => {
@@ -229,20 +338,27 @@ pub fn try_create_aggregate_min_max_any_function<const CMP_TYPE: u8>(
                         precision: s.precision,
                         scale: s.scale,
                     };
-                    type State = ScalarState<DecimalType<i256>, CMP>;
-                    AggregateMinMaxAnyFunction::<DecimalType<i256>, CMP, State>::try_create(
-                        display_name,
-                        DataType::Decimal(DecimalDataType::from_size(decimal_size)?),
-                        need_drop,
+                    let return_type = DataType::Decimal(DecimalDataType::from_size(decimal_size)?);
+                    AggregateUnaryFunction::<
+                        MinMaxAnyDecimalState<DecimalType<i256>, CMP>,
+                        DecimalType<i256>,
+                        DecimalType<i256>,
+                    >::try_create_unary(
+                        display_name, return_type, params, data_type
                     )
                 }
                 _ => {
-                    type State = ScalarState<AnyType, CMP>;
-                    AggregateMinMaxAnyFunction::<AnyType, CMP, State>::try_create(
-                        display_name,
-                        data_type,
-                        need_drop,
+                    let return_type = data_type.clone();
+                    let func = AggregateUnaryFunction::<
+                        MinMaxAnyState<AnyType, CMP>,
+                        AnyType,
+                        AnyType,
+                    >::try_create(
+                        display_name, return_type, params, data_type
                     )
+                    .with_need_drop(need_drop);
+
+                    Ok(Arc::new(func))
                 }
             })
         }

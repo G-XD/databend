@@ -14,9 +14,10 @@
 
 use std::collections::HashMap;
 
-use common_exception::ErrorCode;
-use common_exception::Result;
-use common_expression::Scalar;
+use databend_common_exception::ErrorCode;
+use databend_common_exception::Result;
+use databend_common_expression::Scalar;
+use log::debug;
 
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq)]
 pub struct TableArgs {
@@ -71,11 +72,24 @@ impl TableArgs {
         }
     }
 
+    pub fn expect_all_strings(args: Vec<Scalar>) -> Result<Vec<String>> {
+        args.into_iter()
+            .map(|arg| {
+                let arg = arg
+                    .into_string()
+                    .map_err(|_| ErrorCode::BadArguments("Expected string argument"))?;
+
+                Ok(arg)
+            })
+            .collect::<Result<Vec<_>>>()
+    }
+
     /// Check TableArgs only contain named args.
     ///
     /// Returns the map of named args.
     pub fn expect_all_named(&self, func_name: &str) -> Result<HashMap<String, Scalar>> {
         if !self.positioned.is_empty() {
+            debug!("{:?} accept named args only", self.positioned);
             Err(ErrorCode::BadArguments(format!(
                 "{} accept named args only",
                 func_name

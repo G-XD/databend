@@ -14,24 +14,22 @@
 
 use std::sync::Arc;
 
-use common_catalog::table_context::TableContext;
-use common_exception::ErrorCode;
-use common_exception::Result;
-use common_expression::ComputedExpr;
-use common_expression::DataBlock;
-use common_expression::DataSchemaRef;
-use common_expression::Expr;
-use common_license::license::Feature::ComputedColumn;
-use common_license::license_manager::get_license_manager;
-use common_sql::evaluator::BlockOperator;
-use common_sql::evaluator::CompoundBlockOperator;
-use common_sql::parse_computed_expr;
+use databend_common_catalog::table_context::TableContext;
+use databend_common_exception::ErrorCode;
+use databend_common_exception::Result;
+use databend_common_expression::type_check::check_cast;
+use databend_common_expression::ComputedExpr;
+use databend_common_expression::DataBlock;
+use databend_common_expression::DataSchemaRef;
+use databend_common_expression::Expr;
+use databend_common_functions::BUILTIN_FUNCTIONS;
+use databend_common_license::license::Feature::ComputedColumn;
+use databend_common_license::license_manager::LicenseManagerSwitch;
+use databend_common_pipeline_transforms::processors::Transform;
+use databend_common_sql::evaluator::BlockOperator;
+use databend_common_sql::evaluator::CompoundBlockOperator;
+use databend_common_sql::parse_computed_expr;
 
-use crate::pipelines::processors::port::InputPort;
-use crate::pipelines::processors::port::OutputPort;
-use crate::pipelines::processors::processor::ProcessorPtr;
-use crate::pipelines::processors::transforms::transform::Transform;
-use crate::pipelines::processors::transforms::transform::Transformer;
 use crate::sessions::QueryContext;
 
 pub struct TransformAddComputedColumns {
@@ -42,35 +40,20 @@ pub struct TransformAddComputedColumns {
 impl TransformAddComputedColumns
 where Self: Transform
 {
-    pub fn try_create(
+    pub fn try_new(
         ctx: Arc<QueryContext>,
-        input: Arc<InputPort>,
-        output: Arc<OutputPort>,
         input_schema: DataSchemaRef,
         output_schema: DataSchemaRef,
-    ) -> Result<ProcessorPtr> {
-        let license_manager = get_license_manager();
-        license_manager.manager.check_enterprise_enabled(
-            &ctx.get_settings(),
-            ctx.get_tenant(),
-            ComputedColumn,
-        )?;
+    ) -> Result<Self> {
+        LicenseManagerSwitch::instance()
+            .check_enterprise_enabled(ctx.get_license_key(), ComputedColumn)?;
 
         let mut exprs = Vec::with_capacity(output_schema.fields().len());
         for f in output_schema.fields().iter() {
             let expr = if !input_schema.has_field(f.name()) {
                 if let Some(ComputedExpr::Stored(stored_expr)) = f.computed_expr() {
-                    let mut expr =
-                        parse_computed_expr(ctx.clone(), input_schema.clone(), stored_expr)?;
-                    if expr.data_type() != f.data_type() {
-                        expr = Expr::Cast {
-                            span: None,
-                            is_try: f.data_type().is_nullable(),
-                            expr: Box::new(expr),
-                            dest_type: f.data_type().clone(),
-                        };
-                    }
-                    expr
+                    let expr = parse_computed_expr(ctx.clone(), input_schema.clone(), stored_expr)?;
+                    check_cast(None, false, expr, f.data_type(), &BUILTIN_FUNCTIONS)?
                 } else {
                     return Err(ErrorCode::Internal(
                         "Missed field must be a computed column",
@@ -92,17 +75,16 @@ where Self: Transform
         let func_ctx = ctx.get_function_context()?;
         let expression_transform = CompoundBlockOperator {
             ctx: func_ctx,
-            operators: vec![BlockOperator::Map { exprs }],
+            operators: vec![BlockOperator::Map {
+                exprs,
+                projections: None,
+            }],
         };
 
-        Ok(ProcessorPtr::create(Transformer::create(
-            input,
-            output,
-            Self {
-                expression_transform,
-                input_len: input_schema.num_fields(),
-            },
-        )))
+        Ok(Self {
+            expression_transform,
+            input_len: input_schema.num_fields(),
+        })
     }
 }
 

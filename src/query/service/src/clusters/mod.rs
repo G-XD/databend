@@ -13,8 +13,8 @@
 // limitations under the License.
 
 mod cluster;
-mod metrics;
 
 pub use cluster::Cluster;
 pub use cluster::ClusterDiscovery;
 pub use cluster::ClusterHelper;
+pub use cluster::FlightParams;

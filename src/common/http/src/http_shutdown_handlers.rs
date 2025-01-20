@@ -16,9 +16,10 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use anyerror::AnyError;
-use common_base::base::tokio::sync::broadcast;
-use common_base::base::tokio::sync::oneshot;
-use common_base::base::tokio::task::JoinHandle;
+use databend_common_base::base::tokio;
+use databend_common_base::base::tokio::sync::broadcast;
+use databend_common_base::base::tokio::sync::oneshot;
+use databend_common_base::base::tokio::task::JoinHandle;
 use futures::future::Either;
 use futures::FutureExt;
 use log::error;
@@ -27,7 +28,7 @@ use poem::listener::Acceptor;
 use poem::listener::AcceptorExt;
 use poem::listener::IntoTlsConfigStream;
 use poem::listener::Listener;
-use poem::listener::RustlsConfig;
+use poem::listener::OpensslTlsConfig;
 use poem::listener::TcpListener;
 use poem::Endpoint;
 
@@ -51,7 +52,7 @@ impl HttpShutdownHandler {
     pub async fn start_service(
         &mut self,
         listening: SocketAddr,
-        tls_config: Option<RustlsConfig>,
+        tls_config: Option<OpensslTlsConfig>,
         ep: impl Endpoint + 'static,
         graceful_shutdown_timeout: Option<Duration>,
     ) -> Result<SocketAddr, HttpError> {
@@ -75,16 +76,15 @@ impl HttpShutdownHandler {
                 .into_stream()
                 .map_err(|err| HttpError::TlsConfigError(AnyError::new(&err)))?;
 
-            acceptor = acceptor.rustls(conf_stream).boxed();
+            acceptor = acceptor.openssl_tls(conf_stream).boxed();
         }
 
         let (tx, rx) = oneshot::channel();
-        let join_handle = common_base::base::tokio::spawn(
-            async_backtrace::location!().frame(
-                poem::Server::new_with_acceptor(acceptor)
-                    .name(self.service_name.clone())
-                    .run_with_graceful_shutdown(ep, rx.map(|_| ()), graceful_shutdown_timeout),
-            ),
+        let join_handle = databend_common_base::runtime::spawn(
+            poem::Server::new_with_acceptor(acceptor)
+                .name(self.service_name.clone())
+                .idle_timeout(Duration::from_secs(20))
+                .run_with_graceful_shutdown(ep, rx.map(|_| ()), graceful_shutdown_timeout),
         );
         self.join_handle = Some(join_handle);
         self.abort_handle = Some(tx);
@@ -154,6 +154,12 @@ impl HttpShutdownHandler {
                         "Unexpected error during shutdown Http Server {}. cause {}",
                         self.service_name, error
                     );
+                }
+            }
+
+            if let Some(join_handle) = self.join_handle.take() {
+                if let Err(_err) = tokio::time::timeout(Duration::from_secs(5), join_handle).await {
+                    error!("Timeout during shutdown Http Server {}", self.service_name);
                 }
             }
         } else if let Some(join_handle) = self.join_handle.take() {

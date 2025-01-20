@@ -22,7 +22,7 @@ use serde::Serialize;
 
 use crate::Endpoint;
 
-#[derive(Serialize, Deserialize, Debug, Default, Clone, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Default, Clone, PartialEq, Eq, deepsize::DeepSizeOf)]
 pub struct Node {
     /// Node name for display.
     pub name: String,
@@ -32,8 +32,8 @@ pub struct Node {
 
     /// For backward compatibility, it can not be removed.
     /// 2023-02-09
+    //#[deprecated(note = "it is listening addr, not advertise addr")]
     #[serde(skip)]
-    #[deprecated(note = "it is listening addr, not advertise addr")]
     pub grpc_api_addr: Option<String>,
 
     /// The address `ip:port` for a meta-client to connect to.
@@ -56,7 +56,7 @@ impl Node {
 }
 
 impl fmt::Display for Node {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         let grpc_addr_display = if let Some(grpc_addr) = &self.grpc_api_advertise_address {
             grpc_addr.to_string()
         } else {
@@ -70,30 +70,61 @@ impl fmt::Display for Node {
     }
 }
 
+#[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Default)]
+pub enum NodeType {
+    #[default]
+    SelfManaged,
+    SystemManaged,
+}
+
 /// Query node
 #[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Default)]
 #[serde(default)]
 pub struct NodeInfo {
     pub id: String,
+    pub secret: String,
     pub cpu_nums: u64,
     pub version: u32,
+    pub http_address: String,
     pub flight_address: String,
+    pub discovery_address: String,
     pub binary_version: String,
+    pub node_type: NodeType,
+    pub node_group: Option<String>,
+
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub cluster_id: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub warehouse_id: String,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime_node_group: Option<String>,
 }
 
 impl NodeInfo {
     pub fn create(
         id: String,
+        secret: String,
         cpu_nums: u64,
+        http_address: String,
         flight_address: String,
+        discovery_address: String,
         binary_version: String,
     ) -> NodeInfo {
         NodeInfo {
             id,
+            secret,
             cpu_nums,
             version: 0,
+            http_address,
             flight_address,
+            discovery_address,
             binary_version,
+            cluster_id: "".to_string(),
+            warehouse_id: "".to_string(),
+            node_type: NodeType::SystemManaged,
+            node_group: None,
+            runtime_node_group: None,
         }
     }
 
@@ -101,6 +132,49 @@ impl NodeInfo {
         let addr = SocketAddr::from_str(&self.flight_address)?;
 
         Ok((addr.ip().to_string(), addr.port()))
+    }
+
+    pub fn assigned_warehouse(&self) -> bool {
+        !self.warehouse_id.is_empty() && !self.cluster_id.is_empty()
+    }
+
+    // Unload the warehouse and cluster from the node.
+    // 1. Used when a node is removed from the cluster.
+    // 2. For cluster_node_key: node_info, since its warehouse and cluster are already encoded in the key, we do not need to write the warehouse and cluster into its value again.
+    pub fn unload_warehouse_info(&self) -> NodeInfo {
+        NodeInfo {
+            id: self.id.clone(),
+            secret: self.secret.clone(),
+            cpu_nums: self.cpu_nums,
+            version: self.version,
+            http_address: self.http_address.clone(),
+            flight_address: self.flight_address.clone(),
+            discovery_address: self.discovery_address.clone(),
+            binary_version: self.binary_version.clone(),
+            node_type: self.node_type.clone(),
+            node_group: self.node_group.clone(),
+            cluster_id: String::new(),
+            warehouse_id: String::new(),
+            runtime_node_group: self.runtime_node_group.clone(),
+        }
+    }
+
+    pub fn leave_warehouse(&self) -> NodeInfo {
+        NodeInfo {
+            id: self.id.clone(),
+            secret: self.secret.clone(),
+            cpu_nums: self.cpu_nums,
+            version: self.version,
+            http_address: self.http_address.clone(),
+            flight_address: self.flight_address.clone(),
+            discovery_address: self.discovery_address.clone(),
+            binary_version: self.binary_version.clone(),
+            node_type: self.node_type.clone(),
+            node_group: self.node_group.clone(),
+            cluster_id: String::new(),
+            warehouse_id: String::new(),
+            runtime_node_group: None,
+        }
     }
 }
 

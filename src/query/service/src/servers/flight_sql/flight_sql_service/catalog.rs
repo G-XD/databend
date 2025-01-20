@@ -21,10 +21,10 @@ use arrow_flight::utils::batches_to_flight_data;
 use arrow_schema::DataType;
 use arrow_schema::Field;
 use arrow_schema::Schema;
-use common_catalog::catalog::Catalog;
-use common_catalog::catalog::CatalogManager;
-use common_catalog::table_context::TableContext;
-use common_exception::ErrorCode;
+use databend_common_catalog::catalog::Catalog;
+use databend_common_catalog::catalog::CatalogManager;
+use databend_common_catalog::table_context::TableContext;
+use databend_common_exception::ErrorCode;
 use futures_util::stream;
 use log::warn;
 use tonic::Status;
@@ -37,7 +37,7 @@ impl CatalogInfoProvider {
     fn batch_to_get_stream(batch: RecordBatch) -> Result<DoGetStream, Status> {
         let schema = (*batch.schema()).clone();
         let batches = vec![batch];
-        let flight_data = batches_to_flight_data(schema, batches)
+        let flight_data = batches_to_flight_data(&schema, batches)
             .map_err(|e| Status::internal(format!("{e:?}")))?
             .into_iter()
             .map(Ok);
@@ -49,17 +49,20 @@ impl CatalogInfoProvider {
         ctx: Arc<dyn TableContext>,
         catalog_name: Option<String>,
         database_name: Option<String>,
-    ) -> common_exception::Result<(Vec<String>, Vec<String>, Vec<String>, Vec<String>)> {
+    ) -> databend_common_exception::Result<(Vec<String>, Vec<String>, Vec<String>, Vec<String>)>
+    {
         let tenant = ctx.get_tenant();
         let catalog_mgr = CatalogManager::instance();
         let catalogs: Vec<(String, Arc<dyn Catalog>)> = if let Some(catalog_name) = catalog_name {
             vec![(
                 catalog_name.clone(),
-                catalog_mgr.get_catalog(&tenant, &catalog_name).await?,
+                catalog_mgr
+                    .get_catalog(tenant.tenant_name(), &catalog_name, ctx.session_state())
+                    .await?,
             )]
         } else {
             catalog_mgr
-                .list_catalogs(&tenant)
+                .list_catalogs(&tenant, ctx.session_state())
                 .await?
                 .iter()
                 .map(|r| (r.name(), r.clone()))
@@ -73,14 +76,13 @@ impl CatalogInfoProvider {
         let table_type = "table".to_string();
         for (catalog_name, catalog) in catalogs.into_iter() {
             let dbs = if let Some(database_name) = &database_name {
-                vec![catalog.get_database(tenant.as_str(), database_name).await?]
+                vec![catalog.get_database(&tenant, database_name).await?]
             } else {
-                catalog.list_databases(tenant.as_str()).await?
+                catalog.list_databases(&tenant).await?
             };
             for db in dbs {
-                let db_name = db.name().to_string().into_boxed_str();
-                let db_name: &str = Box::leak(db_name);
-                let tables = match catalog.list_tables(tenant.as_str(), db_name).await {
+                let db_name = db.name();
+                let tables = match catalog.list_tables(&tenant, db_name).await {
                     Ok(tables) => tables,
                     Err(err) if err.code() == ErrorCode::EMPTY_SHARE_ENDPOINT_CONFIG => {
                         warn!("list tables failed on db {}: {}", db.name(), err);

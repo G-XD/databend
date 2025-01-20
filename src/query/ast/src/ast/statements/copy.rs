@@ -14,97 +14,189 @@
 
 use std::collections::BTreeMap;
 use std::collections::HashSet;
+use std::fmt;
 use std::fmt::Display;
 use std::fmt::Formatter;
-use std::io::Error;
-use std::io::ErrorKind;
-use std::io::Result;
+use std::str::FromStr;
 
+use derive_visitor::Drive;
+use derive_visitor::DriveMut;
 use itertools::Itertools;
+use percent_encoding::percent_decode_str;
 use url::Url;
 
-use crate::ast::write_quoted_comma_separated_list;
-use crate::ast::write_space_separated_map;
+use crate::ast::quote::QuotedString;
+use crate::ast::write_comma_separated_map;
+use crate::ast::write_comma_separated_string_list;
+use crate::ast::write_comma_separated_string_map;
 use crate::ast::Hint;
 use crate::ast::Identifier;
 use crate::ast::Query;
-use crate::parser::unescape::escape_at_string;
+use crate::ast::TableRef;
+use crate::ast::With;
+use crate::ParseError;
+use crate::Result;
 
-/// CopyStmt is the parsed statement of `COPY`.
+/// CopyIntoTableStmt is the parsed statement of `COPY into <table> from <location>`.
 ///
 /// ## Examples
 ///
 /// ```sql
 /// COPY INTO table from s3://bucket/path/to/x.csv
 /// ```
-#[derive(Debug, Clone, PartialEq)]
-pub struct CopyStmt {
+#[derive(Debug, Clone, PartialEq, Drive, DriveMut)]
+pub struct CopyIntoTableStmt {
+    pub with: Option<With>,
+    pub src: CopyIntoTableSource,
+    pub dst: TableRef,
+    pub dst_columns: Option<Vec<Identifier>>,
+
     pub hints: Option<Hint>,
-    pub src: CopyUnit,
-    pub dst: CopyUnit,
+
+    pub file_format: FileFormatOptions,
+
+    // files to load
     pub files: Option<Vec<String>>,
-    pub pattern: Option<String>,
-    pub file_format: BTreeMap<String, String>,
-    /// TODO(xuanwo): parse into validation_mode directly.
-    pub validation_mode: String,
-    pub size_limit: usize,
-    pub max_files: usize,
-    pub max_file_size: usize,
-    pub split_size: usize,
-    pub single: bool,
-    pub purge: bool,
-    pub force: bool,
-    pub disable_variant_check: bool,
-    pub on_error: String,
+    pub pattern: Option<LiteralStringOrVariable>,
+
+    pub options: CopyIntoTableOptions,
 }
 
-impl CopyStmt {
-    pub fn apply_option(&mut self, opt: CopyOption) {
+impl CopyIntoTableStmt {
+    pub fn apply_option(
+        &mut self,
+        opt: CopyIntoTableOption,
+    ) -> std::result::Result<(), &'static str> {
         match opt {
-            CopyOption::Files(v) => self.files = Some(v),
-            CopyOption::Pattern(v) => self.pattern = Some(v),
-            CopyOption::FileFormat(v) => self.file_format = v,
-            CopyOption::ValidationMode(v) => self.validation_mode = v,
-            CopyOption::SizeLimit(v) => self.size_limit = v,
-            CopyOption::MaxFiles(v) => self.max_files = v,
-            CopyOption::MaxFileSize(v) => self.max_file_size = v,
-            CopyOption::SplitSize(v) => self.split_size = v,
-            CopyOption::Single(v) => self.single = v,
-            CopyOption::Purge(v) => self.purge = v,
-            CopyOption::Force(v) => self.force = v,
-            CopyOption::DisableVariantCheck(v) => self.disable_variant_check = v,
-            CopyOption::OnError(v) => self.on_error = v,
+            CopyIntoTableOption::Files(v) => self.files = Some(v),
+            CopyIntoTableOption::Pattern(v) => self.pattern = Some(v),
+            CopyIntoTableOption::FileFormat(v) => self.file_format = v,
+            CopyIntoTableOption::SizeLimit(v) => self.options.size_limit = v,
+            CopyIntoTableOption::MaxFiles(v) => self.options.max_files = v,
+            CopyIntoTableOption::SplitSize(v) => self.options.split_size = v,
+            CopyIntoTableOption::Purge(v) => self.options.purge = v,
+            CopyIntoTableOption::Force(v) => self.options.force = v,
+            CopyIntoTableOption::DisableVariantCheck(v) => self.options.disable_variant_check = v,
+            CopyIntoTableOption::ReturnFailedOnly(v) => self.options.return_failed_only = v,
+            CopyIntoTableOption::OnError(v) => self.options.on_error = OnErrorMode::from_str(&v)?,
+            CopyIntoTableOption::ColumnMatchMode(v) => {
+                self.options.column_match_mode = Some(ColumnMatchMode::from_str(&v)?)
+            }
         }
+        Ok(())
     }
 }
 
-impl Display for CopyStmt {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+impl Display for CopyIntoTableStmt {
+    fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
+        if let Some(cte) = &self.with {
+            write!(f, "WITH {} ", cte)?;
+        }
         write!(f, "COPY")?;
         if let Some(hints) = &self.hints {
             write!(f, "{} ", hints)?;
         }
         write!(f, " INTO {}", self.dst)?;
+        if let Some(columns) = &self.dst_columns {
+            write!(f, "({})", columns.iter().map(|c| c.to_string()).join(","))?;
+        }
         write!(f, " FROM {}", self.src)?;
 
         if let Some(files) = &self.files {
             write!(f, " FILES = (")?;
-            write_quoted_comma_separated_list(f, files)?;
+            write_comma_separated_string_list(f, files)?;
             write!(f, " )")?;
         }
 
         if let Some(pattern) = &self.pattern {
-            write!(f, " PATTERN = '{}'", pattern)?;
+            write!(f, " PATTERN = {}", pattern)?;
         }
 
         if !self.file_format.is_empty() {
-            write!(f, " FILE_FORMAT = (")?;
-            for (k, v) in self.file_format.iter() {
-                write!(f, " {} = '{}'", k, v)?;
-            }
-            write!(f, " )")?;
+            write!(f, " FILE_FORMAT = ({})", self.file_format)?;
         }
+        write!(f, " {}", self.options)?;
+        Ok(())
+    }
+}
 
+#[derive(
+    serde::Serialize, serde::Deserialize, Debug, Clone, Default, PartialEq, Drive, DriveMut, Eq,
+)]
+pub struct CopyIntoTableOptions {
+    pub on_error: OnErrorMode,
+    pub size_limit: usize,
+    pub max_files: usize,
+    pub split_size: usize,
+    pub force: bool,
+    pub purge: bool,
+    pub disable_variant_check: bool,
+    pub return_failed_only: bool,
+    pub validation_mode: String,
+    pub column_match_mode: Option<ColumnMatchMode>,
+}
+
+impl CopyIntoTableOptions {
+    fn parse_uint(k: &str, v: &String) -> std::result::Result<usize, String> {
+        usize::from_str(v).map_err(|e| format!("can not parse {}={} as uint: {}", k, v, e))
+    }
+    fn parse_bool(k: &str, v: &String) -> std::result::Result<bool, String> {
+        bool::from_str(v).map_err(|e| format!("can not parse {}={} as bool: {}", k, v, e))
+    }
+
+    pub fn set_column_match_mode(&mut self, mode: ColumnMatchMode) {
+        self.column_match_mode = Some(mode);
+    }
+
+    pub fn apply(
+        &mut self,
+        opts: &BTreeMap<String, String>,
+        ignore_unknown: bool,
+    ) -> std::result::Result<(), String> {
+        if opts.is_empty() {
+            return Ok(());
+        }
+        for (k, v) in opts.iter() {
+            match k.as_str() {
+                "on_error" => {
+                    let on_error = OnErrorMode::from_str(v)?;
+                    self.on_error = on_error;
+                }
+                "column_match_mode" => {
+                    let column_match_mode = ColumnMatchMode::from_str(v)?;
+                    self.column_match_mode = Some(column_match_mode);
+                }
+                "size_limit" => {
+                    self.size_limit = Self::parse_uint(k, v)?;
+                }
+                "max_files" => {
+                    self.max_files = Self::parse_uint(k, v)?;
+                }
+                "split_size" => {
+                    self.split_size = Self::parse_uint(k, v)?;
+                }
+                "purge" => {
+                    self.purge = Self::parse_bool(k, v)?;
+                }
+                "disable_variant_check" => {
+                    self.disable_variant_check = Self::parse_bool(k, v)?;
+                }
+                "return_failed_only" => {
+                    self.return_failed_only = Self::parse_bool(k, v)?;
+                }
+                _ => {
+                    if !ignore_unknown {
+                        return Err(format!("Unknown stage copy option {}", k));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Display for CopyIntoTableOptions {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         if !self.validation_mode.is_empty() {
             write!(f, "VALIDATION_MODE = {}", self.validation_mode)?;
         }
@@ -117,108 +209,144 @@ impl Display for CopyStmt {
             write!(f, " MAX_FILES = {}", self.max_files)?;
         }
 
-        if self.max_file_size != 0 {
-            write!(f, " MAX_FILE_SIZE = {}", self.max_file_size)?;
-        }
-
         if self.split_size != 0 {
             write!(f, " SPLIT_SIZE = {}", self.split_size)?;
         }
 
-        write!(f, " SINGLE = {}", self.single)?;
         write!(f, " PURGE = {}", self.purge)?;
         write!(f, " FORCE = {}", self.force)?;
         write!(f, " DISABLE_VARIANT_CHECK = {}", self.disable_variant_check)?;
-        write!(f, " ON_ERROR = '{}'", self.on_error)?;
+        write!(f, " ON_ERROR = {}", self.on_error)?;
+        write!(f, " RETURN_FAILED_ONLY = {}", self.return_failed_only)?;
+        if let Some(mode) = &self.column_match_mode {
+            write!(f, " COLUMN_MATCH_MODE = {}", mode)?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Drive, DriveMut, Eq)]
+pub struct CopyIntoLocationOptions {
+    pub single: bool,
+    pub max_file_size: usize,
+    pub detailed_output: bool,
+    pub use_raw_path: bool,
+    pub include_query_id: bool,
+    pub overwrite: bool,
+}
+
+impl Default for CopyIntoLocationOptions {
+    fn default() -> Self {
+        Self {
+            single: Default::default(),
+            max_file_size: Default::default(),
+            detailed_output: false,
+            use_raw_path: false,
+            include_query_id: true,
+            overwrite: false,
+        }
+    }
+}
+
+/// CopyIntoLocationStmt is the parsed statement of `COPY into <location>  from <table> ...`
+#[derive(Debug, Clone, PartialEq, Drive, DriveMut)]
+pub struct CopyIntoLocationStmt {
+    pub with: Option<With>,
+    pub hints: Option<Hint>,
+    pub src: CopyIntoLocationSource,
+    pub dst: FileLocation,
+    pub file_format: FileFormatOptions,
+    pub options: CopyIntoLocationOptions,
+}
+
+impl Display for CopyIntoLocationStmt {
+    fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
+        if let Some(cte) = &self.with {
+            write!(f, "WITH {} ", cte)?;
+        }
+        write!(f, "COPY")?;
+        if let Some(hints) = &self.hints {
+            write!(f, "{} ", hints)?;
+        }
+        write!(f, " INTO {}", self.dst)?;
+        write!(f, " FROM {}", self.src)?;
+
+        if !self.file_format.is_empty() {
+            write!(f, " FILE_FORMAT = ({})", self.file_format)?;
+        }
+        write!(f, " SINGLE = {}", self.options.single)?;
+        write!(f, " MAX_FILE_SIZE = {}", self.options.max_file_size)?;
+        write!(f, " DETAILED_OUTPUT = {}", self.options.detailed_output)?;
+        write!(f, " INCLUDE_QUERY_ID = {}", self.options.include_query_id)?;
+        write!(f, " USE_RAW_PATH = {}", self.options.use_raw_path)?;
+        write!(f, " OVERWRITE = {}", self.options.overwrite)?;
 
         Ok(())
     }
 }
 
-/// CopyUnit is the unit that can be used in `COPY`.
-#[derive(Debug, Clone, PartialEq)]
-pub enum CopyUnit {
-    /// Table can be used in `INTO` or `FROM`.
-    ///
-    /// While table used as `FROM`, it will be rewrite as `(SELECT * FROM table)`
-    Table {
-        catalog: Option<Identifier>,
-        database: Option<Identifier>,
-        table: Identifier,
-        columns: Option<Vec<Identifier>>,
-    },
-    /// StageLocation (a.k.a internal and external stage) can be used
-    /// in `INTO` or `FROM`.
-    ///
-    /// For examples:
-    ///
-    /// - internal stage: `@internal_stage/path/to/dir/`
-    /// - external stage: `@s3_external_stage/path/to/dir/`
-    StageLocation(StageLocation),
-    /// UriLocation (a.k.a external location) can be used in `INTO` or `FROM`.
-    ///
-    /// For examples: `'s3://example/path/to/dir' CONNECTION = (AWS_ACCESS_ID="admin" AWS_SECRET_KEY="admin")`
-    UriLocation(UriLocation),
-    /// Query can only be used as `FROM`.
-    ///
-    /// For example:`(SELECT field_a,field_b FROM table)`
-    Query(Box<Query>),
-}
-
-impl CopyUnit {
-    pub fn target(&self) -> &'static str {
-        match self {
-            CopyUnit::Table { .. } => "Table",
-            CopyUnit::StageLocation { .. } => "StageLocation",
-            CopyUnit::UriLocation { .. } => "UriLocation",
-            CopyUnit::Query(_) => "Query",
+impl CopyIntoLocationStmt {
+    pub fn apply_option(&mut self, opt: CopyIntoLocationOption) {
+        match opt {
+            CopyIntoLocationOption::FileFormat(v) => self.file_format = v,
+            CopyIntoLocationOption::Single(v) => self.options.single = v,
+            CopyIntoLocationOption::MaxFileSize(v) => self.options.max_file_size = v,
+            CopyIntoLocationOption::DetailedOutput(v) => self.options.detailed_output = v,
+            CopyIntoLocationOption::IncludeQueryID(v) => self.options.include_query_id = v,
+            CopyIntoLocationOption::UseRawPath(v) => self.options.use_raw_path = v,
+            CopyIntoLocationOption::OverWrite(v) => self.options.overwrite = v,
         }
     }
 }
 
-impl Display for CopyUnit {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+#[derive(Debug, Clone, PartialEq, Drive, DriveMut)]
+pub enum CopyIntoTableSource {
+    Location(FileLocation),
+    /// Load with Transform
+    /// limited to `(SELECT ... FROM <location>)`
+    Query(Box<Query>),
+}
+
+impl Display for CopyIntoTableSource {
+    fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
         match self {
-            CopyUnit::Table {
-                catalog,
-                database,
-                table,
-                columns,
-            } => {
-                let ret = if let Some(catalog) = catalog {
-                    write!(
-                        f,
-                        "{catalog}.{}.{table}",
-                        database.as_ref().expect("database must be valid")
-                    )
-                } else if let Some(database) = database {
-                    write!(f, "{database}.{table}")
-                } else {
-                    write!(f, "{table}")
-                };
-                if let Some(columns) = columns {
-                    write!(f, "({})", columns.iter().map(|c| c.to_string()).join(","))
-                } else {
-                    ret
-                }
-            }
-            CopyUnit::StageLocation(v) => v.fmt(f),
-            CopyUnit::UriLocation(v) => v.fmt(f),
-            CopyUnit::Query(query) => {
+            CopyIntoTableSource::Location(location) => write!(f, "{location}"),
+            CopyIntoTableSource::Query(query) => {
                 write!(f, "({query})")
             }
         }
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Drive, DriveMut)]
+pub enum CopyIntoLocationSource {
+    Query(Box<Query>),
+    /// it will be rewritten as `(SELECT * FROM table)`
+    Table(TableRef),
+}
+
+impl Display for CopyIntoLocationSource {
+    fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
+        match self {
+            CopyIntoLocationSource::Query(query) => {
+                write!(f, "({query})")
+            }
+            CopyIntoLocationSource::Table(table) => {
+                write!(f, "{}", table)
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Drive, DriveMut)]
 pub struct Connection {
+    #[drive(skip)]
     visited_keys: HashSet<String>,
-    conns: BTreeMap<String, String>,
+    pub conns: BTreeMap<String, String>,
 }
 
 impl Connection {
-    fn new(conns: BTreeMap<String, String>) -> Self {
+    pub fn new(conns: BTreeMap<String, String>) -> Self {
         Self {
             visited_keys: HashSet::new(),
             conns,
@@ -227,8 +355,8 @@ impl Connection {
 
     pub fn mask(&self) -> Self {
         let mut conns = BTreeMap::new();
-        for k in self.conns.keys() {
-            conns.insert(k.to_string(), "********".to_string());
+        for (k, v) in &self.conns {
+            conns.insert(k.to_string(), mask_string(v, 3));
         }
         Self {
             visited_keys: self.visited_keys.clone(),
@@ -249,8 +377,8 @@ impl Connection {
             .collect();
 
         if !diffs.is_empty() {
-            return Err(Error::new(
-                ErrorKind::InvalidInput,
+            return Err(ParseError(
+                None,
                 format!(
                     "connection params invalid: expected [{}], got [{}]",
                     self.visited_keys
@@ -267,25 +395,35 @@ impl Connection {
 }
 
 impl Display for Connection {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
         if !self.conns.is_empty() {
             write!(f, " CONNECTION = ( ")?;
-            write_space_separated_map(f, &self.conns)?;
+            write_comma_separated_string_map(f, &self.conns)?;
             write!(f, " )")?;
         }
         Ok(())
     }
 }
 
+/// Mask a string by "******", but keep `unmask_len` of suffix.
+fn mask_string(s: &str, unmask_len: usize) -> String {
+    if s.len() <= unmask_len {
+        s.to_string()
+    } else {
+        let mut ret = "******".to_string();
+        ret.push_str(&s[(s.len() - unmask_len)..]);
+        ret
+    }
+}
+
 /// UriLocation (a.k.a external location) can be used in `INTO` or `FROM`.
 ///
 /// For examples: `'s3://example/path/to/dir' CONNECTION = (AWS_ACCESS_ID="admin" AWS_SECRET_KEY="admin")`
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Drive, DriveMut)]
 pub struct UriLocation {
     pub protocol: String,
     pub name: String,
     pub path: String,
-    pub part_prefix: String,
     pub connection: Connection,
 }
 
@@ -294,36 +432,35 @@ impl UriLocation {
         protocol: String,
         name: String,
         path: String,
-        part_prefix: String,
         conns: BTreeMap<String, String>,
     ) -> Self {
         Self {
             protocol,
             name,
             path,
-            part_prefix,
             connection: Connection::new(conns),
         }
     }
 
-    pub fn from_uri(
-        uri: String,
-        part_prefix: String,
-        conns: BTreeMap<String, String>,
-    ) -> common_exception::Result<Self> {
+    pub fn from_uri(uri: String, conns: BTreeMap<String, String>) -> Result<Self> {
         // fs location is not a valid url, let's check it in advance.
         if let Some(path) = uri.strip_prefix("fs://") {
+            if !path.starts_with('/') {
+                return Err(ParseError(
+                    None,
+                    format!("Invalid uri: {}. fs location must start with 'fs:///'", uri),
+                ));
+            }
             return Ok(UriLocation::new(
                 "fs".to_string(),
                 "".to_string(),
                 path.to_string(),
-                part_prefix,
                 BTreeMap::default(),
             ));
         }
 
-        let parsed = Url::parse(&uri)
-            .map_err(|e| common_exception::ErrorCode::BadArguments(format!("invalid uri {}", e)))?;
+        let parsed =
+            Url::parse(&uri).map_err(|e| ParseError(None, format!("invalid uri {}", e)))?;
 
         let protocol = parsed.scheme().to_string();
 
@@ -336,78 +473,279 @@ impl UriLocation {
                     hostname.to_string()
                 }
             })
-            .ok_or(common_exception::ErrorCode::BadArguments("invalid uri"))?;
+            .ok_or_else(|| ParseError(None, "invalid uri".to_string()))?;
 
         let path = if parsed.path().is_empty() {
             "/".to_string()
         } else {
-            parsed.path().to_string()
+            percent_decode_str(parsed.path())
+                .decode_utf8_lossy()
+                .to_string()
         };
 
         Ok(Self {
             protocol,
             name,
             path,
-            part_prefix,
             connection: Connection::new(conns),
         })
+    }
+
+    pub fn mask(&self) -> Self {
+        Self {
+            connection: self.connection.mask(),
+            ..self.clone()
+        }
     }
 }
 
 impl Display for UriLocation {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
         write!(f, "'{}://{}{}'", self.protocol, self.name, self.path)?;
-        if !self.part_prefix.is_empty() {
-            write!(f, " LOCATION_PREFIX = '{}'", self.part_prefix)?;
-        }
         write!(f, "{}", self.connection)?;
         Ok(())
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StageLocation {
-    pub name: String,
-    pub path: String,
-}
-
-impl Display for StageLocation {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "@{}{}", self.name, escape_at_string(&self.path))
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// StageLocation (a.k.a internal and external stage) can be used
+/// in `INTO` or `FROM`.
+///
+/// For examples:
+///
+/// - internal stage: `@internal_stage/path/to/dir/`
+/// - external stage: `@s3_external_stage/path/to/dir/`
+///
+/// UriLocation (a.k.a external location) can be used in `INTO` or `FROM`.
+///
+/// For examples: `'s3://example/path/to/dir' CONNECTION = (AWS_ACCESS_ID="admin" AWS_SECRET_KEY="admin")`
+#[derive(Debug, Clone, PartialEq, Eq, Drive, DriveMut)]
 pub enum FileLocation {
-    Stage(StageLocation),
-    Uri(String),
+    Stage(String),
+    Uri(UriLocation),
 }
 
 impl Display for FileLocation {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
         match self {
             FileLocation::Uri(loc) => {
-                write!(f, "'{}'", loc)
+                write!(f, "{}", loc)
             }
             FileLocation::Stage(loc) => {
-                write!(f, "{}", loc)
+                write!(f, "'@{}'", loc)
             }
         }
     }
 }
 
-pub enum CopyOption {
+/// Used when we want to allow use variable for options etc.
+/// Other expr is not necessary, because
+/// 1. we can always create a variable that can be used directly.
+/// 2. columns can not be referred.
+///
+/// Can extend to all type of Literals if needed later.
+#[derive(Debug, Clone, PartialEq, Drive, DriveMut)]
+pub enum LiteralStringOrVariable {
+    Literal(String),
+    Variable(String),
+}
+
+impl Display for LiteralStringOrVariable {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LiteralStringOrVariable::Literal(s) => {
+                write!(f, "'{s}'")
+            }
+            LiteralStringOrVariable::Variable(s) => {
+                write!(f, "${s}")
+            }
+        }
+    }
+}
+
+pub enum CopyIntoTableOption {
     Files(Vec<String>),
-    Pattern(String),
-    FileFormat(BTreeMap<String, String>),
-    ValidationMode(String),
+    Pattern(LiteralStringOrVariable),
+    FileFormat(FileFormatOptions),
     SizeLimit(usize),
     MaxFiles(usize),
-    MaxFileSize(usize),
     SplitSize(usize),
-    Single(bool),
     Purge(bool),
     Force(bool),
     DisableVariantCheck(bool),
+    ReturnFailedOnly(bool),
     OnError(String),
+    ColumnMatchMode(String),
+}
+
+pub enum CopyIntoLocationOption {
+    FileFormat(FileFormatOptions),
+    MaxFileSize(usize),
+    Single(bool),
+    IncludeQueryID(bool),
+    UseRawPath(bool),
+    DetailedOutput(bool),
+    OverWrite(bool),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Default, Drive, DriveMut)]
+pub struct FileFormatOptions {
+    pub options: BTreeMap<String, FileFormatValue>,
+}
+
+impl FileFormatOptions {
+    pub fn is_empty(&self) -> bool {
+        self.options.is_empty()
+    }
+}
+
+impl Display for FileFormatOptions {
+    fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
+        write_comma_separated_map(f, &self.options)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Drive, DriveMut)]
+pub enum FileFormatValue {
+    Keyword(String),
+    Bool(bool),
+    U64(u64),
+    String(String),
+    StringList(Vec<String>),
+}
+
+impl FileFormatValue {
+    pub fn to_meta_value(&self) -> String {
+        match self {
+            FileFormatValue::Keyword(v) => v.clone(),
+            FileFormatValue::Bool(v) => v.to_string(),
+            FileFormatValue::U64(v) => v.to_string(),
+            FileFormatValue::String(v) => v.clone(),
+            FileFormatValue::StringList(v) => serde_json::to_string(v).unwrap(),
+        }
+    }
+}
+
+impl Display for FileFormatValue {
+    fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
+        match self {
+            FileFormatValue::Keyword(v) => write!(f, "{v}"),
+            FileFormatValue::Bool(v) => write!(f, "{v}"),
+            FileFormatValue::U64(v) => write!(f, "{v}"),
+            FileFormatValue::String(v) => {
+                write!(f, "{}", QuotedString(v, '\''))
+            }
+            FileFormatValue::StringList(v) => {
+                write!(f, "(")?;
+                for (i, s) in v.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{}", QuotedString(s, '\''))?;
+                }
+                write!(f, ")")
+            }
+        }
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Drive, DriveMut, Eq)]
+pub enum OnErrorMode {
+    Continue,
+    SkipFileNum(u64),
+    AbortNum(u64),
+}
+
+impl Default for OnErrorMode {
+    fn default() -> Self {
+        Self::AbortNum(1)
+    }
+}
+
+impl Display for OnErrorMode {
+    fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
+        match self {
+            OnErrorMode::Continue => {
+                write!(f, "continue")
+            }
+            OnErrorMode::SkipFileNum(n) => {
+                if *n <= 1 {
+                    write!(f, "skipfile")
+                } else {
+                    write!(f, "skipfile_{}", n)
+                }
+            }
+            OnErrorMode::AbortNum(n) => {
+                if *n <= 1 {
+                    write!(f, "abort")
+                } else {
+                    write!(f, "abort_{}", n)
+                }
+            }
+        }
+    }
+}
+
+const ERROR_MODE_MSG: &str =
+    "OnError must one of {{ CONTINUE | SKIP_FILE | SKIP_FILE_<num> | ABORT | ABORT_<num> }}";
+impl FromStr for OnErrorMode {
+    type Err = &'static str;
+
+    fn from_str(s: &str) -> std::result::Result<Self, &'static str> {
+        match s.to_uppercase().as_str() {
+            "" | "ABORT" => Ok(OnErrorMode::AbortNum(1)),
+            "CONTINUE" => Ok(OnErrorMode::Continue),
+            "SKIP_FILE" => Ok(OnErrorMode::SkipFileNum(1)),
+            v => {
+                if v.starts_with("ABORT_") {
+                    let num_str = v.replace("ABORT_", "");
+                    let nums = num_str.parse::<u64>();
+                    match nums {
+                        Ok(n) if n < 1 => Err(ERROR_MODE_MSG),
+                        Ok(n) => Ok(OnErrorMode::AbortNum(n)),
+                        Err(_) => Err(ERROR_MODE_MSG),
+                    }
+                } else {
+                    let num_str = v.replace("SKIP_FILE_", "");
+                    let nums = num_str.parse::<u64>();
+                    match nums {
+                        Ok(n) if n < 1 => Err(ERROR_MODE_MSG),
+                        Ok(n) => Ok(OnErrorMode::SkipFileNum(n)),
+                        Err(_) => Err(ERROR_MODE_MSG),
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Drive, DriveMut, Eq)]
+pub enum ColumnMatchMode {
+    CaseSensitive,
+    CaseInsensitive,
+    Position,
+}
+
+impl Display for ColumnMatchMode {
+    fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
+        match self {
+            ColumnMatchMode::CaseSensitive => write!(f, "CASE_SENSITIVE"),
+            ColumnMatchMode::CaseInsensitive => write!(f, "CASE_INSENSITIVE"),
+            ColumnMatchMode::Position => write!(f, "POSITION"),
+        }
+    }
+}
+
+const COLUMN_MATCH_MODE_MSG: &str =
+    "ColumnMatchMode must be one of {{ CASE_SENSITIVE | CASE_INSENSITIVE | POSITION }}";
+impl FromStr for ColumnMatchMode {
+    type Err = &'static str;
+
+    fn from_str(s: &str) -> std::result::Result<Self, &'static str> {
+        match s.to_uppercase().as_str() {
+            "CASE_SENSITIVE" => Ok(Self::CaseSensitive),
+            "CASE_INSENSITIVE" => Ok(Self::CaseInsensitive),
+            "POSITION" => Ok(Self::Position),
+            _ => Err(COLUMN_MATCH_MODE_MSG),
+        }
+    }
 }

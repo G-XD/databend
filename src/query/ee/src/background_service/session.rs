@@ -14,14 +14,42 @@
 
 use std::sync::Arc;
 
-use common_exception::Result;
+use databend_common_config::InnerConfig;
+use databend_common_exception::Result;
+use databend_common_meta_app::principal::GrantObject;
+use databend_common_meta_app::principal::UserInfo;
+use databend_common_meta_app::principal::UserPrivilegeType;
+use databend_common_users::BUILTIN_ROLE_ACCOUNT_ADMIN;
 use databend_query::sessions::Session;
 use databend_query::sessions::SessionManager;
 use databend_query::sessions::SessionType;
 
-pub async fn create_session() -> Result<Arc<Session>> {
-    let session = SessionManager::instance()
+pub async fn create_session(conf: &InnerConfig) -> Result<Arc<Session>> {
+    let session_manager = SessionManager::instance();
+    let session = session_manager
         .create_session(SessionType::FlightSQL)
         .await?;
+
+    let session = session_manager.register_session(session)?;
+
+    let user = get_background_service_user(conf);
+    session
+        .set_authed_user(user.clone(), Some(BUILTIN_ROLE_ACCOUNT_ADMIN.to_string()))
+        .await?;
     Ok(session)
+}
+
+pub fn get_background_service_user(conf: &InnerConfig) -> UserInfo {
+    let mut user = UserInfo::new_no_auth(
+        format!(
+            "{}-{}-background-svc",
+            conf.query.tenant_id.tenant_name(),
+            conf.query.cluster_id.clone()
+        )
+        .as_str(),
+        "0.0.0.0",
+    );
+    user.grants
+        .grant_privileges(&GrantObject::Global, UserPrivilegeType::Select.into());
+    user
 }

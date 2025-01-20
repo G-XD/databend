@@ -12,14 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use common_exception::Result;
-use common_expression::DataBlock;
+use databend_common_exception::Result;
+use databend_common_expression::DataBlock;
 pub mod csv;
 pub mod json;
 pub mod ndjson;
 pub mod parquet;
 pub mod tsv;
-pub mod values;
 
 pub use csv::CSVOutputFormat;
 pub use csv::CSVWithNamesAndTypesOutputFormat;
@@ -30,7 +29,6 @@ pub use parquet::ParquetOutputFormat;
 pub use tsv::TSVOutputFormat;
 pub use tsv::TSVWithNamesAndTypesOutputFormat;
 pub use tsv::TSVWithNamesOutputFormat;
-pub use values::ValuesOutputFormat;
 
 pub trait OutputFormat: Send {
     fn serialize_block(&mut self, data_block: &DataBlock) -> Result<Vec<u8>>;

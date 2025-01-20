@@ -16,9 +16,9 @@ use std::sync::Arc;
 
 use base64::prelude::BASE64_STANDARD;
 use base64::Engine;
-use common_meta_app::principal::AuthInfo;
-use common_meta_app::principal::UserIdentity;
-use common_users::UserApiProvider;
+use databend_common_meta_app::principal::AuthInfo;
+use databend_common_meta_app::principal::UserIdentity;
+use databend_common_users::UserApiProvider;
 use tonic::metadata::MetadataMap;
 use tonic::Request;
 use tonic::Status;
@@ -89,37 +89,73 @@ impl FlightSqlServiceImpl {
         password: String,
         client_ip: Option<&str>,
     ) -> Result<Arc<Session>, Status> {
-        let session = SessionManager::instance()
+        let user_api = UserApiProvider::instance();
+        let session_manager = SessionManager::instance();
+        let session = session_manager
             .create_session(SessionType::FlightSQL)
             .await
             .map_err(|e| status!("Could not create session", e))?;
+
+        let session = session_manager.register_session(session)?;
+
         let tenant = session.get_current_tenant();
 
         let identity = UserIdentity::new(&user, "%");
-        let user = UserApiProvider::instance()
-            .get_user_with_client_ip(&tenant, identity, client_ip)
+        let mut user = user_api
+            .get_user_with_client_ip(&tenant, identity.clone(), client_ip)
             .await
             .map_err(|e| status!("get_user fail {}", e))?;
+
+        // check global network policy if user is not account admin
+        if !user.is_account_admin() {
+            let global_network_policy = session
+                .get_settings()
+                .get_network_policy()
+                .unwrap_or_default();
+            if !global_network_policy.is_empty() {
+                user_api
+                    .enforce_network_policy(&tenant, &global_network_policy, client_ip)
+                    .await?;
+            }
+        }
+
+        // Check password policy for login
+        let need_change = user_api
+            .check_login_password(&tenant, identity.clone(), &user)
+            .await
+            .map_err(|e| status!("not compliant with password policy {}", e))?;
+
+        if need_change {
+            user.update_auth_need_change_password();
+        }
+
         let password = password.as_bytes().to_vec();
         let password = (!password.is_empty()).then_some(password);
 
-        let user = match &user.auth_info {
-            AuthInfo::None => user,
+        let authed = match &user.auth_info {
+            AuthInfo::None => Ok(()),
             AuthInfo::Password {
                 hash_value: h,
                 hash_method: t,
+                ..
             } => match password {
-                None => return Err(Status::unauthenticated("password required")),
+                None => Err(Status::unauthenticated("password required")),
                 Some(p) => {
                     if *h == t.hash(&p) {
-                        user
+                        Ok(())
                     } else {
-                        return Err(Status::unauthenticated("wrong password"));
+                        Err(Status::unauthenticated("wrong password"))
                     }
                 }
             },
-            _ => return Err(Status::unauthenticated("wrong auth type")),
+            _ => Err(Status::unauthenticated("wrong auth type")),
         };
+
+        user_api
+            .update_user_login_result(tenant, identity, authed.is_ok(), &user)
+            .await?;
+        authed?;
+
         session
             .set_authed_user(user, None)
             .await

@@ -12,29 +12,43 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use common_config::InnerConfig;
-use common_exception::Result;
-use common_license::license_manager::LicenseManager;
+use databend_common_config::InnerConfig;
+use databend_common_exception::Result;
+use databend_common_license::license_manager::LicenseManager;
 
 use crate::aggregating_index::RealAggregatingIndexHandler;
+use crate::attach_table::RealAttachTableHandler;
 use crate::background_service::RealBackgroundService;
 use crate::data_mask::RealDatamaskHandler;
+use crate::fail_safe::RealFailSafeHandler;
+use crate::hilbert_clustering::RealHilbertClusteringHandler;
+use crate::inverted_index::RealInvertedIndexHandler;
 use crate::license::license_mgr::RealLicenseManager;
+use crate::resource_management::init_resources_management;
+use crate::storage_encryption::RealStorageEncryptionHandler;
+use crate::storage_quota::RealStorageQuotaHandler;
 use crate::storages::fuse::operations::RealVacuumHandler;
-use crate::table_lock::RealTableLockHandler;
-use crate::virtual_column::RealVirtualColumnsHandler;
+use crate::stream::RealStreamHandler;
+use crate::virtual_column::RealVirtualColumnHandler;
 
 pub struct EnterpriseServices;
 impl EnterpriseServices {
     #[async_backtrace::framed]
-    pub async fn init(_config: InnerConfig) -> Result<()> {
-        RealLicenseManager::init()?;
+    pub async fn init(cfg: InnerConfig) -> Result<()> {
+        RealLicenseManager::init(cfg.query.tenant_id.tenant_name().to_string())?;
+        RealStorageEncryptionHandler::init(&cfg)?;
         RealVacuumHandler::init()?;
         RealAggregatingIndexHandler::init()?;
-        RealTableLockHandler::init()?;
         RealDatamaskHandler::init()?;
-        RealBackgroundService::init(&_config).await?;
-        RealVirtualColumnsHandler::init()?;
+        RealBackgroundService::init(&cfg).await?;
+        RealVirtualColumnHandler::init()?;
+        RealStreamHandler::init()?;
+        RealAttachTableHandler::init()?;
+        RealInvertedIndexHandler::init()?;
+        RealStorageQuotaHandler::init(&cfg)?;
+        RealFailSafeHandler::init()?;
+        init_resources_management(&cfg).await?;
+        RealHilbertClusteringHandler::init()?;
         Ok(())
     }
 }

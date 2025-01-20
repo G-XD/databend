@@ -14,15 +14,14 @@
 
 use std::sync::Arc;
 
-use common_exception::Result;
-use common_expression::types::number::UInt64Type;
-use common_expression::types::BooleanType;
-use common_expression::types::StringType;
-use common_expression::DataBlock;
-use common_expression::DataSchemaRef;
-use common_expression::FromData;
-use common_sql::plans::ShowRolesPlan;
-use common_storages_fuse::TableContext;
+use databend_common_exception::Result;
+use databend_common_expression::types::number::UInt64Type;
+use databend_common_expression::types::BooleanType;
+use databend_common_expression::types::StringType;
+use databend_common_expression::DataBlock;
+use databend_common_expression::FromData;
+use databend_common_storages_fuse::TableContext;
+use itertools::Itertools;
 use log::debug;
 
 use crate::interpreters::Interpreter;
@@ -32,12 +31,11 @@ use crate::sessions::QueryContext;
 #[derive(Debug)]
 pub struct ShowRolesInterpreter {
     ctx: Arc<QueryContext>,
-    plan: ShowRolesPlan,
 }
 
 impl ShowRolesInterpreter {
-    pub fn try_create(ctx: Arc<QueryContext>, plan: ShowRolesPlan) -> Result<Self> {
-        Ok(ShowRolesInterpreter { ctx, plan })
+    pub fn try_create(ctx: Arc<QueryContext>) -> Result<Self> {
+        Ok(ShowRolesInterpreter { ctx })
     }
 }
 
@@ -47,11 +45,11 @@ impl Interpreter for ShowRolesInterpreter {
         "ShowRolesInterpreter"
     }
 
-    fn schema(&self) -> DataSchemaRef {
-        self.plan.schema()
+    fn is_ddl(&self) -> bool {
+        false
     }
 
-    #[minitrace::trace]
+    #[fastrace::trace]
     #[async_backtrace::framed]
     async fn execute2(&self) -> Result<PipelineBuildResult> {
         debug!("ctx.id" = self.ctx.get_id().as_str(); "show_roles_execute");
@@ -71,13 +69,14 @@ impl Interpreter for ShowRolesInterpreter {
             .cloned()
             .unwrap_or_default();
 
-        let names = roles
-            .iter()
-            .map(|x| x.name.as_bytes().to_vec())
-            .collect::<Vec<_>>();
+        let names = roles.iter().map(|x| x.name.clone()).collect::<Vec<_>>();
         let inherited_roles: Vec<u64> = roles
             .iter()
             .map(|x| x.grants.roles().len() as u64)
+            .collect();
+        let inherited_roles_names: Vec<String> = roles
+            .iter()
+            .map(|x| x.grants.roles().iter().sorted().join(", ").to_string())
             .collect();
         let is_currents: Vec<bool> = roles.iter().map(|r| r.name == current_role_name).collect();
         let is_defaults: Vec<bool> = roles.iter().map(|r| r.name == default_role_name).collect();
@@ -85,6 +84,7 @@ impl Interpreter for ShowRolesInterpreter {
         PipelineBuildResult::from_blocks(vec![DataBlock::new_from_columns(vec![
             StringType::from_data(names),
             UInt64Type::from_data(inherited_roles),
+            StringType::from_data(inherited_roles_names),
             BooleanType::from_data(is_currents),
             BooleanType::from_data(is_defaults),
         ])])

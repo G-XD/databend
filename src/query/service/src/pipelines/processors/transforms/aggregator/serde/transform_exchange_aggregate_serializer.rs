@@ -15,79 +15,109 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use common_exception::Result;
-use common_expression::{BlockMetaInfoDowncast, DataSchemaRef, FromData};
-use common_expression::DataBlock;
-use common_pipeline_core::processors::port::InputPort;
-use common_pipeline_core::processors::port::OutputPort;
-use common_pipeline_core::processors::Processor;
+use arrow_ipc::writer::IpcWriteOptions;
+use arrow_ipc::CompressionType;
+use databend_common_base::base::ProgressValues;
+use databend_common_base::runtime::profile::Profile;
+use databend_common_base::runtime::profile::ProfileStatisticsName;
+use databend_common_catalog::table_context::TableContext;
+use databend_common_exception::Result;
+use databend_common_expression::arrow::serialize_column;
+use databend_common_expression::types::ArgType;
+use databend_common_expression::types::ArrayType;
+use databend_common_expression::types::Int64Type;
+use databend_common_expression::types::UInt64Type;
+use databend_common_expression::types::ValueType;
+use databend_common_expression::BlockMetaInfoDowncast;
+use databend_common_expression::DataBlock;
+use databend_common_expression::DataSchemaRef;
+use databend_common_expression::FromData;
+use databend_common_expression::PartitionedPayload;
+use databend_common_pipeline_core::processors::InputPort;
+use databend_common_pipeline_core::processors::OutputPort;
+use databend_common_pipeline_core::processors::Processor;
+use databend_common_pipeline_transforms::processors::BlockMetaTransform;
+use databend_common_pipeline_transforms::processors::BlockMetaTransformer;
+use databend_common_settings::FlightCompression;
 use futures_util::future::BoxFuture;
-use opendal::Operator;
 use log::info;
-use common_arrow::arrow::io::flight::{default_ipc_fields, WriteOptions};
-use common_arrow::arrow::io::ipc::IpcField;
-use common_base::base::GlobalUniqName;
-use common_expression::arrow::serialize_column;
-use common_expression::types::{ArgType, ArrayType, Int64Type, UInt64Type, ValueType};
-use common_pipeline_transforms::processors::transforms::{BlockMetaTransform, BlockMetaTransformer};
+use opendal::Operator;
 
-use crate::api::{ExchangeShuffleMeta, serialize_block};
-use crate::pipelines::processors::transforms::aggregator::aggregate_meta::{AggregateMeta, HashTablePayload};
-use crate::pipelines::processors::transforms::group_by::{HashMethodBounds, PartitionedHashMethod};
-use crate::pipelines::processors::AggregatorParams;
-use crate::pipelines::processors::transforms::aggregator::serde::transform_aggregate_serializer::{serialize_aggregate, SerializeAggregateStream};
-use crate::pipelines::processors::transforms::aggregator::serde::transform_exchange_group_by_serializer::{FlightSerialized, FlightSerializedMeta};
-use crate::pipelines::processors::transforms::metrics::{metrics_inc_aggregate_spill_data_serialize_milliseconds, metrics_inc_aggregate_spill_write_bytes, metrics_inc_aggregate_spill_write_count, metrics_inc_aggregate_spill_write_milliseconds};
-use common_hashtable::HashtableLike;
-use crate::pipelines::processors::transforms::aggregator::serde::{AggregateSerdeMeta, exchange_defines};
-use crate::pipelines::processors::transforms::aggregator::serde::transform_aggregate_spill_writer::spilling_aggregate_payload as local_spilling_aggregate_payload;
+use super::SerializePayload;
+use crate::pipelines::processors::transforms::aggregator::agg_spilling_aggregate_payload as local_agg_spilling_aggregate_payload;
+use crate::pipelines::processors::transforms::aggregator::aggregate_exchange_injector::compute_block_number;
+use crate::pipelines::processors::transforms::aggregator::aggregate_meta::AggregateMeta;
+use crate::pipelines::processors::transforms::aggregator::exchange_defines;
+use crate::pipelines::processors::transforms::aggregator::AggregateSerdeMeta;
+use crate::pipelines::processors::transforms::aggregator::AggregatorParams;
+use crate::pipelines::processors::transforms::aggregator::FlightSerialized;
+use crate::pipelines::processors::transforms::aggregator::FlightSerializedMeta;
+use crate::pipelines::processors::transforms::aggregator::SerializeAggregateStream;
+use crate::servers::flight::v1::exchange::serde::serialize_block;
+use crate::servers::flight::v1::exchange::ExchangeShuffleMeta;
+use crate::sessions::QueryContext;
+use crate::spillers::Spiller;
+use crate::spillers::SpillerConfig;
+use crate::spillers::SpillerType;
 
-pub struct TransformExchangeAggregateSerializer<Method: HashMethodBounds> {
-    method: Method,
+pub struct TransformExchangeAggregateSerializer {
+    ctx: Arc<QueryContext>,
     local_pos: usize,
-    options: WriteOptions,
-    ipc_fields: Vec<IpcField>,
+    options: IpcWriteOptions,
 
-    operator: Operator,
-    location_prefix: String,
     params: Arc<AggregatorParams>,
+    spiller: Arc<Spiller>,
 }
 
-impl<Method: HashMethodBounds> TransformExchangeAggregateSerializer<Method> {
+impl TransformExchangeAggregateSerializer {
     #[allow(clippy::too_many_arguments)]
-    pub fn create(
+    pub fn try_create(
+        ctx: Arc<QueryContext>,
         input: Arc<InputPort>,
         output: Arc<OutputPort>,
-        method: Method,
+
         operator: Operator,
         location_prefix: String,
         params: Arc<AggregatorParams>,
-        schema: DataSchemaRef,
+        compression: Option<FlightCompression>,
+        _schema: DataSchemaRef,
         local_pos: usize,
-    ) -> Box<dyn Processor> {
-        let arrow_schema = schema.to_arrow();
-        let ipc_fields = default_ipc_fields(&arrow_schema.fields);
-
-        BlockMetaTransformer::create(input, output, TransformExchangeAggregateSerializer::<
-            Method,
-        > {
-            method,
-            params,
-            operator,
+    ) -> Result<Box<dyn Processor>> {
+        let compression = match compression {
+            None => None,
+            Some(compression) => match compression {
+                FlightCompression::Lz4 => Some(CompressionType::LZ4_FRAME),
+                FlightCompression::Zstd => Some(CompressionType::ZSTD),
+            },
+        };
+        let config = SpillerConfig {
+            spiller_type: SpillerType::Aggregation,
             location_prefix,
-            local_pos,
-            ipc_fields,
-            options: WriteOptions { compression: None },
-        })
+            disk_spill: None,
+            use_parquet: ctx.get_settings().get_spilling_file_format()?.is_parquet(),
+        };
+
+        let spiller = Spiller::create(ctx.clone(), operator, config.clone())?;
+        Ok(BlockMetaTransformer::create(
+            input,
+            output,
+            TransformExchangeAggregateSerializer {
+                ctx,
+                params,
+                local_pos,
+                spiller: spiller.into(),
+                options: IpcWriteOptions::default()
+                    .try_with_compression(compression)
+                    .unwrap(),
+            },
+        ))
     }
 }
 
-impl<Method: HashMethodBounds> BlockMetaTransform<ExchangeShuffleMeta>
-    for TransformExchangeAggregateSerializer<Method>
-{
+impl BlockMetaTransform<ExchangeShuffleMeta> for TransformExchangeAggregateSerializer {
     const NAME: &'static str = "TransformExchangeAggregateSerializer";
 
-    fn transform(&mut self, meta: ExchangeShuffleMeta) -> Result<DataBlock> {
+    fn transform(&mut self, meta: ExchangeShuffleMeta) -> Result<Vec<DataBlock>> {
         let mut serialized_blocks = Vec::with_capacity(meta.blocks.len());
         for (index, mut block) in meta.blocks.into_iter().enumerate() {
             if block.is_empty() && block.get_meta().is_none() {
@@ -95,84 +125,84 @@ impl<Method: HashMethodBounds> BlockMetaTransform<ExchangeShuffleMeta>
                 continue;
             }
 
-            match AggregateMeta::<Method, usize>::downcast_from(block.take_meta().unwrap()) {
+            match AggregateMeta::downcast_from(block.take_meta().unwrap()) {
                 None => unreachable!(),
                 Some(AggregateMeta::Spilled(_)) => unreachable!(),
                 Some(AggregateMeta::Serialized(_)) => unreachable!(),
                 Some(AggregateMeta::BucketSpilled(_)) => unreachable!(),
                 Some(AggregateMeta::Partitioned { .. }) => unreachable!(),
-                Some(AggregateMeta::Spilling(payload)) => {
+                Some(AggregateMeta::AggregateSpilling(payload)) => {
                     serialized_blocks.push(FlightSerialized::Future(
                         match index == self.local_pos {
-                            true => local_spilling_aggregate_payload(
-                                self.operator.clone(),
-                                &self.method,
-                                &self.location_prefix,
-                                &self.params,
+                            true => local_agg_spilling_aggregate_payload(
+                                self.ctx.clone(),
+                                self.spiller.clone(),
                                 payload,
                             )?,
-                            false => spilling_aggregate_payload(
-                                self.operator.clone(),
-                                &self.method,
-                                &self.location_prefix,
-                                &self.params,
+                            false => exchange_agg_spilling_aggregate_payload(
+                                self.ctx.clone(),
+                                self.spiller.clone(),
                                 payload,
                             )?,
                         },
                     ));
                 }
 
-                Some(AggregateMeta::HashTable(payload)) => {
+                Some(AggregateMeta::AggregatePayload(p)) => {
+                    let (bucket, max_partition_count) = (p.bucket, p.max_partition_count);
+
                     if index == self.local_pos {
-                        serialized_blocks.push(FlightSerialized::DataBlock(block.add_meta(
-                            Some(Box::new(AggregateMeta::<Method, usize>::HashTable(payload))),
-                        )?));
+                        serialized_blocks.push(FlightSerialized::DataBlock(
+                            block.add_meta(Some(Box::new(AggregateMeta::AggregatePayload(p))))?,
+                        ));
                         continue;
                     }
 
-                    let mut stream =
-                        SerializeAggregateStream::create(&self.method, &self.params, payload);
-                    let bucket = stream.payload.bucket;
-                    serialized_blocks.push(FlightSerialized::DataBlock(match stream.next() {
-                        None => DataBlock::empty(),
-                        Some(data_block) => {
-                            serialize_block(bucket, data_block?, &self.ipc_fields, &self.options)?
-                        }
-                    }));
+                    let block_number = compute_block_number(bucket, max_partition_count)?;
+                    let stream = SerializeAggregateStream::create(
+                        &self.params,
+                        SerializePayload::AggregatePayload(p),
+                    );
+                    let mut stream_blocks = stream.into_iter().collect::<Result<Vec<_>>>()?;
+                    debug_assert!(!stream_blocks.is_empty());
+                    let mut c = DataBlock::concat(&stream_blocks)?;
+                    if let Some(meta) = stream_blocks[0].take_meta() {
+                        c.replace_meta(meta);
+                    }
+                    let c = serialize_block(block_number, c, &self.options)?;
+                    serialized_blocks.push(FlightSerialized::DataBlock(c));
                 }
             };
         }
 
-        Ok(DataBlock::empty_with_meta(FlightSerializedMeta::create(
-            serialized_blocks,
-        )))
+        Ok(vec![DataBlock::empty_with_meta(
+            FlightSerializedMeta::create(serialized_blocks),
+        )])
     }
 }
 
-fn spilling_aggregate_payload<Method: HashMethodBounds>(
-    operator: Operator,
-    method: &Method,
-    location_prefix: &str,
-    params: &Arc<AggregatorParams>,
-    mut payload: HashTablePayload<PartitionedHashMethod<Method>, usize>,
+fn exchange_agg_spilling_aggregate_payload(
+    ctx: Arc<QueryContext>,
+    spiller: Arc<Spiller>,
+    partitioned_payload: PartitionedPayload,
 ) -> Result<BoxFuture<'static, Result<DataBlock>>> {
-    let unique_name = GlobalUniqName::unique();
-    let location = format!("{}/{}", location_prefix, unique_name);
-
+    let partition_count = partitioned_payload.partition_count();
     let mut write_size = 0;
-    let mut write_data = Vec::with_capacity(256);
-    let mut buckets_column_data = Vec::with_capacity(256);
-    let mut data_range_start_column_data = Vec::with_capacity(256);
-    let mut data_range_end_column_data = Vec::with_capacity(256);
-    let mut columns_layout_column_data = Vec::with_capacity(256);
+    let mut write_data = Vec::with_capacity(partition_count);
+    let mut buckets_column_data = Vec::with_capacity(partition_count);
+    let mut data_range_start_column_data = Vec::with_capacity(partition_count);
+    let mut data_range_end_column_data = Vec::with_capacity(partition_count);
+    let mut columns_layout_column_data = Vec::with_capacity(partition_count);
+    // Record how many rows are spilled.
+    let mut rows = 0;
 
-    for (bucket, inner_table) in payload.cell.hashtable.iter_tables_mut().enumerate() {
-        if inner_table.len() == 0 {
+    for (bucket, payload) in partitioned_payload.payloads.into_iter().enumerate() {
+        if payload.len() == 0 {
             continue;
         }
 
-        let now = Instant::now();
-        let data_block = serialize_aggregate(method, params, inner_table)?;
+        let data_block = payload.aggregate_flush_all()?;
+        rows += data_block.num_rows();
 
         let old_write_size = write_size;
         let columns = data_block.columns().to_vec();
@@ -180,18 +210,11 @@ fn spilling_aggregate_payload<Method: HashMethodBounds>(
         let mut columns_layout = Vec::with_capacity(columns.len());
 
         for column in columns.into_iter() {
-            let column = column.value.as_column().unwrap();
-            let column_data = serialize_column(column);
+            let column = column.to_column(data_block.num_rows());
+            let column_data = serialize_column(&column);
             write_size += column_data.len() as u64;
             columns_layout.push(column_data.len() as u64);
             columns_data.push(column_data);
-        }
-
-        // perf
-        {
-            metrics_inc_aggregate_spill_data_serialize_milliseconds(
-                now.elapsed().as_millis() as u64
-            );
         }
 
         write_data.push(columns_data);
@@ -204,23 +227,30 @@ fn spilling_aggregate_payload<Method: HashMethodBounds>(
     Ok(Box::pin(async move {
         if !write_data.is_empty() {
             let instant = Instant::now();
-
-            let mut write_bytes = 0;
-            let mut writer = operator.writer(&location).await?;
-            for write_bucket_data in write_data.into_iter() {
-                for data in write_bucket_data.into_iter() {
-                    write_bytes += data.len();
-                    writer.write(data).await?;
-                }
-            }
-
-            writer.close().await?;
-
+            let (location, write_bytes) = spiller
+                .spill_stream_aggregate_buffer(None, write_data)
+                .await?;
             // perf
             {
-                metrics_inc_aggregate_spill_write_count();
-                metrics_inc_aggregate_spill_write_bytes(write_bytes as u64);
-                metrics_inc_aggregate_spill_write_milliseconds(instant.elapsed().as_millis() as u64);
+                Profile::record_usize_profile(ProfileStatisticsName::RemoteSpillWriteCount, 1);
+                Profile::record_usize_profile(
+                    ProfileStatisticsName::RemoteSpillWriteBytes,
+                    write_bytes,
+                );
+                Profile::record_usize_profile(
+                    ProfileStatisticsName::RemoteSpillWriteTime,
+                    instant.elapsed().as_millis() as usize,
+                );
+            }
+
+            {
+                {
+                    let progress_val = ProgressValues {
+                        rows,
+                        bytes: write_bytes,
+                    };
+                    ctx.get_aggregate_spill_progress().incr(&progress_val);
+                }
             }
 
             info!(
@@ -241,16 +271,16 @@ fn spilling_aggregate_payload<Method: HashMethodBounds>(
                 )),
             ]);
 
-            let data_block = data_block.add_meta(Some(AggregateSerdeMeta::create_spilled(
+            let data_block = data_block.add_meta(Some(AggregateSerdeMeta::create_agg_spilled(
                 -1,
                 location.clone(),
                 0..0,
                 vec![],
+                partition_count,
             )))?;
 
-            let ipc_fields = exchange_defines::spilled_ipc_fields();
             let write_options = exchange_defines::spilled_write_options();
-            return serialize_block(-1, data_block, ipc_fields, write_options);
+            return serialize_block(-1, data_block, &write_options);
         }
 
         Ok(DataBlock::empty())

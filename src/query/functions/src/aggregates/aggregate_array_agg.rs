@@ -15,48 +15,52 @@
 use std::alloc::Layout;
 use std::fmt;
 use std::marker::PhantomData;
+use std::mem;
 use std::sync::Arc;
 
-use common_arrow::arrow::bitmap::Bitmap;
-use common_exception::Result;
-use common_expression::types::decimal::*;
-use common_expression::types::number::*;
-use common_expression::types::DataType;
-use common_expression::types::ValueType;
-use common_expression::types::*;
-use common_expression::with_number_mapped_type;
-use common_expression::Column;
-use common_expression::ColumnBuilder;
-use common_expression::Scalar;
-use common_expression::ScalarRef;
-use common_io::prelude::deserialize_from_slice;
-use common_io::prelude::serialize_into_buf;
+use borsh::BorshDeserialize;
+use borsh::BorshSerialize;
+use databend_common_exception::Result;
+use databend_common_expression::types::decimal::*;
+use databend_common_expression::types::number::*;
+use databend_common_expression::types::Bitmap;
+use databend_common_expression::types::DataType;
+use databend_common_expression::types::ValueType;
+use databend_common_expression::types::*;
+use databend_common_expression::with_number_mapped_type;
+use databend_common_expression::AggrStateRegistry;
+use databend_common_expression::AggrStateType;
+use databend_common_expression::Column;
+use databend_common_expression::ColumnBuilder;
+use databend_common_expression::InputColumns;
+use databend_common_expression::Scalar;
+use databend_common_expression::ScalarRef;
 use ethnum::i256;
-use serde::de::DeserializeOwned;
-use serde::Deserialize;
-use serde::Serialize;
 
 use super::aggregate_function_factory::AggregateFunctionDescription;
 use super::aggregate_scalar_state::ScalarStateFunc;
+use super::borsh_deserialize_state;
+use super::borsh_serialize_state;
 use super::StateAddr;
 use crate::aggregates::assert_unary_arguments;
+use crate::aggregates::AggrState;
+use crate::aggregates::AggrStateLoc;
 use crate::aggregates::AggregateFunction;
 use crate::with_simple_no_number_mapped_type;
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(BorshSerialize, BorshDeserialize, Debug)]
 pub struct ArrayAggState<T>
 where
     T: ValueType,
-    T::Scalar: Serialize + DeserializeOwned,
+    T::Scalar: BorshSerialize + BorshDeserialize,
 {
-    #[serde(bound(deserialize = "T::Scalar: DeserializeOwned"))]
     values: Vec<T::Scalar>,
 }
 
 impl<T> Default for ArrayAggState<T>
 where
     T: ValueType,
-    T::Scalar: Serialize + DeserializeOwned,
+    T::Scalar: BorshSerialize + BorshDeserialize,
 {
     fn default() -> Self {
         Self { values: Vec::new() }
@@ -66,7 +70,7 @@ where
 impl<T> ScalarStateFunc<T> for ArrayAggState<T>
 where
     T: ValueType,
-    T::Scalar: Serialize + DeserializeOwned + Send + Sync,
+    T::Scalar: BorshSerialize + BorshDeserialize + Send + Sync,
 {
     fn new() -> Self {
         Self::default()
@@ -99,11 +103,12 @@ where
         let inner_type = data_type.as_array().unwrap();
 
         let mut inner_builder = ColumnBuilder::with_capacity(inner_type, self.values.len());
-        for value in &self.values {
-            let val = T::upcast_scalar(value.clone());
-            match inner_type.remove_nullable() {
-                DataType::Decimal(decimal_type) => {
-                    let size = decimal_type.size();
+        match inner_type.remove_nullable() {
+            DataType::Decimal(decimal_type) => {
+                let size = decimal_type.size();
+                let values = mem::take(&mut self.values);
+                for value in values.into_iter() {
+                    let val = T::upcast_scalar(value);
                     let decimal_val = val.as_decimal().unwrap();
                     let new_val = match decimal_val {
                         DecimalScalar::Decimal128(v, _) => {
@@ -115,7 +120,11 @@ where
                     };
                     inner_builder.push(new_val);
                 }
-                _ => {
+            }
+            _ => {
+                let values = mem::take(&mut self.values);
+                for value in values.into_iter() {
+                    let val = T::upcast_scalar(value);
                     inner_builder.push(val.as_ref());
                 }
             }
@@ -124,31 +133,21 @@ where
         builder.push(array_value);
         Ok(())
     }
-
-    fn serialize(&self, writer: &mut Vec<u8>) -> Result<()> {
-        serialize_into_buf(writer, self)
-    }
-
-    fn deserialize(&mut self, reader: &mut &[u8]) -> Result<()> {
-        self.values = deserialize_from_slice(reader)?;
-        Ok(())
-    }
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(BorshSerialize, BorshDeserialize, Debug)]
 pub struct NullableArrayAggState<T>
 where
     T: ValueType,
-    T::Scalar: Serialize + DeserializeOwned,
+    T::Scalar: BorshSerialize + BorshDeserialize,
 {
-    #[serde(bound(deserialize = "T::Scalar: DeserializeOwned"))]
     values: Vec<Option<T::Scalar>>,
 }
 
 impl<T> Default for NullableArrayAggState<T>
 where
     T: ValueType,
-    T::Scalar: Serialize + DeserializeOwned,
+    T::Scalar: BorshSerialize + BorshDeserialize,
 {
     fn default() -> Self {
         Self { values: Vec::new() }
@@ -158,7 +157,7 @@ where
 impl<T> ScalarStateFunc<T> for NullableArrayAggState<T>
 where
     T: ValueType,
-    T::Scalar: Serialize + DeserializeOwned + Send + Sync,
+    T::Scalar: BorshSerialize + BorshDeserialize + Send + Sync,
 {
     fn new() -> Self {
         Self::default()
@@ -181,11 +180,17 @@ where
             return Ok(());
         }
         let column_iter = T::iter_column(column);
-        for (val, valid) in column_iter.zip(validity.unwrap().iter()) {
-            if valid {
+        if let Some(validity) = validity {
+            for (val, valid) in column_iter.zip(validity.iter()) {
+                if valid {
+                    self.values.push(Some(T::to_owned_scalar(val)));
+                } else {
+                    self.values.push(None);
+                }
+            }
+        } else {
+            for val in column_iter {
                 self.values.push(Some(T::to_owned_scalar(val)));
-            } else {
-                self.values.push(None);
             }
         }
 
@@ -202,13 +207,13 @@ where
         let inner_type = data_type.as_array().unwrap();
 
         let mut inner_builder = ColumnBuilder::with_capacity(inner_type, self.values.len());
-        for value in &self.values {
-            match value {
-                Some(value) => {
-                    let val = T::upcast_scalar(value.clone());
-                    match inner_type.remove_nullable() {
-                        DataType::Decimal(decimal_type) => {
-                            let size = decimal_type.size();
+        match inner_type.remove_nullable() {
+            DataType::Decimal(decimal_type) => {
+                let size = decimal_type.size();
+                for value in &self.values {
+                    match value {
+                        Some(value) => {
+                            let val = T::upcast_scalar(value.clone());
                             let decimal_val = val.as_decimal().unwrap();
                             let new_val = match decimal_val {
                                 DecimalScalar::Decimal128(v, _) => {
@@ -220,27 +225,28 @@ where
                             };
                             inner_builder.push(new_val);
                         }
-                        _ => {
-                            inner_builder.push(val.as_ref());
+                        None => {
+                            inner_builder.push(ScalarRef::Null);
                         }
                     }
                 }
-                None => {
-                    inner_builder.push(ScalarRef::Null);
+            }
+            _ => {
+                for value in &self.values {
+                    match value {
+                        Some(value) => {
+                            let val = T::upcast_scalar(value.clone());
+                            inner_builder.push(val.as_ref());
+                        }
+                        None => {
+                            inner_builder.push(ScalarRef::Null);
+                        }
+                    }
                 }
             }
         }
         let array_value = ScalarRef::Array(inner_builder.build());
         builder.push(array_value);
-        Ok(())
-    }
-
-    fn serialize(&self, writer: &mut Vec<u8>) -> Result<()> {
-        serialize_into_buf(writer, self)
-    }
-
-    fn deserialize(&mut self, reader: &mut &[u8]) -> Result<()> {
-        self.values = deserialize_from_slice(reader)?;
         Ok(())
     }
 }
@@ -266,18 +272,18 @@ where
         Ok(self.return_type.clone())
     }
 
-    fn init_state(&self, place: StateAddr) {
-        place.write(|| State::new());
+    fn init_state(&self, place: AggrState) {
+        place.write(State::new);
     }
 
-    fn state_layout(&self) -> Layout {
-        Layout::new::<State>()
+    fn register_state(&self, registry: &mut AggrStateRegistry) {
+        registry.register(AggrStateType::Custom(Layout::new::<State>()));
     }
 
     fn accumulate(
         &self,
-        place: StateAddr,
-        columns: &[Column],
+        place: AggrState,
+        columns: InputColumns,
         _validity: Option<&Bitmap>,
         _input_rows: usize,
     ) -> Result<()> {
@@ -297,8 +303,8 @@ where
     fn accumulate_keys(
         &self,
         places: &[StateAddr],
-        offset: usize,
-        columns: &[Column],
+        loc: &[AggrStateLoc],
+        columns: InputColumns,
         _input_rows: usize,
     ) -> Result<()> {
         match &columns[0] {
@@ -308,8 +314,7 @@ where
                 column_iter
                     .zip(nullable_column.validity.iter().zip(places.iter()))
                     .for_each(|(v, (valid, place))| {
-                        let addr = place.next(offset);
-                        let state = addr.get::<State>();
+                        let state = AggrState::new(*place, loc).get::<State>();
                         if valid {
                             state.add(Some(v.clone()))
                         } else {
@@ -321,8 +326,7 @@ where
                 let column = T::try_downcast_column(&columns[0]).unwrap();
                 let column_iter = T::iter_column(&column);
                 column_iter.zip(places.iter()).for_each(|(v, place)| {
-                    let addr = place.next(offset);
-                    let state = addr.get::<State>();
+                    let state = AggrState::new(*place, loc).get::<State>();
                     state.add(Some(v.clone()))
                 });
             }
@@ -331,7 +335,7 @@ where
         Ok(())
     }
 
-    fn accumulate_row(&self, place: StateAddr, columns: &[Column], row: usize) -> Result<()> {
+    fn accumulate_row(&self, place: AggrState, columns: InputColumns, row: usize) -> Result<()> {
         let state = place.get::<State>();
         match &columns[0] {
             Column::Nullable(box nullable_column) => {
@@ -354,23 +358,25 @@ where
         Ok(())
     }
 
-    fn serialize(&self, place: StateAddr, writer: &mut Vec<u8>) -> Result<()> {
+    fn serialize(&self, place: AggrState, writer: &mut Vec<u8>) -> Result<()> {
         let state = place.get::<State>();
-        state.serialize(writer)
+        borsh_serialize_state(writer, state)
     }
 
-    fn deserialize(&self, place: StateAddr, reader: &mut &[u8]) -> Result<()> {
+    fn merge(&self, place: AggrState, reader: &mut &[u8]) -> Result<()> {
         let state = place.get::<State>();
-        state.deserialize(reader)
+        let rhs: State = borsh_deserialize_state(reader)?;
+
+        state.merge(&rhs)
     }
 
-    fn merge(&self, place: StateAddr, rhs: StateAddr) -> Result<()> {
-        let rhs = rhs.get::<State>();
+    fn merge_states(&self, place: AggrState, rhs: AggrState) -> Result<()> {
         let state = place.get::<State>();
-        state.merge(rhs)
+        let other = rhs.get::<State>();
+        state.merge(other)
     }
 
-    fn merge_result(&self, place: StateAddr, builder: &mut ColumnBuilder) -> Result<()> {
+    fn merge_result(&self, place: AggrState, builder: &mut ColumnBuilder) -> Result<()> {
         let state = place.get::<State>();
         state.merge_result(builder)
     }
@@ -379,7 +385,7 @@ where
         true
     }
 
-    unsafe fn drop_state(&self, place: StateAddr) {
+    unsafe fn drop_state(&self, place: AggrState) {
         let state = place.get::<State>();
         std::ptr::drop_in_place(state);
     }
@@ -414,12 +420,12 @@ pub fn try_create_aggregate_array_agg_function(
 ) -> Result<Arc<dyn AggregateFunction>> {
     assert_unary_arguments(display_name, argument_types.len())?;
     let data_type = argument_types[0].clone();
-    let nullable = data_type.is_nullable();
+    let is_nullable = data_type.is_nullable_or_null();
     let return_type = DataType::Array(Box::new(data_type.clone()));
 
     with_simple_no_number_mapped_type!(|T| match data_type.remove_nullable() {
         DataType::T => {
-            if nullable {
+            if is_nullable {
                 type State = NullableArrayAggState<T>;
                 AggregateArrayAggFunction::<T, State>::try_create(display_name, return_type)
             } else {
@@ -430,7 +436,7 @@ pub fn try_create_aggregate_array_agg_function(
         DataType::Number(num_type) => {
             with_number_mapped_type!(|NUM| match num_type {
                 NumberDataType::NUM => {
-                    if nullable {
+                    if is_nullable {
                         type State = NullableArrayAggState<NumberType<NUM>>;
                         AggregateArrayAggFunction::<NumberType<NUM>, State>::try_create(
                             display_name,
@@ -447,7 +453,7 @@ pub fn try_create_aggregate_array_agg_function(
             })
         }
         DataType::Decimal(DecimalDataType::Decimal128(_)) => {
-            if nullable {
+            if is_nullable {
                 type State = NullableArrayAggState<DecimalType<i128>>;
                 AggregateArrayAggFunction::<DecimalType<i128>, State>::try_create(
                     display_name,
@@ -462,7 +468,7 @@ pub fn try_create_aggregate_array_agg_function(
             }
         }
         DataType::Decimal(DecimalDataType::Decimal256(_)) => {
-            if nullable {
+            if is_nullable {
                 type State = NullableArrayAggState<DecimalType<i256>>;
                 AggregateArrayAggFunction::<DecimalType<i256>, State>::try_create(
                     display_name,
@@ -477,7 +483,7 @@ pub fn try_create_aggregate_array_agg_function(
             }
         }
         _ => {
-            if nullable {
+            if is_nullable {
                 type State = NullableArrayAggState<AnyType>;
                 AggregateArrayAggFunction::<AnyType, State>::try_create(display_name, return_type)
             } else {

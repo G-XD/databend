@@ -15,9 +15,9 @@
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
-use common_exception::Result;
-use common_storages_system::ClusteringHistoryLogElement;
-use common_storages_system::ClusteringHistoryQueue;
+use databend_common_exception::Result;
+use databend_common_storages_system::ClusteringHistoryLogElement;
+use databend_common_storages_system::ClusteringHistoryQueue;
 
 use crate::sessions::QueryContext;
 use crate::sessions::TableContext;
@@ -30,7 +30,6 @@ impl InterpreterClusteringHistory {
         start: SystemTime,
         db_name: &str,
         table_name: &str,
-        block_count: u64,
     ) -> Result<()> {
         ClusteringHistoryQueue::instance()?.append_data(ClusteringHistoryLogElement {
             start_time: start
@@ -43,7 +42,6 @@ impl InterpreterClusteringHistory {
                 .as_micros() as i64,
             database: db_name.to_string(),
             table: table_name.to_string(),
-            block_count,
             byte_size: ctx.get_scan_progress_value().bytes as u64,
             row_count: ctx.get_scan_progress_value().rows as u64,
         })

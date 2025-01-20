@@ -10,14 +10,16 @@ runs:
         bypass_env_vars: RUSTFLAGS,RUSTDOCFLAGS,RUST_TEST_THREADS,RUST_LOG,RUST_BACKTRACE
 
     - shell: bash
-      run: cargo test
+      run: |
+        cargo -Zgitoxide=fetch -Zgit=shallow-index,shallow-deps nextest run --no-fail-fast --hide-progress-bar
       env:
-        RUST_TEST_THREADS: "2"
-        RUST_LOG: INFO
-        RUST_BACKTRACE: full
+        RUST_TEST_THREADS: "8"
+        RUST_LOG: ERROR
+        RUST_MIN_STACK: 104857600
+        # RUST_BACKTRACE: 1
 
     - name: Upload failure
-      if: failure() || cancelled()
+      if: failure()
       uses: ./.github/actions/artifact_failure
       with:
         name: test-unit

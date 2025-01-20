@@ -12,16 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use common_exception::Result;
-use common_expression::types::Int32Type;
-use common_expression::DataBlock;
-use common_expression::FromData;
-use common_pipeline_core::processors::connect;
-use common_pipeline_core::processors::port::InputPort;
-use common_pipeline_core::processors::port::OutputPort;
-use common_pipeline_core::processors::processor::Event;
-use common_pipeline_core::processors::DuplicateProcessor;
-use common_pipeline_core::processors::Processor;
+use databend_common_exception::Result;
+use databend_common_expression::types::Int32Type;
+use databend_common_expression::DataBlock;
+use databend_common_expression::FromData;
+use databend_common_pipeline_core::processors::connect;
+use databend_common_pipeline_core::processors::DuplicateProcessor;
+use databend_common_pipeline_core::processors::Event;
+use databend_common_pipeline_core::processors::InputPort;
+use databend_common_pipeline_core::processors::OutputPort;
+use databend_common_pipeline_core::processors::Processor;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn test_duplicate_output_finish() -> Result<()> {
@@ -29,8 +29,11 @@ async fn test_duplicate_output_finish() -> Result<()> {
         let input = InputPort::create();
         let output1 = OutputPort::create();
         let output2 = OutputPort::create();
-        let mut processor =
-            DuplicateProcessor::create(input.clone(), output1.clone(), output2.clone(), false);
+        let mut processor = DuplicateProcessor::create(
+            input.clone(),
+            vec![output1.clone(), output2.clone()],
+            false,
+        );
 
         let upstream_output = OutputPort::create();
         let downstream_input1 = InputPort::create();
@@ -58,7 +61,7 @@ async fn test_duplicate_output_finish() -> Result<()> {
         let output1 = OutputPort::create();
         let output2 = OutputPort::create();
         let mut processor =
-            DuplicateProcessor::create(input.clone(), output1.clone(), output2.clone(), true);
+            DuplicateProcessor::create(input.clone(), vec![output1.clone(), output2.clone()], true);
 
         let upstream_output = OutputPort::create();
         let downstream_input1 = InputPort::create();
@@ -80,8 +83,11 @@ async fn test_duplicate_output_finish() -> Result<()> {
         let input = InputPort::create();
         let output1 = OutputPort::create();
         let output2 = OutputPort::create();
-        let mut processor =
-            DuplicateProcessor::create(input.clone(), output1.clone(), output2.clone(), false);
+        let mut processor = DuplicateProcessor::create(
+            input.clone(),
+            vec![output1.clone(), output2.clone()],
+            false,
+        );
 
         let upstream_output = OutputPort::create();
         let downstream_input1 = InputPort::create();
@@ -107,7 +113,7 @@ async fn test_duplicate_processor() -> Result<()> {
     let output1 = OutputPort::create();
     let output2 = OutputPort::create();
     let mut processor =
-        DuplicateProcessor::create(input.clone(), output1.clone(), output2.clone(), true);
+        DuplicateProcessor::create(input.clone(), vec![output1.clone(), output2.clone()], true);
 
     let upstream_output = OutputPort::create();
     let downstream_input1 = InputPort::create();

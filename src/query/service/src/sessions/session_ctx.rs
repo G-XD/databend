@@ -14,18 +14,24 @@
 
 use std::collections::HashMap;
 use std::collections::HashSet;
-use std::net::SocketAddr;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::sync::Weak;
 
-use common_config::GlobalConfig;
-use common_exception::Result;
-use common_meta_app::principal::RoleInfo;
-use common_meta_app::principal::UserInfo;
-use common_settings::ChangeValue;
-use common_settings::Settings;
+use databend_common_config::GlobalConfig;
+use databend_common_exception::Result;
+use databend_common_expression::Scalar;
+use databend_common_meta_app::principal::RoleInfo;
+use databend_common_meta_app::principal::UserInfo;
+use databend_common_meta_app::tenant::Tenant;
+use databend_common_settings::Settings;
+use databend_storages_common_session::SessionState;
+use databend_storages_common_session::TempTblMgr;
+use databend_storages_common_session::TempTblMgrRef;
+use databend_storages_common_session::TxnManager;
+use databend_storages_common_session::TxnManagerRef;
+use parking_lot::Mutex;
 use parking_lot::RwLock;
 
 use super::SessionType;
@@ -36,38 +42,59 @@ pub struct SessionContext {
     settings: Arc<Settings>,
     current_catalog: RwLock<String>,
     current_database: RwLock<String>,
-    // The current tenant can be determined by databend-query's config file, or by X-DATABEND-TENANT
-    // if it's in management mode. If databend-query is not in management mode, the current tenant
-    // can not be modified at runtime.
-    current_tenant: RwLock<String>,
-    // The current user is determined by the authentication phase on each connection. It will not be
-    // changed during a session.
+
+    /// The current tenant can be determined by databend-query's config file, or by X-DATABEND-TENANT
+    /// if it's in management mode.
+    /// If databend-query is not in management mode, the current tenant can **NOT** be modified at runtime.
+    current_tenant: Option<Tenant>,
+
+    /// The current user is determined by the authentication phase on each connection. It will not be
+    /// changed during a session.
     current_user: RwLock<Option<UserInfo>>,
-    // Each session have a current role which takes effects, the privileges from the user's other
-    // roles will not take effect. The user can switch to another available role by `SET ROLE`.
-    // If the current_role is not set, it takes the user's default role.
+    /// Each session has a current role, by default all the users' granted roles will take effect,
+    /// and the current role will become the owner of the database/table that the user created.
+    /// The user can switch to another available role by `SET ROLE`. If the current_role is not set,
+    /// it takes the user's default role.
     current_role: RwLock<Option<RoleInfo>>,
-    // The role granted to user by external auth provider, when auth_role is provided, the current
-    // user's all other roles are overridden by this role.
+    /// When a user comes from an external authenticator, the session is usually mapped to a single role.
     auth_role: RwLock<Option<String>>,
-    // The client IP from the client.
-    client_host: RwLock<Option<SocketAddr>>,
+    /// To SET SECONDARY ROLES ALL, the session will have all the roles take effect. On the other hand,
+    /// SET SECONDARY ROLES NONE will disable all the roles except the current role.
+    /// By default, the SECONDARY ROLES is ALL, which is None here. There are a few cases that the SECONDARY
+    /// ROLES is preferred to be empty, which is Some([]) here:
+    /// 1. The user comes from an external authenticator, which maps to a single role.
+    /// 2. The role is intentionally restricted by the sql client, to run SQLs with a restricted privileges.
+    secondary_roles: RwLock<Option<Vec<String>>>,
+    /// The client IP from the client.
+    client_host: RwLock<Option<String>>,
     io_shutdown_tx: RwLock<Option<Box<dyn FnOnce() + Send + Sync + 'static>>>,
     query_context_shared: RwLock<Weak<QueryContextShared>>,
-    // We store `query_id -> query_result_cache_key` to session context, so that we can fetch
-    // query result through previous query_id easily.
+    /// We store `query_id -> query_result_cache_key` to session context, so that we can fetch
+    /// query result through previous query_id easily.
     query_ids_results: RwLock<Vec<(String, Option<String>)>>,
+    // Used in set variables inside session
+    variables: Arc<RwLock<HashMap<String, Scalar>>>,
     typ: SessionType,
+    txn_mgr: Mutex<TxnManagerRef>,
+    temp_tbl_mgr: Mutex<TempTblMgrRef>,
+    /// The uniq id for session from the perspective of client.
+    /// for HTTP handler, client session lives longer then the `Session` object, the id is generated in response of /v1/session/login,
+    /// and carried in session and refresh token. If token is not used, client session id is not available,
+    /// some features like temp table will be unavailable.
+    /// for mysql handler: simple use set id of `Session`
+    client_session_id: RwLock<Option<String>>,
+    current_warehouse: RwLock<Option<String>>,
 }
 
 impl SessionContext {
-    pub fn try_create(settings: Arc<Settings>, typ: SessionType) -> Result<Arc<Self>> {
-        Ok(Arc::new(SessionContext {
+    pub fn try_create(settings: Arc<Settings>, typ: SessionType) -> Result<Self> {
+        Ok(SessionContext {
             settings,
             abort: Default::default(),
             current_user: Default::default(),
             current_role: Default::default(),
             auth_role: Default::default(),
+            secondary_roles: Default::default(),
             current_tenant: Default::default(),
             client_host: Default::default(),
             current_catalog: RwLock::new("default".to_string()),
@@ -75,8 +102,13 @@ impl SessionContext {
             io_shutdown_tx: Default::default(),
             query_context_shared: Default::default(),
             query_ids_results: Default::default(),
+            variables: Default::default(),
             typ,
-        }))
+            txn_mgr: Mutex::new(TxnManager::init()),
+            client_session_id: Default::default(),
+            temp_tbl_mgr: Mutex::new(TempTblMgr::init()),
+            current_warehouse: Default::default(),
+        })
     }
 
     // Get abort status.
@@ -91,17 +123,6 @@ impl SessionContext {
 
     pub fn get_settings(&self) -> Arc<Settings> {
         self.settings.clone()
-    }
-
-    pub fn get_changed_settings(&self) -> HashMap<String, ChangeValue> {
-        self.settings.get_changes()
-    }
-
-    pub fn apply_changed_settings(&self, changes: HashMap<String, ChangeValue>) -> Result<()> {
-        unsafe {
-            self.settings.unchecked_apply_changes(changes);
-        }
-        Ok(())
     }
 
     // Get current catalog name.
@@ -140,29 +161,47 @@ impl SessionContext {
         *lock = role
     }
 
-    pub fn get_current_tenant(&self) -> String {
+    pub fn get_auth_role(&self) -> Option<String> {
+        let lock = self.auth_role.read();
+        lock.clone()
+    }
+
+    pub fn set_current_warehouse(&self, w: Option<String>) {
+        let mut lock = self.current_warehouse.write();
+        *lock = w
+    }
+
+    pub fn get_current_warehouse(&self) -> Option<String> {
+        let lock = self.current_warehouse.read();
+        lock.clone()
+    }
+
+    pub fn set_auth_role(&self, role: Option<String>) {
+        let mut lock = self.auth_role.write();
+        *lock = role
+    }
+
+    pub fn get_current_tenant(&self) -> Tenant {
         let conf = GlobalConfig::instance();
 
         if conf.query.internal_enable_sandbox_tenant {
             let sandbox_tenant = self.settings.get_sandbox_tenant().unwrap_or_default();
             if !sandbox_tenant.is_empty() {
-                return sandbox_tenant;
+                return Tenant::new_or_err(sandbox_tenant, "create from sandbox_tenant").unwrap();
             }
         }
 
         if conf.query.management_mode || self.typ == SessionType::Local {
-            let lock = self.current_tenant.read();
-            if !lock.is_empty() {
-                return lock.clone();
+            if let Some(tenant) = &self.current_tenant {
+                return tenant.clone();
             }
         }
 
         conf.query.tenant_id.clone()
     }
 
-    pub fn set_current_tenant(&self, tenant: String) {
-        let mut lock = self.current_tenant.write();
-        *lock = tenant;
+    pub(in crate::sessions) fn set_current_tenant(&mut self, tenant: Tenant) {
+        self.current_tenant = Some(tenant);
     }
 
     // Get current user
@@ -177,23 +216,24 @@ impl SessionContext {
         *lock = Some(user);
     }
 
-    // Get auth role. Auth role is the role granted by authenticator.
-    pub fn get_auth_role(&self) -> Option<String> {
-        let lock = self.auth_role.read();
+    // Get restricted role. Restricted role is the role granted by authenticator, or set
+    // by sql client to restrict its privilege.
+    pub fn get_secondary_roles(&self) -> Option<Vec<String>> {
+        let lock = self.secondary_roles.read();
         lock.clone()
     }
 
-    pub fn set_auth_role(&self, role: Option<String>) {
-        let mut lock = self.auth_role.write();
-        *lock = role;
+    pub fn set_secondary_roles(&self, secondary_roles: Option<Vec<String>>) {
+        let mut lock = self.secondary_roles.write();
+        *lock = secondary_roles;
     }
 
-    pub fn get_client_host(&self) -> Option<SocketAddr> {
+    pub fn get_client_host(&self) -> Option<String> {
         let lock = self.client_host.read();
-        *lock
+        lock.clone()
     }
 
-    pub fn set_client_host(&self, sock: Option<SocketAddr>) {
+    pub fn set_client_host(&self, sock: Option<String>) {
         let mut lock = self.client_host.write();
         *lock = sock
     }
@@ -269,7 +309,7 @@ impl SessionContext {
             index
         };
 
-        if idx < 0 || idx > (query_ids_len - 1) as i32 {
+        if query_ids_len < 1 || idx < 0 || idx > (query_ids_len - 1) as i32 {
             return "".to_string();
         }
 
@@ -279,5 +319,54 @@ impl SessionContext {
     pub fn get_query_id_history(&self) -> HashSet<String> {
         let lock = self.query_ids_results.read();
         HashSet::from_iter(lock.iter().map(|result| result.clone().0))
+    }
+
+    pub fn txn_mgr(&self) -> TxnManagerRef {
+        self.txn_mgr.lock().clone()
+    }
+
+    pub fn temp_tbl_mgr(&self) -> TempTblMgrRef {
+        self.temp_tbl_mgr.lock().clone()
+    }
+
+    pub fn set_txn_mgr(&self, txn_mgr: TxnManagerRef) {
+        *self.txn_mgr.lock() = txn_mgr;
+    }
+
+    pub fn set_temp_tbl_mgr(&self, temp_tbl_mgr: TempTblMgrRef) {
+        *self.temp_tbl_mgr.lock() = temp_tbl_mgr;
+    }
+
+    pub fn set_variable(&self, key: String, value: Scalar) {
+        self.variables.write().insert(key, value);
+    }
+
+    pub fn unset_variable(&self, key: &str) {
+        self.variables.write().remove(key);
+    }
+
+    pub fn get_variable(&self, key: &str) -> Option<Scalar> {
+        self.variables.read().get(key).cloned()
+    }
+    pub fn get_all_variables(&self) -> HashMap<String, Scalar> {
+        self.variables.read().clone()
+    }
+    pub fn set_all_variables(&self, variables: HashMap<String, Scalar>) {
+        *self.variables.write() = variables
+    }
+
+    pub fn session_state(&self) -> SessionState {
+        SessionState {
+            txn_mgr: self.txn_mgr(),
+            temp_tbl_mgr: self.temp_tbl_mgr(),
+        }
+    }
+
+    pub fn get_client_session_id(&self) -> Option<String> {
+        self.client_session_id.read().clone()
+    }
+
+    pub fn set_client_session_id(&mut self, id: String) {
+        *self.client_session_id.write() = Some(id.to_string());
     }
 }

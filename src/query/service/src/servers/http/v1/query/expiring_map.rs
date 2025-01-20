@@ -17,9 +17,9 @@ use std::hash::Hash;
 use std::sync::Arc;
 use std::time::Duration;
 
-use common_base::base::tokio::task;
-use common_base::base::tokio::time::sleep;
 use dashmap::DashMap;
+use databend_common_base::base::tokio::task;
+use databend_common_base::base::tokio::time::sleep;
 
 use crate::servers::http::v1::query::expirable::Expirable;
 use crate::servers::http::v1::query::expirable::ExpiringState;
@@ -101,7 +101,7 @@ where
                 let map_clone = self.map.clone();
                 let v_clone = v.clone();
                 let k_clone = k.clone();
-                let task = task::spawn(async move {
+                let task = databend_common_base::runtime::spawn(async move {
                     if run_check(&v_clone, d).await {
                         Self::remove_inner(&map_clone, &k_clone);
                     }
@@ -114,26 +114,26 @@ where
         self.map.insert(k, i);
     }
 
-    pub fn get<Q: ?Sized>(&self, k: &Q) -> Option<V>
+    pub fn get<Q>(&self, k: &Q) -> Option<V>
     where
         K: Borrow<Q>,
-        Q: Hash + Eq,
+        Q: Hash + Eq + ?Sized,
     {
         self.map.get(k).map(|i| i.value().value.clone())
     }
 
-    pub fn remove<Q: ?Sized>(&mut self, k: &Q)
+    pub fn remove<Q>(&mut self, k: &Q)
     where
         K: Borrow<Q>,
-        Q: Hash + Eq,
+        Q: Hash + Eq + ?Sized,
     {
         Self::remove_inner(&self.map, k)
     }
 
-    fn remove_inner<Q: ?Sized>(map: &Arc<DashMap<K, MaybeExpiring<V>>>, k: &Q)
+    fn remove_inner<Q>(map: &Arc<DashMap<K, MaybeExpiring<V>>>, k: &Q)
     where
         K: Borrow<Q>,
-        Q: Hash + Eq,
+        Q: Hash + Eq + ?Sized,
     {
         let checker = { map.remove(k) };
         if let Some((_, mut checker)) = checker {

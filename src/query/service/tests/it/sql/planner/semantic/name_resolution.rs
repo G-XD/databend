@@ -12,14 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use common_ast::ast::Identifier;
-use common_ast::parser::parse_expr;
-use common_ast::parser::tokenize_sql;
-use common_ast::walk_expr_mut;
-use common_ast::Dialect;
+use databend_common_ast::ast::Identifier;
+use databend_common_ast::parser::parse_expr;
+use databend_common_ast::parser::tokenize_sql;
+use databend_common_ast::parser::Dialect;
 use databend_query::sql::normalize_identifier;
 use databend_query::sql::IdentifierNormalizer;
 use databend_query::sql::NameResolutionContext;
+use derive_visitor::DriveMut;
 
 #[test]
 fn test_normalize_identifier_default() {
@@ -27,12 +27,10 @@ fn test_normalize_identifier_default() {
 
     {
         // Unquoted
-        let ident = Identifier {
-            name: "FooBar 这是一个标识符 これは識別子です Это ИДЕНТификатор Dies ist eine Kennung"
-                .to_string(),
-            quote: None,
-            span: None,
-        };
+        let ident = Identifier::from_name(
+            None,
+            "FooBar 这是一个标识符 これは識別子です Это ИДЕНТификатор Dies ist eine Kennung",
+        );
         let norm_name = normalize_identifier(&ident, &ctx).name;
         assert_eq!(
             norm_name,
@@ -42,12 +40,11 @@ fn test_normalize_identifier_default() {
 
     {
         // Quoted
-        let ident = Identifier {
-            name: "FooBar 这是一个标识符 これは識別子です Это ИДЕНТификатор Dies ist eine Kennung"
-                .to_string(),
-            quote: Some('"'),
-            span: None,
-        };
+        let ident = Identifier::from_name_with_quoted(
+            None,
+            "FooBar 这是一个标识符 これは識別子です Это ИДЕНТификатор Dies ist eine Kennung",
+            Some('"'),
+        );
         let norm_name = normalize_identifier(&ident, &ctx).name;
         assert_eq!(
             norm_name,
@@ -61,16 +58,16 @@ fn test_normalize_identifier_quoted_case_insensitive() {
     let ctx = NameResolutionContext {
         unquoted_ident_case_sensitive: false,
         quoted_ident_case_sensitive: false,
+        deny_column_reference: false,
     };
 
     {
         // Quoted
-        let ident = Identifier {
-            name: "FooBar 这是一个标识符 これは識別子です Это ИДЕНТификатор Dies ist eine Kennung"
-                .to_string(),
-            quote: Some('"'),
-            span: None,
-        };
+        let ident = Identifier::from_name_with_quoted(
+            None,
+            "FooBar 这是一个标识符 これは識別子です Это ИДЕНТификатор Dies ist eine Kennung",
+            Some('"'),
+        );
         let norm_name = normalize_identifier(&ident, &ctx).name;
         assert_eq!(
             norm_name,
@@ -84,16 +81,15 @@ fn test_normalize_identifier_unquoted_case_sensitive() {
     let ctx = NameResolutionContext {
         unquoted_ident_case_sensitive: true,
         quoted_ident_case_sensitive: true,
+        deny_column_reference: false,
     };
 
     {
         // Unquoted
-        let ident = Identifier {
-            name: "FooBar 这是一个标识符 これは識別子です Это ИДЕНТификатор Dies ist eine Kennung"
-                .to_string(),
-            quote: None,
-            span: None,
-        };
+        let ident = Identifier::from_name(
+            None,
+            "FooBar 这是一个标识符 これは識別子です Это ИДЕНТификатор Dies ist eine Kennung",
+        );
         let norm_name = normalize_identifier(&ident, &ctx).name;
         assert_eq!(
             norm_name,
@@ -110,10 +106,10 @@ fn test_normalize_identifiers_in_expr() {
     let ctx = NameResolutionContext::default();
     let mut normalizer = IdentifierNormalizer { ctx: &ctx };
 
-    walk_expr_mut(&mut normalizer, &mut expr);
+    expr.drive_mut(&mut normalizer);
 
     assert_eq!(
         format!("{:#}", expr),
-        "EXISTS (SELECT func((\"T\".a + 1)) AS b)".to_string()
+        "EXISTS (SELECT func(\"T\".a + 1) AS b)".to_string()
     );
 }

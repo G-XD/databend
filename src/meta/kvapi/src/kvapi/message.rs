@@ -12,15 +12,24 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use common_meta_types::Change;
-use common_meta_types::SeqV;
-use common_meta_types::UpsertKV;
+use std::fmt;
+use std::fmt::Formatter;
 
-pub type UpsertKVReq = UpsertKV;
+use databend_common_meta_types::seq_value::SeqV;
+use databend_common_meta_types::Change;
+use databend_common_meta_types::VecDisplay;
 
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct GetKVReq {
     pub key: String,
+}
+
+impl GetKVReq {
+    pub fn new(key: impl ToString) -> Self {
+        Self {
+            key: key.to_string(),
+        }
+    }
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
@@ -28,9 +37,31 @@ pub struct MGetKVReq {
     pub keys: Vec<String>,
 }
 
+impl MGetKVReq {
+    pub fn new<S: ToString>(keys: impl IntoIterator<Item = S>) -> Self {
+        Self {
+            keys: keys.into_iter().map(|x| x.to_string()).collect(),
+        }
+    }
+}
+
+impl fmt::Display for MGetKVReq {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+        write!(f, "{}", VecDisplay::new_at_most(&self.keys, 5))
+    }
+}
+
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct ListKVReq {
     pub prefix: String,
+}
+
+impl ListKVReq {
+    pub fn new(prefix: impl ToString) -> Self {
+        Self {
+            prefix: prefix.to_string(),
+        }
+    }
 }
 
 pub type UpsertKVReply = Change<Vec<u8>>;

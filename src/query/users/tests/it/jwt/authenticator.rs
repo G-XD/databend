@@ -14,9 +14,9 @@
 
 use base64::engine::general_purpose;
 use base64::prelude::*;
-use common_base::base::tokio;
-use common_exception::Result;
-use common_users::JwtAuthenticator;
+use databend_common_base::base::tokio;
+use databend_common_exception::Result;
+use databend_common_users::JwtAuthenticator;
 use jwt_simple::prelude::*;
 use wiremock::matchers::method;
 use wiremock::matchers::path;
@@ -53,7 +53,7 @@ async fn test_parse_non_custom_claim() -> Result<()> {
         .mount(&server)
         .await;
     let first_url = format!("http://{}{}", server.address(), json_path);
-    let auth = JwtAuthenticator::create(first_url, vec![]).unwrap();
+    let auth = JwtAuthenticator::create(first_url, vec![], 600, 10).unwrap();
     let user_name = "test-user2";
     let my_additional_data = MyAdditionalData {
         user_is_admin: false,

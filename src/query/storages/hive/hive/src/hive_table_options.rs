@@ -15,8 +15,8 @@
 use std::collections::BTreeMap;
 use std::convert::TryFrom;
 
-use common_exception::ErrorCode;
-use common_exception::Result;
+use databend_common_exception::ErrorCode;
+use databend_common_exception::Result;
 
 pub const PARTITION_KEYS: &str = "partition_keys";
 pub const LOCATION: &str = "location";
@@ -52,7 +52,11 @@ impl TryFrom<&BTreeMap<String, String>> for HiveTableOptions {
         let partition_keys = options.get(PARTITION_KEYS);
         let partition_keys = if let Some(partition_keys) = partition_keys {
             let a: Vec<String> = partition_keys.split(' ').map(str::to_string).collect();
-            if !a.is_empty() { Some(a) } else { None }
+            if !a.is_empty() {
+                Some(a)
+            } else {
+                None
+            }
         } else {
             None
         };

@@ -15,16 +15,20 @@
 use std::any::Any;
 use std::sync::Arc;
 
-use common_exception::Result;
-use common_expression::DataBlock;
-use common_pipeline_core::processors::port::InputPort;
-use common_pipeline_core::processors::port::OutputPort;
-use common_pipeline_core::processors::processor::Event;
-use common_pipeline_core::processors::Processor;
+use databend_common_exception::Result;
+use databend_common_expression::DataBlock;
+use databend_common_pipeline_core::processors::Event;
+use databend_common_pipeline_core::processors::InputPort;
+use databend_common_pipeline_core::processors::OutputPort;
+use databend_common_pipeline_core::processors::Processor;
 
 #[async_trait::async_trait]
 pub trait AsyncAccumulatingTransform: Send {
     const NAME: &'static str;
+
+    async fn on_start(&mut self) -> Result<()> {
+        Ok(())
+    }
 
     async fn transform(&mut self, data: DataBlock) -> Result<Option<DataBlock>>;
 
@@ -38,6 +42,7 @@ pub struct AsyncAccumulatingTransformer<T: AsyncAccumulatingTransform + 'static>
     input: Arc<InputPort>,
     output: Arc<OutputPort>,
 
+    called_on_start: bool,
     called_on_finish: bool,
     input_data: Option<DataBlock>,
     output_data: Option<DataBlock>,
@@ -51,6 +56,7 @@ impl<T: AsyncAccumulatingTransform + 'static> AsyncAccumulatingTransformer<T> {
             output,
             input_data: None,
             output_data: None,
+            called_on_start: false,
             called_on_finish: false,
         })
     }
@@ -67,6 +73,10 @@ impl<T: AsyncAccumulatingTransform + 'static> Processor for AsyncAccumulatingTra
     }
 
     fn event(&mut self) -> Result<Event> {
+        if !self.called_on_start {
+            return Ok(Event::Async);
+        }
+
         if self.output.is_finished() {
             if !self.called_on_finish {
                 return Ok(Event::Async);
@@ -109,7 +119,14 @@ impl<T: AsyncAccumulatingTransform + 'static> Processor for AsyncAccumulatingTra
         Ok(Event::NeedData)
     }
 
+    #[async_backtrace::framed]
     async fn async_process(&mut self) -> Result<()> {
+        if !self.called_on_start {
+            self.called_on_start = true;
+            self.inner.on_start().await?;
+            return Ok(());
+        }
+
         if let Some(data_block) = self.input_data.take() {
             self.output_data = self.inner.transform(data_block).await?;
             return Ok(());

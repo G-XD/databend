@@ -12,12 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use databend_common_column::types::months_days_micros;
 use enum_as_inner::EnumAsInner;
 
 use crate::types::boolean::BooleanDomain;
 use crate::types::decimal::Decimal128Type;
 use crate::types::decimal::Decimal256Type;
 use crate::types::decimal::DecimalDomain;
+use crate::types::decimal::DecimalScalar;
 use crate::types::nullable::NullableDomain;
 use crate::types::number::NumberDomain;
 use crate::types::number::NumberScalar;
@@ -31,6 +33,7 @@ use crate::types::BooleanType;
 use crate::types::DataType;
 use crate::types::DateType;
 use crate::types::DecimalDataType;
+use crate::types::IntervalType;
 use crate::types::NumberDataType;
 use crate::types::NumberType;
 use crate::types::StringType;
@@ -98,18 +101,19 @@ pub enum Domain {
     String(StringDomain),
     Timestamp(SimpleDomain<i64>),
     Date(SimpleDomain<i32>),
+    Interval(SimpleDomain<months_days_micros>),
     Nullable(NullableDomain<AnyType>),
     /// `Array(None)` means that the array is empty, thus there is no inner domain information.
     Array(Option<Box<Domain>>),
     /// `Map(None)` means that the map is empty, thus there is no inner domain information.
-    Map(Option<(Box<Domain>, Box<Domain>)>),
+    Map(Option<Box<Domain>>),
     Tuple(Vec<Domain>),
     /// For certain types, like `Variant`, the domain is useless therefore is not defined.
     Undefined,
 }
 
 impl<T: ValueType> FunctionDomain<T> {
-    pub fn map<U: ValueType>(self, f: impl FnOnce(T::Domain) -> U::Domain) -> FunctionDomain<U> {
+    pub fn map<U: ValueType>(self, f: impl Fn(T::Domain) -> U::Domain) -> FunctionDomain<U> {
         match self {
             FunctionDomain::MayThrow => FunctionDomain::MayThrow,
             FunctionDomain::Full => FunctionDomain::Full,
@@ -176,6 +180,7 @@ impl Domain {
             },
             DataType::Timestamp => Domain::Timestamp(TimestampType::full_domain()),
             DataType::Date => Domain::Date(DateType::full_domain()),
+            DataType::Interval => Domain::Interval(IntervalType::full_domain()),
             DataType::Null => Domain::Nullable(NullableDomain {
                 has_null: true,
                 value: None,
@@ -190,18 +195,12 @@ impl Domain {
             DataType::EmptyArray => Domain::Array(None),
             DataType::Array(ty) => Domain::Array(Some(Box::new(Domain::full(ty)))),
             DataType::EmptyMap => Domain::Map(None),
-            DataType::Map(box ty) => {
-                let inner_domain = match ty {
-                    DataType::Tuple(inner_tys) => {
-                        let key_domain = Box::new(Domain::full(&inner_tys[0]));
-                        let val_domain = Box::new(Domain::full(&inner_tys[1]));
-                        (key_domain, val_domain)
-                    }
-                    _ => unreachable!(),
-                };
-                Domain::Map(Some(inner_domain))
-            }
-            DataType::Bitmap | DataType::Variant => Domain::Undefined,
+            DataType::Map(ty) => Domain::Map(Some(Box::new(Domain::full(ty)))),
+            DataType::Binary
+            | DataType::Bitmap
+            | DataType::Variant
+            | DataType::Geometry
+            | DataType::Geography => Domain::Undefined,
             DataType::Generic(_) => unreachable!(),
         }
     }
@@ -236,12 +235,12 @@ impl Domain {
                 has_true: this.has_true || other.has_true,
             }),
             (Domain::String(this), Domain::String(other)) => Domain::String(StringDomain {
-                min: this.min.as_slice().min(&other.min).to_vec(),
+                min: this.min.as_str().min(&other.min).to_string(),
                 max: this
                     .max
                     .as_ref()
                     .zip(other.max.as_ref())
-                    .map(|(self_max, other_max)| self_max.max(other_max).to_vec()),
+                    .map(|(self_max, other_max)| self_max.max(other_max).to_string()),
             }),
             (Domain::Timestamp(this), Domain::Timestamp(other)) => {
                 Domain::Timestamp(SimpleDomain {
@@ -250,6 +249,10 @@ impl Domain {
                 })
             }
             (Domain::Date(this), Domain::Date(other)) => Domain::Date(SimpleDomain {
+                min: this.min.min(other.min),
+                max: this.max.max(other.max),
+            }),
+            (Domain::Interval(this), Domain::Interval(other)) => Domain::Interval(SimpleDomain {
                 min: this.min.min(other.min),
                 max: this.max.max(other.max),
             }),
@@ -314,13 +317,9 @@ impl Domain {
             (Domain::Map(None), Domain::Map(None)) => Domain::Map(None),
             (Domain::Map(Some(_)), Domain::Map(None)) => self.clone(),
             (Domain::Map(None), Domain::Map(Some(_))) => other.clone(),
-            (
-                Domain::Map(Some((self_key, self_val))),
-                Domain::Map(Some((other_key, other_val))),
-            ) => Domain::Map(Some((
-                Box::new(self_key.merge(other_key)),
-                Box::new(self_val.merge(other_val)),
-            ))),
+            (Domain::Map(Some(self_arr)), Domain::Map(Some(other_arr))) => {
+                Domain::Map(Some(Box::new(self_arr.merge(other_arr))))
+            }
             (Domain::Tuple(self_tup), Domain::Tuple(other_tup)) => Domain::Tuple(
                 self_tup
                     .iter()
@@ -369,6 +368,16 @@ impl Domain {
             {
                 Some(Scalar::Number(NumberScalar::Float64(*min)))
             }
+            Domain::Decimal(DecimalDomain::Decimal128(SimpleDomain { min, max }, sz))
+                if min == max =>
+            {
+                Some(Scalar::Decimal(DecimalScalar::Decimal128(*min, *sz)))
+            }
+            Domain::Decimal(DecimalDomain::Decimal256(SimpleDomain { min, max }, sz))
+                if min == max =>
+            {
+                Some(Scalar::Decimal(DecimalScalar::Decimal256(*min, *sz)))
+            }
             Domain::Boolean(BooleanDomain {
                 has_false: true,
                 has_true: false,
@@ -384,6 +393,9 @@ impl Domain {
                 Some(Scalar::Timestamp(*min))
             }
             Domain::Date(SimpleDomain { min, max }) if min == max => Some(Scalar::Date(*min)),
+            Domain::Interval(SimpleDomain { min, max }) if min == max => {
+                Some(Scalar::Interval(*min))
+            }
             Domain::Nullable(NullableDomain {
                 has_null: true,
                 value: None,
@@ -410,6 +422,7 @@ pub trait SimpleDomainCmp {
     fn domain_gte(&self, other: &Self) -> FunctionDomain<BooleanType>;
     fn domain_lt(&self, other: &Self) -> FunctionDomain<BooleanType>;
     fn domain_lte(&self, other: &Self) -> FunctionDomain<BooleanType>;
+    fn domain_contains(&self, other: &Self) -> FunctionDomain<BooleanType>;
 }
 
 const ALL_TRUE_DOMAIN: BooleanDomain = BooleanDomain {
@@ -478,36 +491,76 @@ impl<T: Ord + PartialOrd> SimpleDomainCmp for SimpleDomain<T> {
             FunctionDomain::Full
         }
     }
+
+    fn domain_contains(&self, other: &Self) -> FunctionDomain<BooleanType> {
+        if self.min > other.max || self.max < other.min {
+            FunctionDomain::Domain(ALL_FALSE_DOMAIN)
+        } else {
+            FunctionDomain::Full
+        }
+    }
 }
 
 impl SimpleDomainCmp for StringDomain {
     fn domain_eq(&self, other: &Self) -> FunctionDomain<BooleanType> {
-        let (d1, d2) = self.unify(other);
+        let (d1, d2) = unify_string(self, other);
         d1.domain_eq(&d2)
     }
 
     fn domain_noteq(&self, other: &Self) -> FunctionDomain<BooleanType> {
-        let (d1, d2) = self.unify(other);
+        let (d1, d2) = unify_string(self, other);
         d1.domain_noteq(&d2)
     }
 
     fn domain_gt(&self, other: &Self) -> FunctionDomain<BooleanType> {
-        let (d1, d2) = self.unify(other);
+        let (d1, d2) = unify_string(self, other);
         d1.domain_gt(&d2)
     }
 
     fn domain_gte(&self, other: &Self) -> FunctionDomain<BooleanType> {
-        let (d1, d2) = self.unify(other);
+        let (d1, d2) = unify_string(self, other);
         d1.domain_gte(&d2)
     }
 
     fn domain_lt(&self, other: &Self) -> FunctionDomain<BooleanType> {
-        let (d1, d2) = self.unify(other);
+        let (d1, d2) = unify_string(self, other);
         d1.domain_lt(&d2)
     }
 
     fn domain_lte(&self, other: &Self) -> FunctionDomain<BooleanType> {
-        let (d1, d2) = self.unify(other);
+        let (d1, d2) = unify_string(self, other);
         d1.domain_lte(&d2)
     }
+
+    fn domain_contains(&self, other: &Self) -> FunctionDomain<BooleanType> {
+        let (d1, d2) = unify_string(self, other);
+        d1.domain_contains(&d2)
+    }
+}
+
+pub fn unify_string(
+    lhs: &StringDomain,
+    rhs: &StringDomain,
+) -> (SimpleDomain<String>, SimpleDomain<String>) {
+    let mut max = lhs.min.as_str().max(&rhs.min);
+    if let Some(lhs_max) = &lhs.max {
+        max = max.max(lhs_max);
+    }
+    if let Some(rhs_max) = &rhs.max {
+        max = max.max(rhs_max);
+    }
+
+    let mut max = max.to_string();
+    max.push('\0');
+
+    (
+        SimpleDomain {
+            min: lhs.min.clone(),
+            max: lhs.max.clone().unwrap_or_else(|| max.clone()),
+        },
+        SimpleDomain {
+            min: rhs.min.clone(),
+            max: rhs.max.clone().unwrap_or_else(|| max.clone()),
+        },
+    )
 }

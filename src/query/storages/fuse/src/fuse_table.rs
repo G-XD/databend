@@ -15,68 +15,100 @@
 use std::any::Any;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
+use std::collections::HashSet;
+use std::hash::RandomState;
 use std::str;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::time::Instant;
 
-use common_catalog::catalog::StorageDescription;
-use common_catalog::plan::DataSourcePlan;
-use common_catalog::plan::PartStatistics;
-use common_catalog::plan::Partitions;
-use common_catalog::plan::PushDownInfo;
-use common_catalog::table::AppendMode;
-use common_catalog::table::ColumnStatistics;
-use common_catalog::table::ColumnStatisticsProvider;
-use common_catalog::table::CompactTarget;
-use common_catalog::table::NavigationDescriptor;
-use common_catalog::table_context::TableContext;
-use common_exception::ErrorCode;
-use common_exception::Result;
-use common_expression::BlockThresholds;
-use common_expression::ColumnId;
-use common_expression::FieldIndex;
-use common_expression::RemoteExpr;
-use common_expression::TableField;
-use common_io::constants::DEFAULT_BLOCK_BUFFER_SIZE;
-use common_io::constants::DEFAULT_BLOCK_MAX_ROWS;
-use common_meta_app::schema::DatabaseType;
-use common_meta_app::schema::TableInfo;
-use common_meta_app::schema::UpsertTableCopiedFileReq;
-use common_sharing::create_share_table_operator;
-use common_sql::parse_exprs;
-use common_sql::BloomIndexColumns;
-use common_storage::init_operator;
-use common_storage::DataOperator;
-use common_storage::ShareTableConfig;
-use common_storage::StorageMetrics;
-use common_storage::StorageMetricsLayer;
-use log::error;
+use async_channel::Receiver;
+use chrono::Duration;
+use chrono::TimeDelta;
+use databend_common_base::base::tokio;
+use databend_common_base::runtime::GlobalIORuntime;
+use databend_common_catalog::catalog::StorageDescription;
+use databend_common_catalog::plan::DataSourcePlan;
+use databend_common_catalog::plan::PartInfoPtr;
+use databend_common_catalog::plan::PartStatistics;
+use databend_common_catalog::plan::Partitions;
+use databend_common_catalog::plan::PushDownInfo;
+use databend_common_catalog::plan::ReclusterParts;
+use databend_common_catalog::plan::StreamColumn;
+use databend_common_catalog::table::Bound;
+use databend_common_catalog::table::ColumnRange;
+use databend_common_catalog::table::ColumnStatisticsProvider;
+use databend_common_catalog::table::CompactionLimits;
+use databend_common_catalog::table::DistributionLevel;
+use databend_common_catalog::table::NavigationDescriptor;
+use databend_common_catalog::table::TimeNavigation;
+use databend_common_catalog::table_context::AbortChecker;
+use databend_common_catalog::table_context::TableContext;
+use databend_common_exception::ErrorCode;
+use databend_common_exception::Result;
+use databend_common_expression::types::DataType;
+use databend_common_expression::BlockThresholds;
+use databend_common_expression::ColumnId;
+use databend_common_expression::RemoteExpr;
+use databend_common_expression::TableSchema;
+use databend_common_expression::ORIGIN_BLOCK_ID_COL_NAME;
+use databend_common_expression::ORIGIN_BLOCK_ROW_NUM_COL_NAME;
+use databend_common_expression::ORIGIN_VERSION_COL_NAME;
+use databend_common_expression::ROW_VERSION_COL_NAME;
+use databend_common_expression::SEARCH_SCORE_COLUMN_ID;
+use databend_common_io::constants::DEFAULT_BLOCK_BUFFER_SIZE;
+use databend_common_io::constants::DEFAULT_BLOCK_MAX_ROWS;
+use databend_common_meta_app::schema::DatabaseType;
+use databend_common_meta_app::schema::TableInfo;
+use databend_common_meta_app::schema::UpdateStreamMetaReq;
+use databend_common_meta_app::schema::UpsertTableCopiedFileReq;
+use databend_common_pipeline_core::Pipeline;
+use databend_common_sql::binder::STREAM_COLUMN_FACTORY;
+use databend_common_sql::parse_cluster_keys;
+use databend_common_sql::BloomIndexColumns;
+use databend_common_storage::init_operator;
+use databend_common_storage::DataOperator;
+use databend_common_storage::StorageMetrics;
+use databend_common_storage::StorageMetricsLayer;
+use databend_storages_common_cache::LoadParams;
+use databend_storages_common_io::Files;
+use databend_storages_common_table_meta::meta::parse_storage_prefix;
+use databend_storages_common_table_meta::meta::ClusterKey;
+use databend_storages_common_table_meta::meta::CompactSegmentInfo;
+use databend_storages_common_table_meta::meta::SnapshotId;
+use databend_storages_common_table_meta::meta::TableSnapshot;
+use databend_storages_common_table_meta::meta::TableSnapshotStatistics;
+use databend_storages_common_table_meta::meta::Versioned;
+use databend_storages_common_table_meta::table::ChangeType;
+use databend_storages_common_table_meta::table::ClusterType;
+use databend_storages_common_table_meta::table::TableCompression;
+use databend_storages_common_table_meta::table::OPT_KEY_BLOOM_INDEX_COLUMNS;
+use databend_storages_common_table_meta::table::OPT_KEY_CHANGE_TRACKING;
+use databend_storages_common_table_meta::table::OPT_KEY_CLUSTER_TYPE;
+use databend_storages_common_table_meta::table::OPT_KEY_LEGACY_SNAPSHOT_LOC;
+use databend_storages_common_table_meta::table::OPT_KEY_SNAPSHOT_LOCATION;
+use databend_storages_common_table_meta::table::OPT_KEY_SNAPSHOT_LOCATION_FIXED_FLAG;
+use databend_storages_common_table_meta::table::OPT_KEY_STORAGE_FORMAT;
+use databend_storages_common_table_meta::table::OPT_KEY_TABLE_ATTACHED_DATA_URI;
+use databend_storages_common_table_meta::table::OPT_KEY_TABLE_COMPRESSION;
+use futures_util::TryStreamExt;
+use log::info;
 use log::warn;
 use opendal::Operator;
-use storages_common_cache::LoadParams;
-use storages_common_table_meta::meta::ClusterKey;
-use storages_common_table_meta::meta::ColumnStatistics as FuseColumnStatistics;
-use storages_common_table_meta::meta::SnapshotId;
-use storages_common_table_meta::meta::Statistics as FuseStatistics;
-use storages_common_table_meta::meta::TableSnapshot;
-use storages_common_table_meta::meta::TableSnapshotStatistics;
-use storages_common_table_meta::meta::Versioned;
-use storages_common_table_meta::table::table_storage_prefix;
-use storages_common_table_meta::table::TableCompression;
-use storages_common_table_meta::table::OPT_KEY_BLOOM_INDEX_COLUMNS;
-use storages_common_table_meta::table::OPT_KEY_DATABASE_ID;
-use storages_common_table_meta::table::OPT_KEY_LEGACY_SNAPSHOT_LOC;
-use storages_common_table_meta::table::OPT_KEY_SNAPSHOT_LOCATION;
-use storages_common_table_meta::table::OPT_KEY_STORAGE_FORMAT;
-use storages_common_table_meta::table::OPT_KEY_STORAGE_PREFIX;
-use storages_common_table_meta::table::OPT_KEY_TABLE_COMPRESSION;
-use uuid::Uuid;
+use parking_lot::Mutex;
 
+use crate::fuse_column::FuseTableColumnStatisticsProvider;
+use crate::fuse_type::FuseTableType;
 use crate::io::MetaReaders;
+use crate::io::SegmentsIO;
 use crate::io::TableMetaLocationGenerator;
+use crate::io::TableSnapshotReader;
 use crate::io::WriteSettings;
-use crate::pipelines::Pipeline;
-use crate::table_functions::unwrap_tuple;
+use crate::operations::ChangesDesc;
+use crate::operations::TruncateMode;
+use crate::statistics::reduce_block_statistics;
+use crate::statistics::Trim;
+use crate::FuseStorageFormat;
 use crate::NavigationPoint;
 use crate::Table;
 use crate::TableStatistics;
@@ -85,6 +117,7 @@ use crate::DEFAULT_ROW_PER_PAGE;
 use crate::DEFAULT_ROW_PER_PAGE_FOR_BLOCKING;
 use crate::FUSE_OPT_KEY_BLOCK_IN_MEM_SIZE_THRESHOLD;
 use crate::FUSE_OPT_KEY_BLOCK_PER_SEGMENT;
+use crate::FUSE_OPT_KEY_DATA_RETENTION_PERIOD_IN_HOURS;
 use crate::FUSE_OPT_KEY_ROW_PER_BLOCK;
 use crate::FUSE_OPT_KEY_ROW_PER_PAGE;
 use crate::FUSE_TBL_LAST_SNAPSHOT_HINT;
@@ -101,33 +134,70 @@ pub struct FuseTable {
 
     pub(crate) operator: Operator,
     pub(crate) data_metrics: Arc<StorageMetrics>,
+
+    table_type: FuseTableType,
+
+    // If this is set, reading from fuse_table should only return the increment blocks
+    pub(crate) changes_desc: Option<ChangesDesc>,
+
+    pub(crate) pruned_result_receiver: Arc<Mutex<PartInfoReceiver>>,
 }
+
+type PartInfoReceiver = Option<Receiver<Result<PartInfoPtr>>>;
+
+// default schema refreshing timeout is 5 seconds.
+const DEFAULT_SCHEMA_REFRESHING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 impl FuseTable {
     pub fn try_create(table_info: TableInfo) -> Result<Box<dyn Table>> {
-        Ok(Self::do_create(table_info)?)
+        Ok(Self::do_create_table_ext(table_info, false)?)
     }
 
     pub fn do_create(table_info: TableInfo) -> Result<Box<FuseTable>> {
-        let storage_prefix = Self::parse_storage_prefix(&table_info)?;
-        let cluster_key_meta = table_info.meta.cluster_key();
+        Self::do_create_table_ext(table_info, true)
+    }
 
-        let mut operator = match table_info.db_type.clone() {
-            DatabaseType::ShareDB(share_ident) => create_share_table_operator(
-                ShareTableConfig::share_endpoint_address(),
-                ShareTableConfig::share_endpoint_token(),
-                &share_ident.tenant,
-                &share_ident.share_name,
-                &table_info.name,
-            ),
+    pub fn try_create_ext(table_info: TableInfo, disable_refresh: bool) -> Result<Box<dyn Table>> {
+        Ok(Self::do_create_table_ext(table_info, disable_refresh)?)
+    }
+
+    pub fn do_create_table_ext(
+        mut table_info: TableInfo,
+        disable_refresh: bool,
+    ) -> Result<Box<FuseTable>> {
+        let storage_prefix = Self::parse_storage_prefix_from_table_info(&table_info)?;
+        let cluster_key_meta = table_info.cluster_key();
+        let (mut operator, table_type) = match table_info.db_type.clone() {
             DatabaseType::NormalDB => {
                 let storage_params = table_info.meta.storage_params.clone();
                 match storage_params {
-                    Some(sp) => Ok(init_operator(&sp)?),
-                    None => Ok(DataOperator::instance().operator()),
+                    // External or attached table.
+                    Some(sp) => {
+                        let table_meta_options = &table_info.meta.options;
+                        let operator = init_operator(&sp)?;
+                        let table_type = if Self::is_table_attached(table_meta_options) {
+                            if !disable_refresh {
+                                Self::refresh_table_info(
+                                    &mut table_info,
+                                    &operator,
+                                    &storage_prefix,
+                                )?;
+                            }
+                            FuseTableType::Attached
+                        } else {
+                            FuseTableType::External
+                        };
+
+                        (operator, table_type)
+                    }
+                    // Normal table.
+                    None => {
+                        let operator = DataOperator::instance().operator();
+                        (operator, FuseTableType::Standard)
+                    }
                 }
             }
-        }?;
+        };
 
         let data_metrics = Arc::new(StorageMetrics::default());
         operator = operator.layer(StorageMetricsLayer::new(data_metrics.clone()));
@@ -150,10 +220,13 @@ impl FuseTable {
             .and_then(|s| s.parse::<BloomIndexColumns>().ok())
             .unwrap_or(BloomIndexColumns::All);
 
-        let part_prefix = table_info.meta.part_prefix.clone();
+        if !table_info.meta.part_prefix.is_empty() {
+            return Err(ErrorCode::StorageOther(
+                "Location_prefix no longer supported. The last version that supports it is: https://github.com/databendlabs/databend/releases/tag/v1.2.653-nightly",
+            ));
+        }
 
-        let meta_location_generator =
-            TableMetaLocationGenerator::with_prefix(storage_prefix).with_part_prefix(part_prefix);
+        let meta_location_generator = TableMetaLocationGenerator::with_prefix(storage_prefix);
 
         Ok(Box::new(FuseTable {
             table_info,
@@ -164,6 +237,9 @@ impl FuseTable {
             data_metrics,
             storage_format: FuseStorageFormat::from_str(storage_format.as_str())?,
             table_compression: table_compression.as_str().try_into()?,
+            table_type,
+            changes_desc: None,
+            pruned_result_receiver: Arc::new(Mutex::new(None)),
         }))
     }
 
@@ -184,7 +260,7 @@ impl FuseTable {
     }
 
     pub fn get_write_settings(&self) -> WriteSettings {
-        let default_rows_per_page = if self.operator.info().can_blocking() {
+        let default_rows_per_page = if self.operator.info().native_capability().blocking {
             DEFAULT_ROW_PER_PAGE_FOR_BLOCKING
         } else {
             DEFAULT_ROW_PER_PAGE
@@ -210,43 +286,21 @@ impl FuseTable {
         }
     }
 
-    pub fn parse_storage_prefix(table_info: &TableInfo) -> Result<String> {
-        // if OPT_KE_STORAGE_PREFIX is specified, use it as storage prefix
-        if let Some(prefix) = table_info.options().get(OPT_KEY_STORAGE_PREFIX) {
-            return Ok(prefix.clone());
-        }
-
-        // otherwise, use database id and table id as storage prefix
-
-        let table_id = table_info.ident.table_id;
-        let db_id = table_info
-            .options()
-            .get(OPT_KEY_DATABASE_ID)
-            .ok_or_else(|| {
-                ErrorCode::Internal(format!(
-                    "Invalid fuse table, table option {} not found",
-                    OPT_KEY_DATABASE_ID
-                ))
-            })?;
-        Ok(table_storage_prefix(db_id, table_id))
+    pub fn parse_storage_prefix_from_table_info(table_info: &TableInfo) -> Result<String> {
+        parse_storage_prefix(table_info.options(), table_info.ident.table_id)
     }
-
-    pub fn table_snapshot_statistics_format_version(&self, location: &String) -> u64 {
-        TableMetaLocationGenerator::snapshot_version(location)
-    }
-
-    #[minitrace::trace]
+    #[fastrace::trace]
     #[async_backtrace::framed]
-    pub(crate) async fn read_table_snapshot_statistics(
+    pub async fn read_table_snapshot_statistics(
         &self,
         snapshot: Option<&Arc<TableSnapshot>>,
     ) -> Result<Option<Arc<TableSnapshotStatistics>>> {
         match snapshot {
             Some(snapshot) => {
                 if let Some(loc) = &snapshot.table_statistics_location {
-                    let ver = self.table_snapshot_statistics_format_version(loc);
                     let reader = MetaReaders::table_snapshot_statistics_reader(self.get_operator());
 
+                    let ver = TableMetaLocationGenerator::table_statistics_version(loc);
                     let load_params = LoadParams {
                         location: loc.clone(),
                         len_hint: None,
@@ -263,14 +317,32 @@ impl FuseTable {
         }
     }
 
-    #[minitrace::trace]
+    #[fastrace::trace]
     #[async_backtrace::framed]
     pub async fn read_table_snapshot(&self) -> Result<Option<Arc<TableSnapshot>>> {
-        if let Some(loc) = self.snapshot_loc().await? {
-            let reader = MetaReaders::table_snapshot_reader(self.get_operator());
-            let ver = self.snapshot_format_version(Some(loc.clone())).await?;
+        let reader = MetaReaders::table_snapshot_reader(self.get_operator());
+        let loc = self.snapshot_loc();
+        let ver = self.snapshot_format_version(loc.clone())?;
+        Self::read_table_snapshot_with_reader(reader, loc, ver).await
+    }
+
+    #[fastrace::trace]
+    #[async_backtrace::framed]
+    pub async fn read_table_snapshot_without_cache(&self) -> Result<Option<Arc<TableSnapshot>>> {
+        let reader = MetaReaders::table_snapshot_reader_without_cache(self.get_operator());
+        let loc = self.snapshot_loc();
+        let ver = self.snapshot_format_version(loc.clone())?;
+        Self::read_table_snapshot_with_reader(reader, loc, ver).await
+    }
+
+    async fn read_table_snapshot_with_reader(
+        reader: TableSnapshotReader,
+        snapshot_location: Option<String>,
+        ver: u64,
+    ) -> Result<Option<Arc<TableSnapshot>>> {
+        if let Some(location) = snapshot_location {
             let params = LoadParams {
-                location: loc,
+                location,
                 len_hint: None,
                 ver,
                 put_cache: true,
@@ -282,44 +354,26 @@ impl FuseTable {
     }
 
     #[async_backtrace::framed]
-    pub async fn snapshot_format_version(&self, location_opt: Option<String>) -> Result<u64> {
+    pub fn snapshot_format_version(&self, location_opt: Option<String>) -> Result<u64> {
         let location_opt = if location_opt.is_some() {
             location_opt
         } else {
-            self.snapshot_loc().await?
+            self.snapshot_loc()
         };
         // If no snapshot location here, indicates that there are no data of this table yet
-        // in this case, we just returns the current snapshot version
+        // in this case, we just return the current snapshot version
         Ok(location_opt.map_or(TableSnapshot::VERSION, |loc| {
             TableMetaLocationGenerator::snapshot_version(loc.as_str())
         }))
     }
 
-    #[async_backtrace::framed]
-    pub async fn snapshot_loc(&self) -> Result<Option<String>> {
-        match self.table_info.db_type {
-            DatabaseType::ShareDB(_) => {
-                let url = FUSE_TBL_LAST_SNAPSHOT_HINT;
-                match self.operator.read(url).await {
-                    Ok(data) => {
-                        let s = str::from_utf8(&data)?;
-                        Ok(Some(s.to_string()))
-                    }
-                    Err(e) => {
-                        error!("read share snapshot location error: {:?}", e);
-                        Ok(None)
-                    }
-                }
-            }
-            DatabaseType::NormalDB => {
-                let options = self.table_info.options();
-                Ok(options
-                    .get(OPT_KEY_SNAPSHOT_LOCATION)
-                    // for backward compatibility, we check the legacy table option
-                    .or_else(|| options.get(OPT_KEY_LEGACY_SNAPSHOT_LOC))
-                    .cloned())
-            }
-        }
+    pub fn snapshot_loc(&self) -> Option<String> {
+        let options = self.table_info.options();
+        options
+            .get(OPT_KEY_SNAPSHOT_LOCATION)
+            // for backward compatibility, we check the legacy table option
+            .or_else(|| options.get(OPT_KEY_LEGACY_SNAPSHOT_LOC))
+            .cloned()
     }
 
     pub fn get_operator(&self) -> Operator {
@@ -339,7 +393,7 @@ impl FuseTable {
         })
     }
 
-    pub fn transient(&self) -> bool {
+    pub fn is_transient(&self) -> bool {
         self.table_info.meta.options.contains_key("TRANSIENT")
     }
 
@@ -351,15 +405,209 @@ impl FuseTable {
         self.cluster_key_meta.clone().map(|v| v.0)
     }
 
+    pub fn linear_cluster_keys(&self, ctx: Arc<dyn TableContext>) -> Vec<RemoteExpr<String>> {
+        if self
+            .cluster_type()
+            .is_none_or(|v| matches!(v, ClusterType::Hilbert))
+        {
+            return vec![];
+        }
+
+        let table_meta = Arc::new(self.clone());
+        let cluster_key_exprs = self.resolve_cluster_keys(ctx.clone()).unwrap();
+        let exprs = parse_cluster_keys(ctx, table_meta.clone(), cluster_key_exprs).unwrap();
+        let cluster_keys = exprs
+            .iter()
+            .map(|k| {
+                k.project_column_ref(|index| table_meta.schema().field(*index).name().to_string())
+                    .as_remote_expr()
+            })
+            .collect();
+        cluster_keys
+    }
+
     pub fn bloom_index_cols(&self) -> BloomIndexColumns {
         self.bloom_index_cols.clone()
+    }
+
+    // Check if table is attached.
+    pub fn is_table_attached(table_meta_options: &BTreeMap<String, String>) -> bool {
+        table_meta_options
+            .get(OPT_KEY_TABLE_ATTACHED_DATA_URI)
+            .is_some()
+    }
+
+    pub fn cluster_key_types(&self, ctx: Arc<dyn TableContext>) -> Vec<DataType> {
+        let Some(ast_exprs) = self.resolve_cluster_keys(ctx.clone()) else {
+            return vec![];
+        };
+        let cluster_type = self.get_option(OPT_KEY_CLUSTER_TYPE, ClusterType::Linear);
+        match cluster_type {
+            ClusterType::Hilbert => vec![DataType::Binary],
+            ClusterType::Linear => {
+                let cluster_keys =
+                    parse_cluster_keys(ctx, Arc::new(self.clone()), ast_exprs).unwrap();
+                cluster_keys
+                    .into_iter()
+                    .map(|v| v.data_type().clone())
+                    .collect()
+            }
+        }
+    }
+
+    pub fn get_data_retention_period(&self, ctx: &dyn TableContext) -> Result<TimeDelta> {
+        let retention_period = if let Some(v) = self
+            .table_info
+            .meta
+            .options
+            .get(FUSE_OPT_KEY_DATA_RETENTION_PERIOD_IN_HOURS)
+        {
+            let retention_period = v.parse::<u64>()?;
+            Duration::hours(retention_period as i64)
+        } else {
+            Duration::days(ctx.get_settings().get_data_retention_time_in_days()? as i64)
+        };
+        Ok(retention_period)
+    }
+
+    pub fn get_storage_format(&self) -> FuseStorageFormat {
+        self.storage_format
+    }
+
+    pub fn get_storage_prefix(&self) -> &str {
+        self.meta_location_generator.prefix()
+    }
+
+    fn refresh_schema_from_hint(
+        operator: &Operator,
+        storage_prefix: &str,
+        table_description: &str,
+    ) -> Result<Option<(String, TableSchema)>> {
+        let refresh_task = async {
+            let hint_file_path = format!("{}/{}", storage_prefix, FUSE_TBL_LAST_SNAPSHOT_HINT);
+            let begin_load_hint = Instant::now();
+            let maybe_hint_content = operator.read(&hint_file_path).await;
+            info!(
+                "loaded last snapshot hint file [{}], time used {:?}",
+                hint_file_path,
+                begin_load_hint.elapsed()
+            );
+
+            match maybe_hint_content {
+                Ok(buf) => {
+                    let hint_content = buf.to_vec();
+                    let snapshot_full_path = String::from_utf8(hint_content)?;
+                    let operator_info = operator.info();
+
+                    let loc = snapshot_full_path[operator_info.root().len()..].to_string();
+
+                    // refresh table schema by loading the snapshot
+                    let begin = Instant::now();
+                    let reader = MetaReaders::table_snapshot_reader_without_cache(operator.clone());
+                    let ver = TableMetaLocationGenerator::snapshot_version(loc.as_str());
+                    let snapshot =
+                        Self::read_table_snapshot_with_reader(reader, Some(loc), ver).await?;
+                    info!("table snapshot refreshed, time used {:?}", begin.elapsed());
+
+                    let schema = snapshot
+                        .ok_or_else(|| {
+                            ErrorCode::ShareStorageError(
+                                "Failed to load snapshot of read_only attach table".to_string(),
+                            )
+                        })?
+                        .schema
+                        .clone();
+
+                    Ok::<_, ErrorCode>(Some((
+                        snapshot_full_path[operator_info.root().len()..].to_string(),
+                        schema,
+                    )))
+                }
+                Err(e) if e.kind() == opendal::ErrorKind::NotFound => {
+                    // Table be attached has not last snapshot hint file, treat it as empty table
+                    Ok(None)
+                }
+                Err(e) => Err(e.into()),
+            }
+        };
+
+        let refresh_task_with_timeout = async {
+            tokio::time::timeout(DEFAULT_SCHEMA_REFRESHING_TIMEOUT, refresh_task)
+                .await
+                .map_err(|_e| {
+                    ErrorCode::RefreshTableInfoFailure(format!(
+                        "failed to refresh table info {} in time",
+                        table_description
+                    ))
+                })
+                .map_err(|e| {
+                    ErrorCode::RefreshTableInfoFailure(format!(
+                        "failed to refresh table info {} : {}",
+                        table_description, e
+                    ))
+                })?
+        };
+
+        GlobalIORuntime::instance().block_on(refresh_task_with_timeout)
+    }
+
+    fn refresh_table_info(
+        table_info: &mut TableInfo,
+        operator: &Operator,
+        storage_prefix: &str,
+    ) -> Result<()> {
+        let table_meta_options = &table_info.meta.options;
+
+        if table_meta_options.contains_key(OPT_KEY_SNAPSHOT_LOCATION_FIXED_FLAG) {
+            // If table_info options contains key OPT_KEY_SNAPSHOT_LOCATION_FIXED_FLAG,
+            // it means that this table info has been tweaked according to the rules of
+            // resolving snapshot location from the hint file, it should not be tweaked again.
+            return Ok(());
+        }
+
+        let refreshed = Self::refresh_schema_from_hint(operator, storage_prefix, &table_info.desc)?;
+
+        info!(
+            "extracted snapshot location [{:?}] of table {}, with id {:?} from the last snapshot hint file.",
+            refreshed.as_ref().map(|(location, _)| location),
+            table_info.desc,
+            table_info.ident
+        );
+
+        // Adjust snapshot location to the values extracted from the last snapshot hint
+        match refreshed {
+            None => {
+                table_info.options_mut().remove(OPT_KEY_SNAPSHOT_LOCATION);
+            }
+            Some((location, schema)) => {
+                table_info
+                    .options_mut()
+                    .insert(OPT_KEY_SNAPSHOT_LOCATION.to_string(), location);
+
+                table_info.meta.schema = Arc::new(schema);
+            }
+        }
+
+        // Mark the snapshot as fixed, indicating it doesn't need to be reloaded from the hint.
+        // NOTE:
+        // - Attached tables do not commit `table_info` to the meta server,
+        //   except when the table is created by a DDL statement for the first time.
+        // - As a result, the key `OPT_KEY_SNAPSHOT_LOCATION_FIXED_FLAG` is transient
+        //   and will NOT appear when this table is resolved within another query context
+        //   for the first time.
+
+        table_info.options_mut().insert(
+            OPT_KEY_SNAPSHOT_LOCATION_FIXED_FLAG.to_string(),
+            "does not matter".to_string(),
+        );
+        Ok(())
     }
 }
 
 #[async_trait::async_trait]
 impl Table for FuseTable {
-    fn is_local(&self) -> bool {
-        false
+    fn distribution_level(&self) -> DistributionLevel {
+        DistributionLevel::Cluster
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -374,7 +622,15 @@ impl Table for FuseTable {
         Some(self.data_metrics.clone())
     }
 
+    fn supported_internal_column(&self, column_id: ColumnId) -> bool {
+        column_id >= SEARCH_SCORE_COLUMN_ID
+    }
+
     fn support_column_projection(&self) -> bool {
+        true
+    }
+
+    fn support_distributed_insert(&self) -> bool {
         true
     }
 
@@ -382,136 +638,40 @@ impl Table for FuseTable {
         true
     }
 
-    fn cluster_keys(&self, ctx: Arc<dyn TableContext>) -> Vec<RemoteExpr<String>> {
-        let table_meta = Arc::new(self.clone());
-        if let Some((_, order)) = &self.cluster_key_meta {
-            let cluster_keys = parse_exprs(ctx, table_meta.clone(), order).unwrap();
-            let cluster_keys = if cluster_keys.len() == 1 {
-                unwrap_tuple(&cluster_keys[0]).unwrap_or(cluster_keys)
-            } else {
-                cluster_keys
-            };
-            let cluster_keys = cluster_keys
-                .iter()
-                .map(|k| {
-                    k.project_column_ref(|index| {
-                        table_meta.schema().field(*index).name().to_string()
-                    })
-                    .as_remote_expr()
-                })
-                .collect();
-            return cluster_keys;
-        }
-        vec![]
+    fn storage_format_as_parquet(&self) -> bool {
+        matches!(self.storage_format, FuseStorageFormat::Parquet)
     }
 
-    #[async_backtrace::framed]
-    async fn alter_table_cluster_keys(
-        &self,
-        ctx: Arc<dyn TableContext>,
-        cluster_key_str: String,
-    ) -> Result<()> {
-        // if new cluter_key_str is the same with old one,
-        // no need to change
-        if let Some(old_cluster_key_str) = self.cluster_key_str() && *old_cluster_key_str == cluster_key_str{
-            return Ok(())
-        }
-        let mut new_table_meta = self.get_table_info().meta.clone();
-        new_table_meta = new_table_meta.push_cluster_key(cluster_key_str);
-        let cluster_key_meta = new_table_meta.cluster_key();
-        let schema = self.schema().as_ref().clone();
+    fn cluster_key_meta(&self) -> Option<ClusterKey> {
+        self.cluster_key_meta.clone()
+    }
 
-        let prev = self.read_table_snapshot().await?;
-        let prev_version = self.snapshot_format_version(None).await?;
-        let prev_timestamp = prev.as_ref().and_then(|v| v.timestamp);
-        let prev_snapshot_id = prev.as_ref().map(|v| (v.snapshot_id, prev_version));
-        let prev_statistics_location = prev
-            .as_ref()
-            .and_then(|v| v.table_statistics_location.clone());
-        let (summary, segments) = if let Some(v) = prev {
-            (v.summary.clone(), v.segments.clone())
+    fn change_tracking_enabled(&self) -> bool {
+        self.get_option(OPT_KEY_CHANGE_TRACKING, false)
+    }
+
+    fn stream_columns(&self) -> Vec<StreamColumn> {
+        if self.change_tracking_enabled() {
+            vec![
+                STREAM_COLUMN_FACTORY
+                    .get_stream_column(ORIGIN_VERSION_COL_NAME)
+                    .unwrap(),
+                STREAM_COLUMN_FACTORY
+                    .get_stream_column(ORIGIN_BLOCK_ID_COL_NAME)
+                    .unwrap(),
+                STREAM_COLUMN_FACTORY
+                    .get_stream_column(ORIGIN_BLOCK_ROW_NUM_COL_NAME)
+                    .unwrap(),
+                STREAM_COLUMN_FACTORY
+                    .get_stream_column(ROW_VERSION_COL_NAME)
+                    .unwrap(),
+            ]
         } else {
-            (FuseStatistics::default(), vec![])
-        };
-
-        let new_snapshot = TableSnapshot::new(
-            Uuid::new_v4(),
-            &prev_timestamp,
-            prev_snapshot_id,
-            schema,
-            summary,
-            segments,
-            cluster_key_meta,
-            prev_statistics_location,
-        );
-
-        let mut table_info = self.table_info.clone();
-        table_info.meta = new_table_meta;
-
-        FuseTable::commit_to_meta_server(
-            ctx.as_ref(),
-            &table_info,
-            &self.meta_location_generator,
-            new_snapshot,
-            None,
-            &None,
-            &self.operator,
-        )
-        .await
-    }
-
-    #[async_backtrace::framed]
-    async fn drop_table_cluster_keys(&self, ctx: Arc<dyn TableContext>) -> Result<()> {
-        if self.cluster_key_meta.is_none() {
-            return Ok(());
+            vec![]
         }
-
-        let mut new_table_meta = self.get_table_info().meta.clone();
-        new_table_meta.default_cluster_key = None;
-        new_table_meta.default_cluster_key_id = None;
-
-        let schema = self.schema().as_ref().clone();
-
-        let prev = self.read_table_snapshot().await?;
-        let prev_version = self.snapshot_format_version(None).await?;
-        let prev_timestamp = prev.as_ref().and_then(|v| v.timestamp);
-        let prev_statistics_location = prev
-            .as_ref()
-            .and_then(|v| v.table_statistics_location.clone());
-        let prev_snapshot_id = prev.as_ref().map(|v| (v.snapshot_id, prev_version));
-        let (summary, segments) = if let Some(v) = prev {
-            (v.summary.clone(), v.segments.clone())
-        } else {
-            (FuseStatistics::default(), vec![])
-        };
-
-        let new_snapshot = TableSnapshot::new(
-            Uuid::new_v4(),
-            &prev_timestamp,
-            prev_snapshot_id,
-            schema,
-            summary,
-            segments,
-            None,
-            prev_statistics_location,
-        );
-
-        let mut table_info = self.table_info.clone();
-        table_info.meta = new_table_meta;
-
-        FuseTable::commit_to_meta_server(
-            ctx.as_ref(),
-            &table_info,
-            &self.meta_location_generator,
-            new_snapshot,
-            None,
-            &None,
-            &self.operator,
-        )
-        .await
     }
 
-    #[minitrace::trace(name = "fuse_table_read_partitions")]
+    #[fastrace::trace]
     #[async_backtrace::framed]
     async fn read_partitions(
         &self,
@@ -522,34 +682,28 @@ impl Table for FuseTable {
         self.do_read_partitions(ctx, push_downs, dry_run).await
     }
 
-    #[minitrace::trace(name = "fuse_table_read_data")]
+    #[fastrace::trace]
     fn read_data(
         &self,
         ctx: Arc<dyn TableContext>,
         plan: &DataSourcePlan,
         pipeline: &mut Pipeline,
+        put_cache: bool,
     ) -> Result<()> {
-        self.do_read_data(ctx, plan, pipeline)
+        self.do_read_data(ctx, plan, pipeline, put_cache)
     }
 
-    fn append_data(
+    fn build_prune_pipeline(
         &self,
-        ctx: Arc<dyn TableContext>,
-        pipeline: &mut Pipeline,
-        append_mode: AppendMode,
-    ) -> Result<()> {
-        self.do_append_data(ctx, pipeline, append_mode)
+        table_ctx: Arc<dyn TableContext>,
+        plan: &DataSourcePlan,
+        source_pipeline: &mut Pipeline,
+    ) -> Result<Option<Pipeline>> {
+        self.do_build_prune_pipeline(table_ctx, plan, source_pipeline)
     }
 
-    #[async_backtrace::framed]
-    async fn replace_into(
-        &self,
-        ctx: Arc<dyn TableContext>,
-        pipeline: &mut Pipeline,
-        on_conflict_fields: Vec<TableField>,
-    ) -> Result<()> {
-        self.build_replace_pipeline(ctx, on_conflict_fields, pipeline)
-            .await
+    fn append_data(&self, ctx: Arc<dyn TableContext>, pipeline: &mut Pipeline) -> Result<()> {
+        self.do_append_data(ctx, pipeline)
     }
 
     fn commit_insertion(
@@ -557,78 +711,128 @@ impl Table for FuseTable {
         ctx: Arc<dyn TableContext>,
         pipeline: &mut Pipeline,
         copied_files: Option<UpsertTableCopiedFileReq>,
+        update_stream_meta: Vec<UpdateStreamMetaReq>,
         overwrite: bool,
         prev_snapshot_id: Option<SnapshotId>,
+        deduplicated_label: Option<String>,
     ) -> Result<()> {
-        self.do_commit(ctx, pipeline, copied_files, overwrite, prev_snapshot_id)
+        self.do_commit(
+            ctx,
+            pipeline,
+            copied_files,
+            update_stream_meta,
+            overwrite,
+            prev_snapshot_id,
+            deduplicated_label,
+        )
     }
 
-    #[minitrace::trace(name = "fuse_table_truncate")]
+    #[fastrace::trace]
     #[async_backtrace::framed]
-    async fn truncate(&self, ctx: Arc<dyn TableContext>, purge: bool) -> Result<()> {
-        self.do_truncate(ctx, purge).await
+    async fn truncate(&self, ctx: Arc<dyn TableContext>, pipeline: &mut Pipeline) -> Result<()> {
+        self.do_truncate(ctx, pipeline, TruncateMode::Normal).await
     }
 
-    #[minitrace::trace(name = "fuse_table_optimize")]
+    #[fastrace::trace]
     #[async_backtrace::framed]
     async fn purge(
         &self,
         ctx: Arc<dyn TableContext>,
         instant: Option<NavigationPoint>,
-        limit: Option<usize>,
+        num_snapshot_limit: Option<usize>,
         keep_last_snapshot: bool,
         dry_run: bool,
     ) -> Result<Option<Vec<String>>> {
         match self.navigate_for_purge(&ctx, instant).await {
             Ok((table, files)) => {
                 table
-                    .do_purge(&ctx, files, limit, keep_last_snapshot, dry_run)
+                    .do_purge(&ctx, files, num_snapshot_limit, keep_last_snapshot, dry_run)
                     .await
             }
             Err(e) if e.code() == ErrorCode::TABLE_HISTORICAL_DATA_NOT_FOUND => {
                 warn!("navigate failed: {:?}", e);
-                if dry_run { Ok(Some(vec![])) } else { Ok(None) }
+                if dry_run {
+                    Ok(Some(vec![]))
+                } else {
+                    Ok(None)
+                }
             }
             Err(e) => Err(e),
         }
     }
 
-    #[minitrace::trace(name = "analyze")]
-    #[async_backtrace::framed]
-    async fn analyze(&self, ctx: Arc<dyn TableContext>) -> Result<()> {
-        self.do_analyze(&ctx).await
+    async fn table_statistics(
+        &self,
+        ctx: Arc<dyn TableContext>,
+        require_fresh: bool,
+        change_type: Option<ChangeType>,
+    ) -> Result<Option<TableStatistics>> {
+        if let Some(desc) = &self.changes_desc {
+            assert!(change_type.is_some());
+            return self
+                .changes_table_statistics(ctx, &desc.location, change_type.unwrap())
+                .await;
+        }
+
+        let stats = match self.table_type {
+            FuseTableType::Attached if require_fresh => {
+                info!(
+                    "refresh table statistics of attached table {}",
+                    self.table_info.desc
+                );
+                let snapshot = self.read_table_snapshot().await?.ok_or_else(|| {
+                    // For table created with "ATTACH TABLE ... READ_ONLY"statement, this should be unreachable:
+                    // IO or Deserialization related error should have already been thrown, thus
+                    // `Internal` error is used.
+                    ErrorCode::Internal("Failed to load snapshot of read_only attach table")
+                })?;
+                let summary = &snapshot.summary;
+                TableStatistics {
+                    num_rows: Some(summary.row_count),
+                    data_size: Some(summary.uncompressed_byte_size),
+                    data_size_compressed: Some(summary.compressed_byte_size),
+                    index_size: Some(summary.index_size),
+                    number_of_blocks: Some(summary.block_count),
+                    number_of_segments: Some(snapshot.segments.len() as u64),
+                }
+            }
+            _ => {
+                let s = &self.table_info.meta.statistics;
+                TableStatistics {
+                    num_rows: Some(s.number_of_rows),
+                    data_size: Some(s.data_bytes),
+                    data_size_compressed: Some(s.compressed_data_bytes),
+                    index_size: Some(s.index_data_bytes),
+                    number_of_blocks: s.number_of_blocks,
+                    number_of_segments: s.number_of_segments,
+                }
+            }
+        };
+        Ok(Some(stats))
     }
 
-    fn table_statistics(&self) -> Result<Option<TableStatistics>> {
-        let s = &self.table_info.meta.statistics;
-        Ok(Some(TableStatistics {
-            num_rows: Some(s.number_of_rows),
-            data_size: Some(s.data_bytes),
-            data_size_compressed: Some(s.compressed_data_bytes),
-            index_size: Some(s.index_data_bytes),
-            number_of_blocks: s.number_of_blocks,
-            number_of_segments: s.number_of_segments,
-        }))
-    }
-
     #[async_backtrace::framed]
-    async fn column_statistics_provider(&self) -> Result<Box<dyn ColumnStatisticsProvider>> {
+    async fn column_statistics_provider(
+        &self,
+        _ctx: Arc<dyn TableContext>,
+    ) -> Result<Box<dyn ColumnStatisticsProvider>> {
         let provider = if let Some(snapshot) = self.read_table_snapshot().await? {
             let stats = &snapshot.summary.col_stats;
             let table_statistics = self.read_table_snapshot_statistics(Some(&snapshot)).await?;
             if let Some(table_statistics) = table_statistics {
-                FuseTableColumnStatisticsProvider {
-                    column_stats: stats.clone(),
-                    row_count: snapshot.summary.row_count,
-                    // save row count first
-                    column_distinct_values: Some(table_statistics.column_distinct_values.clone()),
-                }
+                FuseTableColumnStatisticsProvider::new(
+                    stats.clone(),
+                    table_statistics.histograms.clone(),
+                    Some(table_statistics.column_distinct_values()),
+                    snapshot.summary.row_count,
+                )
             } else {
-                FuseTableColumnStatisticsProvider {
-                    column_stats: stats.clone(),
-                    row_count: snapshot.summary.row_count,
-                    column_distinct_values: None,
-                }
+                FuseTableColumnStatisticsProvider::new(
+                    stats.clone(),
+                    HashMap::new(),
+                    None,
+                    snapshot.summary.row_count,
+                )
             }
         } else {
             FuseTableColumnStatisticsProvider::default()
@@ -636,47 +840,146 @@ impl Table for FuseTable {
         Ok(Box::new(provider))
     }
 
-    #[minitrace::trace(name = "fuse_table_navigate_to")]
     #[async_backtrace::framed]
-    async fn navigate_to(&self, point: &NavigationPoint) -> Result<Arc<dyn Table>> {
-        let snapshot_location = if let Some(loc) = self.snapshot_loc().await? {
-            loc
-        } else {
-            // not an error?
-            return Err(ErrorCode::TableHistoricalDataNotFound(
-                "Empty Table has no historical data",
-            ));
+    async fn accurate_columns_ranges(
+        &self,
+        ctx: Arc<dyn TableContext>,
+        column_ids: &[ColumnId],
+    ) -> Result<Option<HashMap<ColumnId, ColumnRange>>> {
+        if column_ids.is_empty() {
+            return Ok(Some(HashMap::new()));
+        }
+
+        let Some(snapshot) = self.read_table_snapshot().await? else {
+            return Ok(Some(HashMap::new()));
         };
 
-        match point {
-            NavigationPoint::SnapshotID(snapshot_id) => Ok(self
-                .navigate_to_snapshot(snapshot_location, snapshot_id.as_str())
-                .await?),
-            NavigationPoint::TimePoint(time_point) => Ok(self
-                .navigate_to_time_point(snapshot_location, *time_point)
-                .await?),
+        let segment_locations = &snapshot.segments;
+        let num_segments = snapshot.segments.len();
+
+        if num_segments == 0 {
+            return Ok(Some(HashMap::new()));
+        }
+
+        let column_ids: HashSet<&ColumnId, RandomState> = HashSet::from_iter(column_ids);
+
+        let schema = self.schema();
+        let num_fields = schema.fields.len();
+        let segments_io = SegmentsIO::create(ctx.clone(), self.operator.clone(), schema);
+        let chunk_size = std::cmp::min(
+            ctx.get_settings().get_max_threads()? as usize * 4,
+            num_segments,
+        )
+        .max(1);
+
+        ctx.set_status_info(&format!(
+            "processing {} segments, chunk size {}",
+            num_segments, chunk_size
+        ));
+
+        // Fold column ranges of segments chunk by chunk
+        let mut reduced = HashMap::with_capacity(num_fields);
+
+        for (idx, chunk) in segment_locations.chunks(chunk_size).enumerate() {
+            let segments = segments_io
+                .read_segments::<Arc<CompactSegmentInfo>>(chunk, false)
+                .await?;
+            let mut partial_col_stats = Vec::with_capacity(chunk_size);
+            // 1. Carry the previously reduced ranges
+            partial_col_stats.push(reduced);
+            // 2. Append ranges of this chunk
+            for compacted_seg in segments.into_iter() {
+                let segment = compacted_seg?;
+                let mut cols_stats = segment.summary.col_stats.clone();
+                cols_stats.retain(|k, _| column_ids.contains(k));
+                partial_col_stats.push(cols_stats);
+            }
+            // 3. Reduces them
+            reduced = reduce_block_statistics(&partial_col_stats);
+            ctx.set_status_info(&format!("processed {} segments", (idx + 1) * chunk_size));
+        }
+
+        let r = reduced
+            .into_iter()
+            .map(|(k, v)| {
+                (k, ColumnRange {
+                    min: Bound {
+                        may_be_truncated: v.min.may_be_trimmed(),
+                        value: v.min,
+                    },
+                    max: Bound {
+                        may_be_truncated: v.max.may_be_trimmed(),
+                        value: v.max,
+                    },
+                })
+            })
+            .collect();
+        Ok(Some(r))
+    }
+
+    #[fastrace::trace]
+    #[async_backtrace::framed]
+    async fn navigate_to(
+        &self,
+        navigation: &TimeNavigation,
+        abort_checker: AbortChecker,
+    ) -> Result<Arc<dyn Table>> {
+        match navigation {
+            TimeNavigation::TimeTravel(point) => {
+                Ok(self.navigate_to_point(point, abort_checker).await?)
+            }
+            TimeNavigation::Changes {
+                append_only,
+                at,
+                end,
+                desc,
+            } => {
+                let mut end_point = if let Some(end) = end {
+                    self.navigate_to_point(end, abort_checker.clone())
+                        .await?
+                        .as_ref()
+                        .clone()
+                } else {
+                    self.clone()
+                };
+                let changes_desc = end_point
+                    .get_change_descriptor(*append_only, desc.clone(), Some(at), abort_checker)
+                    .await?;
+                end_point.changes_desc = Some(changes_desc);
+                Ok(Arc::new(end_point))
+            }
         }
     }
 
     #[async_backtrace::framed]
-    async fn update(
+    async fn generate_changes_query(
         &self,
         ctx: Arc<dyn TableContext>,
-        filter: Option<RemoteExpr<String>>,
-        col_indices: Vec<FieldIndex>,
-        update_list: Vec<(FieldIndex, RemoteExpr<String>)>,
-        computed_list: BTreeMap<FieldIndex, RemoteExpr<String>>,
-        query_row_id_col: bool,
-        pipeline: &mut Pipeline,
-    ) -> Result<()> {
-        self.do_update(
+        database_name: &str,
+        table_name: &str,
+        _with_options: &str,
+    ) -> Result<String> {
+        let db_tb_name = format!("'{}'.'{}'", database_name, table_name);
+        let Some(ChangesDesc {
+            seq,
+            desc,
+            mode,
+            location,
+        }) = self.changes_desc.as_ref()
+        else {
+            return Err(ErrorCode::Internal(format!(
+                "No changes descriptor found in table {db_tb_name}"
+            )));
+        };
+
+        self.check_changes_valid(&db_tb_name, *seq)?;
+        let quote = ctx.get_settings().get_sql_dialect()?.default_ident_quote();
+        self.get_changes_query(
             ctx,
-            filter,
-            col_indices,
-            update_list,
-            computed_list,
-            query_row_id_col,
-            pipeline,
+            mode,
+            location,
+            format!("{quote}{database_name}{quote}.{quote}{table_name}{quote} {desc}"),
+            *seq,
         )
         .await
     }
@@ -684,7 +987,7 @@ impl Table for FuseTable {
     fn get_block_thresholds(&self) -> BlockThresholds {
         let max_rows_per_block =
             self.get_option(FUSE_OPT_KEY_ROW_PER_BLOCK, DEFAULT_BLOCK_MAX_ROWS);
-        let min_rows_per_block = (max_rows_per_block as f64 * 0.8) as usize;
+        let min_rows_per_block = (max_rows_per_block * 4).div_ceil(5);
         let max_bytes_per_block = self.get_option(
             FUSE_OPT_KEY_BLOCK_IN_MEM_SIZE_THRESHOLD,
             DEFAULT_BLOCK_BUFFER_SIZE,
@@ -693,14 +996,21 @@ impl Table for FuseTable {
     }
 
     #[async_backtrace::framed]
-    async fn compact(
+    async fn compact_segments(
         &self,
         ctx: Arc<dyn TableContext>,
-        target: CompactTarget,
         limit: Option<usize>,
-        pipeline: &mut Pipeline,
     ) -> Result<()> {
-        self.do_compact(ctx, target, limit, pipeline).await
+        self.do_compact_segments(ctx, limit).await
+    }
+
+    #[async_backtrace::framed]
+    async fn compact_blocks(
+        &self,
+        ctx: Arc<dyn TableContext>,
+        limits: CompactionLimits,
+    ) -> Result<Option<(Partitions, Arc<TableSnapshot>)>> {
+        self.do_compact_blocks(ctx, limits).await
     }
 
     #[async_backtrace::framed]
@@ -709,9 +1019,8 @@ impl Table for FuseTable {
         ctx: Arc<dyn TableContext>,
         push_downs: Option<PushDownInfo>,
         limit: Option<usize>,
-        pipeline: &mut Pipeline,
-    ) -> Result<u64> {
-        self.do_recluster(ctx, push_downs, limit, pipeline).await
+    ) -> Result<Option<(ReclusterParts, Arc<TableSnapshot>)>> {
+        self.do_recluster(ctx, push_downs, limit).await
     }
 
     #[async_backtrace::framed]
@@ -720,7 +1029,7 @@ impl Table for FuseTable {
         ctx: Arc<dyn TableContext>,
         point: NavigationDescriptor,
     ) -> Result<()> {
-        self.do_revert_to(ctx.as_ref(), point).await
+        self.do_revert_to(ctx, point).await
     }
 
     fn support_prewhere(&self) -> bool {
@@ -732,61 +1041,70 @@ impl Table for FuseTable {
     }
 
     fn support_virtual_columns(&self) -> bool {
-        matches!(self.storage_format, FuseStorageFormat::Native)
-    }
-
-    fn support_row_id_column(&self) -> bool {
         true
     }
 
     fn result_can_be_cached(&self) -> bool {
         true
     }
-}
 
-#[derive(Clone, Copy, Debug)]
-pub enum FuseStorageFormat {
-    Parquet,
-    Native,
-}
-
-impl FromStr for FuseStorageFormat {
-    type Err = ErrorCode;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_lowercase().as_str() {
-            "" | "parquet" => Ok(FuseStorageFormat::Parquet),
-            "native" => Ok(FuseStorageFormat::Native),
-            other => Err(ErrorCode::UnknownFormat(format!(
-                "unknown fuse storage_format {}",
-                other
-            ))),
-        }
+    fn is_read_only(&self) -> bool {
+        self.table_type.is_readonly()
     }
-}
 
-#[derive(Default)]
-struct FuseTableColumnStatisticsProvider {
-    column_stats: HashMap<ColumnId, FuseColumnStatistics>,
-    pub column_distinct_values: Option<HashMap<ColumnId, u64>>,
-    pub row_count: u64,
-}
+    fn use_own_sample_block(&self) -> bool {
+        true
+    }
 
-impl ColumnStatisticsProvider for FuseTableColumnStatisticsProvider {
-    fn column_statistics(&self, column_id: ColumnId) -> Option<ColumnStatistics> {
-        let col_stats = &self.column_stats.get(&column_id);
-        col_stats.map(|s| {
-            let mut ndv = self
-                .column_distinct_values
-                .as_ref()
-                .map_or(self.row_count, |map| map.get(&column_id).map_or(0, |v| *v));
-            ndv = self.adjust_ndv_by_min_max(ndv, s.min().clone(), s.max().clone());
-            ColumnStatistics {
-                min: s.min().clone(),
-                max: s.max().clone(),
-                null_count: s.null_count,
-                number_of_distinct_values: ndv,
+    async fn remove_aggregating_index_files(
+        &self,
+        ctx: Arc<dyn TableContext>,
+        index_id: u64,
+    ) -> Result<u64> {
+        let prefix = format!(
+            "{}/{}",
+            self.meta_location_generator.agg_index_location_prefix(),
+            index_id
+        );
+        let op = &self.operator;
+        info!("remove_aggregating_index_files: {}", prefix);
+        let mut lister = op.lister_with(&prefix).recursive(true).await?;
+        let mut files = Vec::new();
+        while let Some(entry) = lister.try_next().await? {
+            if entry.metadata().is_dir() {
+                continue;
             }
-        })
+            files.push(entry.path().to_string());
+        }
+
+        let op = Files::create(ctx, self.operator.clone());
+        let len = files.len() as u64;
+        op.remove_file_in_batch(files).await?;
+        Ok(len)
+    }
+
+    async fn remove_inverted_index_files(
+        &self,
+        ctx: Arc<dyn TableContext>,
+        index_name: String,
+        index_version: String,
+    ) -> Result<u64> {
+        let prefix = self
+            .meta_location_generator
+            .gen_specific_inverted_index_prefix(&index_name, &index_version);
+        let op = &self.operator;
+        info!("remove_inverted_index_files: {}", prefix);
+        let mut lister = op.lister_with(&prefix).recursive(true).await?;
+        let mut files = Vec::new();
+        while let Some(entry) = lister.try_next().await? {
+            if entry.metadata().is_dir() {
+                continue;
+            }
+            files.push(entry.path().to_string());
+        }
+        let op = Files::create(ctx, self.operator.clone());
+        let len = files.len() as u64;
+        op.remove_file_in_batch(files).await?;
+        Ok(len)
     }
 }

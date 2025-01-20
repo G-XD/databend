@@ -1,4 +1,4 @@
-// Copyright 2021 Datafuse Labs.
+// Copyright 2021 Datafuse Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -18,13 +18,13 @@
 use std::ops::Deref;
 use std::time::Duration;
 
-use common_grpc::ConnectionFactory;
-use common_meta_client::from_digit_ver;
-use common_meta_client::to_digit_ver;
-use common_meta_client::MetaGrpcClient;
-use common_meta_client::METACLI_COMMIT_SEMVER;
-use common_meta_client::MIN_METASRV_SEMVER;
-use common_meta_types::protobuf::meta_service_client::MetaServiceClient;
+use databend_common_grpc::ConnectionFactory;
+use databend_common_meta_client::from_digit_ver;
+use databend_common_meta_client::to_digit_ver;
+use databend_common_meta_client::MetaChannelManager;
+use databend_common_meta_client::MetaGrpcClient;
+use databend_common_meta_client::METACLI_COMMIT_SEMVER;
+use databend_common_meta_client::MIN_METASRV_SEMVER;
 use databend_meta::version::MIN_METACLI_SEMVER;
 use log::debug;
 use log::info;
@@ -37,7 +37,7 @@ use crate::tests::start_metasrv;
 /// - Test client version < serverside min-compatible-client-ver.
 /// - Test metasrv version < client min-compatible-metasrv-ver.
 #[test(harness = meta_service_test_harness)]
-#[minitrace::trace]
+#[fastrace::trace]
 async fn test_metasrv_handshake() -> anyhow::Result<()> {
     fn smaller_ver(v: &Version) -> Version {
         if v.major > 0 {
@@ -55,7 +55,7 @@ async fn test_metasrv_handshake() -> anyhow::Result<()> {
 
     let c = ConnectionFactory::create_rpc_channel(addr, Some(Duration::from_millis(1000)), None)
         .await?;
-    let mut client = MetaServiceClient::new(c);
+    let (mut client, _once) = MetaChannelManager::new_real_client(c);
 
     info!("--- client has smaller ver than S.min_cli_ver");
     {

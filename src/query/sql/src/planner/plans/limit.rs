@@ -14,11 +14,10 @@
 
 use std::sync::Arc;
 
-use common_catalog::table_context::TableContext;
-use common_exception::Result;
+use databend_common_catalog::table_context::TableContext;
+use databend_common_exception::Result;
 
 use crate::optimizer::Distribution;
-use crate::optimizer::PhysicalProperty;
 use crate::optimizer::RelExpr;
 use crate::optimizer::RelationalProperty;
 use crate::optimizer::RequiredProperty;
@@ -29,17 +28,37 @@ use crate::plans::RelOp;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Limit {
+    pub before_exchange: bool,
     pub limit: Option<usize>,
     pub offset: usize,
+}
+
+impl Limit {
+    pub fn derive_limit_stats(&self, stat_info: Arc<StatInfo>) -> Result<Arc<StatInfo>> {
+        let cardinality = match self.limit {
+            Some(limit) if (limit as f64) < stat_info.cardinality => limit as f64,
+            _ => stat_info.cardinality,
+        };
+        let precise_cardinality = match (self.limit, stat_info.statistics.precise_cardinality) {
+            (Some(limit), Some(pc)) => {
+                Some((pc.saturating_sub(self.offset as u64)).min(limit as u64))
+            }
+            _ => None,
+        };
+
+        Ok(Arc::new(StatInfo {
+            cardinality,
+            statistics: Statistics {
+                precise_cardinality,
+                column_stats: Default::default(),
+            },
+        }))
+    }
 }
 
 impl Operator for Limit {
     fn rel_op(&self) -> RelOp {
         RelOp::Limit
-    }
-
-    fn derive_physical_prop(&self, rel_expr: &RelExpr) -> Result<PhysicalProperty> {
-        rel_expr.derive_physical_prop_child(0)
     }
 
     fn compute_required_prop_child(
@@ -54,22 +73,23 @@ impl Operator for Limit {
         Ok(required)
     }
 
+    fn compute_required_prop_children(
+        &self,
+        _ctx: Arc<dyn TableContext>,
+        _rel_expr: &RelExpr,
+        _required: &RequiredProperty,
+    ) -> Result<Vec<Vec<RequiredProperty>>> {
+        Ok(vec![vec![RequiredProperty {
+            distribution: Distribution::Serial,
+        }]])
+    }
+
     fn derive_relational_prop(&self, rel_expr: &RelExpr) -> Result<Arc<RelationalProperty>> {
         rel_expr.derive_relational_prop_child(0)
     }
 
-    fn derive_cardinality(&self, rel_expr: &RelExpr) -> Result<Arc<StatInfo>> {
+    fn derive_stats(&self, rel_expr: &RelExpr) -> Result<Arc<StatInfo>> {
         let stat_info = rel_expr.derive_cardinality_child(0)?;
-        let cardinality = match self.limit {
-            Some(limit) if (limit as f64) < stat_info.cardinality => limit as f64,
-            _ => stat_info.cardinality,
-        };
-        Ok(Arc::new(StatInfo {
-            cardinality,
-            statistics: Statistics {
-                precise_cardinality: None,
-                column_stats: Default::default(),
-            },
-        }))
+        self.derive_limit_stats(stat_info)
     }
 }

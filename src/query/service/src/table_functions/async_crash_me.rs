@@ -18,30 +18,28 @@ use std::sync::Arc;
 use std::task::Context;
 use std::task::Poll;
 
-use chrono::NaiveDateTime;
-use chrono::TimeZone;
-use chrono::Utc;
-use common_catalog::plan::DataSourcePlan;
-use common_catalog::plan::PartStatistics;
-use common_catalog::plan::Partitions;
-use common_catalog::plan::PushDownInfo;
-use common_catalog::table_args::TableArgs;
-use common_catalog::table_function::TableFunction;
-use common_exception::ErrorCode;
-use common_exception::Result;
-use common_expression::DataBlock;
-use common_expression::Scalar;
-use common_expression::TableSchema;
-use common_meta_app::schema::TableIdent;
-use common_meta_app::schema::TableInfo;
-use common_meta_app::schema::TableMeta;
-use common_pipeline_sources::AsyncSource;
-use common_pipeline_sources::AsyncSourcer;
+use chrono::DateTime;
+use databend_common_catalog::plan::DataSourcePlan;
+use databend_common_catalog::plan::PartStatistics;
+use databend_common_catalog::plan::Partitions;
+use databend_common_catalog::plan::PushDownInfo;
+use databend_common_catalog::table_args::TableArgs;
+use databend_common_catalog::table_function::TableFunction;
+use databend_common_exception::ErrorCode;
+use databend_common_exception::Result;
+use databend_common_expression::DataBlock;
+use databend_common_expression::Scalar;
+use databend_common_expression::TableSchemaRefExt;
+use databend_common_meta_app::schema::TableIdent;
+use databend_common_meta_app::schema::TableInfo;
+use databend_common_meta_app::schema::TableMeta;
+use databend_common_pipeline_core::Pipeline;
+use databend_common_pipeline_sources::AsyncSource;
+use databend_common_pipeline_sources::AsyncSourcer;
 use futures::Stream;
 
-use crate::pipelines::processors::port::OutputPort;
-use crate::pipelines::processors::processor::ProcessorPtr;
-use crate::pipelines::Pipeline;
+use crate::pipelines::processors::OutputPort;
+use crate::pipelines::processors::ProcessorPtr;
 use crate::sessions::TableContext;
 use crate::storages::Table;
 
@@ -61,10 +59,10 @@ impl AsyncCrashMeTable {
         let args = table_args.expect_all_positioned(table_func_name, None)?;
         if args.len() == 1 {
             let arg = args[0].clone();
-            panic_message =
-                Some(String::from_utf8(arg.into_string().map_err(|_| {
-                    ErrorCode::BadArguments("Expected string argument")
-                })?)?);
+            panic_message = Some(
+                arg.into_string()
+                    .map_err(|_| ErrorCode::BadArguments("Expected string argument"))?,
+            );
         }
 
         let table_info = TableInfo {
@@ -72,14 +70,12 @@ impl AsyncCrashMeTable {
             desc: format!("'{}'.'{}'", database_name, table_func_name),
             name: String::from("async_crash_me"),
             meta: TableMeta {
-                schema: Arc::new(TableSchema::empty()),
+                schema: TableSchemaRefExt::create_dummy(),
                 engine: String::from(table_func_name),
                 // Assuming that created_on is unnecessary for function table,
                 // we could make created_on fixed to pass test_shuffle_action_try_into.
-                created_on: Utc
-                    .from_utc_datetime(&NaiveDateTime::from_timestamp_opt(0, 0).unwrap()),
-                updated_on: Utc
-                    .from_utc_datetime(&NaiveDateTime::from_timestamp_opt(0, 0).unwrap()),
+                created_on: DateTime::from_timestamp(0, 0).unwrap(),
+                updated_on: DateTime::from_timestamp(0, 0).unwrap(),
                 ..Default::default()
             },
             ..Default::default()
@@ -94,10 +90,6 @@ impl AsyncCrashMeTable {
 
 #[async_trait::async_trait]
 impl Table for AsyncCrashMeTable {
-    fn is_local(&self) -> bool {
-        true
-    }
-
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -119,7 +111,7 @@ impl Table for AsyncCrashMeTable {
 
     fn table_args(&self) -> Option<TableArgs> {
         let args = match &self.panic_message {
-            Some(s) => vec![Scalar::String(s.as_bytes().to_vec())],
+            Some(s) => vec![Scalar::String(s.clone())],
             None => vec![],
         };
         Some(TableArgs::new_positioned(args))
@@ -130,6 +122,7 @@ impl Table for AsyncCrashMeTable {
         ctx: Arc<dyn TableContext>,
         _plan: &DataSourcePlan,
         pipeline: &mut Pipeline,
+        _put_cache: bool,
     ) -> Result<()> {
         pipeline.add_source(
             |output| AsyncCrashMeSource::create(ctx.clone(), output, self.panic_message.clone()),
@@ -158,7 +151,6 @@ impl AsyncCrashMeSource {
 impl AsyncSource for AsyncCrashMeSource {
     const NAME: &'static str = "async_crash_me";
 
-    #[async_trait::unboxed_simple]
     #[async_backtrace::framed]
     async fn generate(&mut self) -> Result<Option<DataBlock>> {
         match &self.message {

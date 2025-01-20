@@ -12,20 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::BTreeMap;
-use std::str::FromStr;
+use databend_common_ast::ast::CreateStageStmt;
+use databend_common_ast::ast::FileFormatOptions;
+use databend_common_ast::ast::UriLocation;
+use databend_common_exception::ErrorCode;
+use databend_common_exception::Result;
+use databend_common_meta_app::principal::FileFormatOptionsReader;
+use databend_common_meta_app::principal::FileFormatParams;
+use databend_common_meta_app::principal::StageInfo;
+use databend_common_storage::init_operator;
 
-use common_ast::ast::CreateStageStmt;
-use common_ast::ast::UriLocation;
-use common_exception::ErrorCode;
-use common_exception::Result;
-use common_meta_app::principal::FileFormatOptionsAst;
-use common_meta_app::principal::FileFormatParams;
-use common_meta_app::principal::OnErrorMode;
-use common_meta_app::principal::StageInfo;
-
-use super::super::copy::parse_stage_location;
-use crate::binder::location::parse_uri_location;
+use super::super::copy_into_table::resolve_stage_location;
+use crate::binder::location::parse_storage_params_from_uri;
 use crate::binder::Binder;
 use crate::plans::CreateStagePlan;
 use crate::plans::Plan;
@@ -38,8 +36,7 @@ impl Binder {
         location: &str,
         pattern: &str,
     ) -> Result<Plan> {
-        let stage_name = format!("@{location}");
-        let (stage, path) = parse_stage_location(&self.ctx, stage_name.as_str()).await?;
+        let (stage, path) = resolve_stage_location(self.ctx.as_ref(), location).await?;
         let plan_node = RemoveStagePlan {
             path,
             stage,
@@ -55,13 +52,10 @@ impl Binder {
         stmt: &CreateStageStmt,
     ) -> Result<Plan> {
         let CreateStageStmt {
-            if_not_exists,
+            create_option,
             stage_name,
             location,
             file_format_options,
-            on_error,
-            size_limit,
-            validation_mode: _,
             comments: _,
         } = stmt;
 
@@ -78,19 +72,24 @@ impl Binder {
                     protocol: uri.protocol.clone(),
                     name: uri.name.clone(),
                     path: uri.path.clone(),
-                    part_prefix: uri.part_prefix.clone(),
                     connection: uri.connection.clone(),
                 };
 
-                let (stage_storage, path) = parse_uri_location(&mut uri)?;
+                let stage_storage = parse_storage_params_from_uri(
+                    &mut uri,
+                    Some(self.ctx.as_ref()),
+                    "when CREATE STAGE",
+                )
+                .await?;
 
-                if !path.ends_with('/') {
-                    return Err(ErrorCode::SyntaxException(
-                        "URL's path must ends with `/` when do CREATE STAGE",
-                    ));
-                }
+                // Check the storage params via init operator.
+                let _ = init_operator(&stage_storage).map_err(|err| {
+                    ErrorCode::InvalidConfig(format!(
+                        "Input storage config for stage is invalid: {err:?}"
+                    ))
+                })?;
 
-                StageInfo::new_external_stage(stage_storage, &path).with_stage_name(stage_name)
+                StageInfo::new_external_stage(stage_storage, true).with_stage_name(stage_name)
             }
         };
 
@@ -98,19 +97,9 @@ impl Binder {
             stage_info.file_format_params =
                 self.try_resolve_file_format(file_format_options).await?;
         }
-        // Copy options.
-        {
-            // on_error.
-            if !on_error.is_empty() {
-                stage_info.copy_options.on_error =
-                    OnErrorMode::from_str(on_error).map_err(ErrorCode::SyntaxException)?;
-            }
-
-            stage_info.copy_options.size_limit = *size_limit;
-        }
 
         Ok(Plan::CreateStage(Box::new(CreateStagePlan {
-            if_not_exists: *if_not_exists,
+            create_option: create_option.clone().into(),
             tenant: self.ctx.get_tenant(),
             stage_info,
         })))
@@ -119,14 +108,13 @@ impl Binder {
     #[async_backtrace::framed]
     pub(crate) async fn try_resolve_file_format(
         &self,
-        options: &BTreeMap<String, String>,
+        options: &FileFormatOptions,
     ) -> Result<FileFormatParams> {
-        if let Some(name) = options.get("format_name") {
+        let reader = FileFormatOptionsReader::from_ast(options);
+        if let Some(name) = reader.options.get("format_name") {
             self.ctx.get_file_format(name).await
         } else {
-            FileFormatParams::try_from(FileFormatOptionsAst {
-                options: options.clone(),
-            })
+            FileFormatParams::try_from_reader(reader, false)
         }
     }
 }

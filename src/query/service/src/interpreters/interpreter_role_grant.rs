@@ -14,11 +14,11 @@
 
 use std::sync::Arc;
 
-use common_exception::Result;
-use common_meta_app::principal::PrincipalIdentity;
-use common_sql::plans::GrantRolePlan;
-use common_users::RoleCacheManager;
-use common_users::UserApiProvider;
+use databend_common_exception::Result;
+use databend_common_meta_app::principal::PrincipalIdentity;
+use databend_common_sql::plans::GrantRolePlan;
+use databend_common_users::RoleCacheManager;
+use databend_common_users::UserApiProvider;
 use log::debug;
 
 use crate::interpreters::Interpreter;
@@ -44,7 +44,11 @@ impl Interpreter for GrantRoleInterpreter {
         "GrantRoleInterpreter"
     }
 
-    #[minitrace::trace]
+    fn is_ddl(&self) -> bool {
+        true
+    }
+
+    #[fastrace::trace]
     #[async_backtrace::framed]
     async fn execute2(&self) -> Result<PipelineBuildResult> {
         debug!("ctx.id" = self.ctx.get_id().as_str(); "grant_role_execute");
@@ -60,7 +64,7 @@ impl Interpreter for GrantRoleInterpreter {
         match plan.principal {
             PrincipalIdentity::User(user) => {
                 user_mgr
-                    .grant_role_to_user(&tenant, user, plan.role)
+                    .grant_role_to_user(tenant.clone(), user, plan.role)
                     .await?;
             }
             PrincipalIdentity::Role(role) => {

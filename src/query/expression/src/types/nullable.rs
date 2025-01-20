@@ -12,14 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::cmp::Ordering;
+use std::iter::TrustedLen;
 use std::marker::PhantomData;
 use std::ops::Range;
 
-use common_arrow::arrow::bitmap::Bitmap;
-use common_arrow::arrow::bitmap::MutableBitmap;
-use common_arrow::arrow::trusted_len::TrustedLen;
+use databend_common_column::bitmap::Bitmap;
+use databend_common_column::bitmap::MutableBitmap;
 
 use super::AnyType;
+use super::DecimalSize;
 use crate::property::Domain;
 use crate::types::ArgType;
 use crate::types::DataType;
@@ -29,6 +31,7 @@ use crate::utils::arrow::bitmap_into_mut;
 use crate::values::Column;
 use crate::values::Scalar;
 use crate::ColumnBuilder;
+use crate::ColumnVec;
 use crate::ScalarRef;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -49,11 +52,11 @@ impl<T: ValueType> ValueType for NullableType<T> {
         long.map(|long| T::upcast_gat(long))
     }
 
-    fn to_owned_scalar<'a>(scalar: Self::ScalarRef<'a>) -> Self::Scalar {
+    fn to_owned_scalar(scalar: Self::ScalarRef<'_>) -> Self::Scalar {
         scalar.map(T::to_owned_scalar)
     }
 
-    fn to_scalar_ref<'a>(scalar: &'a Self::Scalar) -> Self::ScalarRef<'a> {
+    fn to_scalar_ref(scalar: &Self::Scalar) -> Self::ScalarRef<'_> {
         scalar.as_ref().map(T::to_scalar_ref)
     }
 
@@ -64,7 +67,7 @@ impl<T: ValueType> ValueType for NullableType<T> {
         }
     }
 
-    fn try_downcast_column<'a>(col: &'a Column) -> Option<Self::Column> {
+    fn try_downcast_column(col: &Column) -> Option<Self::Column> {
         NullableColumn::try_downcast(col.as_nullable()?)
     }
 
@@ -88,10 +91,45 @@ impl<T: ValueType> ValueType for NullableType<T> {
         }
     }
 
-    fn try_downcast_builder<'a>(
-        _builder: &'a mut ColumnBuilder,
-    ) -> Option<&'a mut Self::ColumnBuilder> {
+    fn try_downcast_builder(_builder: &mut ColumnBuilder) -> Option<&mut Self::ColumnBuilder> {
         None
+    }
+
+    #[allow(clippy::manual_map)]
+    fn try_downcast_owned_builder(builder: ColumnBuilder) -> Option<Self::ColumnBuilder> {
+        match builder {
+            ColumnBuilder::Nullable(inner) => {
+                let builder = T::try_downcast_owned_builder(inner.builder);
+                // ```
+                // builder.map(|builder| NullableColumnBuilder {
+                //     builder,
+                //     validity: inner.validity,
+                // })
+                // ```
+                // If we using the clippy recommend way like above, the compiler will complain:
+                // use of partially moved value: `inner`.
+                // That's rust borrow checker error, if we using the new borrow checker named polonius,
+                // everything goes fine, but polonius is very slow, so we allow manual map here.
+                if let Some(builder) = builder {
+                    Some(NullableColumnBuilder {
+                        builder,
+                        validity: inner.validity,
+                    })
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
+    fn try_upcast_column_builder(
+        builder: Self::ColumnBuilder,
+        decimal_size: Option<DecimalSize>,
+    ) -> Option<ColumnBuilder> {
+        Some(ColumnBuilder::Nullable(Box::new(
+            builder.upcast(decimal_size),
+        )))
     }
 
     fn upcast_scalar(scalar: Self::Scalar) -> Scalar {
@@ -112,26 +150,24 @@ impl<T: ValueType> ValueType for NullableType<T> {
         })
     }
 
-    fn column_len<'a>(col: &'a Self::Column) -> usize {
+    fn column_len(col: &Self::Column) -> usize {
         col.len()
     }
 
-    fn index_column<'a>(col: &'a Self::Column, index: usize) -> Option<Self::ScalarRef<'a>> {
+    fn index_column(col: &Self::Column, index: usize) -> Option<Self::ScalarRef<'_>> {
         col.index(index)
     }
 
-    unsafe fn index_column_unchecked<'a>(
-        col: &'a Self::Column,
-        index: usize,
-    ) -> Self::ScalarRef<'a> {
+    #[inline(always)]
+    unsafe fn index_column_unchecked(col: &Self::Column, index: usize) -> Self::ScalarRef<'_> {
         col.index_unchecked(index)
     }
 
-    fn slice_column<'a>(col: &'a Self::Column, range: Range<usize>) -> Self::Column {
+    fn slice_column(col: &Self::Column, range: Range<usize>) -> Self::Column {
         col.slice(range)
     }
 
-    fn iter_column<'a>(col: &'a Self::Column) -> Self::ColumnIterator<'a> {
+    fn iter_column(col: &Self::Column) -> Self::ColumnIterator<'_> {
         col.iter()
     }
 
@@ -147,6 +183,17 @@ impl<T: ValueType> ValueType for NullableType<T> {
         match item {
             Some(item) => builder.push(item),
             None => builder.push_null(),
+        }
+    }
+
+    fn push_item_repeat(builder: &mut Self::ColumnBuilder, item: Self::ScalarRef<'_>, n: usize) {
+        match item {
+            Some(item) => builder.push_repeat(item, n),
+            None => {
+                for _ in 0..n {
+                    builder.push_null()
+                }
+            }
         }
     }
 
@@ -166,7 +213,7 @@ impl<T: ValueType> ValueType for NullableType<T> {
         builder.build_scalar()
     }
 
-    fn scalar_memory_size<'a>(scalar: &Self::ScalarRef<'a>) -> usize {
+    fn scalar_memory_size(scalar: &Self::ScalarRef<'_>) -> usize {
         match scalar {
             Some(scalar) => T::scalar_memory_size(scalar),
             None => 0,
@@ -175,6 +222,17 @@ impl<T: ValueType> ValueType for NullableType<T> {
 
     fn column_memory_size(col: &Self::Column) -> usize {
         col.memory_size()
+    }
+
+    // Null default lastly
+    #[inline(always)]
+    fn compare(lhs: Self::ScalarRef<'_>, rhs: Self::ScalarRef<'_>) -> Ordering {
+        match (lhs, rhs) {
+            (Some(lhs), Some(rhs)) => T::compare(lhs, rhs),
+            (Some(_), None) => Ordering::Greater,
+            (None, Some(_)) => Ordering::Less,
+            (None, None) => Ordering::Equal,
+        }
     }
 }
 
@@ -201,9 +259,35 @@ pub struct NullableColumn<T: ValueType> {
     pub validity: Bitmap,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct NullableColumnVec {
+    pub column: ColumnVec,
+    pub validity: ColumnVec,
+}
+
 impl<T: ValueType> NullableColumn<T> {
+    // though column and validity are public
+    // we should better use new to create a new instance to ensure the validity and column are consistent
+    // todo: make column and validity private
+    pub fn new(column: T::Column, validity: Bitmap) -> Self {
+        debug_assert_eq!(T::column_len(&column), validity.len());
+        debug_assert!(!matches!(
+            T::upcast_column(column.clone()),
+            Column::Nullable(_)
+        ));
+        NullableColumn { column, validity }
+    }
+
     pub fn len(&self) -> usize {
         self.validity.len()
+    }
+
+    pub fn column_ref(&self) -> &T::Column {
+        &self.column
+    }
+
+    pub fn validity_ref(&self) -> &Bitmap {
+        &self.validity
     }
 
     pub fn index(&self, index: usize) -> Option<Option<T::ScalarRef<'_>>> {
@@ -218,9 +302,15 @@ impl<T: ValueType> NullableColumn<T> {
     ///
     /// Calling this method with an out-of-bounds index is *[undefined behavior]*
     pub unsafe fn index_unchecked(&self, index: usize) -> Option<T::ScalarRef<'_>> {
-        match self.validity.get_bit_unchecked(index) {
-            true => Some(T::index_column(&self.column, index).unwrap()),
-            false => None,
+        // we need to check the validity firstly
+        // cause `self.validity.get_bit_unchecked` may check the index from buffer address with `true` result
+        if index < self.validity.len() {
+            match self.validity.get_bit_unchecked(index) {
+                true => Some(T::index_column_unchecked(&self.column, index)),
+                false => None,
+            }
+        } else {
+            None
         }
     }
 
@@ -242,10 +332,7 @@ impl<T: ValueType> NullableColumn<T> {
     }
 
     pub fn upcast(self) -> NullableColumn<AnyType> {
-        NullableColumn {
-            column: T::upcast_column(self.column),
-            validity: self.validity,
-        }
+        NullableColumn::new(T::upcast_column(self.column), self.validity)
     }
 
     pub fn memory_size(&self) -> usize {
@@ -255,16 +342,22 @@ impl<T: ValueType> NullableColumn<T> {
 
 impl NullableColumn<AnyType> {
     pub fn try_downcast<T: ValueType>(&self) -> Option<NullableColumn<T>> {
-        Some(NullableColumn {
-            column: T::try_downcast_column(&self.column)?,
-            validity: self.validity.clone(),
-        })
+        Some(NullableColumn::new(
+            T::try_downcast_column(&self.column)?,
+            self.validity.clone(),
+        ))
+    }
+
+    pub fn new_column(column: Column, validity: Bitmap) -> Column {
+        debug_assert_eq!(column.len(), validity.len());
+        debug_assert!(!matches!(column, Column::Nullable(_)));
+        Column::Nullable(Box::new(NullableColumn { column, validity }))
     }
 }
 
 pub struct NullableIterator<'a, T: ValueType> {
     iter: T::ColumnIterator<'a>,
-    validity: common_arrow::arrow::bitmap::utils::BitmapIter<'a>,
+    validity: databend_common_column::bitmap::utils::BitmapIter<'a>,
 }
 
 impl<'a, T: ValueType> Iterator for NullableIterator<'a, T> {
@@ -276,7 +369,11 @@ impl<'a, T: ValueType> Iterator for NullableIterator<'a, T> {
             .zip(self.validity.next())
             .map(
                 |(scalar, is_not_null)| {
-                    if is_not_null { Some(scalar) } else { None }
+                    if is_not_null {
+                        Some(scalar)
+                    } else {
+                        None
+                    }
                 },
             )
     }
@@ -287,7 +384,7 @@ impl<'a, T: ValueType> Iterator for NullableIterator<'a, T> {
     }
 }
 
-unsafe impl<'a, T: ValueType> TrustedLen for NullableIterator<'a, T> {}
+unsafe impl<T: ValueType> TrustedLen for NullableIterator<'_, T> {}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct NullableColumnBuilder<T: ValueType> {
@@ -312,9 +409,21 @@ impl<T: ValueType> NullableColumnBuilder<T> {
         self.validity.push(true);
     }
 
+    pub fn push_repeat(&mut self, item: T::ScalarRef<'_>, n: usize) {
+        T::push_item_repeat(&mut self.builder, item, n);
+        self.validity.extend_constant(n, true)
+    }
+
     pub fn push_null(&mut self) {
         T::push_default(&mut self.builder);
         self.validity.push(false);
+    }
+
+    pub fn push_repeat_null(&mut self, repeat: usize) {
+        for _ in 0..repeat {
+            T::push_default(&mut self.builder);
+        }
+        self.validity.extend_constant(repeat, false);
     }
 
     pub fn append_column(&mut self, other: &NullableColumn<T>) {
@@ -324,10 +433,7 @@ impl<T: ValueType> NullableColumnBuilder<T> {
 
     pub fn build(self) -> NullableColumn<T> {
         assert_eq!(self.validity.len(), T::builder_len(&self.builder));
-        NullableColumn {
-            column: T::build_column(self.builder),
-            validity: self.validity.into(),
-        }
+        NullableColumn::new(T::build_column(self.builder), self.validity.into())
     }
 
     pub fn build_scalar(self) -> Option<T::Scalar> {
@@ -337,6 +443,13 @@ impl<T: ValueType> NullableColumnBuilder<T> {
             Some(T::build_scalar(self.builder))
         } else {
             None
+        }
+    }
+
+    pub fn upcast(self, decimal_size: Option<DecimalSize>) -> NullableColumnBuilder<AnyType> {
+        NullableColumnBuilder {
+            builder: T::try_upcast_column_builder(self.builder, decimal_size).unwrap(),
+            validity: self.validity,
         }
     }
 }

@@ -14,27 +14,26 @@
 
 use std::sync::Arc;
 
-use common_catalog::plan::PushDownInfo;
-use common_catalog::table::Table;
-use common_catalog::table_context::TableContext;
-use common_exception::Result;
-use common_expression::types::NumberDataType;
-use common_expression::types::NumberType;
-use common_expression::types::StringType;
-use common_expression::types::TimestampType;
-use common_expression::types::VariantType;
-use common_expression::DataBlock;
-use common_expression::FromData;
-use common_expression::FromOptData;
-use common_expression::TableDataType;
-use common_expression::TableField;
-use common_expression::TableSchemaRefExt;
-use common_meta_api::BackgroundApi;
-use common_meta_app::background::ListBackgroundTasksReq;
-use common_meta_app::schema::TableIdent;
-use common_meta_app::schema::TableInfo;
-use common_meta_app::schema::TableMeta;
-use common_users::UserApiProvider;
+use databend_common_catalog::plan::PushDownInfo;
+use databend_common_catalog::table::Table;
+use databend_common_catalog::table_context::TableContext;
+use databend_common_exception::Result;
+use databend_common_expression::types::NumberDataType;
+use databend_common_expression::types::NumberType;
+use databend_common_expression::types::StringType;
+use databend_common_expression::types::TimestampType;
+use databend_common_expression::types::VariantType;
+use databend_common_expression::DataBlock;
+use databend_common_expression::FromData;
+use databend_common_expression::TableDataType;
+use databend_common_expression::TableField;
+use databend_common_expression::TableSchemaRefExt;
+use databend_common_meta_api::BackgroundApi;
+use databend_common_meta_app::background::ListBackgroundTasksReq;
+use databend_common_meta_app::schema::TableIdent;
+use databend_common_meta_app::schema::TableInfo;
+use databend_common_meta_app::schema::TableMeta;
+use databend_common_users::UserApiProvider;
 
 use crate::table::AsyncOneBlockSystemTable;
 use crate::table::AsyncSystemTable;
@@ -60,7 +59,7 @@ impl AsyncSystemTable for BackgroundTaskTable {
         let tenant = ctx.get_tenant();
         let meta_api = UserApiProvider::instance().get_meta_store_client();
         let tasks = meta_api
-            .list_background_tasks(ListBackgroundTasksReq { tenant })
+            .list_background_tasks(ListBackgroundTasksReq::new(&tenant))
             .await?;
         let mut names = Vec::with_capacity(tasks.len());
         let mut types = Vec::with_capacity(tasks.len());
@@ -75,22 +74,24 @@ impl AsyncSystemTable for BackgroundTaskTable {
         let mut trigger = Vec::with_capacity(tasks.len());
         let mut create_timestamps = Vec::with_capacity(tasks.len());
         let mut update_timestamps = Vec::with_capacity(tasks.len());
-        for (_, name, task) in tasks {
-            names.push(name.as_bytes().to_vec());
-            types.push(task.task_type.to_string().as_bytes().to_vec());
-            stats.push(task.task_state.to_string().as_bytes().to_vec());
-            messages.push(task.message.as_bytes().to_vec());
+        for (name, seq_task) in tasks {
+            names.push(name.name().to_string());
+            types.push(seq_task.task_type.to_string());
+            stats.push(seq_task.task_state.to_string());
+            messages.push(seq_task.message.to_string());
             compaction_stats.push(
-                task.compaction_task_stats
+                seq_task
+                    .compaction_task_stats
                     .as_ref()
                     .map(|s| serde_json::to_vec(s).unwrap_or_default()),
             );
             vacuum_stats.push(
-                task.vacuum_stats
+                seq_task
+                    .vacuum_stats
                     .as_ref()
                     .map(|s| serde_json::to_vec(s).unwrap_or_default()),
             );
-            if let Some(compact_stats) = task.compaction_task_stats.as_ref() {
+            if let Some(compact_stats) = seq_task.compaction_task_stats.as_ref() {
                 database_ids.push(compact_stats.db_id);
                 table_ids.push(compact_stats.table_id);
                 task_run_secs.push(compact_stats.total_compaction_time.map(|s| s.as_secs()));
@@ -99,13 +100,15 @@ impl AsyncSystemTable for BackgroundTaskTable {
                 table_ids.push(0);
                 task_run_secs.push(None);
             }
-            creators.push(task.creator.map(|s| s.to_string().as_bytes().to_vec()));
+            creators.push(seq_task.creator.as_ref().map(|s| s.to_string()));
             trigger.push(
-                task.manual_trigger
-                    .map(|s| s.trigger.to_string().as_bytes().to_vec()),
+                seq_task
+                    .manual_trigger
+                    .as_ref()
+                    .map(|s| s.trigger.display().to_string()),
             );
-            create_timestamps.push(task.created_at.timestamp_micros());
-            update_timestamps.push(task.last_updated.unwrap_or_default().timestamp_micros());
+            create_timestamps.push(seq_task.created_at.timestamp_micros());
+            update_timestamps.push(seq_task.last_updated.unwrap_or_default().timestamp_micros());
         }
         Ok(DataBlock::new_from_columns(vec![
             StringType::from_data(names),

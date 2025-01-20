@@ -12,12 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use common_ast::ast::PresignAction as AstPresignAction;
-use common_ast::ast::PresignLocation;
-use common_ast::ast::PresignStmt;
-use common_exception::Result;
+use databend_common_ast::ast::PresignAction as AstPresignAction;
+use databend_common_ast::ast::PresignLocation;
+use databend_common_ast::ast::PresignStmt;
+use databend_common_exception::Result;
 
-use super::copy::parse_stage_location_v2;
+use crate::binder::resolve_stage_location;
 use crate::binder::Binder;
 use crate::plans::Plan;
 use crate::plans::PresignAction;
@@ -34,8 +34,7 @@ impl Binder {
         match &stmt.location {
             PresignLocation::StageLocation(stage_location) => {
                 let (stage_info, path) =
-                    parse_stage_location_v2(&self.ctx, &stage_location.name, &stage_location.path)
-                        .await?;
+                    resolve_stage_location(self.ctx.as_ref(), stage_location).await?;
 
                 Ok(Plan::Presign(Box::new(PresignPlan {
                     stage: Box::new(stage_info),

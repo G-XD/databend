@@ -14,13 +14,11 @@
 
 use std::sync::Arc;
 
-use common_exception::Result;
-use common_expression::types::StringType;
-use common_expression::DataBlock;
-use common_expression::DataSchemaRef;
-use common_expression::FromData;
-use common_sql::plans::ShowNetworkPoliciesPlan;
-use common_users::UserApiProvider;
+use databend_common_exception::Result;
+use databend_common_expression::types::StringType;
+use databend_common_expression::DataBlock;
+use databend_common_expression::FromData;
+use databend_common_users::UserApiProvider;
 
 use crate::interpreters::Interpreter;
 use crate::pipelines::PipelineBuildResult;
@@ -30,12 +28,11 @@ use crate::sessions::TableContext;
 #[derive(Debug)]
 pub struct ShowNetworkPoliciesInterpreter {
     ctx: Arc<QueryContext>,
-    plan: ShowNetworkPoliciesPlan,
 }
 
 impl ShowNetworkPoliciesInterpreter {
-    pub fn try_create(ctx: Arc<QueryContext>, plan: ShowNetworkPoliciesPlan) -> Result<Self> {
-        Ok(ShowNetworkPoliciesInterpreter { ctx, plan })
+    pub fn try_create(ctx: Arc<QueryContext>) -> Result<Self> {
+        Ok(ShowNetworkPoliciesInterpreter { ctx })
     }
 }
 
@@ -45,8 +42,8 @@ impl Interpreter for ShowNetworkPoliciesInterpreter {
         "ShowNetworkPoliciesInterpreter"
     }
 
-    fn schema(&self) -> DataSchemaRef {
-        self.plan.schema()
+    fn is_ddl(&self) -> bool {
+        false
     }
 
     #[async_backtrace::framed]
@@ -60,10 +57,10 @@ impl Interpreter for ShowNetworkPoliciesInterpreter {
         let mut blocked_ip_lists = Vec::with_capacity(network_policies.len());
         let mut comments = Vec::with_capacity(network_policies.len());
         for network_policy in network_policies {
-            names.push(network_policy.name.as_bytes().to_vec());
-            allowed_ip_lists.push(network_policy.allowed_ip_list.join(",").as_bytes().to_vec());
-            blocked_ip_lists.push(network_policy.blocked_ip_list.join(",").as_bytes().to_vec());
-            comments.push(network_policy.comment.as_bytes().to_vec());
+            names.push(network_policy.name.clone());
+            allowed_ip_lists.push(network_policy.allowed_ip_list.join(",").clone());
+            blocked_ip_lists.push(network_policy.blocked_ip_list.join(",").clone());
+            comments.push(network_policy.comment.clone());
         }
 
         PipelineBuildResult::from_blocks(vec![DataBlock::new_from_columns(vec![

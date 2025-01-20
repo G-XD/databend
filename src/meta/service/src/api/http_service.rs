@@ -16,21 +16,20 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use anyerror::AnyError;
-use common_base::base::tokio::sync::broadcast;
-use common_base::base::Stoppable;
-use common_http::health_handler;
-use common_http::home::debug_home_handler;
+use databend_common_base::base::tokio::sync::broadcast;
+use databend_common_base::base::Stoppable;
+use databend_common_http::health_handler;
+use databend_common_http::home::debug_home_handler;
 #[cfg(feature = "memory-profiling")]
-use common_http::jeprof::debug_jeprof_dump_handler;
-use common_http::pprof::debug_pprof_handler;
-use common_http::HttpError;
-use common_http::HttpShutdownHandler;
-use common_meta_types::MetaNetworkError;
+use databend_common_http::jeprof::debug_jeprof_dump_handler;
+use databend_common_http::pprof::debug_pprof_handler;
+use databend_common_http::HttpError;
+use databend_common_http::HttpShutdownHandler;
+use databend_common_meta_types::MetaNetworkError;
 use log::info;
 use log::warn;
 use poem::get;
-use poem::listener::RustlsCertificate;
-use poem::listener::RustlsConfig;
+use poem::listener::OpensslTlsConfig;
 use poem::Endpoint;
 use poem::EndpointExt;
 use poem::Route;
@@ -63,12 +62,8 @@ impl HttpService {
                 get(super::http::v1::ctrl::trigger_snapshot),
             )
             .at(
-                "/v1/ctrl/block_write_snapshot",
-                get(super::http::v1::ctrl::block_write_snapshot),
-            )
-            .at(
-                "/v1/ctrl/block_compact_snapshot",
-                get(super::http::v1::ctrl::block_compact_snapshot),
+                "/v1/ctrl/trigger_transfer_leader",
+                get(super::http::v1::ctrl::trigger_transfer_leader),
             )
             .at(
                 "/v1/cluster/nodes",
@@ -100,17 +95,10 @@ impl HttpService {
         route.data(self.meta_node.clone()).data(self.cfg.clone())
     }
 
-    fn build_tls(config: &Config) -> Result<RustlsConfig, MetaNetworkError> {
-        let conf = config.clone();
-
-        let tls_cert = std::fs::read(conf.admin_tls_server_cert.as_str())
-            .map_err(|e| MetaNetworkError::TLSConfigError(AnyError::new(&e)))?;
-
-        let tls_key = std::fs::read(conf.admin_tls_server_key)
-            .map_err(|e| MetaNetworkError::TLSConfigError(AnyError::new(&e)))?;
-
-        let certificate = RustlsCertificate::new().cert(tls_cert).key(tls_key);
-        let cfg = RustlsConfig::new().fallback(certificate);
+    fn build_tls(config: &Config) -> Result<OpensslTlsConfig, MetaNetworkError> {
+        let cfg = OpensslTlsConfig::new()
+            .cert_from_file(config.admin_tls_server_cert.as_str())
+            .key_from_file(config.admin_tls_server_key.as_str());
         Ok(cfg)
     }
 

@@ -14,27 +14,33 @@
 
 use std::sync::Arc;
 
-use common_exception::ErrorCode;
-use common_exception::Result;
-use common_expression::TableSchemaRef;
+use databend_common_exception::ErrorCode;
+use databend_common_exception::Result;
+use databend_common_expression::is_internal_column;
+use databend_common_expression::TableSchemaRef;
+use databend_common_expression::SEARCH_MATCHED_COL_NAME;
+use databend_common_expression::SEARCH_SCORE_COL_NAME;
 
+use crate::optimizer::extract::Matcher;
 use crate::optimizer::rule::Rule;
 use crate::optimizer::ColumnSet;
 use crate::optimizer::RuleID;
 use crate::optimizer::SExpr;
+use crate::plans::BoundColumnRef;
 use crate::plans::Filter;
-use crate::plans::PatternPlan;
 use crate::plans::Prewhere;
 use crate::plans::RelOp;
 use crate::plans::ScalarExpr;
 use crate::plans::Scan;
+use crate::plans::SubqueryExpr;
+use crate::plans::Visitor;
 use crate::IndexType;
 use crate::MetadataRef;
 use crate::Visibility;
 
 pub struct RulePushDownPrewhere {
     id: RuleID,
-    patterns: Vec<SExpr>,
+    matchers: Vec<Matcher>,
     metadata: MetadataRef,
 }
 
@@ -42,20 +48,13 @@ impl RulePushDownPrewhere {
     pub fn new(metadata: MetadataRef) -> Self {
         Self {
             id: RuleID::PushDownPrewhere,
-            patterns: vec![SExpr::create_unary(
-                Arc::new(
-                    PatternPlan {
-                        plan_type: RelOp::Filter,
-                    }
-                    .into(),
-                ),
-                Arc::new(SExpr::create_leaf(Arc::new(
-                    PatternPlan {
-                        plan_type: RelOp::Scan,
-                    }
-                    .into(),
-                ))),
-            )],
+            matchers: vec![Matcher::MatchOp {
+                op_type: RelOp::Filter,
+                children: vec![Matcher::MatchOp {
+                    op_type: RelOp::Scan,
+                    children: vec![],
+                }],
+            }],
             metadata,
         }
     }
@@ -65,39 +64,60 @@ impl RulePushDownPrewhere {
         table_index: IndexType,
         schema: &TableSchemaRef,
         expr: &ScalarExpr,
-        columns: &mut ColumnSet,
-    ) -> Result<()> {
-        match expr {
-            ScalarExpr::BoundColumnRef(column) => {
+    ) -> Result<ColumnSet> {
+        struct ColumnVisitor {
+            table_index: IndexType,
+            schema: TableSchemaRef,
+            columns: ColumnSet,
+        }
+        impl<'a> Visitor<'a> for ColumnVisitor {
+            fn visit_bound_column_ref(&mut self, column: &'a BoundColumnRef) -> Result<()> {
                 if let Some(index) = &column.column.table_index {
-                    if table_index == *index
+                    if self.table_index == *index
                         && (column.column.visibility == Visibility::InVisible
-                            || schema.index_of(column.column.column_name.as_str()).is_ok())
+                            || self
+                                .schema
+                                .index_of(column.column.column_name.as_str())
+                                .is_ok())
                     {
-                        columns.insert(column.column.index);
+                        if column.column.column_name == SEARCH_SCORE_COL_NAME
+                            || column.column.column_name == SEARCH_MATCHED_COL_NAME
+                        {
+                            return Err(ErrorCode::StorageUnsupported(
+                                "Prewhere don't support search functions".to_string(),
+                            ));
+                        }
+                        if is_internal_column(&column.column.column_name) {
+                            return Err(ErrorCode::StorageUnsupported(format!(
+                                "Prewhere don't support internal column {}",
+                                column.column.column_name
+                            )));
+                        }
+                        self.columns.insert(column.column.index);
                         return Ok(());
                     }
                 }
-                return Err(ErrorCode::Unimplemented("Column is not in the table"));
+                Err(ErrorCode::Unimplemented("Column is not in the table"))
             }
-            ScalarExpr::FunctionCall(func) => {
-                for arg in func.arguments.iter() {
-                    Self::collect_columns_impl(table_index, schema, arg, columns)?;
-                }
-            }
-            ScalarExpr::CastExpr(cast) => {
-                Self::collect_columns_impl(table_index, schema, cast.argument.as_ref(), columns)?;
-            }
-            ScalarExpr::ConstantExpr(_) => {}
-            _ => {
-                // SubqueryExpr and AggregateFunction will not appear in Filter-LogicalGet
-                return Err(ErrorCode::Unimplemented(format!(
+
+            fn visit_subquery(&mut self, subquery: &'a SubqueryExpr) -> Result<()> {
+                Err(ErrorCode::Unimplemented(format!(
                     "Prewhere don't support expr {:?}",
-                    expr
-                )));
+                    subquery
+                )))
             }
         }
-        Ok(())
+
+        let mut column_visitor = ColumnVisitor {
+            table_index,
+            schema: schema.clone(),
+            columns: ColumnSet::new(),
+        };
+        // WindowFunc, SubqueryExpr and AggregateFunction will not appear in Scan
+        // WindowFunc and AggFunc already check in binder:
+        // Where clause can't contain aggregate or window functions
+        column_visitor.visit(expr)?;
+        Ok(column_visitor.columns)
     }
 
     // analyze if the expression can be moved to prewhere
@@ -106,18 +126,17 @@ impl RulePushDownPrewhere {
         schema: &TableSchemaRef,
         expr: &ScalarExpr,
     ) -> Option<ColumnSet> {
-        let mut columns = ColumnSet::new();
-        // columns in subqueries are not considered
-        Self::collect_columns_impl(table_index, schema, expr, &mut columns).ok()?;
-
-        Some(columns)
+        Self::collect_columns_impl(table_index, schema, expr).ok()
     }
 
     pub fn prewhere_optimize(&self, s_expr: &SExpr) -> Result<SExpr> {
-        let mut get: Scan = s_expr.child(0)?.plan().clone().try_into()?;
+        let mut scan: Scan = s_expr.child(0)?.plan().clone().try_into()?;
+        if scan.update_stream_columns {
+            return Ok(s_expr.clone());
+        }
         let metadata = self.metadata.read().clone();
 
-        let table = metadata.table(get.table_index).table();
+        let table = metadata.table(scan.table_index).table();
         if !table.support_prewhere() {
             // cannot optimize
             return Ok(s_expr.clone());
@@ -129,7 +148,7 @@ impl RulePushDownPrewhere {
 
         // filter.predicates are already split by AND
         for pred in filter.predicates.iter() {
-            match Self::collect_columns(get.table_index, &table.schema(), pred) {
+            match Self::collect_columns(scan.table_index, &table.schema(), pred) {
                 Some(columns) => {
                     prewhere_pred.push(pred.clone());
                     prewhere_columns.extend(&columns);
@@ -139,28 +158,24 @@ impl RulePushDownPrewhere {
         }
 
         if !prewhere_pred.is_empty() {
-            if let Some(prewhere) = get.prewhere.as_ref() {
+            if let Some(prewhere) = scan.prewhere.as_ref() {
                 prewhere_pred.extend(prewhere.predicates.clone());
                 prewhere_columns.extend(&prewhere.prewhere_columns);
             }
 
-            get.prewhere = Some(Prewhere {
-                output_columns: get.columns.clone(),
+            scan.prewhere = Some(Prewhere {
+                output_columns: scan.columns.clone(),
                 prewhere_columns,
                 predicates: prewhere_pred,
             });
         }
-        Ok(SExpr::create_leaf(Arc::new(get.into())))
+        Ok(SExpr::create_leaf(Arc::new(scan.into())))
     }
 }
 
 impl Rule for RulePushDownPrewhere {
     fn id(&self) -> RuleID {
         self.id
-    }
-
-    fn patterns(&self) -> &Vec<SExpr> {
-        &self.patterns
     }
 
     fn apply(
@@ -172,5 +187,9 @@ impl Rule for RulePushDownPrewhere {
         result.set_applied_rule(&self.id);
         state.add_result(result);
         Ok(())
+    }
+
+    fn matchers(&self) -> &[Matcher] {
+        &self.matchers
     }
 }

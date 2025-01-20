@@ -12,11 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::cmp::Ordering;
 use std::ops::Range;
 
 use crate::property::Domain;
 use crate::types::ArgType;
 use crate::types::DataType;
+use crate::types::DecimalSize;
 use crate::types::GenericMap;
 use crate::types::ValueType;
 use crate::values::Column;
@@ -38,11 +40,11 @@ impl ValueType for EmptyMapType {
     #[inline]
     fn upcast_gat<'short, 'long: 'short>(_: Self::ScalarRef<'long>) -> Self::ScalarRef<'short> {}
 
-    fn to_owned_scalar<'a>(scalar: Self::ScalarRef<'a>) -> Self::Scalar {
+    fn to_owned_scalar(scalar: Self::ScalarRef<'_>) -> Self::Scalar {
         scalar
     }
 
-    fn to_scalar_ref<'a>(scalar: &'a Self::Scalar) -> Self::ScalarRef<'a> {
+    fn to_scalar_ref(scalar: &Self::Scalar) -> Self::ScalarRef<'_> {
         *scalar
     }
 
@@ -53,7 +55,7 @@ impl ValueType for EmptyMapType {
         }
     }
 
-    fn try_downcast_column<'a>(col: &'a Column) -> Option<Self::Column> {
+    fn try_downcast_column(col: &Column) -> Option<Self::Column> {
         match col {
             Column::EmptyMap { len } => Some(*len),
             _ => None,
@@ -67,13 +69,25 @@ impl ValueType for EmptyMapType {
         }
     }
 
-    fn try_downcast_builder<'a>(
-        builder: &'a mut ColumnBuilder,
-    ) -> Option<&'a mut Self::ColumnBuilder> {
+    fn try_downcast_builder(builder: &mut ColumnBuilder) -> Option<&mut Self::ColumnBuilder> {
         match builder {
             ColumnBuilder::EmptyMap { len } => Some(len),
             _ => None,
         }
+    }
+
+    fn try_downcast_owned_builder(builder: ColumnBuilder) -> Option<Self::ColumnBuilder> {
+        match builder {
+            ColumnBuilder::EmptyMap { len } => Some(len),
+            _ => None,
+        }
+    }
+
+    fn try_upcast_column_builder(
+        len: Self::ColumnBuilder,
+        _decimal_size: Option<DecimalSize>,
+    ) -> Option<ColumnBuilder> {
+        Some(ColumnBuilder::EmptyMap { len })
     }
 
     fn upcast_scalar(_: Self::Scalar) -> Scalar {
@@ -88,26 +102,27 @@ impl ValueType for EmptyMapType {
         Domain::Map(None)
     }
 
-    fn column_len<'a>(len: &'a Self::Column) -> usize {
+    fn column_len(len: &Self::Column) -> usize {
         *len
     }
 
-    fn index_column<'a>(len: &'a Self::Column, index: usize) -> Option<Self::ScalarRef<'a>> {
-        if index < *len { Some(()) } else { None }
+    fn index_column(len: &Self::Column, index: usize) -> Option<Self::ScalarRef<'_>> {
+        if index < *len {
+            Some(())
+        } else {
+            None
+        }
     }
 
-    unsafe fn index_column_unchecked<'a>(
-        _len: &'a Self::Column,
-        _index: usize,
-    ) -> Self::ScalarRef<'a> {
-    }
+    #[inline(always)]
+    unsafe fn index_column_unchecked(_len: &Self::Column, _index: usize) -> Self::ScalarRef<'_> {}
 
-    fn slice_column<'a>(len: &'a Self::Column, range: Range<usize>) -> Self::Column {
+    fn slice_column(len: &Self::Column, range: Range<usize>) -> Self::Column {
         assert!(range.end <= *len, "range {range:?} out of 0..{len}");
         range.end - range.start
     }
 
-    fn iter_column<'a>(len: &'a Self::Column) -> Self::ColumnIterator<'a> {
+    fn iter_column(len: &Self::Column) -> Self::ColumnIterator<'_> {
         std::iter::repeat(()).take(*len)
     }
 
@@ -121,6 +136,10 @@ impl ValueType for EmptyMapType {
 
     fn push_item(len: &mut Self::ColumnBuilder, _: Self::Scalar) {
         *len += 1
+    }
+
+    fn push_item_repeat(len: &mut Self::ColumnBuilder, _: Self::ScalarRef<'_>, n: usize) {
+        *len += n
     }
 
     fn push_default(len: &mut Self::ColumnBuilder) {
@@ -139,12 +158,17 @@ impl ValueType for EmptyMapType {
         assert_eq!(len, 1);
     }
 
-    fn scalar_memory_size<'a>(_: &Self::ScalarRef<'a>) -> usize {
+    fn scalar_memory_size(_: &Self::ScalarRef<'_>) -> usize {
         0
     }
 
     fn column_memory_size(_: &Self::Column) -> usize {
         std::mem::size_of::<usize>()
+    }
+
+    #[inline(always)]
+    fn compare(lhs: Self::ScalarRef<'_>, rhs: Self::ScalarRef<'_>) -> Ordering {
+        lhs.cmp(&rhs)
     }
 }
 

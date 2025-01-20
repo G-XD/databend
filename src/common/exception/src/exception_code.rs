@@ -37,6 +37,7 @@ macro_rules! build_exceptions {
                         $code,
                         stringify!($body),
                         display_text.into(),
+                        String::new(),
                         None,
                         bt,
                     )
@@ -99,11 +100,11 @@ build_exceptions! {
     TooManyUserConnections(1041),
     AbortedSession(1042),
     AbortedQuery(1043),
+    ClosedQuery(1044),
     CannotListenerPort(1045),
     BadBytes(1046),
     InitPrometheusFailure(1047),
     Overflow(1049),
-    AuthenticateFailure(1051),
     TLSConfigurationFailure(1052),
     UnknownSession(1053),
     SHA1CheckFailed(1057),
@@ -114,13 +115,13 @@ build_exceptions! {
     PermissionDenied(1063),
     UnmarshalError(1064),
     SemanticError(1065),
+    NeedChangePasswordDenied(1066),
     UnknownException(1067),
     TokioError(1068),
     HttpNotFound(1072),
     UnknownFormat(1074),
     UnknownCompressionType(1075),
     InvalidCompressionData(1076),
-    InvalidAuthInfo(1077),
     InvalidTimezone(1078),
     InvalidDate(1079),
     InvalidTimestamp(1080),
@@ -143,15 +144,26 @@ build_exceptions! {
     VirtualColumnNotFound(1115),
     VirtualColumnAlreadyExists(1116),
     ColumnReferencedByComputedColumn(1117),
+    ColumnReferencedByInvertedIndex(1118),
     // The table is not a clustered table.
     UnclusteredTable(1118),
-    UnknownCatalog(11119),
-    UnknownCatalogType(11120),
+    UnknownCatalog(1119),
+    UnknownCatalogType(1120),
+    UnmatchMaskPolicyReturnType(1121),
+    Timeout(1122),
+    Outdated(1123),
+    // sequence
+    OutofSequenceRange(1124),
+    WrongSequenceCount(1125),
+    UnknownSequence(1126),
+    UnknownQuery(1127),
 
     // Data Related Errors
 
     /// ParquetFileInvalid is used when given parquet file is invalid.
     ParquetFileInvalid(1201),
+    /// InvalidUtf8String is used when given string is not a valid utf8 string.
+    InvalidUtf8String(1202),
 
     // Table related errors starts here.
 
@@ -180,13 +192,36 @@ build_exceptions! {
     ///
     /// For example: license key is expired
     LicenseKeyInvalid(1402),
+    EnterpriseFeatureNotEnable(1403),
+    LicenseKeyExpired(1404),
 
     BackgroundJobAlreadyExists(1501),
     UnknownBackgroundJob(1502),
 
+    InvalidRowIdIndex(1503),
     // Index related errors.
     UnsupportedIndex(1601),
     RefreshIndexError(1602),
+    IndexOptionInvalid(1603),
+
+    // Cloud control error codes
+    CloudControlConnectError(1701),
+    CloudControlNotEnabled(1702),
+    IllegalCloudControlMessageFormat(1703),
+
+    // Geometry errors.
+    GeometryError(1801),
+    InvalidGeometryFormat(1802),
+
+    // UDF errors.
+    UDFRuntimeError(1810),
+
+    // Tantivy errors.
+    TantivyError(1901),
+    TantivyOpenReadError(1902),
+    TantivyQueryParserError(1903),
+
+    ReqwestError(1910)
 }
 
 // Meta service errors [2001, 3000].
@@ -217,6 +252,14 @@ build_exceptions! {
     NetworkPolicyAlreadyExists(2208),
     IllegalNetworkPolicy(2209),
     NetworkPolicyIsUsedByUser(2210),
+    UnknownPasswordPolicy(2211),
+    PasswordPolicyAlreadyExists(2212),
+    IllegalPasswordPolicy(2213),
+    PasswordPolicyIsUsedByUser(2214),
+    InvalidPassword(2215),
+    RoleAlreadyExists(2216),
+    IllegalRole(2217),
+    IllegalUser(2218),
 
     // Meta api error codes.
     DatabaseAlreadyExists(2301),
@@ -247,10 +290,21 @@ build_exceptions! {
     /// data mask error codes
     DatamaskAlreadyExists(2321),
 
+    CommitTableMetaError(2322),
+    CreateAsDropTableWithoutDropTime(2323),
+
 
     // Cluster error codes.
     ClusterUnknownNode(2401),
     ClusterNodeAlreadyExists(2402),
+    InvalidWarehouse(2403),
+    NoResourcesAvailable(2404),
+    WarehouseAlreadyExists(2405),
+    UnknownWarehouse(2406),
+    WarehouseOperateConflict(2407),
+    EmptyNodesForWarehouse(2408),
+    WarehouseClusterAlreadyExists(2409),
+    WarehouseClusterNotExists(2410),
 
     // Stage error codes.
     UnknownStage(2501),
@@ -265,10 +319,19 @@ build_exceptions! {
     IllegalFileFormat(2508),
     FileFormatAlreadyExists(2509),
 
+    // Connection error codes.
+    UnknownConnection(2510),
+    IllegalConnection(2511),
+    ConnectionAlreadyExists(2512),
+
     // User defined function error codes.
     IllegalUDFFormat(2601),
     UnknownUDF(2602),
     UdfAlreadyExists(2603),
+    UDFServerConnectError(2604),
+    UDFSchemaMismatch(2605),
+    UnsupportedDataType(2606),
+    UDFDataError(2607),
 
     // Database error codes.
     UnknownDatabaseEngine(2701),
@@ -288,8 +351,9 @@ build_exceptions! {
     ShareEndpointAlreadyExists(2714),
     UnknownShareEndpoint(2715),
     UnknownShareEndpointId(2716),
-    UnknownShareTable(2717),
+    CannotAccessShareTable(2717),
     CannotShareDatabaseCreatedFromShare(2718),
+    ShareStorageError(2719),
 
     // Index error codes.
     CreateIndexWithDropTime(2720),
@@ -297,6 +361,19 @@ build_exceptions! {
     UnknownIndex(2722),
     DropIndexWithDropTime(2723),
     GetIndexWithDropTime(2724),
+    DuplicatedIndexColumnId(2725),
+    IndexColumnIdNotFound(2726),
+
+    // Stream error codes.
+    UnknownStream(2730),
+    UnknownStreamId(2731),
+    StreamAlreadyExists(2732),
+    IllegalStream(2733),
+    StreamVersionMismatched(2734),
+    WithOptionInvalid(2735),
+
+    // dynamic error codes.
+    IllegalDynamicTable(2740),
 
     // Variable error codes.
     UnknownVariable(2801),
@@ -308,6 +385,25 @@ build_exceptions! {
     TenantQuotaUnknown(2902),
     TenantQuotaExceeded(2903),
 
+    // Script error codes.
+    ScriptSemanticError(3001),
+    ScriptExecutionError(3002),
+
+    // sequence
+    SequenceError(3101),
+
+    // Share error codes(continue).
+    ErrorShareEndpointCredential(3111),
+    WrongSharePrivileges(3112),
+
+    // dictionary
+    DictionaryAlreadyExists(3113),
+    UnknownDictionary(3114),
+    DictionarySourceError(3115),
+    // Procedure
+    UnknownProcedure(3130),
+    ProcedureAlreadyExists(3131),
+    IllegalProcedureFormat(3132),
 }
 
 // Storage errors [3001, 4000].
@@ -318,12 +414,33 @@ build_exceptions! {
     StorageUnsupported(3902),
     StorageInsecure(3903),
     DeprecatedIndexFormat(3904),
+    InvalidOperation(3905),
     StorageOther(4000),
     UnresolvableConflict(4001),
+
+    // transaction error codes
+    CurrentTransactionIsAborted(4002),
+    TransactionTimeout(4003),
+    InvalidSessionState(4004),
+
+    // recluster error codes
+    NoNeedToRecluster(4011),
+    NoNeedToCompact(4012),
+    UnsupportedClusterType(4013),
+
+    RefreshTableInfoFailure(4021),
 }
 
 // Service errors [5001,6000].
 build_exceptions! {
-    // A task that already stopped and can not stopped twice.
+    // A task that already stopped and can not stop twice.
     AlreadyStopped(5002),
+
+    // auth related
+    AuthenticateFailure(5100),
+    // the flowing 4 code is used by clients
+    SessionTokenExpired(5101),
+    RefreshTokenExpired(5102),
+    SessionTokenNotFound(5103),
+    RefreshTokenNotFound(5104)
 }

@@ -1,4 +1,4 @@
-// Copyright 2021 Datafuse Labs.
+// Copyright 2021 Datafuse Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,65 +12,63 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use common_meta_raft_store::state_machine::testing::snapshot_logs;
-use common_meta_sled_store::openraft::async_trait::async_trait;
-use common_meta_sled_store::openraft::entry::RaftEntry;
-use common_meta_sled_store::openraft::storage::Adaptor;
-use common_meta_sled_store::openraft::storage::RaftLogReaderExt;
-use common_meta_sled_store::openraft::testing::log_id;
-use common_meta_sled_store::openraft::testing::StoreBuilder;
-use common_meta_sled_store::openraft::RaftSnapshotBuilder;
-use common_meta_sled_store::openraft::RaftStorage;
-use common_meta_types::new_log_id;
-use common_meta_types::Entry;
-use common_meta_types::Membership;
-use common_meta_types::StorageError;
-use common_meta_types::StoredMembership;
-use common_meta_types::TypeConfig;
-use common_meta_types::Vote;
-use common_tracing::func_name;
-use databend_meta::meta_service::raftmeta::LogStore;
-use databend_meta::meta_service::raftmeta::SMStore;
+use std::io;
+
+use databend_common_meta_raft_store::leveled_store::db_exporter::DBExporter;
+use databend_common_meta_raft_store::state_machine::testing::snapshot_logs;
+use databend_common_meta_sled_store::openraft::entry::RaftEntry;
+use databend_common_meta_sled_store::openraft::storage::RaftLogReaderExt;
+use databend_common_meta_sled_store::openraft::storage::RaftLogStorage;
+use databend_common_meta_sled_store::openraft::storage::RaftLogStorageExt;
+use databend_common_meta_sled_store::openraft::storage::RaftStateMachine;
+use databend_common_meta_sled_store::openraft::testing::log::StoreBuilder;
+use databend_common_meta_sled_store::openraft::testing::log_id;
+use databend_common_meta_sled_store::openraft::RaftLogReader;
+use databend_common_meta_sled_store::openraft::RaftSnapshotBuilder;
+use databend_common_meta_types::raft_types::new_log_id;
+use databend_common_meta_types::raft_types::Entry;
+use databend_common_meta_types::raft_types::Membership;
+use databend_common_meta_types::raft_types::StorageError;
+use databend_common_meta_types::raft_types::StoredMembership;
+use databend_common_meta_types::raft_types::TypeConfig;
+use databend_common_meta_types::raft_types::Vote;
+use databend_common_meta_types::snapshot_db::DB;
+use databend_meta::meta_service::meta_node::LogStore;
+use databend_meta::meta_service::meta_node::SMStore;
 use databend_meta::store::RaftStore;
-use databend_meta::Opened;
+use futures::TryStreamExt;
 use log::debug;
 use log::info;
 use maplit::btreeset;
-use minitrace::prelude::*;
 use pretty_assertions::assert_eq;
 use test_harness::test;
 
 use crate::testing::meta_service_test_harness;
-use crate::testing::meta_service_test_harness_sync;
 use crate::tests::service::MetaSrvTestContext;
 
 struct MetaStoreBuilder {}
 
-#[async_trait]
 impl StoreBuilder<TypeConfig, LogStore, SMStore, MetaSrvTestContext> for MetaStoreBuilder {
     async fn build(&self) -> Result<(MetaSrvTestContext, LogStore, SMStore), StorageError> {
         let tc = MetaSrvTestContext::new(555);
-        let sto = RaftStore::open_create(&tc.config.raft_config, None, Some(()))
+        let sto = RaftStore::open(&tc.config.raft_config)
             .await
             .expect("fail to create store");
-        let (log_store, sm_store) = Adaptor::new(sto);
-        Ok((tc, log_store, sm_store))
+        Ok((tc, sto.clone(), sto))
     }
 }
 
-#[test(harness = meta_service_test_harness_sync)]
-#[minitrace::trace]
-fn test_impl_raft_storage() -> anyhow::Result<()> {
-    let root = Span::root(func_name!(), SpanContext::random());
-    let _guard = root.set_local_parent();
-
-    common_meta_sled_store::openraft::testing::Suite::test_all(MetaStoreBuilder {})?;
+#[test(harness = meta_service_test_harness)]
+#[fastrace::trace]
+async fn test_impl_raft_storage() -> anyhow::Result<()> {
+    databend_common_meta_sled_store::openraft::testing::log::Suite::test_all(MetaStoreBuilder {})
+        .await?;
 
     Ok(())
 }
 
 #[test(harness = meta_service_test_harness)]
-#[minitrace::trace]
+#[fastrace::trace]
 async fn test_meta_store_restart() -> anyhow::Result<()> {
     // - Create a meta store
     // - Update meta store
@@ -82,36 +80,35 @@ async fn test_meta_store_restart() -> anyhow::Result<()> {
 
     info!("--- new meta store");
     {
-        let mut sto = RaftStore::open_create(&tc.config.raft_config, None, Some(())).await?;
+        let mut sto = RaftStore::open(&tc.config.raft_config).await?;
         assert_eq!(id, sto.id);
-        assert!(!sto.is_opened());
+        assert!(!sto.is_opened);
         assert_eq!(None, sto.read_vote().await?);
 
         info!("--- update metasrv");
 
         sto.save_vote(&Vote::new(10, 5)).await?;
 
-        sto.append_to_log([Entry::new_blank(log_id(1, 2, 1))])
+        sto.blocking_append([Entry::new_blank(log_id(1, 2, 1))])
             .await?;
 
         sto.save_committed(Some(log_id(1, 2, 2))).await?;
 
-        sto.apply_to_state_machine(&[Entry::new_blank(log_id(1, 2, 2))])
-            .await?;
+        sto.apply([Entry::new_blank(log_id(1, 2, 2))]).await?;
     }
 
     info!("--- reopen meta store");
     {
-        let mut sto = RaftStore::open_create(&tc.config.raft_config, Some(()), None).await?;
+        let mut sto = RaftStore::open(&tc.config.raft_config).await?;
         assert_eq!(id, sto.id);
-        assert!(sto.is_opened());
+        assert!(sto.is_opened);
         assert_eq!(Some(Vote::new(10, 5)), sto.read_vote().await?);
 
         assert_eq!(log_id(1, 2, 1), sto.get_log_id(1).await?);
         assert_eq!(Some(log_id(1, 2, 2)), sto.read_committed().await?);
         assert_eq!(
             None,
-            sto.last_applied_state().await?.0,
+            sto.applied_state().await?.0,
             "state machine is not persisted"
         );
     }
@@ -119,7 +116,7 @@ async fn test_meta_store_restart() -> anyhow::Result<()> {
 }
 
 #[test(harness = meta_service_test_harness)]
-#[minitrace::trace]
+#[fastrace::trace]
 async fn test_meta_store_build_snapshot() -> anyhow::Result<()> {
     // - Create a metasrv
     // - Apply logs
@@ -128,14 +125,14 @@ async fn test_meta_store_build_snapshot() -> anyhow::Result<()> {
     let id = 3;
     let tc = MetaSrvTestContext::new(id);
 
-    let mut sto = RaftStore::open_create(&tc.config.raft_config, None, Some(())).await?;
+    let mut sto = RaftStore::open(&tc.config.raft_config).await?;
 
     info!("--- feed logs and state machine");
 
     let (logs, want) = snapshot_logs();
 
-    sto.log.append(logs.clone()).await?;
-    sto.state_machine.write().await.apply_entries(&logs);
+    sto.blocking_append(logs.clone()).await?;
+    sto.state_machine.write().await.apply_entries(logs).await?;
 
     let curr_snap = sto.build_snapshot().await?;
     assert_eq!(Some(new_log_id(1, 0, 9)), curr_snap.meta.last_log_id);
@@ -143,7 +140,7 @@ async fn test_meta_store_build_snapshot() -> anyhow::Result<()> {
     info!("--- check snapshot");
     {
         let data = curr_snap.snapshot;
-        let res = data.read_to_lines().await?;
+        let res = db_to_lines(&data).await?;
 
         debug!("res: {:?}", res);
 
@@ -158,7 +155,8 @@ async fn test_meta_store_build_snapshot() -> anyhow::Result<()> {
         sto.build_snapshot().await?;
 
         let snapshot_store = sto.snapshot_store();
-        let (snapshot_ids, _) = snapshot_store.load_snapshot_ids().await?;
+        let loader = snapshot_store.new_loader();
+        let (snapshot_ids, _) = loader.load_snapshot_ids().await?;
         assert_eq!(3, snapshot_ids.len());
     }
 
@@ -166,7 +164,7 @@ async fn test_meta_store_build_snapshot() -> anyhow::Result<()> {
 }
 
 #[test(harness = meta_service_test_harness)]
-#[minitrace::trace]
+#[fastrace::trace]
 async fn test_meta_store_current_snapshot() -> anyhow::Result<()> {
     // - Create a metasrv
     // - Apply logs
@@ -175,16 +173,16 @@ async fn test_meta_store_current_snapshot() -> anyhow::Result<()> {
     let id = 3;
     let tc = MetaSrvTestContext::new(id);
 
-    let mut sto = RaftStore::open_create(&tc.config.raft_config, None, Some(())).await?;
+    let mut sto = RaftStore::open(&tc.config.raft_config).await?;
 
     info!("--- feed logs and state machine");
 
     let (logs, want) = snapshot_logs();
 
-    sto.log.append(logs.clone()).await?;
+    sto.blocking_append(logs.clone()).await?;
     {
         let mut sm = sto.state_machine.write().await;
-        sm.apply_entries(&logs);
+        sm.apply_entries(logs).await?;
     }
 
     sto.build_snapshot().await?;
@@ -197,7 +195,7 @@ async fn test_meta_store_current_snapshot() -> anyhow::Result<()> {
     info!("--- check snapshot");
     {
         let data = curr_snap.snapshot;
-        let res = data.read_to_lines().await?;
+        let res = db_to_lines(&data).await?;
 
         debug!("res: {:?}", res);
 
@@ -208,7 +206,7 @@ async fn test_meta_store_current_snapshot() -> anyhow::Result<()> {
 }
 
 #[test(harness = meta_service_test_harness)]
-#[minitrace::trace]
+#[fastrace::trace]
 async fn test_meta_store_install_snapshot() -> anyhow::Result<()> {
     // - Create a metasrv
     // - Feed logs
@@ -222,12 +220,12 @@ async fn test_meta_store_install_snapshot() -> anyhow::Result<()> {
     {
         let tc = MetaSrvTestContext::new(id);
 
-        let mut sto = RaftStore::open_create(&tc.config.raft_config, None, Some(())).await?;
+        let mut sto = RaftStore::open(&tc.config.raft_config).await?;
 
         info!("--- feed logs and state machine");
 
-        sto.log.append(logs.clone()).await?;
-        sto.state_machine.write().await.apply_entries(&logs);
+        sto.blocking_append(logs.clone()).await?;
+        sto.state_machine.write().await.apply_entries(logs).await?;
 
         snap = sto.build_snapshot().await?;
     }
@@ -238,13 +236,11 @@ async fn test_meta_store_install_snapshot() -> anyhow::Result<()> {
     {
         let tc = MetaSrvTestContext::new(id);
 
-        let mut sto = RaftStore::open_create(&tc.config.raft_config, None, Some(())).await?;
+        let mut sto = RaftStore::open(&tc.config.raft_config).await?;
 
         info!("--- install snapshot");
         {
-            // TODO(1): remove write_state_machine_id
-            // sto.raft_state.write_state_machine_id(&(0, 0)).await?;
-            sto.do_install_snapshot(data).await?;
+            sto.do_install_snapshot(data.as_ref().clone()).await?;
         }
 
         info!("--- check installed meta");
@@ -253,6 +249,7 @@ async fn test_meta_store_install_snapshot() -> anyhow::Result<()> {
                 .state_machine
                 .write()
                 .await
+                .sys_data_ref()
                 .last_membership_ref()
                 .clone();
 
@@ -264,7 +261,12 @@ async fn test_meta_store_install_snapshot() -> anyhow::Result<()> {
                 mem
             );
 
-            let last_applied = *sto.state_machine.write().await.last_applied_ref();
+            let last_applied = *sto
+                .state_machine
+                .write()
+                .await
+                .sys_data_ref()
+                .last_applied_ref();
             assert_eq!(Some(log_id(1, 0, 9)), last_applied);
         }
 
@@ -272,7 +274,7 @@ async fn test_meta_store_install_snapshot() -> anyhow::Result<()> {
         {
             let curr_snap = sto.build_snapshot().await?;
             let data = curr_snap.snapshot;
-            let res = data.read_to_lines().await?;
+            let res = db_to_lines(&data).await?;
 
             debug!("res: {:?}", res);
 
@@ -281,4 +283,19 @@ async fn test_meta_store_install_snapshot() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+async fn db_to_lines(db: &DB) -> Result<Vec<String>, io::Error> {
+    let res = DBExporter::new(db)
+        .export()
+        .await?
+        .try_collect::<Vec<_>>()
+        .await?;
+
+    let res = res
+        .into_iter()
+        .map(|sm_ent| serde_json::to_string(&sm_ent).unwrap())
+        .collect::<Vec<_>>();
+
+    Ok(res)
 }

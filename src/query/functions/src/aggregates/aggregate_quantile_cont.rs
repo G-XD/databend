@@ -12,98 +12,56 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::alloc::Layout;
-use std::fmt::Display;
-use std::fmt::Formatter;
-use std::marker::PhantomData;
+use std::any::Any;
 use std::sync::Arc;
 
-use common_arrow::arrow::bitmap::Bitmap;
-use common_exception::ErrorCode;
-use common_exception::Result;
-use common_expression::type_check::check_number;
-use common_expression::types::number::*;
-use common_expression::types::*;
-use common_expression::with_number_mapped_type;
-use common_expression::Column;
-use common_expression::ColumnBuilder;
-use common_expression::Expr;
-use common_expression::FunctionContext;
-use common_expression::Scalar;
-use common_expression::ScalarRef;
-use common_io::prelude::deserialize_from_slice;
-use common_io::prelude::serialize_into_buf;
+use borsh::BorshDeserialize;
+use borsh::BorshSerialize;
+use databend_common_base::base::OrderedFloat;
+use databend_common_exception::ErrorCode;
+use databend_common_exception::Result;
+use databend_common_expression::type_check::check_number;
+use databend_common_expression::types::array::ArrayColumnBuilder;
+use databend_common_expression::types::decimal::Decimal;
+use databend_common_expression::types::decimal::DecimalType;
+use databend_common_expression::types::number::*;
+use databend_common_expression::types::*;
+use databend_common_expression::with_number_mapped_type;
+use databend_common_expression::Column;
+use databend_common_expression::Expr;
+use databend_common_expression::FunctionContext;
+use databend_common_expression::Scalar;
+use databend_common_expression::ScalarRef;
+use ethnum::i256;
 use num_traits::AsPrimitive;
-use ordered_float::OrderedFloat;
-use serde::Deserialize;
-use serde::Serialize;
 
+use super::AggregateUnaryFunction;
+use super::FunctionData;
+use super::UnaryState;
 use crate::aggregates::aggregate_function_factory::AggregateFunctionDescription;
 use crate::aggregates::assert_params;
 use crate::aggregates::assert_unary_arguments;
-use crate::aggregates::AggregateFunction;
 use crate::aggregates::AggregateFunctionRef;
-use crate::aggregates::StateAddr;
 use crate::BUILTIN_FUNCTIONS;
 
 const MEDIAN: u8 = 0;
 const QUANTILE_CONT: u8 = 1;
 
-#[derive(Default, Serialize, Deserialize)]
+pub(crate) struct QuantileData {
+    pub(crate) levels: Vec<f64>,
+}
+
+impl FunctionData for QuantileData {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+#[derive(Default, BorshSerialize, BorshDeserialize)]
 struct QuantileContState {
     pub value: Vec<OrderedFloat<f64>>,
 }
 
 impl QuantileContState {
-    fn new() -> Self {
-        Self::default()
-    }
-
-    #[inline(always)]
-    fn add(&mut self, other: f64) {
-        self.value.push(other.into());
-    }
-
-    fn merge(&mut self, rhs: &Self) -> Result<()> {
-        self.value.extend(rhs.value.iter());
-        Ok(())
-    }
-
-    fn merge_result(&mut self, builder: &mut ColumnBuilder, levels: Vec<f64>) -> Result<()> {
-        let value_len = self.value.len();
-        if levels.len() > 1 {
-            let builder = match builder {
-                ColumnBuilder::Array(box b) => b,
-                _ => unreachable!(),
-            };
-            let indices = levels
-                .iter()
-                .map(|level| libm::modf((value_len - 1) as f64 * (*level)))
-                .collect::<Vec<(f64, f64)>>();
-            for (frac, whole) in indices {
-                let whole = whole as usize;
-                if whole >= value_len {
-                    builder.push_default();
-                } else {
-                    let n = self.compute_result(whole, frac, value_len);
-                    builder.put_item(ScalarRef::Number(NumberScalar::Float64(n.into())));
-                }
-            }
-            builder.commit_row();
-        } else {
-            let builder = NumberType::<F64>::try_downcast_builder(builder).unwrap();
-            let (frac, whole) = libm::modf((value_len - 1) as f64 * levels[0]);
-            let whole = whole as usize;
-            if whole >= value_len {
-                builder.push(0_f64.into());
-            } else {
-                let n = self.compute_result(whole, frac, value_len);
-                builder.push(n.into());
-            }
-        }
-        Ok(())
-    }
-
     fn compute_result(&mut self, whole: usize, frac: f64, value_len: usize) -> f64 {
         self.value.as_mut_slice().select_nth_unstable(whole);
         let value = self.value.get(whole).unwrap().0;
@@ -118,139 +76,260 @@ impl QuantileContState {
     }
 }
 
-#[derive(Clone)]
-pub struct AggregateQuantileContFunction<T> {
-    display_name: String,
-    return_type: DataType,
-    levels: Vec<f64>,
-    _arguments: Vec<DataType>,
-    _t: PhantomData<T>,
-}
-
-impl<T> Display for AggregateQuantileContFunction<T>
-where T: Number + AsPrimitive<f64>
+impl<T, R> UnaryState<T, R> for QuantileContState
+where
+    T: ValueType,
+    T::Scalar: Number + AsPrimitive<f64>,
+    R: ValueType,
 {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.display_name)
-    }
-}
-
-impl<T> AggregateFunction for AggregateQuantileContFunction<T>
-where T: Number + AsPrimitive<f64>
-{
-    fn name(&self) -> &str {
-        "AggregateQuantileContFunction"
-    }
-
-    fn return_type(&self) -> Result<DataType> {
-        Ok(self.return_type.clone())
-    }
-
-    fn init_state(&self, place: StateAddr) {
-        place.write(QuantileContState::new)
-    }
-
-    fn state_layout(&self) -> Layout {
-        Layout::new::<QuantileContState>()
-    }
-
-    fn accumulate(
-        &self,
-        place: StateAddr,
-        columns: &[Column],
-        validity: Option<&Bitmap>,
-        _input_rows: usize,
+    fn add(
+        &mut self,
+        other: T::ScalarRef<'_>,
+        _function_data: Option<&dyn FunctionData>,
     ) -> Result<()> {
-        let column = NumberType::<T>::try_downcast_column(&columns[0]).unwrap();
-        let state = place.get::<QuantileContState>();
-        match validity {
-            Some(bitmap) => {
-                for (value, is_valid) in column.iter().zip(bitmap.iter()) {
-                    if is_valid {
-                        state.add(value.as_());
-                    }
+        let other = T::to_owned_scalar(other).as_();
+        self.value.push(other.into());
+        Ok(())
+    }
+
+    fn merge(&mut self, rhs: &Self) -> Result<()> {
+        self.value.extend(rhs.value.iter());
+        Ok(())
+    }
+
+    fn merge_result(
+        &mut self,
+        builder: &mut R::ColumnBuilder,
+        function_data: Option<&dyn FunctionData>,
+    ) -> Result<()> {
+        let value_len = self.value.len();
+        let quantile_cont_data = unsafe {
+            function_data
+                .unwrap()
+                .as_any()
+                .downcast_ref_unchecked::<QuantileData>()
+        };
+        if quantile_cont_data.levels.len() > 1 {
+            let indices = quantile_cont_data
+                .levels
+                .iter()
+                .map(|level| libm::modf((value_len - 1) as f64 * (*level)))
+                .collect::<Vec<(f64, f64)>>();
+            // as we already know the return type `R` here is `ArrayType<Float64Type>`
+            // we should has a inner builder to build `Float64Type::Column` and
+            // provide to `R::ColumnBuilder` when `push_item`
+            let mut inner_column_builder = NumberColumnBuilder::Float64(Vec::new());
+            for (frac, whole) in indices {
+                let whole = whole as usize;
+                if whole >= value_len {
+                    R::push_default(builder);
+                } else {
+                    let n = self.compute_result(whole, frac, value_len);
+                    inner_column_builder.push(NumberScalar::Float64(n.into()));
                 }
             }
-            None => {
-                for value in column.iter() {
-                    state.add(value.as_());
+            let float64_column = inner_column_builder.build();
+            R::push_item(
+                builder,
+                R::try_downcast_scalar(&ScalarRef::Array(Column::Number(float64_column))).unwrap(),
+            )
+        } else {
+            let (frac, whole) = libm::modf((value_len - 1) as f64 * quantile_cont_data.levels[0]);
+            let whole = whole as usize;
+            if whole >= value_len {
+                R::push_default(builder);
+            } else {
+                let n = self.compute_result(whole, frac, value_len);
+                R::push_item(
+                    builder,
+                    R::try_downcast_scalar(&ScalarRef::Number(NumberScalar::Float64(n.into())))
+                        .unwrap(),
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(BorshDeserialize, BorshSerialize)]
+pub struct DecimalQuantileContState<T>
+where
+    T: ValueType,
+    T::Scalar: Decimal + BorshSerialize + BorshDeserialize,
+{
+    pub value: Vec<T::Scalar>,
+}
+
+impl<T> Default for DecimalQuantileContState<T>
+where
+    T: ValueType,
+    T::Scalar: BorshDeserialize + BorshSerialize + Decimal,
+{
+    fn default() -> Self {
+        Self { value: vec![] }
+    }
+}
+
+impl<T> DecimalQuantileContState<T>
+where
+    T: ValueType,
+    T::Scalar: Decimal + BorshSerialize + BorshDeserialize,
+{
+    fn compute_result(&mut self, whole: usize, frac: f64, value_len: usize) -> Result<T::Scalar> {
+        self.value.as_mut_slice().select_nth_unstable(whole);
+        let value = *self.value.get(whole).unwrap();
+        let value1 = if whole + 1 >= value_len {
+            value
+        } else {
+            self.value.as_mut_slice().select_nth_unstable(whole + 1);
+            *self.value.get(whole + 1).unwrap()
+        };
+
+        let result = value1
+            .checked_sub(value)
+            .and_then(|sub_result| sub_result.checked_mul(Decimal::from_float(frac)))
+            .and_then(|mul_result| value.checked_add(mul_result));
+
+        match result {
+            Some(r) => Ok(r),
+            None => Err(ErrorCode::Overflow("Decimal overflow when interpolate")),
+        }
+    }
+}
+
+impl<T> UnaryState<T, ArrayType<T>> for DecimalQuantileContState<T>
+where
+    T: ValueType,
+    T::Scalar: Decimal + BorshSerialize + BorshDeserialize,
+{
+    fn add(
+        &mut self,
+        other: T::ScalarRef<'_>,
+        _function_data: Option<&dyn FunctionData>,
+    ) -> Result<()> {
+        self.value.push(T::to_owned_scalar(other));
+        Ok(())
+    }
+
+    fn merge(&mut self, rhs: &Self) -> Result<()> {
+        self.value.extend(
+            rhs.value
+                .iter()
+                .map(|v| T::to_owned_scalar(T::to_scalar_ref(v))),
+        );
+        Ok(())
+    }
+
+    fn merge_result(
+        &mut self,
+        builder: &mut ArrayColumnBuilder<T>,
+        function_data: Option<&dyn FunctionData>,
+    ) -> Result<()> {
+        let value_len = self.value.len();
+        let quantile_cont_data = unsafe {
+            function_data
+                .unwrap()
+                .as_any()
+                .downcast_ref_unchecked::<QuantileData>()
+        };
+
+        if quantile_cont_data.levels.len() > 1 {
+            let indices = quantile_cont_data
+                .levels
+                .iter()
+                .map(|level| libm::modf((value_len - 1) as f64 * (*level)))
+                .collect::<Vec<(f64, f64)>>();
+
+            for (frac, whole) in indices {
+                let whole = whole as usize;
+                if whole >= value_len {
+                    builder.push_default();
+                } else {
+                    let n = self.compute_result(whole, frac, value_len)?;
+                    builder.put_item(T::to_scalar_ref(&n));
                 }
             }
+            builder.commit_row();
         }
 
         Ok(())
     }
+}
 
-    fn accumulate_row(&self, place: StateAddr, columns: &[Column], row: usize) -> Result<()> {
-        let column = NumberType::<T>::try_downcast_column(&columns[0]).unwrap();
-
-        let state = place.get::<QuantileContState>();
-        let v: f64 = column[row].as_();
-        state.add(v);
-        Ok(())
-    }
-
-    fn accumulate_keys(
-        &self,
-        places: &[StateAddr],
-        offset: usize,
-        columns: &[Column],
-        _input_rows: usize,
+impl<T> UnaryState<T, T> for DecimalQuantileContState<T>
+where
+    T: ValueType,
+    T::Scalar: Decimal + BorshSerialize + BorshDeserialize,
+{
+    fn add(
+        &mut self,
+        other: T::ScalarRef<'_>,
+        _function_data: Option<&dyn FunctionData>,
     ) -> Result<()> {
-        let column = NumberType::<T>::try_downcast_column(&columns[0]).unwrap();
-
-        column.iter().zip(places.iter()).for_each(|(value, place)| {
-            let place = place.next(offset);
-            let state = place.get::<QuantileContState>();
-            let v: f64 = value.as_();
-            state.add(v);
-        });
+        self.value.push(T::to_owned_scalar(other));
         Ok(())
     }
 
-    fn serialize(&self, place: StateAddr, writer: &mut Vec<u8>) -> Result<()> {
-        let state = place.get::<QuantileContState>();
-        serialize_into_buf(writer, state)
-    }
-
-    fn deserialize(&self, place: StateAddr, reader: &mut &[u8]) -> Result<()> {
-        let state = place.get::<QuantileContState>();
-        *state = deserialize_from_slice(reader)?;
-
+    fn merge(&mut self, rhs: &Self) -> Result<()> {
+        self.value.extend(
+            rhs.value
+                .iter()
+                .map(|v| T::to_owned_scalar(T::to_scalar_ref(v))),
+        );
         Ok(())
     }
 
-    fn merge(&self, place: StateAddr, rhs: StateAddr) -> Result<()> {
-        let rhs = rhs.get::<QuantileContState>();
-        let state = place.get::<QuantileContState>();
-        state.merge(rhs)
-    }
+    fn merge_result(
+        &mut self,
+        builder: &mut T::ColumnBuilder,
+        function_data: Option<&dyn FunctionData>,
+    ) -> Result<()> {
+        let value_len = self.value.len();
+        let quantile_cont_data = unsafe {
+            function_data
+                .unwrap()
+                .as_any()
+                .downcast_ref_unchecked::<QuantileData>()
+        };
 
-    fn merge_result(&self, place: StateAddr, builder: &mut ColumnBuilder) -> Result<()> {
-        let state = place.get::<QuantileContState>();
-        state.merge_result(builder, self.levels.clone())
-    }
+        let (frac, whole) = libm::modf((value_len - 1) as f64 * quantile_cont_data.levels[0]);
+        let whole = whole as usize;
+        if whole >= value_len {
+            T::push_default(builder);
+        } else {
+            let n = self.compute_result(whole, frac, value_len)?;
+            T::push_item(builder, T::to_scalar_ref(&n));
+        }
 
-    fn need_manual_drop_state(&self) -> bool {
-        true
-    }
-
-    unsafe fn drop_state(&self, place: StateAddr) {
-        let state = place.get::<QuantileContState>();
-        std::ptr::drop_in_place(state);
+        Ok(())
     }
 }
 
-impl<T> AggregateQuantileContFunction<T>
-where T: Number + AsPrimitive<f64>
-{
-    fn try_create(
-        display_name: &str,
-        return_type: DataType,
-        params: Vec<Scalar>,
-        arguments: Vec<DataType>,
-    ) -> Result<Arc<dyn AggregateFunction>> {
-        let levels = if params.len() == 1 {
+pub(crate) fn get_levels(params: &Vec<Scalar>) -> Result<Vec<f64>> {
+    let levels = if params.len() == 1 {
+        let level: F64 = check_number(
+            None,
+            &FunctionContext::default(),
+            &Expr::<usize>::Constant {
+                span: None,
+                scalar: params[0].clone(),
+                data_type: params[0].as_ref().infer_data_type(),
+            },
+            &BUILTIN_FUNCTIONS,
+        )?;
+        let level = level.0;
+        if !(0.0..=1.0).contains(&level) {
+            return Err(ErrorCode::BadDataValueType(format!(
+                "level range between [0, 1], got: {:?}",
+                level
+            )));
+        }
+        vec![level]
+    } else if params.is_empty() {
+        vec![0.5f64]
+    } else {
+        let mut levels = Vec::with_capacity(params.len());
+        for param in params {
             let level: F64 = check_number(
                 None,
                 &FunctionContext::default(),
@@ -259,8 +338,8 @@ where T: Number + AsPrimitive<f64>
                     is_try: false,
                     expr: Box::new(Expr::Constant {
                         span: None,
-                        scalar: params[0].clone(),
-                        data_type: params[0].as_ref().infer_data_type(),
+                        scalar: param.clone(),
+                        data_type: param.as_ref().infer_data_type(),
                     }),
                     dest_type: DataType::Number(NumberDataType::Float64),
                 },
@@ -269,53 +348,15 @@ where T: Number + AsPrimitive<f64>
             let level = level.0;
             if !(0.0..=1.0).contains(&level) {
                 return Err(ErrorCode::BadDataValueType(format!(
-                    "level range between [0, 1], got: {:?}",
+                    "level range between [0, 1], got: {:?} in levels",
                     level
                 )));
             }
-            vec![level]
-        } else if params.is_empty() {
-            vec![0.5f64]
-        } else {
-            let mut levels = Vec::with_capacity(params.len());
-            for param in params {
-                let level: F64 = check_number(
-                    None,
-                    &FunctionContext::default(),
-                    &Expr::<usize>::Cast {
-                        span: None,
-                        is_try: false,
-                        expr: Box::new(Expr::Constant {
-                            span: None,
-                            scalar: param.clone(),
-                            data_type: param.as_ref().infer_data_type(),
-                        }),
-                        dest_type: DataType::Number(NumberDataType::Float64),
-                    },
-                    &BUILTIN_FUNCTIONS,
-                )?;
-                let level = level.0;
-                if !(0.0..=1.0).contains(&level) {
-                    return Err(ErrorCode::BadDataValueType(format!(
-                        "level range between [0, 1], got: {:?} in levels",
-                        level
-                    )));
-                }
-                levels.push(level);
-            }
-            levels
-        };
-
-        let func = AggregateQuantileContFunction::<T> {
-            display_name: display_name.to_string(),
-            return_type,
-            levels,
-            _arguments: arguments,
-            _t: PhantomData,
-        };
-
-        Ok(Arc::new(func))
-    }
+            levels.push(level);
+        }
+        levels
+    };
+    Ok(levels)
 }
 
 pub fn try_create_aggregate_quantile_cont_function<const TYPE: u8>(
@@ -329,19 +370,105 @@ pub fn try_create_aggregate_quantile_cont_function<const TYPE: u8>(
 
     assert_unary_arguments(display_name, arguments.len())?;
 
+    let levels = get_levels(&params)?;
+
     with_number_mapped_type!(|NUM_TYPE| match &arguments[0] {
         DataType::Number(NumberDataType::NUM_TYPE) => {
-            let return_type = if params.len() > 1 {
-                DataType::Array(Box::new(DataType::Number(NumberDataType::Float64)))
+            if params.len() > 1 {
+                let return_type =
+                    DataType::Array(Box::new(DataType::Number(NumberDataType::Float64)));
+                let func = AggregateUnaryFunction::<
+                    QuantileContState,
+                    NumberType<NUM_TYPE>,
+                    ArrayType<Float64Type>,
+                >::try_create(
+                    display_name, return_type, params, arguments[0].clone()
+                )
+                .with_function_data(Box::new(QuantileData { levels }))
+                .with_need_drop(true);
+
+                Ok(Arc::new(func))
             } else {
-                DataType::Number(NumberDataType::Float64)
+                let return_type = DataType::Number(NumberDataType::Float64);
+                let func = AggregateUnaryFunction::<
+                    QuantileContState,
+                    NumberType<NUM_TYPE>,
+                    Float64Type,
+                >::try_create(
+                    display_name, return_type, params, arguments[0].clone()
+                )
+                .with_function_data(Box::new(QuantileData { levels }))
+                .with_need_drop(true);
+
+                Ok(Arc::new(func))
+            }
+        }
+
+        DataType::Decimal(DecimalDataType::Decimal128(s)) => {
+            let decimal_size = DecimalSize {
+                precision: s.precision,
+                scale: s.scale,
             };
-            AggregateQuantileContFunction::<NUM_TYPE>::try_create(
-                display_name,
-                return_type,
-                params,
-                arguments,
-            )
+            let data_type = DataType::Decimal(DecimalDataType::from_size(decimal_size)?);
+            if params.len() > 1 {
+                let func = AggregateUnaryFunction::<
+                    DecimalQuantileContState<DecimalType<i128>>,
+                    DecimalType<i128>,
+                    ArrayType<DecimalType<i128>>,
+                >::try_create(
+                    display_name,
+                    DataType::Array(Box::new(data_type)),
+                    params,
+                    arguments[0].clone(),
+                )
+                .with_function_data(Box::new(QuantileData { levels }))
+                .with_need_drop(true);
+                Ok(Arc::new(func))
+            } else {
+                let func = AggregateUnaryFunction::<
+                    DecimalQuantileContState<DecimalType<i128>>,
+                    DecimalType<i128>,
+                    DecimalType<i128>,
+                >::try_create(
+                    display_name, data_type, params, arguments[0].clone()
+                )
+                .with_function_data(Box::new(QuantileData { levels }))
+                .with_need_drop(true);
+                Ok(Arc::new(func))
+            }
+        }
+        DataType::Decimal(DecimalDataType::Decimal256(s)) => {
+            let decimal_size = DecimalSize {
+                precision: s.precision,
+                scale: s.scale,
+            };
+            let data_type = DataType::Decimal(DecimalDataType::from_size(decimal_size)?);
+            if params.len() > 1 {
+                let func = AggregateUnaryFunction::<
+                    DecimalQuantileContState<DecimalType<i256>>,
+                    DecimalType<i256>,
+                    ArrayType<DecimalType<i256>>,
+                >::try_create(
+                    display_name,
+                    DataType::Array(Box::new(data_type)),
+                    params,
+                    arguments[0].clone(),
+                )
+                .with_function_data(Box::new(QuantileData { levels }))
+                .with_need_drop(true);
+                Ok(Arc::new(func))
+            } else {
+                let func = AggregateUnaryFunction::<
+                    DecimalQuantileContState<DecimalType<i256>>,
+                    DecimalType<i256>,
+                    DecimalType<i256>,
+                >::try_create(
+                    display_name, data_type, params, arguments[0].clone()
+                )
+                .with_function_data(Box::new(QuantileData { levels }))
+                .with_need_drop(true);
+                Ok(Arc::new(func))
+            }
         }
 
         _ => Err(ErrorCode::BadDataValueType(format!(

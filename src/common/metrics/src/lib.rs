@@ -12,32 +12,25 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#![feature(duration_millis_float)]
 #![allow(clippy::uninlined_format_args)]
+#![allow(dead_code)]
+#![recursion_limit = "256"]
 
-pub mod counter;
-mod dump;
-mod recorder;
-mod reset;
+pub mod count;
+mod metrics;
 
-pub use dump::dump_metric_samples;
-pub use dump::HistogramCount;
-pub use dump::MetricSample;
-pub use dump::MetricValue;
-pub use dump::SummaryCount;
-pub use metrics::Counter;
-pub use metrics::Gauge;
-pub use metrics::Histogram;
-pub use metrics_exporter_prometheus::PrometheusHandle;
-pub use recorder::init_default_metrics_recorder;
-pub use recorder::label_counter;
-pub use recorder::label_counter_with_val;
-pub use recorder::label_counter_with_val_and_labels;
-pub use recorder::label_decrement_gauge_with_val_and_labels;
-pub use recorder::label_gauge;
-pub use recorder::label_gauge_with_val_and_labels;
-pub use recorder::label_histogram_with_val;
-pub use recorder::label_increment_gauge_with_val_and_labels;
-pub use recorder::try_handle;
-pub use recorder::LABEL_KEY_CLUSTER;
-pub use recorder::LABEL_KEY_TENANT;
-pub use reset::reset_metrics;
+pub type VecLabels = Vec<(&'static str, String)>;
+
+pub use crate::metrics::cache;
+pub use crate::metrics::cluster;
+pub use crate::metrics::external_server;
+/// Metrics.
+pub use crate::metrics::http;
+pub use crate::metrics::interpreter;
+pub use crate::metrics::lock;
+pub use crate::metrics::mysql;
+pub use crate::metrics::openai;
+pub use crate::metrics::session;
+pub use crate::metrics::storage;
+pub use crate::metrics::system;

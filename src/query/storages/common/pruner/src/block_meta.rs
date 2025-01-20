@@ -12,20 +12,23 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::any::Any;
+use std::collections::BTreeMap;
+use std::collections::HashSet;
 use std::ops::Range;
 
-use common_exception::ErrorCode;
-use common_exception::Result;
-use common_expression::BlockMetaInfo;
-use common_expression::BlockMetaInfoDowncast;
-use common_expression::BlockMetaInfoPtr;
+use databend_common_exception::ErrorCode;
+use databend_common_exception::Result;
+use databend_common_expression::types::number::F32;
+use databend_common_expression::BlockMetaInfo;
+use databend_common_expression::BlockMetaInfoDowncast;
+use databend_common_expression::BlockMetaInfoPtr;
+use databend_storages_common_table_meta::meta::ColumnMeta;
 
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug, Default, PartialEq, Eq)]
 pub struct BlockMetaIndex {
-    // {segment|block}_id is used in `InternalColumnMeta` to generate internal column data,
-    // where older data has smaller id, but {segment|block}_idx is opposite,
-    // so {segment|block}_id = {segment|block}_count - {segment|block}_idx - 1
+    /// {segment|block}_id is used in `InternalColumnMeta` to generate internal column data,
+    /// where older data has smaller id, but {segment|block}_idx is opposite,
+    /// so {segment|block}_id = {segment|block}_count - {segment|block}_idx - 1
     pub segment_idx: usize,
     pub block_idx: usize,
     pub range: Option<Range<usize>>,
@@ -37,14 +40,24 @@ pub struct BlockMetaIndex {
     pub block_location: String,
     pub segment_location: String,
     pub snapshot_location: Option<String>,
+    // The search matched rows and optional scores in the block.
+    pub matched_rows: Option<Vec<(usize, Option<F32>)>>,
+    // The optional meta of virtual columns.
+    pub virtual_block_meta: Option<VirtualBlockMetaIndex>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, Default, PartialEq, Eq)]
+pub struct VirtualBlockMetaIndex {
+    pub virtual_block_location: String,
+    // Key is virtual column id, value is the column meta.
+    pub virtual_column_metas: BTreeMap<u32, ColumnMeta>,
+    // If all the virtual columns are generated,
+    // we can reduce IO by ignoring the source column.
+    pub ignored_source_column_ids: HashSet<u32>,
 }
 
 #[typetag::serde(name = "block_meta_index")]
 impl BlockMetaInfo for BlockMetaIndex {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn equals(&self, info: &Box<dyn BlockMetaInfo>) -> bool {
         BlockMetaIndex::downcast_ref_from(info).is_some_and(|other| self == other)
     }
@@ -56,8 +69,8 @@ impl BlockMetaInfo for BlockMetaIndex {
 
 impl BlockMetaIndex {
     pub fn from_meta(info: &BlockMetaInfoPtr) -> Result<&BlockMetaIndex> {
-        BlockMetaIndex::downcast_ref_from(info).ok_or(ErrorCode::Internal(
-            "Cannot downcast from BlockMetaInfo to BlockMetaIndex.",
-        ))
+        BlockMetaIndex::downcast_ref_from(info).ok_or_else(|| {
+            ErrorCode::Internal("Cannot downcast from BlockMetaInfo to BlockMetaIndex.")
+        })
     }
 }

@@ -1,4 +1,4 @@
-// Copyright 2021 Datafuse Labs.
+// Copyright 2021 Datafuse Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,12 +15,12 @@
 //! Test arrow-grpc API of metasrv
 use std::collections::HashSet;
 
-use common_base::base::tokio;
-use common_base::base::Stoppable;
-use common_meta_kvapi::kvapi::KVApi;
-use common_meta_kvapi::kvapi::UpsertKVReply;
-use common_meta_kvapi::kvapi::UpsertKVReq;
-use common_meta_types::SeqV;
+use databend_common_base::base::tokio;
+use databend_common_base::base::Stoppable;
+use databend_common_meta_kvapi::kvapi::KVApi;
+use databend_common_meta_kvapi::kvapi::UpsertKVReply;
+use databend_common_meta_types::seq_value::SeqV;
+use databend_common_meta_types::UpsertKV;
 use log::debug;
 use log::info;
 use pretty_assertions::assert_eq;
@@ -32,7 +32,7 @@ use crate::tests::service::MetaSrvTestContext;
 use crate::tests::start_metasrv_with_context;
 
 #[test(harness = meta_service_test_harness)]
-#[minitrace::trace]
+#[fastrace::trace]
 async fn test_restart() -> anyhow::Result<()> {
     // Fix: Issue 1134  https://github.com/datafuselabs/databend/issues/1134
     // - Start a metasrv server.
@@ -46,7 +46,7 @@ async fn test_restart() -> anyhow::Result<()> {
 
     info!("--- upsert kv");
     {
-        let res = client.upsert_kv(UpsertKVReq::update("foo", b"bar")).await;
+        let res = client.upsert_kv(UpsertKV::update("foo", b"bar")).await;
 
         debug!("set kv res: {:?}", res);
         let res = res?;
@@ -71,6 +71,7 @@ async fn test_restart() -> anyhow::Result<()> {
         srv.stop(None).await?;
 
         drop(client);
+        drop(srv);
 
         tokio::time::sleep(Duration::from_millis(1000)).await;
 
@@ -94,7 +95,7 @@ async fn test_restart() -> anyhow::Result<()> {
 }
 
 #[test(harness = meta_service_test_harness)]
-#[minitrace::trace]
+#[fastrace::trace]
 async fn test_retry_join() -> anyhow::Result<()> {
     // - Start 2 metasrv.
     // - Join node-1 to node-0
@@ -144,7 +145,7 @@ async fn test_retry_join() -> anyhow::Result<()> {
 }
 
 #[test(harness = meta_service_test_harness)]
-#[minitrace::trace]
+#[fastrace::trace]
 async fn test_join() -> anyhow::Result<()> {
     // - Start 2 metasrv.
     // - Join node-1 to node-0
@@ -162,7 +163,7 @@ async fn test_join() -> anyhow::Result<()> {
     let client0 = tc0.grpc_client().await?;
     let client1 = tc1.grpc_client().await?;
 
-    let clients = vec![client0, client1];
+    let clients = [client0, client1];
 
     info!("--- upsert kv to every nodes");
     {
@@ -170,7 +171,7 @@ async fn test_join() -> anyhow::Result<()> {
             let k = format!("join-{}", i);
 
             let res = cli
-                .upsert_kv(UpsertKVReq::update(k.as_str(), k.as_bytes()))
+                .upsert_kv(UpsertKV::update(k.as_str(), k.as_bytes()))
                 .await;
 
             debug!("set kv res: {:?}", res);
@@ -204,7 +205,7 @@ async fn test_join() -> anyhow::Result<()> {
 }
 
 #[test(harness = meta_service_test_harness)]
-#[minitrace::trace]
+#[fastrace::trace]
 async fn test_auto_sync_addr() -> anyhow::Result<()> {
     // - Start 3 metasrv.
     // - Join node-1, node-2 to node-0
@@ -239,7 +240,7 @@ async fn test_auto_sync_addr() -> anyhow::Result<()> {
     {
         let k = "join-k".to_string();
 
-        let res = client.upsert_kv(UpsertKVReq::update(&k, &b(&k))).await;
+        let res = client.upsert_kv(UpsertKV::update(&k, &b(&k))).await;
 
         debug!("set kv res: {:?}", res);
         let res = res?;

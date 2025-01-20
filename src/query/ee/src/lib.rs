@@ -13,11 +13,18 @@
 // limitations under the License.
 
 pub mod aggregating_index;
+pub mod attach_table;
 pub mod background_service;
 pub mod data_mask;
 pub mod enterprise_services;
+pub mod fail_safe;
+pub mod hilbert_clustering;
+pub mod inverted_index;
 pub mod license;
+pub mod resource_management;
+pub mod storage_encryption;
+pub mod storage_quota;
 pub mod storages;
-pub mod table_lock;
+pub mod stream;
 pub mod test_kits;
 pub mod virtual_column;

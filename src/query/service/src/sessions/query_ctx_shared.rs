@@ -18,29 +18,49 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::sync::Weak;
+use std::time::Duration;
 use std::time::SystemTime;
 
-use common_base::base::Progress;
-use common_base::runtime::Runtime;
-use common_catalog::catalog::CatalogManager;
-use common_catalog::table_context::MaterializedCtesBlocks;
-use common_catalog::table_context::StageAttachment;
-use common_exception::ErrorCode;
-use common_exception::Result;
-use common_meta_app::principal::OnErrorMode;
-use common_meta_app::principal::RoleInfo;
-use common_meta_app::principal::UserInfo;
-use common_pipeline_core::InputError;
-use common_settings::ChangeValue;
-use common_settings::Settings;
-use common_storage::DataOperator;
-use common_storage::StorageMetrics;
 use dashmap::DashMap;
+use databend_common_base::base::short_sql;
+use databend_common_base::base::Progress;
+use databend_common_base::base::SpillProgress;
+use databend_common_base::runtime::drop_guard;
+use databend_common_base::runtime::Runtime;
+use databend_common_catalog::catalog::Catalog;
+use databend_common_catalog::catalog::CatalogManager;
+use databend_common_catalog::merge_into_join::MergeIntoJoin;
+use databend_common_catalog::query_kind::QueryKind;
+use databend_common_catalog::runtime_filter_info::RuntimeFilterInfo;
+use databend_common_catalog::runtime_filter_info::RuntimeFilterReady;
+use databend_common_catalog::statistics::data_cache_statistics::DataCacheMetrics;
+use databend_common_catalog::table_context::ContextError;
+use databend_common_catalog::table_context::StageAttachment;
+use databend_common_config::GlobalConfig;
+use databend_common_exception::ErrorCode;
+use databend_common_exception::Result;
+use databend_common_meta_app::principal::OnErrorMode;
+use databend_common_meta_app::principal::RoleInfo;
+use databend_common_meta_app::principal::UserDefinedConnection;
+use databend_common_meta_app::principal::UserInfo;
+use databend_common_meta_app::tenant::Tenant;
+use databend_common_pipeline_core::processors::PlanProfile;
+use databend_common_pipeline_core::InputError;
+use databend_common_settings::Settings;
+use databend_common_sql::IndexType;
+use databend_common_storage::CopyStatus;
+use databend_common_storage::DataOperator;
+use databend_common_storage::MultiTableInsertStatus;
+use databend_common_storage::MutationStatus;
+use databend_common_storage::StorageMetrics;
+use databend_common_storages_stream::stream_table::StreamTable;
+use databend_common_users::UserApiProvider;
 use parking_lot::Mutex;
 use parking_lot::RwLock;
 use uuid::Uuid;
 
 use crate::clusters::Cluster;
+use crate::clusters::ClusterDiscovery;
 use crate::pipelines::executor::PipelineExecutor;
 use crate::sessions::query_affect::QueryAffect;
 use crate::sessions::Session;
@@ -50,46 +70,87 @@ type DatabaseAndTable = (String, String, String);
 
 /// Data that needs to be shared in a query context.
 pub struct QueryContextShared {
+    // Query level
+    pub(crate) query_settings: Arc<Settings>,
     /// total_scan_values for scan stats
     pub(in crate::sessions) total_scan_values: Arc<Progress>,
     /// scan_progress for scan metrics of datablocks (uncompressed)
     pub(in crate::sessions) scan_progress: Arc<Progress>,
     /// write_progress for write/commit metrics of datablocks (uncompressed)
     pub(in crate::sessions) write_progress: Arc<Progress>,
+    /// Record how many bytes/rows have been spilled in join.
+    pub(in crate::sessions) join_spill_progress: Arc<Progress>,
+    /// Record how many bytes/rows have been spilled in agg.
+    pub(in crate::sessions) agg_spill_progress: Arc<Progress>,
+    /// Record how many bytes/rows have been spilled in group by
+    pub(in crate::sessions) group_by_spill_progress: Arc<Progress>,
+    /// Record how many bytes/rows have been spilled in window partition
+    pub(in crate::sessions) window_partition_spill_progress: Arc<Progress>,
     /// result_progress for metrics of result datablocks (uncompressed)
     pub(in crate::sessions) result_progress: Arc<Progress>,
-    pub(in crate::sessions) error: Arc<Mutex<Option<ErrorCode>>>,
+    pub(in crate::sessions) error: Arc<Mutex<Option<ErrorCode<ContextError>>>>,
+    pub(in crate::sessions) warnings: Arc<Mutex<Vec<String>>>,
     pub(in crate::sessions) session: Arc<Session>,
     pub(in crate::sessions) runtime: Arc<RwLock<Option<Arc<Runtime>>>>,
     pub(in crate::sessions) init_query_id: Arc<RwLock<String>>,
-    pub(in crate::sessions) cluster_cache: Arc<Cluster>,
+    pub(in crate::sessions) cluster_cache: Arc<RwLock<Arc<Cluster>>>,
+    pub(in crate::sessions) warehouse_cache: Arc<RwLock<Option<Arc<Cluster>>>>,
     pub(in crate::sessions) running_query: Arc<RwLock<Option<String>>>,
-    pub(in crate::sessions) running_query_kind: Arc<RwLock<Option<String>>>,
+    pub(in crate::sessions) running_query_kind: Arc<RwLock<Option<QueryKind>>>,
+    pub(in crate::sessions) running_query_text_hash: Arc<RwLock<Option<String>>>,
+    pub(in crate::sessions) running_query_parameterized_hash: Arc<RwLock<Option<String>>>,
     pub(in crate::sessions) aborting: Arc<AtomicBool>,
     pub(in crate::sessions) tables_refs: Arc<Mutex<HashMap<DatabaseAndTable, Arc<dyn Table>>>>,
+    pub(in crate::sessions) streams_refs: Arc<RwLock<HashMap<DatabaseAndTable, bool>>>,
     pub(in crate::sessions) affect: Arc<Mutex<Option<QueryAffect>>>,
     pub(in crate::sessions) catalog_manager: Arc<CatalogManager>,
     pub(in crate::sessions) data_operator: DataOperator,
     pub(in crate::sessions) executor: Arc<RwLock<Weak<PipelineExecutor>>>,
     pub(in crate::sessions) stage_attachment: Arc<RwLock<Option<StageAttachment>>>,
     pub(in crate::sessions) created_time: SystemTime,
+    // now it is only set in query_log::log_query_finished
+    pub(in crate::sessions) finish_time: RwLock<Option<SystemTime>>,
     // DashMap<file_path, HashMap<ErrorCode::code, (ErrorCode, Number of occurrences)>>
     // We use this field to count maximum of one error found per data file.
     #[allow(clippy::type_complexity)]
     pub(in crate::sessions) on_error_map:
         Arc<RwLock<Option<Arc<DashMap<String, HashMap<u16, InputError>>>>>>,
     pub(in crate::sessions) on_error_mode: Arc<RwLock<Option<OnErrorMode>>>,
+    pub(in crate::sessions) copy_status: Arc<CopyStatus>,
+    pub(in crate::sessions) mutation_status: Arc<RwLock<MutationStatus>>,
+    pub(in crate::sessions) multi_table_insert_status: Arc<Mutex<MultiTableInsertStatus>>,
     /// partitions_sha for each table in the query. Not empty only when enabling query result cache.
     pub(in crate::sessions) partitions_shas: Arc<RwLock<Vec<String>>>,
     pub(in crate::sessions) cacheable: Arc<AtomicBool>,
     pub(in crate::sessions) can_scan_from_agg_index: Arc<AtomicBool>,
+    pub(in crate::sessions) num_fragmented_block_hint: Arc<Mutex<HashMap<String, u64>>>,
+    pub(in crate::sessions) enable_sort_spill: Arc<AtomicBool>,
     // Status info.
     pub(in crate::sessions) status: Arc<RwLock<String>>,
 
     // Client User-Agent
     pub(in crate::sessions) user_agent: Arc<RwLock<String>>,
-    /// Key is (cte index, used_count), value contains cte's materialized blocks
-    pub(in crate::sessions) materialized_cte_tables: MaterializedCtesBlocks,
+
+    pub(in crate::sessions) query_profiles: Arc<RwLock<HashMap<Option<u32>, PlanProfile>>>,
+
+    pub(in crate::sessions) runtime_filters: Arc<RwLock<HashMap<IndexType, RuntimeFilterInfo>>>,
+
+    pub(in crate::sessions) runtime_filter_ready:
+        Arc<RwLock<HashMap<IndexType, Vec<Arc<RuntimeFilterReady>>>>>,
+
+    pub(in crate::sessions) wait_runtime_filter: Arc<RwLock<HashMap<IndexType, bool>>>,
+
+    pub(in crate::sessions) merge_into_join: Arc<RwLock<MergeIntoJoin>>,
+
+    // Records query level data cache metrics
+    pub(in crate::sessions) query_cache_metrics: DataCacheMetrics,
+
+    pub(in crate::sessions) query_queued_duration: Arc<RwLock<Duration>>,
+
+    pub(in crate::sessions) cluster_spill_progress: Arc<RwLock<HashMap<String, SpillProgress>>>,
+    pub(in crate::sessions) spilled_files:
+        Arc<RwLock<HashMap<crate::spillers::Location, crate::spillers::Layout>>>,
+    pub(in crate::sessions) unload_callbacked: AtomicBool,
 }
 
 impl QueryContextShared {
@@ -98,9 +159,10 @@ impl QueryContextShared {
         cluster_cache: Arc<Cluster>,
     ) -> Result<Arc<QueryContextShared>> {
         Ok(Arc::new(QueryContextShared {
-            session,
-            cluster_cache,
+            query_settings: Settings::create(session.get_current_tenant()),
             catalog_manager: CatalogManager::instance(),
+            session,
+            cluster_cache: Arc::new(RwLock::new(cluster_cache)),
             data_operator: DataOperator::instance(),
             init_query_id: Arc::new(RwLock::new(Uuid::new_v4().to_string())),
             total_scan_values: Arc::new(Progress::create()),
@@ -108,34 +170,73 @@ impl QueryContextShared {
             result_progress: Arc::new(Progress::create()),
             write_progress: Arc::new(Progress::create()),
             error: Arc::new(Mutex::new(None)),
+            warnings: Arc::new(Mutex::new(vec![])),
             runtime: Arc::new(RwLock::new(None)),
             running_query: Arc::new(RwLock::new(None)),
             running_query_kind: Arc::new(RwLock::new(None)),
+            running_query_text_hash: Arc::new(RwLock::new(None)),
+            running_query_parameterized_hash: Arc::new(RwLock::new(None)),
             aborting: Arc::new(AtomicBool::new(false)),
             tables_refs: Arc::new(Mutex::new(HashMap::new())),
+            streams_refs: Default::default(),
             affect: Arc::new(Mutex::new(None)),
             executor: Arc::new(RwLock::new(Weak::new())),
             stage_attachment: Arc::new(RwLock::new(None)),
             created_time: SystemTime::now(),
+            finish_time: Default::default(),
             on_error_map: Arc::new(RwLock::new(None)),
             on_error_mode: Arc::new(RwLock::new(None)),
+            copy_status: Default::default(),
+            mutation_status: Default::default(),
             partitions_shas: Arc::new(RwLock::new(vec![])),
             cacheable: Arc::new(AtomicBool::new(true)),
             can_scan_from_agg_index: Arc::new(AtomicBool::new(true)),
+            num_fragmented_block_hint: Default::default(),
+            enable_sort_spill: Arc::new(AtomicBool::new(true)),
             status: Arc::new(RwLock::new("null".to_string())),
             user_agent: Arc::new(RwLock::new("null".to_string())),
-            materialized_cte_tables: Arc::new(Default::default()),
+            join_spill_progress: Arc::new(Progress::create()),
+            agg_spill_progress: Arc::new(Progress::create()),
+            group_by_spill_progress: Arc::new(Progress::create()),
+            window_partition_spill_progress: Arc::new(Progress::create()),
+            query_cache_metrics: DataCacheMetrics::new(),
+            query_profiles: Arc::new(RwLock::new(HashMap::new())),
+            runtime_filters: Default::default(),
+            runtime_filter_ready: Default::default(),
+            wait_runtime_filter: Default::default(),
+            merge_into_join: Default::default(),
+            multi_table_insert_status: Default::default(),
+            query_queued_duration: Arc::new(RwLock::new(Duration::from_secs(0))),
+
+            cluster_spill_progress: Default::default(),
+            spilled_files: Default::default(),
+            unload_callbacked: AtomicBool::new(false),
+            warehouse_cache: Arc::new(RwLock::new(None)),
         }))
     }
 
-    pub fn set_error(&self, err: ErrorCode) {
+    pub fn set_error<C>(&self, err: ErrorCode<C>) {
+        let err = err.with_context("query context error");
+
         let mut guard = self.error.lock();
         *guard = Some(err);
     }
 
-    pub fn get_error(&self) -> Option<ErrorCode> {
+    pub fn get_error(&self) -> Option<ErrorCode<ContextError>> {
         let guard = self.error.lock();
         (*guard).clone()
+    }
+
+    pub fn push_warning(&self, warn: String) {
+        let mut guard = self.warnings.lock();
+        (*guard).push(warn);
+    }
+
+    pub fn pop_warnings(&self) -> Vec<String> {
+        let mut guard = self.warnings.lock();
+        let warnings = (*guard).clone();
+        (*guard).clear();
+        warnings
     }
 
     pub fn set_on_error_map(&self, map: Arc<DashMap<String, HashMap<u16, InputError>>>) {
@@ -150,40 +251,70 @@ impl QueryContextShared {
     pub fn get_on_error_mode(&self) -> Option<OnErrorMode> {
         self.on_error_mode.read().clone()
     }
+
     pub fn set_on_error_mode(&self, mode: OnErrorMode) {
         let mut guard = self.on_error_mode.write();
         *guard = Some(mode);
     }
 
-    pub fn kill(&self, cause: ErrorCode) {
+    pub fn kill<C>(&self, cause: ErrorCode<C>) {
         self.set_error(cause.clone());
-        self.aborting.store(true, Ordering::Release);
 
         if let Some(executor) = self.executor.read().upgrade() {
             executor.finish(Some(cause));
         }
 
+        self.aborting.store(true, Ordering::Release);
+
         // TODO: Wait for the query to be processed (write out the last error)
     }
 
+    pub fn set_cluster(&self, cluster: Arc<Cluster>) {
+        let mut cluster_cache = self.cluster_cache.write();
+        *cluster_cache = cluster;
+    }
+
     pub fn get_cluster(&self) -> Arc<Cluster> {
-        self.cluster_cache.clone()
+        self.cluster_cache.read().clone()
+    }
+
+    pub async fn get_warehouse_clusters(&self) -> Result<Arc<Cluster>> {
+        if let Some(warehouse) = self.warehouse_cache.read().as_ref() {
+            return Ok(warehouse.clone());
+        }
+
+        let config = GlobalConfig::instance();
+        let discovery = ClusterDiscovery::instance();
+        let warehouse = discovery.discover_warehouse_nodes(&config).await?;
+
+        let mut write_guard = self.warehouse_cache.write();
+
+        if write_guard.is_none() {
+            *write_guard = Some(warehouse.clone());
+        }
+
+        Ok(write_guard.as_ref().cloned().expect("expect cluster."))
     }
 
     pub fn get_current_catalog(&self) -> String {
         self.session.get_current_catalog()
     }
 
+    pub fn set_current_catalog(&self, catalog_name: String) {
+        self.session.set_current_catalog(catalog_name)
+    }
+
     pub fn get_aborting(&self) -> Arc<AtomicBool> {
         self.aborting.clone()
     }
 
-    pub fn check_aborting(&self) -> Result<()> {
+    pub fn check_aborting(&self) -> Result<(), ContextError> {
         if self.aborting.load(Ordering::Acquire) {
             Err(self.get_error().unwrap_or_else(|| {
                 ErrorCode::AbortedQuery(
                     "Aborted query, because the server is shutting down or the query was killed.",
                 )
+                .with_context("query aborted")
             }))
         } else {
             Ok(())
@@ -206,10 +337,6 @@ impl QueryContextShared {
         self.session.get_current_role()
     }
 
-    pub fn set_current_tenant(&self, tenant: String) {
-        self.session.set_current_tenant(tenant);
-    }
-
     /// Get all tables that already attached in this query.
     pub fn get_tables_refs(&self) -> Vec<Arc<dyn Table>> {
         let tables = self.tables_refs.lock();
@@ -223,7 +350,7 @@ impl QueryContextShared {
         StorageMetrics::merge(&metrics)
     }
 
-    pub fn get_tenant(&self) -> String {
+    pub fn get_tenant(&self) -> Tenant {
         self.session.get_current_tenant()
     }
 
@@ -231,12 +358,13 @@ impl QueryContextShared {
         self.session.get_settings()
     }
 
-    pub fn get_changed_settings(&self) -> HashMap<String, ChangeValue> {
-        self.session.get_changed_settings()
-    }
+    pub fn attach_table(&self, catalog: &str, database: &str, name: &str, table: Arc<dyn Table>) {
+        let mut tables_refs = self.tables_refs.lock();
+        let table_meta_key = (catalog.to_string(), database.to_string(), name.to_string());
 
-    pub fn apply_changed_settings(&self, changes: HashMap<String, ChangeValue>) -> Result<()> {
-        self.session.apply_changed_settings(changes)
+        if let Entry::Vacant(v) = tables_refs.entry(table_meta_key) {
+            v.insert(table);
+        };
     }
 
     #[async_backtrace::framed]
@@ -245,34 +373,54 @@ impl QueryContextShared {
         catalog: &str,
         database: &str,
         table: &str,
+        max_batch_size: Option<u64>,
     ) -> Result<Arc<dyn Table>> {
         // Always get same table metadata in the same query
-
         let table_meta_key = (catalog.to_string(), database.to_string(), table.to_string());
 
         let already_in_cache = { self.tables_refs.lock().contains_key(&table_meta_key) };
-        match already_in_cache {
-            false => self.get_table_to_cache(catalog, database, table).await,
-            true => Ok(self
+        let res = match already_in_cache {
+            false => {
+                self.get_table_to_cache(catalog, database, table, max_batch_size)
+                    .await?
+            }
+            true => self
                 .tables_refs
                 .lock()
                 .get(&table_meta_key)
                 .ok_or_else(|| ErrorCode::Internal("Logical error, it's a bug."))?
-                .clone()),
-        }
+                .clone(),
+        };
+
+        Ok(res)
     }
 
     #[async_backtrace::framed]
     async fn get_table_to_cache(
         &self,
-        catalog: &str,
+        catalog_name: &str,
         database: &str,
         table: &str,
+        max_batch_size: Option<u64>,
     ) -> Result<Arc<dyn Table>> {
         let tenant = self.get_tenant();
-        let table_meta_key = (catalog.to_string(), database.to_string(), table.to_string());
-        let catalog = self.catalog_manager.get_catalog(&tenant, catalog).await?;
-        let cache_table = catalog.get_table(tenant.as_str(), database, table).await?;
+        let table_meta_key = (
+            catalog_name.to_string(),
+            database.to_string(),
+            table.to_string(),
+        );
+        let catalog = self
+            .catalog_manager
+            .get_catalog(
+                tenant.tenant_name(),
+                catalog_name,
+                self.session.session_ctx.session_state(),
+            )
+            .await?;
+        let cache_table = catalog.get_table(&tenant, database, table).await?;
+        let cache_table = self
+            .cache_stream_source_table(catalog, cache_table, max_batch_size)
+            .await?;
 
         let mut tables_refs = self.tables_refs.lock();
 
@@ -282,11 +430,84 @@ impl QueryContextShared {
         }
     }
 
+    // Cache the source table of a stream table to ensure can get the same table metadata.
+    #[async_backtrace::framed]
+    async fn cache_stream_source_table(
+        &self,
+        catalog: Arc<dyn Catalog>,
+        table: Arc<dyn Table>,
+        max_batch_size: Option<u64>,
+    ) -> Result<Arc<dyn Table>> {
+        if !table.is_stream() {
+            return Ok(table);
+        }
+
+        let stream = StreamTable::try_from_table(table.as_ref())?;
+        let source_database_name = stream.source_database_name(catalog.as_ref()).await?;
+        let source_table_name = stream.source_table_name(catalog.as_ref()).await?;
+        let meta_key = (
+            catalog.name(),
+            source_database_name.to_string(),
+            source_table_name.to_string(),
+        );
+        let already_in_cache = { self.tables_refs.lock().contains_key(&meta_key) };
+        let source_table = match already_in_cache {
+            false => {
+                let stream_desc = &stream.get_table_info().desc;
+                let source_table =
+                    match catalog.get_stream_source_table(stream_desc, max_batch_size)? {
+                        Some(source_table) => source_table,
+                        None => {
+                            let source_table = stream
+                                .navigate_within_batch_limit(
+                                    catalog.as_ref(),
+                                    &self.get_tenant(),
+                                    &source_database_name,
+                                    &source_table_name,
+                                    max_batch_size,
+                                )
+                                .await?;
+                            catalog.cache_stream_source_table(
+                                stream.get_table_info().clone(),
+                                source_table.get_table_info().clone(),
+                                max_batch_size,
+                            );
+                            source_table
+                        }
+                    };
+
+                let mut tables_refs = self.tables_refs.lock();
+                tables_refs.entry(meta_key).or_insert(source_table.clone());
+                source_table
+            }
+            true => self
+                .tables_refs
+                .lock()
+                .get(&meta_key)
+                .ok_or_else(|| ErrorCode::Internal("Logical error, it's a bug."))?
+                .clone(),
+        };
+
+        let mut stream_info = stream.get_table_info().to_owned();
+        stream_info.meta.schema = source_table.schema();
+
+        Ok(StreamTable::create(
+            stream_info,
+            max_batch_size,
+            Some(source_table),
+        ))
+    }
+
     pub fn evict_table_from_cache(&self, catalog: &str, database: &str, table: &str) -> Result<()> {
         let table_meta_key = (catalog.to_string(), database.to_string(), table.to_string());
         let mut tables_refs = self.tables_refs.lock();
         tables_refs.remove(&table_meta_key);
         Ok(())
+    }
+
+    pub fn clear_tables_cache(&self) {
+        let mut tables_refs = self.tables_refs.lock();
+        tables_refs.clear();
     }
 
     /// Init runtime when first get
@@ -312,10 +533,15 @@ impl QueryContextShared {
         (*query_runtime).clone()
     }
 
-    pub fn attach_query_str(&self, kind: String, query: String) {
+    pub fn attach_query_str(&self, kind: QueryKind, query: String) {
         {
             let mut running_query = self.running_query.write();
-            *running_query = Some(short_sql(query));
+            *running_query = Some(short_sql(
+                query,
+                self.get_settings()
+                    .get_short_sql_max_length()
+                    .unwrap_or(1000),
+            ));
         }
 
         {
@@ -324,17 +550,46 @@ impl QueryContextShared {
         }
     }
 
+    pub fn attach_query_hash(&self, text_hash: String, parameterized_hash: String) {
+        {
+            let mut running_query_hash = self.running_query_text_hash.write();
+            *running_query_hash = Some(text_hash);
+        }
+
+        {
+            let mut running_query_parameterized_hash =
+                self.running_query_parameterized_hash.write();
+            *running_query_parameterized_hash = Some(parameterized_hash);
+        }
+    }
+
     pub fn get_query_str(&self) -> String {
         let running_query = self.running_query.read();
         running_query.as_ref().unwrap_or(&"".to_string()).clone()
     }
 
-    pub fn get_query_kind(&self) -> String {
+    pub fn get_query_parameterized_hash(&self) -> String {
+        let running_query_parameterized_hash = self.running_query_parameterized_hash.read();
+        running_query_parameterized_hash
+            .as_ref()
+            .unwrap_or(&"".to_string())
+            .clone()
+    }
+
+    pub fn get_query_text_hash(&self) -> String {
+        let running_query_text_hash = self.running_query_text_hash.read();
+        running_query_text_hash
+            .as_ref()
+            .unwrap_or(&"".to_string())
+            .clone()
+    }
+
+    pub fn get_query_kind(&self) -> QueryKind {
         let running_query_kind = self.running_query_kind.read();
         running_query_kind
             .as_ref()
             .cloned()
-            .unwrap_or_else(|| "Unknown".to_string())
+            .unwrap_or(QueryKind::Unknown)
     }
 
     pub fn get_connection_id(&self) -> String {
@@ -360,7 +615,7 @@ impl QueryContextShared {
             }
             Err(err) => {
                 executor.finish(Some(err.clone()));
-                Err(err)
+                Err(err.with_context("failed to set executor"))
             }
         }
     }
@@ -382,35 +637,56 @@ impl QueryContextShared {
         let status = self.status.read();
         status.clone()
     }
+
+    pub async fn get_connection(&self, name: &str) -> Result<UserDefinedConnection> {
+        let user_mgr = UserApiProvider::instance();
+        let tenant = self.get_tenant();
+        user_mgr.get_connection(&tenant, name).await
+    }
+
+    pub fn get_query_cache_metrics(&self) -> &DataCacheMetrics {
+        &self.query_cache_metrics
+    }
+
+    pub fn set_priority(&self, priority: u8) {
+        if let Some(executor) = self.executor.read().upgrade() {
+            executor.change_priority(priority)
+        }
+    }
+
+    pub fn get_query_profiles(&self) -> Vec<PlanProfile> {
+        if let Some(executor) = self.executor.read().upgrade() {
+            self.add_query_profiles(&executor.fetch_profiling(false));
+        }
+
+        self.query_profiles.read().values().cloned().collect()
+    }
+
+    pub fn add_query_profiles(&self, profiles: &HashMap<u32, PlanProfile>) {
+        let mut merged_profiles = self.query_profiles.write();
+
+        for query_profile in profiles.values() {
+            match merged_profiles.entry(query_profile.id) {
+                Entry::Vacant(v) => {
+                    v.insert(query_profile.clone());
+                }
+                Entry::Occupied(mut v) => {
+                    v.get_mut().merge(query_profile);
+                }
+            };
+        }
+    }
 }
 
 impl Drop for QueryContextShared {
     fn drop(&mut self) {
-        // last_query_id() should return the query_id of the last executed statement,
-        // so we set it when the current context drops
-        // to avoid returning the query_id of the current statement.
-        self.session
-            .session_ctx
-            .update_query_ids_results(self.init_query_id.read().clone(), None)
-    }
-}
-
-pub fn short_sql(sql: String) -> String {
-    use unicode_segmentation::UnicodeSegmentation;
-    let query = sql.trim_start();
-    if query.as_bytes().len() >= 64 && query.as_bytes()[..6].eq_ignore_ascii_case(b"INSERT") {
-        // keep first 64 graphemes
-        String::from_utf8(
-            query
-                .graphemes(true)
-                .take(64)
-                .flat_map(|g| g.as_bytes().iter())
-                .copied() // copied converts &u8 into u8
-                .chain(b"...".iter().copied())
-                .collect::<Vec<u8>>(),
-        )
-        .unwrap() // by construction, this cannot panic as we extracted unicode grapheme
-    } else {
-        sql
+        drop_guard(move || {
+            // last_query_id() should return the query_id of the last executed statement,
+            // so we set it when the current context drops
+            // to avoid returning the query_id of the current statement.
+            self.session
+                .session_ctx
+                .update_query_ids_results(self.init_query_id.read().clone(), None)
+        })
     }
 }

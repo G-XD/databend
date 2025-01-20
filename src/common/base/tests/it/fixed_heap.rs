@@ -1,4 +1,4 @@
-// Copyright 2021 Datafuse Labs.
+// Copyright 2021 Datafuse Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,7 +17,7 @@ use std::cmp::Ordering;
 use std::fmt::Debug;
 use std::rc::Rc;
 
-use common_base::containers::FixedHeap;
+use databend_common_base::containers::FixedHeap;
 use rand::Rng;
 
 #[test]
@@ -149,7 +149,7 @@ fn test_is_full() {
 #[derive(PartialEq, Eq, PartialOrd, Ord)]
 struct DropCounted<'a>(&'a RefCell<usize>);
 
-impl<'a> Drop for DropCounted<'a> {
+impl Drop for DropCounted<'_> {
     fn drop(&mut self) {
         *self.0.borrow_mut() += 1;
     }
@@ -184,7 +184,7 @@ struct CompareWrapper<T> {
 }
 
 impl<T: Debug> Debug for CompareWrapper<T> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         write!(f, "{:?}", self.value)
     }
 }

@@ -15,50 +15,53 @@
 use std::cmp;
 use std::sync::Arc;
 
-use common_exception::Result;
+use databend_common_exception::Result;
 
+use crate::optimizer::extract::Matcher;
 use crate::optimizer::rule::Rule;
 use crate::optimizer::rule::TransformResult;
 use crate::optimizer::RuleID;
 use crate::optimizer::SExpr;
-use crate::plans::PatternPlan;
 use crate::plans::RelOp;
 use crate::plans::RelOperator;
-use crate::plans::Scan;
 use crate::plans::Sort;
 
 /// Input:  Sort
 ///           \
-///          LogicalGet
+///          Scan
 ///
 /// Output:
 ///         Sort
 ///           \
-///           LogicalGet(padding order_by and limit)
-
+///           Scan(padding order_by and limit)
 pub struct RulePushDownSortScan {
     id: RuleID,
-    patterns: Vec<SExpr>,
+    matchers: Vec<Matcher>,
 }
 
 impl RulePushDownSortScan {
     pub fn new() -> Self {
         Self {
             id: RuleID::PushDownSortScan,
-            patterns: vec![SExpr::create_unary(
-                Arc::new(
-                    PatternPlan {
-                        plan_type: RelOp::Sort,
-                    }
-                    .into(),
-                ),
-                Arc::new(SExpr::create_leaf(Arc::new(
-                    PatternPlan {
-                        plan_type: RelOp::Scan,
-                    }
-                    .into(),
-                ))),
-            )],
+            matchers: vec![
+                Matcher::MatchOp {
+                    op_type: RelOp::Sort,
+                    children: vec![Matcher::MatchOp {
+                        op_type: RelOp::Scan,
+                        children: vec![],
+                    }],
+                },
+                Matcher::MatchOp {
+                    op_type: RelOp::Sort,
+                    children: vec![Matcher::MatchOp {
+                        op_type: RelOp::EvalScalar,
+                        children: vec![Matcher::MatchOp {
+                            op_type: RelOp::Scan,
+                            children: vec![],
+                        }],
+                    }],
+                },
+            ],
         }
     }
 }
@@ -71,22 +74,38 @@ impl Rule for RulePushDownSortScan {
     fn apply(&self, s_expr: &SExpr, state: &mut TransformResult) -> Result<()> {
         let sort: Sort = s_expr.plan().clone().try_into()?;
         let child = s_expr.child(0)?;
-        let mut get: Scan = child.plan().clone().try_into()?;
+        let mut get = match child.plan() {
+            RelOperator::Scan(scan) => scan.clone(),
+            RelOperator::EvalScalar(_) => {
+                let child = child.child(0)?;
+                child.plan().clone().try_into()?
+            }
+            _ => unreachable!(),
+        };
         if get.order_by.is_none() {
             get.order_by = Some(sort.items);
         }
         if let Some(limit) = sort.limit {
             get.limit = Some(get.limit.map_or(limit, |c| cmp::max(c, limit)));
         }
+
         let get = SExpr::create_leaf(Arc::new(RelOperator::Scan(get)));
 
-        let mut result = s_expr.replace_children(vec![Arc::new(get)]);
+        let mut result = match child.plan() {
+            RelOperator::Scan(_) => s_expr.replace_children(vec![Arc::new(get)]),
+            RelOperator::EvalScalar(_) => {
+                let child = child.replace_children(vec![Arc::new(get)]);
+                s_expr.replace_children(vec![Arc::new(child)])
+            }
+            _ => unreachable!(),
+        };
+
         result.set_applied_rule(&self.id);
         state.add_result(result);
         Ok(())
     }
 
-    fn patterns(&self) -> &Vec<SExpr> {
-        &self.patterns
+    fn matchers(&self) -> &[Matcher] {
+        &self.matchers
     }
 }

@@ -27,14 +27,23 @@ use byteorder::BigEndian;
 use byteorder::ByteOrder;
 use chrono::DateTime;
 use chrono::Utc;
-use common_meta_sled_store::sled::IVec;
-use common_meta_sled_store::SledBytesError;
-use common_meta_sled_store::SledOrderedSerde;
-use common_meta_sled_store::SledSerde;
+use databend_common_meta_sled_store::sled::IVec;
+use databend_common_meta_sled_store::SledBytesError;
+use databend_common_meta_sled_store::SledOrderedSerde;
+use databend_common_meta_sled_store::SledSerde;
 
 /// The identifier of the index for kv with expiration.
 #[derive(
-    Default, Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq, PartialOrd, Ord,
+    Default,
+    Debug,
+    Clone,
+    Copy,
+    serde::Serialize,
+    serde::Deserialize,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
 )]
 pub struct ExpireKey {
     /// The time in millisecond when a key will be expired.
@@ -107,7 +116,7 @@ impl SledOrderedSerde for ExpireKey {
 }
 
 impl Display for ExpireKey {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
         let t = UNIX_EPOCH + Duration::from_millis(self.time_ms);
         let datetime: DateTime<Utc> = t.into();
         write!(f, "{}={}", datetime.format("%Y-%m-%d-%H-%M-%S"), self.seq)
@@ -122,7 +131,7 @@ impl ExpireKey {
 
 #[cfg(test)]
 mod tests {
-    use common_meta_sled_store::SledOrderedSerde;
+    use databend_common_meta_sled_store::SledOrderedSerde;
 
     use crate::state_machine::ExpireKey;
     use crate::state_machine::ExpireValue;

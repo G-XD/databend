@@ -13,29 +13,32 @@
 // limitations under the License.
 
 #![feature(let_chains)]
-#![feature(ip_in_core)]
 #![allow(clippy::uninlined_format_args)]
 
 extern crate core;
 
 mod jwt;
 mod network_policy;
+mod password_policy;
 mod role_mgr;
 mod user;
 mod user_api;
 mod user_mgr;
-mod user_setting;
 mod user_stage;
 mod user_udf;
+mod visibility_checker;
 
+pub mod builtin;
+pub mod connection;
 pub mod file_format;
-pub mod idm_config;
 pub mod role_cache_mgr;
 pub mod role_util;
 
 pub use jwt::*;
+pub use password_policy::*;
 pub use role_cache_mgr::RoleCacheManager;
 pub use role_mgr::BUILTIN_ROLE_ACCOUNT_ADMIN;
 pub use role_mgr::BUILTIN_ROLE_PUBLIC;
 pub use user::CertifiedInfo;
 pub use user_api::UserApiProvider;
+pub use visibility_checker::GrantObjectVisibilityChecker;

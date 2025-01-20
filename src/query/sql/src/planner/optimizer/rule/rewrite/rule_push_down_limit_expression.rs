@@ -14,15 +14,14 @@
 
 use std::sync::Arc;
 
+use crate::optimizer::extract::Matcher;
 use crate::optimizer::rule::Rule;
 use crate::optimizer::rule::TransformResult;
 use crate::optimizer::RuleID;
 use crate::optimizer::SExpr;
 use crate::plans::EvalScalar;
 use crate::plans::Limit;
-use crate::plans::PatternPlan;
 use crate::plans::RelOp;
-use crate::plans::RelOp::Pattern;
 use crate::plans::RelOperator;
 
 /// Input:  Limit
@@ -36,44 +35,36 @@ use crate::plans::RelOperator;
 ///          limit
 ///             \
 ///               *
-pub struct RulePushDownLimitExpression {
+pub struct RulePushDownLimitEvalScalar {
     id: RuleID,
-    patterns: Vec<SExpr>,
+    matchers: Vec<Matcher>,
 }
 
-impl RulePushDownLimitExpression {
+impl RulePushDownLimitEvalScalar {
     pub fn new() -> Self {
         Self {
-            id: RuleID::RulePushDownLimitExpression,
-            patterns: vec![SExpr::create_unary(
-                Arc::new(
-                    PatternPlan {
-                        plan_type: RelOp::Limit,
-                    }
-                    .into(),
-                ),
-                Arc::new(SExpr::create_unary(
-                    Arc::new(
-                        PatternPlan {
-                            plan_type: RelOp::EvalScalar,
-                        }
-                        .into(),
-                    ),
-                    Arc::new(SExpr::create_leaf(Arc::new(
-                        PatternPlan { plan_type: Pattern }.into(),
-                    ))),
-                )),
-            )],
+            id: RuleID::PushDownLimitEvalScalar,
+            matchers: vec![Matcher::MatchOp {
+                op_type: RelOp::Limit,
+                children: vec![Matcher::MatchOp {
+                    op_type: RelOp::EvalScalar,
+                    children: vec![Matcher::Leaf],
+                }],
+            }],
         }
     }
 }
 
-impl Rule for RulePushDownLimitExpression {
+impl Rule for RulePushDownLimitEvalScalar {
     fn id(&self) -> RuleID {
         self.id
     }
 
-    fn apply(&self, s_expr: &SExpr, state: &mut TransformResult) -> common_exception::Result<()> {
+    fn apply(
+        &self,
+        s_expr: &SExpr,
+        state: &mut TransformResult,
+    ) -> databend_common_exception::Result<()> {
         let limit: Limit = s_expr.plan().clone().try_into()?;
         let eval_plan = s_expr.child(0)?;
         let eval_scalar: EvalScalar = eval_plan.plan().clone().try_into()?;
@@ -92,7 +83,7 @@ impl Rule for RulePushDownLimitExpression {
         Ok(())
     }
 
-    fn patterns(&self) -> &Vec<SExpr> {
-        &self.patterns
+    fn matchers(&self) -> &[Matcher] {
+        &self.matchers
     }
 }

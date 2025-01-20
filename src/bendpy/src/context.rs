@@ -14,8 +14,13 @@
 
 use std::sync::Arc;
 
-use common_exception::Result;
-use common_meta_app::principal::UserInfo;
+use databend_common_config::GlobalConfig;
+use databend_common_exception::Result;
+use databend_common_meta_app::principal::GrantObject;
+use databend_common_meta_app::principal::UserInfo;
+use databend_common_meta_app::principal::UserPrivilegeSet;
+use databend_common_meta_app::tenant::Tenant;
+use databend_common_users::UserApiProvider;
 use databend_query::sessions::QueryContext;
 use databend_query::sessions::Session;
 use databend_query::sessions::SessionManager;
@@ -40,21 +45,40 @@ impl PySessionContext {
     #[pyo3(signature = (tenant = None))]
     fn new(tenant: Option<&str>, py: Python) -> PyResult<Self> {
         let session = RUNTIME.block_on(async {
-            let session = SessionManager::instance()
+            let session_manager = SessionManager::instance();
+            let mut session = session_manager
                 .create_session(SessionType::Local)
                 .await
                 .unwrap();
 
-            if let Some(tenant) = tenant {
-                session.set_current_tenant(tenant.to_owned());
+            let tenant = if let Some(tenant) = tenant {
+                tenant.to_owned()
             } else {
-                session.set_current_tenant(uuid::Uuid::new_v4().to_string());
-            }
+                uuid::Uuid::new_v4().to_string()
+            };
 
-            let user = UserInfo::new_no_auth("root", "%");
+            let tenant = Tenant::new_or_err(tenant, "PySessionContext::new()").map_err(|e| {
+                PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Error: {}", e))
+            })?;
+
+            session.set_current_tenant(tenant.clone());
+
+            let session = session_manager.register_session(session).unwrap();
+
+            let config = GlobalConfig::instance();
+            UserApiProvider::try_create_simple(config.meta.to_meta_grpc_client_conf(), &tenant, config.query.enable_meta_data_upgrade_json_to_pb_from_v307)
+                .await
+                .unwrap();
+
+            let mut user = UserInfo::new_no_auth("root", "%");
+            user.grants.grant_privileges(
+                &GrantObject::Global,
+                UserPrivilegeSet::available_privileges_on_global(),
+            );
+
             session.set_authed_user(user, None).await.unwrap();
-            session
-        });
+            Ok::<Arc<Session>, PyErr>(session)
+        })?;
 
         let mut res = Self { session };
 

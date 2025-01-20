@@ -16,9 +16,10 @@ use std::fmt::Debug;
 use std::fmt::Formatter;
 use std::sync::Arc;
 
-use crate::processors::port::InputPort;
-use crate::processors::port::OutputPort;
-use crate::processors::processor::ProcessorPtr;
+use crate::processors::InputPort;
+use crate::processors::OutputPort;
+use crate::processors::PlanScope;
+use crate::processors::ProcessorPtr;
 
 #[derive(Clone)]
 pub struct PipeItem {
@@ -42,7 +43,7 @@ impl PipeItem {
 }
 
 impl Debug for PipeItem {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
         f.debug_struct("PipeItem")
             .field("name", &unsafe { self.processor.name() })
             .field("inputs", &self.inputs_port.len())
@@ -56,10 +57,11 @@ pub struct Pipe {
     pub items: Vec<PipeItem>,
     pub input_length: usize,
     pub output_length: usize,
+    pub scope: Option<PlanScope>,
 }
 
 impl Debug for Pipe {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
         write!(f, "{:?}", &self.items)
     }
 }
@@ -70,6 +72,7 @@ impl Pipe {
             items,
             input_length: inputs,
             output_length: outputs,
+            scope: None,
         }
     }
 }
@@ -136,5 +139,18 @@ impl TransformPipeBuilder {
     ) {
         self.items
             .push(PipeItem::create(proc, vec![input], vec![output]));
+    }
+
+    pub fn add_items_prepend(&mut self, mut items: Vec<PipeItem>) {
+        for item in self.items.drain(..) {
+            items.push(item)
+        }
+        self.items = items
+    }
+
+    pub fn add_items(&mut self, items: Vec<PipeItem>) {
+        for item in items {
+            self.items.push(item)
+        }
     }
 }

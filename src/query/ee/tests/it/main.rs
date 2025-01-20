@@ -15,5 +15,7 @@
 #![feature(unwrap_infallible)]
 mod aggregating_index;
 mod background_service;
+mod inverted_index;
 mod license;
 mod storages;
+mod stream;

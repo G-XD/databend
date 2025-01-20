@@ -12,25 +12,32 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use common_ast::ast::BinaryOperator;
-use common_ast::ast::Expr as AExpr;
-use common_ast::ast::IntervalKind;
-use common_ast::ast::Literal as ASTLiteral;
-use common_ast::ast::MapAccessor;
-use common_ast::ast::UnaryOperator;
-use common_ast::parser::parse_expr;
-use common_ast::parser::tokenize_sql;
-use common_ast::Dialect;
-use common_expression::shrink_scalar;
-use common_expression::types::decimal::DecimalDataType;
-use common_expression::types::decimal::DecimalScalar;
-use common_expression::types::decimal::DecimalSize;
-use common_expression::types::DataType;
-use common_expression::types::NumberDataType;
-use common_expression::types::NumberScalar;
-use common_expression::RawExpr;
-use common_expression::Scalar;
-use ordered_float::OrderedFloat;
+use databend_common_ast::ast::BinaryOperator;
+use databend_common_ast::ast::ColumnRef;
+use databend_common_ast::ast::Expr as AExpr;
+use databend_common_ast::ast::FunctionCall;
+use databend_common_ast::ast::IntervalKind;
+use databend_common_ast::ast::Literal as ASTLiteral;
+use databend_common_ast::ast::MapAccessor;
+use databend_common_ast::ast::UnaryOperator;
+use databend_common_ast::ast::Weekday;
+use databend_common_ast::parser::parse_expr;
+use databend_common_ast::parser::tokenize_sql;
+use databend_common_ast::parser::Dialect;
+use databend_common_base::base::OrderedFloat;
+use databend_common_expression::shrink_scalar;
+use databend_common_expression::type_check;
+use databend_common_expression::types::decimal::DecimalDataType;
+use databend_common_expression::types::decimal::DecimalScalar;
+use databend_common_expression::types::decimal::DecimalSize;
+use databend_common_expression::types::DataType;
+use databend_common_expression::types::NumberDataType;
+use databend_common_expression::types::NumberScalar;
+use databend_common_expression::ConstantFolder;
+use databend_common_expression::FunctionContext;
+use databend_common_expression::RawExpr;
+use databend_common_expression::Scalar;
+use databend_common_functions::BUILTIN_FUNCTIONS;
 
 pub fn parse_raw_expr(text: &str, columns: &[(&str, DataType)]) -> RawExpr {
     let tokens = tokenize_sql(text).unwrap();
@@ -42,8 +49,20 @@ macro_rules! with_interval_mapped_name {
     (| $t:tt | $($tail:tt)*) => {
         match_template::match_template! {
             $t = [
-              Year => "year", Quarter => "quarter", Month => "month", Day => "day",
+              Year => "year", Quarter => "quarter", Month => "month", Week => "week", Day => "day",
               Hour => "hour", Minute => "minute", Second => "second",
+            ],
+            $($tail)*
+        }
+    }
+}
+
+macro_rules! with_weekday_mapped_name {
+    (| $t:tt | $($tail:tt)*) => {
+        match_template::match_template! {
+            $t = [
+              Monday => "monday", Tuesday => "tuesday", Wednesday => "wednesday", Thursday => "thursday", Friday => "friday",
+              Saturday => "saturday", Sunday => "sunday",
             ],
             $($tail)*
         }
@@ -90,15 +109,18 @@ macro_rules! transform_interval_add_sub {
 
 pub fn transform_expr(ast: AExpr, columns: &[(&str, DataType)]) -> RawExpr {
     match ast {
-        AExpr::Literal { span, lit } => RawExpr::Constant {
+        AExpr::Literal { span, value } => RawExpr::Constant {
             span,
-            scalar: transform_literal(lit),
+            scalar: transform_literal(value),
         },
         AExpr::ColumnRef {
             span,
-            database: None,
-            table: None,
-            column,
+            column:
+                ColumnRef {
+                    database: None,
+                    table: None,
+                    column,
+                },
         } => {
             let col_id = columns
                 .iter()
@@ -135,9 +157,9 @@ pub fn transform_expr(ast: AExpr, columns: &[(&str, DataType)]) -> RawExpr {
         },
         AExpr::FunctionCall {
             span,
-            name,
-            args,
-            params,
+            func: FunctionCall {
+                name, args, params, ..
+            },
             ..
         } => RawExpr::FunctionCall {
             span,
@@ -148,10 +170,15 @@ pub fn transform_expr(ast: AExpr, columns: &[(&str, DataType)]) -> RawExpr {
                 .collect(),
             params: params
                 .into_iter()
-                .map(|param| match param {
-                    ASTLiteral::UInt64(u) => u as usize,
-                    ASTLiteral::Decimal256 { .. } => 0_usize,
-                    _ => unimplemented!(),
+                .map(|param| {
+                    let raw_expr = transform_expr(param, &[]);
+                    let expr = type_check::check(&raw_expr, &BUILTIN_FUNCTIONS).unwrap();
+                    let (expr, _) = ConstantFolder::fold(
+                        &expr,
+                        &FunctionContext::default(),
+                        &BUILTIN_FUNCTIONS,
+                    );
+                    expr.into_constant().unwrap().1
                 })
                 .collect(),
         },
@@ -195,6 +222,20 @@ pub fn transform_expr(ast: AExpr, columns: &[(&str, DataType)]) -> RawExpr {
                 },
             },
         },
+        AExpr::JsonOp {
+            span,
+            op,
+            left,
+            right,
+        } => RawExpr::FunctionCall {
+            span,
+            name: op.to_func_name(),
+            params: vec![],
+            args: vec![
+                transform_expr(*left, columns),
+                transform_expr(*right, columns),
+            ],
+        },
         AExpr::Position {
             span,
             substr_expr,
@@ -215,7 +256,7 @@ pub fn transform_expr(ast: AExpr, columns: &[(&str, DataType)]) -> RawExpr {
         } => {
             if let Some(inner) = trim_where {
                 match inner.0 {
-                    common_ast::ast::TrimWhere::Both => RawExpr::FunctionCall {
+                    databend_common_ast::ast::TrimWhere::Both => RawExpr::FunctionCall {
                         span,
                         name: "trim_both".to_string(),
                         params: vec![],
@@ -224,7 +265,7 @@ pub fn transform_expr(ast: AExpr, columns: &[(&str, DataType)]) -> RawExpr {
                             transform_expr(*inner.1, columns),
                         ],
                     },
-                    common_ast::ast::TrimWhere::Leading => RawExpr::FunctionCall {
+                    databend_common_ast::ast::TrimWhere::Leading => RawExpr::FunctionCall {
                         span,
                         name: "trim_leading".to_string(),
                         params: vec![],
@@ -233,7 +274,7 @@ pub fn transform_expr(ast: AExpr, columns: &[(&str, DataType)]) -> RawExpr {
                             transform_expr(*inner.1, columns),
                         ],
                     },
-                    common_ast::ast::TrimWhere::Trailing => RawExpr::FunctionCall {
+                    databend_common_ast::ast::TrimWhere::Trailing => RawExpr::FunctionCall {
                         span,
                         name: "trim_trailing".to_string(),
                         params: vec![],
@@ -285,7 +326,7 @@ pub fn transform_expr(ast: AExpr, columns: &[(&str, DataType)]) -> RawExpr {
             let mut keys = Vec::with_capacity(kvs.len());
             let mut vals = Vec::with_capacity(kvs.len());
             for (key, val) in kvs {
-                keys.push(transform_expr(key, columns));
+                keys.push(transform_expr(AExpr::Literal { span, value: key }, columns));
                 vals.push(transform_expr(val, columns));
             }
             let keys = RawExpr::FunctionCall {
@@ -327,17 +368,21 @@ pub fn transform_expr(ast: AExpr, columns: &[(&str, DataType)]) -> RawExpr {
                     transform_expr(*expr, columns),
                     transform_expr(*key, columns),
                 ]),
-                MapAccessor::Period { key } | MapAccessor::Colon { key } => (vec![], vec![
+                MapAccessor::Colon { key } => (vec![], vec![
                     transform_expr(*expr, columns),
                     RawExpr::Constant {
                         span,
-                        scalar: Scalar::String(key.name.into_bytes()),
+                        scalar: Scalar::String(key.name),
                     },
                 ]),
-                MapAccessor::PeriodNumber { key } => {
-                    (vec![key as usize], vec![transform_expr(*expr, columns)])
+                MapAccessor::DotNumber { key } => {
+                    (vec![key as i64], vec![transform_expr(*expr, columns)])
                 }
             };
+            let params = params
+                .into_iter()
+                .map(|x| Scalar::Number(x.into()))
+                .collect();
             RawExpr::FunctionCall {
                 span,
                 name: "get".to_string(),
@@ -386,6 +431,27 @@ pub fn transform_expr(ast: AExpr, columns: &[(&str, DataType)]) -> RawExpr {
                 }
             })
         }
+        AExpr::DateDiff {
+            span,
+            unit,
+            date_start,
+            date_end,
+        } => {
+            with_interval_mapped_name!(|INTERVAL| match unit {
+                IntervalKind::INTERVAL => RawExpr::FunctionCall {
+                    span,
+                    name: concat!("diff_", INTERVAL, "s").to_string(),
+                    params: vec![],
+                    args: vec![
+                        transform_expr(*date_end, columns),
+                        transform_expr(*date_start, columns),
+                    ],
+                },
+                kind => {
+                    unimplemented!("{kind:?} is not supported")
+                }
+            })
+        }
         AExpr::DateSub {
             span,
             unit,
@@ -420,6 +486,39 @@ pub fn transform_expr(ast: AExpr, columns: &[(&str, DataType)]) -> RawExpr {
                 }
             })
         }
+        AExpr::LastDay { span, unit, date } => {
+            with_interval_mapped_name!(|INTERVAL| match unit {
+                IntervalKind::INTERVAL => RawExpr::FunctionCall {
+                    span,
+                    name: concat!("to_last_of_", INTERVAL).to_string(),
+                    params: vec![],
+                    args: vec![transform_expr(*date, columns),],
+                },
+                kind => {
+                    unimplemented!("{kind:?} is not supported")
+                }
+            })
+        }
+        AExpr::PreviousDay { span, unit, date } => {
+            with_weekday_mapped_name!(|WEEKDAY| match unit {
+                Weekday::WEEKDAY => RawExpr::FunctionCall {
+                    span,
+                    name: concat!("to_previous_", WEEKDAY).to_string(),
+                    params: vec![],
+                    args: vec![transform_expr(*date, columns),],
+                },
+            })
+        }
+        AExpr::NextDay { span, unit, date } => {
+            with_weekday_mapped_name!(|WEEKDAY| match unit {
+                Weekday::WEEKDAY => RawExpr::FunctionCall {
+                    span,
+                    name: concat!("to_next_", WEEKDAY).to_string(),
+                    params: vec![],
+                    args: vec![transform_expr(*date, columns),],
+                },
+            })
+        }
         AExpr::InList {
             span,
             expr,
@@ -442,7 +541,7 @@ pub fn transform_expr(ast: AExpr, columns: &[(&str, DataType)]) -> RawExpr {
 
             let list: Vec<AExpr> = list
                 .into_iter()
-                .filter(|e| matches!(e, AExpr::Literal { lit, .. } if lit != &ASTLiteral::Null))
+                .filter(|e| matches!(e, AExpr::Literal { value, .. } if value != &ASTLiteral::Null))
                 .collect();
             if list.is_empty()
                 || (list.len() > 3 && list.iter().all(|e| matches!(e, AExpr::Literal { .. })))
@@ -489,41 +588,46 @@ pub fn transform_expr(ast: AExpr, columns: &[(&str, DataType)]) -> RawExpr {
     }
 }
 
-fn transform_data_type(target_type: common_ast::ast::TypeName) -> DataType {
+fn transform_data_type(target_type: databend_common_ast::ast::TypeName) -> DataType {
     match target_type {
-        common_ast::ast::TypeName::Boolean => DataType::Boolean,
-        common_ast::ast::TypeName::UInt8 => DataType::Number(NumberDataType::UInt8),
-        common_ast::ast::TypeName::UInt16 => DataType::Number(NumberDataType::UInt16),
-        common_ast::ast::TypeName::UInt32 => DataType::Number(NumberDataType::UInt32),
-        common_ast::ast::TypeName::UInt64 => DataType::Number(NumberDataType::UInt64),
-        common_ast::ast::TypeName::Int8 => DataType::Number(NumberDataType::Int8),
-        common_ast::ast::TypeName::Int16 => DataType::Number(NumberDataType::Int16),
-        common_ast::ast::TypeName::Int32 => DataType::Number(NumberDataType::Int32),
-        common_ast::ast::TypeName::Int64 => DataType::Number(NumberDataType::Int64),
-        common_ast::ast::TypeName::Float32 => DataType::Number(NumberDataType::Float32),
-        common_ast::ast::TypeName::Float64 => DataType::Number(NumberDataType::Float64),
-        common_ast::ast::TypeName::Decimal { precision, scale } => {
+        databend_common_ast::ast::TypeName::Boolean => DataType::Boolean,
+        databend_common_ast::ast::TypeName::UInt8 => DataType::Number(NumberDataType::UInt8),
+        databend_common_ast::ast::TypeName::UInt16 => DataType::Number(NumberDataType::UInt16),
+        databend_common_ast::ast::TypeName::UInt32 => DataType::Number(NumberDataType::UInt32),
+        databend_common_ast::ast::TypeName::UInt64 => DataType::Number(NumberDataType::UInt64),
+        databend_common_ast::ast::TypeName::Int8 => DataType::Number(NumberDataType::Int8),
+        databend_common_ast::ast::TypeName::Int16 => DataType::Number(NumberDataType::Int16),
+        databend_common_ast::ast::TypeName::Int32 => DataType::Number(NumberDataType::Int32),
+        databend_common_ast::ast::TypeName::Int64 => DataType::Number(NumberDataType::Int64),
+        databend_common_ast::ast::TypeName::Float32 => DataType::Number(NumberDataType::Float32),
+        databend_common_ast::ast::TypeName::Float64 => DataType::Number(NumberDataType::Float64),
+        databend_common_ast::ast::TypeName::Decimal { precision, scale } => {
             DataType::Decimal(DecimalDataType::from_size(DecimalSize { precision, scale }).unwrap())
         }
-        common_ast::ast::TypeName::String => DataType::String,
-        common_ast::ast::TypeName::Timestamp => DataType::Timestamp,
-        common_ast::ast::TypeName::Date => DataType::Date,
-        common_ast::ast::TypeName::Array(item_type) => {
+        databend_common_ast::ast::TypeName::Binary => DataType::Binary,
+        databend_common_ast::ast::TypeName::String => DataType::String,
+        databend_common_ast::ast::TypeName::Timestamp => DataType::Timestamp,
+        databend_common_ast::ast::TypeName::Date => DataType::Date,
+        databend_common_ast::ast::TypeName::Interval => DataType::Interval,
+        databend_common_ast::ast::TypeName::Array(item_type) => {
             DataType::Array(Box::new(transform_data_type(*item_type)))
         }
-        common_ast::ast::TypeName::Map { key_type, val_type } => {
+        databend_common_ast::ast::TypeName::Map { key_type, val_type } => {
             let key_type = transform_data_type(*key_type);
             let val_type = transform_data_type(*val_type);
             DataType::Map(Box::new(DataType::Tuple(vec![key_type, val_type])))
         }
-        common_ast::ast::TypeName::Bitmap => DataType::Bitmap,
-        common_ast::ast::TypeName::Tuple { fields_type, .. } => {
+        databend_common_ast::ast::TypeName::Bitmap => DataType::Bitmap,
+        databend_common_ast::ast::TypeName::Tuple { fields_type, .. } => {
             DataType::Tuple(fields_type.into_iter().map(transform_data_type).collect())
         }
-        common_ast::ast::TypeName::Nullable(inner_type) => {
+        databend_common_ast::ast::TypeName::Nullable(inner_type) => {
             DataType::Nullable(Box::new(transform_data_type(*inner_type)))
         }
-        common_ast::ast::TypeName::Variant => DataType::Variant,
+        databend_common_ast::ast::TypeName::Variant => DataType::Variant,
+        databend_common_ast::ast::TypeName::Geometry => DataType::Geometry,
+        databend_common_ast::ast::TypeName::Geography => DataType::Geography,
+        databend_common_ast::ast::TypeName::NotNull(inner_type) => transform_data_type(*inner_type),
     }
 }
 
@@ -538,11 +642,10 @@ pub fn transform_literal(lit: ASTLiteral) -> Scalar {
             precision,
             scale,
         })),
-        ASTLiteral::String(s) => Scalar::String(s.as_bytes().to_vec()),
+        ASTLiteral::String(s) => Scalar::String(s),
         ASTLiteral::Boolean(b) => Scalar::Boolean(b),
         ASTLiteral::Null => Scalar::Null,
         ASTLiteral::Float64(f) => Scalar::Number(NumberScalar::Float64(OrderedFloat(f))),
-        _ => unimplemented!("{lit}"),
     };
 
     shrink_scalar(scalar)

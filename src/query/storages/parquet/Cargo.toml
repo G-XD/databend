@@ -1,46 +1,48 @@
 [package]
-name = "common-storages-parquet"
+name = "databend-common-storages-parquet"
 version = { workspace = true }
 authors = { workspace = true }
 license = { workspace = true }
 publish = { workspace = true }
 edition = { workspace = true }
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 [lib]
 doctest = false
-test = false
+test = true
 
 [dependencies]
-arrow-buffer = "43.0.0"
-arrow-schema = "43.0.0"
-bytes = "1.4.0"
-common-arrow = { path = "../../../common/arrow" }
-common-base = { path = "../../../common/base" }
-common-catalog = { path = "../../catalog" }
-common-exception = { path = "../../../common/exception" }
-common-expression = { path = "../../expression" }
-common-functions = { path = "../../functions" }
-common-meta-app = { path = "../../../meta/app" }
-common-pipeline-core = { path = "../../pipeline/core" }
-common-pipeline-sources = { path = "../../pipeline/sources" }
-common-storage = { path = "../../../common/storage" }
-
-ethnum = { workspace = true }
-parquet = "43.0.0"
-
-storages-common-index = { path = "../common/index" }
-storages-common-pruner = { path = "../common/pruner" }
-storages-common-table-meta = { path = "../common/table-meta" }
-
+arrow-array = { workspace = true }
+arrow-buffer = { workspace = true }
+arrow-schema = { workspace = true }
 async-backtrace = { workspace = true }
-async-trait = { version = "0.1.57", package = "async-trait-fn" }
+async-trait = { workspace = true }
+bytes = { workspace = true }
 chrono = { workspace = true }
-futures = "0.3.24"
+
+databend-common-ast = { workspace = true }
+databend-common-base = { workspace = true }
+databend-common-catalog = { workspace = true }
+databend-common-exception = { workspace = true }
+databend-common-expression = { workspace = true }
+databend-common-functions = { workspace = true }
+databend-common-meta-app = { workspace = true }
+databend-common-metrics = { workspace = true }
+databend-common-pipeline-core = { workspace = true }
+databend-common-settings = { workspace = true }
+databend-common-storage = { workspace = true }
+databend-storages-common-cache = { workspace = true }
+databend-storages-common-pruner = { workspace = true }
+databend-storages-common-stage = { workspace = true }
+databend-storages-common-table-meta = { workspace = true }
+ethnum = { workspace = true }
+futures = { workspace = true }
 log = { workspace = true }
 opendal = { workspace = true }
+parquet = { workspace = true }
+rand = { workspace = true }
 serde = { workspace = true }
-typetag = "0.2.3"
+thrift = { workspace = true }
+typetag = { workspace = true }
 
-[dev-dependencies]
-common-sql = { path = "../../sql" }
+[lints]
+workspace = true

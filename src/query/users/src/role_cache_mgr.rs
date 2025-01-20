@@ -17,11 +17,13 @@ use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
 
-use common_base::base::tokio;
-use common_base::base::tokio::task::JoinHandle;
-use common_base::base::GlobalInstance;
-use common_exception::Result;
-use common_meta_app::principal::RoleInfo;
+use databend_common_base::base::tokio;
+use databend_common_base::base::tokio::task::JoinHandle;
+use databend_common_base::base::GlobalInstance;
+use databend_common_exception::Result;
+use databend_common_meta_app::principal::OwnershipObject;
+use databend_common_meta_app::principal::RoleInfo;
+use databend_common_meta_app::tenant::Tenant;
 use log::warn;
 use parking_lot::RwLock;
 
@@ -35,7 +37,7 @@ struct CachedRoles {
 
 pub struct RoleCacheManager {
     user_manager: Arc<UserApiProvider>,
-    cache: Arc<RwLock<HashMap<String, CachedRoles>>>,
+    cache: Arc<RwLock<HashMap<Tenant, CachedRoles>>>,
     polling_interval: Duration,
     polling_join_handle: Option<JoinHandle<()>>,
 }
@@ -69,40 +71,39 @@ impl RoleCacheManager {
         let cache = self.cache.clone();
         let polling_interval = self.polling_interval;
         let user_manager = self.user_manager.clone();
-        self.polling_join_handle = Some(tokio::spawn(async_backtrace::location!().frame(
-            async move {
-                loop {
-                    let tenants: Vec<String> = {
-                        let cached = cache.read();
-                        cached.keys().cloned().collect()
-                    };
-                    for tenant in tenants {
-                        match load_roles_data(&user_manager, &tenant).await {
-                            Err(err) => {
-                                warn!(
-                                    "role_cache_mgr load roles data of tenant {} failed: {}",
-                                    tenant, err,
-                                )
-                            }
-                            Ok(data) => {
-                                let mut cached = cache.write();
-                                cached.insert(tenant.to_string(), data);
-                            }
+        self.polling_join_handle = Some(databend_common_base::runtime::spawn(async move {
+            loop {
+                let tenants = {
+                    let cached = cache.read();
+                    cached.keys().cloned().collect::<Vec<_>>()
+                };
+                for tenant in tenants {
+                    match load_roles_data(&user_manager, &tenant).await {
+                        Err(err) => {
+                            warn!(
+                                "role_cache_mgr load roles data of tenant {} failed: {}",
+                                tenant.display(),
+                                err,
+                            )
+                        }
+                        Ok(data) => {
+                            let mut cached = cache.write();
+                            cached.insert(tenant, data);
                         }
                     }
-                    tokio::time::sleep(polling_interval).await
                 }
-            },
-        )));
+                tokio::time::sleep(polling_interval).await
+            }
+        }));
     }
 
-    pub fn invalidate_cache(&self, tenant: &str) {
+    pub fn invalidate_cache(&self, tenant: &Tenant) {
         let mut cached = self.cache.write();
         cached.remove(tenant);
     }
 
     #[async_backtrace::framed]
-    pub async fn find_role(&self, tenant: &str, role: &str) -> Result<Option<RoleInfo>> {
+    pub async fn find_role(&self, tenant: &Tenant, role: &str) -> Result<Option<RoleInfo>> {
         let cached = self.cache.read();
         let cached_roles = match cached.get(tenant) {
             None => return Ok(None),
@@ -111,11 +112,24 @@ impl RoleCacheManager {
         Ok(cached_roles.roles.get(role).cloned())
     }
 
+    // TODO(liyz): really cache it if got any performance issue. IMHO the ownership data won't become a big memory.
+    #[async_backtrace::framed]
+    pub async fn find_object_owner(
+        &self,
+        tenant: &Tenant,
+        object: &OwnershipObject,
+    ) -> Result<Option<String>> {
+        match self.user_manager.get_ownership(tenant, object).await? {
+            None => return Ok(None),
+            Some(owner) => Ok(Some(owner.role)),
+        }
+    }
+
     // find_related_roles is called on validating an user's privileges.
     #[async_backtrace::framed]
     pub async fn find_related_roles(
         &self,
-        tenant: &str,
+        tenant: &Tenant,
         roles: &[String],
     ) -> Result<Vec<RoleInfo>> {
         self.maybe_reload(tenant).await?;
@@ -128,17 +142,17 @@ impl RoleCacheManager {
     }
 
     #[async_backtrace::framed]
-    pub async fn force_reload(&self, tenant: &str) -> Result<()> {
+    pub async fn force_reload(&self, tenant: &Tenant) -> Result<()> {
         let data = load_roles_data(&self.user_manager, tenant).await?;
         let mut cached = self.cache.write();
-        cached.insert(tenant.to_string(), data);
+        cached.insert(tenant.clone(), data);
         Ok(())
     }
 
     // Load roles data if not found in cache. Watch this tenant's role data in background if
     // once it loads successfully.
     #[async_backtrace::framed]
-    async fn maybe_reload(&self, tenant: &str) -> Result<()> {
+    async fn maybe_reload(&self, tenant: &Tenant) -> Result<()> {
         let need_reload = {
             let cached = self.cache.read();
             match cached.get(tenant) {
@@ -160,7 +174,7 @@ impl RoleCacheManager {
     }
 }
 
-async fn load_roles_data(user_api: &Arc<UserApiProvider>, tenant: &str) -> Result<CachedRoles> {
+async fn load_roles_data(user_api: &Arc<UserApiProvider>, tenant: &Tenant) -> Result<CachedRoles> {
     let roles = user_api.get_roles(tenant).await?;
     let roles_map = roles
         .into_iter()

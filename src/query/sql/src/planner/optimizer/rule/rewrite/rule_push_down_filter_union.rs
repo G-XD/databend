@@ -15,29 +15,20 @@
 use std::sync::Arc;
 
 use ahash::HashMap;
-use common_exception::ErrorCode;
-use common_exception::Result;
+use databend_common_exception::Result;
 
 use crate::binder::ColumnBindingBuilder;
+use crate::optimizer::extract::Matcher;
 use crate::optimizer::rule::Rule;
 use crate::optimizer::rule::TransformResult;
 use crate::optimizer::RuleID;
 use crate::optimizer::SExpr;
-use crate::plans::AggregateFunction;
 use crate::plans::BoundColumnRef;
-use crate::plans::CastExpr;
 use crate::plans::Filter;
-use crate::plans::FunctionCall;
-use crate::plans::LagLeadFunction;
-use crate::plans::LambdaFunc;
-use crate::plans::NthValueFunction;
-use crate::plans::PatternPlan;
 use crate::plans::RelOp;
 use crate::plans::ScalarExpr;
 use crate::plans::UnionAll;
-use crate::plans::WindowFunc;
-use crate::plans::WindowFuncType;
-use crate::plans::WindowOrderBy;
+use crate::plans::VisitorMut;
 use crate::IndexType;
 use crate::Visibility;
 
@@ -49,7 +40,7 @@ use crate::Visibility;
 // So it'll be efficient to push down `filter` to `union`, reduce the size of data to pull from table.
 pub struct RulePushDownFilterUnion {
     id: RuleID,
-    patterns: Vec<SExpr>,
+    matchers: Vec<Matcher>,
 }
 
 impl RulePushDownFilterUnion {
@@ -61,34 +52,13 @@ impl RulePushDownFilterUnion {
             //   UnionAll
             //     /  \
             //   ...   ...
-            patterns: vec![SExpr::create_unary(
-                Arc::new(
-                    PatternPlan {
-                        plan_type: RelOp::Filter,
-                    }
-                    .into(),
-                ),
-                Arc::new(SExpr::create_binary(
-                    Arc::new(
-                        PatternPlan {
-                            plan_type: RelOp::UnionAll,
-                        }
-                        .into(),
-                    ),
-                    Arc::new(SExpr::create_leaf(Arc::new(
-                        PatternPlan {
-                            plan_type: RelOp::Pattern,
-                        }
-                        .into(),
-                    ))),
-                    Arc::new(SExpr::create_leaf(Arc::new(
-                        PatternPlan {
-                            plan_type: RelOp::Pattern,
-                        }
-                        .into(),
-                    ))),
-                )),
-            )],
+            matchers: vec![Matcher::MatchOp {
+                op_type: RelOp::Filter,
+                children: vec![Matcher::MatchOp {
+                    op_type: RelOp::UnionAll,
+                    children: vec![Matcher::Leaf, Matcher::Leaf],
+                }],
+            }],
         }
     }
 }
@@ -102,28 +72,43 @@ impl Rule for RulePushDownFilterUnion {
         let filter: Filter = s_expr.plan().clone().try_into()?;
         let union_s_expr = s_expr.child(0)?;
         let union: UnionAll = union_s_expr.plan().clone().try_into()?;
-
-        // Create a filter which matches union's right child.
-        let index_pairs: HashMap<IndexType, IndexType> =
-            union.pairs.iter().map(|pair| (pair.0, pair.1)).collect();
-        let new_predicates = filter
-            .predicates
-            .iter()
-            .map(|predicate| replace_column_binding(&index_pairs, predicate.clone()))
-            .collect::<Result<Vec<_>>>()?;
-        let right_filer = Filter {
-            predicates: new_predicates,
-            is_having: filter.is_having,
-        };
+        if !union.cte_scan_names.is_empty() {
+            // If the union has cte scan names, it's not allowed to push down filter.
+            state.add_result(s_expr.clone());
+            return Ok(());
+        }
 
         let mut union_left_child = union_s_expr.child(0)?.clone();
         let mut union_right_child = union_s_expr.child(1)?.clone();
 
         // Add filter to union children
-        union_left_child = SExpr::create_unary(Arc::new(filter.into()), Arc::new(union_left_child));
-        union_right_child =
-            SExpr::create_unary(Arc::new(right_filer.into()), Arc::new(union_right_child));
+        for (union_side, union_sexpr) in [&union.left_outputs, &union.right_outputs]
+            .iter()
+            .zip([&mut union_left_child, &mut union_right_child].iter_mut())
+        {
+            // Create a filter which matches union's right child.
+            let index_pairs: HashMap<IndexType, IndexType> = union
+                .output_indexes
+                .iter()
+                .zip(union_side.iter())
+                .map(|(index, side)| (*index, side.0))
+                .collect();
 
+            let new_predicates = filter
+                .predicates
+                .iter()
+                .map(|predicate| replace_column_binding(&index_pairs, predicate.clone()))
+                .collect::<Result<Vec<_>>>()?;
+
+            let filter = Filter {
+                predicates: new_predicates,
+            };
+
+            let s = (*union_sexpr).clone();
+            **union_sexpr = SExpr::create_unary(Arc::new(filter.into()), Arc::new(s));
+        }
+
+        // Create a filter which matches union's right child.
         let result = SExpr::create_binary(
             Arc::new(union.into()),
             Arc::new(union_left_child),
@@ -134,142 +119,39 @@ impl Rule for RulePushDownFilterUnion {
         Ok(())
     }
 
-    fn patterns(&self) -> &Vec<SExpr> {
-        &self.patterns
+    fn matchers(&self) -> &[Matcher] {
+        &self.matchers
     }
 }
 
 fn replace_column_binding(
     index_pairs: &HashMap<IndexType, IndexType>,
-    scalar: ScalarExpr,
+    mut scalar: ScalarExpr,
 ) -> Result<ScalarExpr> {
-    match scalar {
-        ScalarExpr::BoundColumnRef(column) => {
+    struct ReplaceColumnVisitor<'a> {
+        index_pairs: &'a HashMap<IndexType, IndexType>,
+    }
+
+    impl<'a> VisitorMut<'a> for ReplaceColumnVisitor<'a> {
+        fn visit_bound_column_ref(&mut self, column: &mut BoundColumnRef) -> Result<()> {
             let index = column.column.index;
-            if index_pairs.contains_key(&index) {
+            if self.index_pairs.contains_key(&index) {
                 let new_column = ColumnBindingBuilder::new(
                     column.column.column_name.clone(),
-                    *index_pairs.get(&index).unwrap(),
-                    column.column.data_type,
+                    *self.index_pairs.get(&index).unwrap(),
+                    column.column.data_type.clone(),
                     Visibility::Visible,
                 )
                 .virtual_computed_expr(column.column.virtual_computed_expr.clone())
                 .build();
-                return Ok(ScalarExpr::BoundColumnRef(BoundColumnRef {
-                    span: column.span,
-                    column: new_column,
-                }));
+                column.column = new_column;
             }
-            Ok(ScalarExpr::BoundColumnRef(column))
+            Ok(())
         }
-        constant_expr @ ScalarExpr::ConstantExpr(_) => Ok(constant_expr),
-        ScalarExpr::WindowFunction(expr) => Ok(ScalarExpr::WindowFunction(WindowFunc {
-            span: expr.span,
-            display_name: expr.display_name,
-            func: match expr.func {
-                WindowFuncType::Aggregate(arg) => WindowFuncType::Aggregate(AggregateFunction {
-                    display_name: arg.display_name,
-                    func_name: arg.func_name,
-                    distinct: arg.distinct,
-                    params: arg.params,
-                    args: arg
-                        .args
-                        .into_iter()
-                        .map(|arg| replace_column_binding(index_pairs, arg))
-                        .collect::<Result<Vec<_>>>()?,
-                    return_type: arg.return_type,
-                }),
-                WindowFuncType::LagLead(ll) => {
-                    let new_arg = replace_column_binding(index_pairs, *ll.arg)?;
-                    let new_default = match &ll.default {
-                        None => None,
-                        Some(d) => Some(Box::new(replace_column_binding(index_pairs, *d.clone())?)),
-                    };
-                    WindowFuncType::LagLead(LagLeadFunction {
-                        is_lag: ll.is_lag,
-                        arg: Box::new(new_arg),
-                        offset: ll.offset,
-                        default: new_default,
-                        return_type: ll.return_type.clone(),
-                    })
-                }
-                WindowFuncType::NthValue(func) => {
-                    let new_arg = replace_column_binding(index_pairs, *func.arg)?;
-                    WindowFuncType::NthValue(NthValueFunction {
-                        n: func.n,
-                        arg: Box::new(new_arg),
-                        return_type: func.return_type.clone(),
-                    })
-                }
-                t => t,
-            },
-            partition_by: expr
-                .partition_by
-                .into_iter()
-                .map(|p| replace_column_binding(index_pairs, p))
-                .collect::<Result<Vec<_>>>()?,
-            order_by: expr
-                .order_by
-                .into_iter()
-                .map(|p| {
-                    Ok(WindowOrderBy {
-                        expr: replace_column_binding(index_pairs, p.expr)?,
-                        asc: p.asc,
-                        nulls_first: p.nulls_first,
-                    })
-                })
-                .collect::<Result<Vec<_>>>()?,
-            frame: expr.frame,
-        })),
-        ScalarExpr::AggregateFunction(expr) => {
-            Ok(ScalarExpr::AggregateFunction(AggregateFunction {
-                display_name: expr.display_name,
-                func_name: expr.func_name,
-                distinct: expr.distinct,
-                params: expr.params,
-                args: expr
-                    .args
-                    .into_iter()
-                    .map(|arg| replace_column_binding(index_pairs, arg))
-                    .collect::<Result<Vec<_>>>()?,
-                return_type: expr.return_type,
-            }))
-        }
-        ScalarExpr::FunctionCall(expr) => Ok(ScalarExpr::FunctionCall(FunctionCall {
-            span: expr.span,
-            func_name: expr.func_name,
-            params: expr.params,
-            arguments: expr
-                .arguments
-                .into_iter()
-                .map(|arg| replace_column_binding(index_pairs, arg))
-                .collect::<Result<Vec<_>>>()?,
-        })),
-        ScalarExpr::LambdaFunction(lambda_func) => {
-            let args = lambda_func
-                .args
-                .into_iter()
-                .map(|arg| replace_column_binding(index_pairs, arg))
-                .collect::<Result<Vec<ScalarExpr>>>()?;
-
-            Ok(ScalarExpr::LambdaFunction(LambdaFunc {
-                span: lambda_func.span,
-                func_name: lambda_func.func_name.clone(),
-                display_name: lambda_func.display_name.clone(),
-                args,
-                params: lambda_func.params.clone(),
-                lambda_expr: lambda_func.lambda_expr.clone(),
-                return_type: lambda_func.return_type,
-            }))
-        }
-        ScalarExpr::CastExpr(expr) => Ok(ScalarExpr::CastExpr(CastExpr {
-            span: expr.span,
-            is_try: expr.is_try,
-            argument: Box::new(replace_column_binding(index_pairs, *(expr.argument))?),
-            target_type: expr.target_type,
-        })),
-        ScalarExpr::SubqueryExpr(_) => Err(ErrorCode::Unimplemented(
-            "replace_column_binding: don't support subquery",
-        )),
     }
+
+    let mut visitor = ReplaceColumnVisitor { index_pairs };
+    visitor.visit(&mut scalar)?;
+
+    Ok(scalar)
 }

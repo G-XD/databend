@@ -12,24 +12,26 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use common_base::base::tokio::io::AsyncWrite;
-use common_exception::ErrorCode;
-use common_exception::Result;
-use common_expression::types::number::NumberScalar;
-use common_expression::types::DataType;
-use common_expression::types::NumberDataType;
-use common_expression::Column as ExprColumn;
-use common_expression::DataField;
-use common_expression::DataSchemaRef;
-use common_expression::ScalarRef;
-use common_expression::SendableDataBlockStream;
-use common_formats::field_encoder::FieldEncoderRowBased;
-use common_formats::field_encoder::FieldEncoderValues;
-use common_io::prelude::FormatSettings;
+use std::sync::Arc;
+
+use databend_common_base::base::tokio::io::AsyncWrite;
+use databend_common_exception::ErrorCode;
+use databend_common_exception::Result;
+use databend_common_expression::types::number::NumberScalar;
+use databend_common_expression::types::DataType;
+use databend_common_expression::types::NumberDataType;
+use databend_common_expression::Column as ExprColumn;
+use databend_common_expression::DataField;
+use databend_common_expression::DataSchemaRef;
+use databend_common_expression::ScalarRef;
+use databend_common_expression::SendableDataBlockStream;
+use databend_common_formats::field_encoder::FieldEncoderValues;
+use databend_common_io::prelude::FormatSettings;
 use futures_util::StreamExt;
 use log::error;
 use opensrv_mysql::*;
 
+use crate::sessions::Session;
 /// Reports progress information as string, intend to be put into the mysql Ok packet.
 /// Mainly for decoupling with concrete type like `QueryContext`
 ///
@@ -68,6 +70,7 @@ impl QueryResult {
 
 pub struct DFQueryResultWriter<'a, W: AsyncWrite + Send + Unpin> {
     inner: Option<QueryResultWriter<'a, W>>,
+    session: Arc<Session>,
 }
 
 fn write_field<W: AsyncWrite + Unpin>(
@@ -78,14 +81,20 @@ fn write_field<W: AsyncWrite + Unpin>(
     row_index: usize,
 ) -> Result<()> {
     buf.clear();
-    encoder.write_field(column, row_index, buf, true);
+    encoder.write_field(column, row_index, buf, false);
     row_writer.write_col(&buf[..])?;
     Ok(())
 }
 
 impl<'a, W: AsyncWrite + Send + Unpin> DFQueryResultWriter<'a, W> {
-    pub fn create(inner: QueryResultWriter<'a, W>) -> DFQueryResultWriter<'a, W> {
-        DFQueryResultWriter::<'a, W> { inner: Some(inner) }
+    pub fn create(
+        inner: QueryResultWriter<'a, W>,
+        session: Arc<Session>,
+    ) -> DFQueryResultWriter<'a, W> {
+        DFQueryResultWriter::<'a, W> {
+            inner: Some(inner),
+            session,
+        }
     }
 
     #[async_backtrace::framed]
@@ -98,12 +107,12 @@ impl<'a, W: AsyncWrite + Send + Unpin> DFQueryResultWriter<'a, W> {
             match query_result {
                 Ok((query_result, query_format)) => {
                     if let Some(format) = query_format {
-                        Self::ok(query_result, writer, &format).await?
+                        self.ok(query_result, writer, &format).await?
                     } else {
-                        Self::ok(query_result, writer, format).await?
+                        self.ok(query_result, writer, format).await?
                     }
                 }
-                Err(error) => Self::err(&error, writer).await?,
+                Err(error) => self.err(&error, writer).await?,
             }
         }
         Ok(())
@@ -111,6 +120,7 @@ impl<'a, W: AsyncWrite + Send + Unpin> DFQueryResultWriter<'a, W> {
 
     #[async_backtrace::framed]
     async fn ok(
+        &self,
         mut query_result: QueryResult,
         dataset_writer: QueryResultWriter<'a, W>,
         format: &FormatSettings,
@@ -122,6 +132,7 @@ impl<'a, W: AsyncWrite + Send + Unpin> DFQueryResultWriter<'a, W> {
             while let Some(block) = blocks.next().await {
                 if let Err(e) = block {
                     error!("dataset write failed: {:?}", e);
+                    self.session.txn_mgr().lock().set_fail();
                     dataset_writer
                         .error(
                             ErrorKind::ER_UNKNOWN_ERROR,
@@ -156,6 +167,7 @@ impl<'a, W: AsyncWrite + Send + Unpin> DFQueryResultWriter<'a, W> {
                 DataType::EmptyArray => Ok(ColumnType::MYSQL_TYPE_VARCHAR),
                 DataType::EmptyMap => Ok(ColumnType::MYSQL_TYPE_VARCHAR),
                 DataType::Boolean => Ok(ColumnType::MYSQL_TYPE_SHORT),
+                DataType::Binary => Ok(ColumnType::MYSQL_TYPE_BLOB),
                 DataType::String => Ok(ColumnType::MYSQL_TYPE_VARCHAR),
                 DataType::Number(num_ty) => match num_ty {
                     NumberDataType::Int8 => Ok(ColumnType::MYSQL_TYPE_TINY),
@@ -176,6 +188,8 @@ impl<'a, W: AsyncWrite + Send + Unpin> DFQueryResultWriter<'a, W> {
                 DataType::Bitmap => Ok(ColumnType::MYSQL_TYPE_VARCHAR),
                 DataType::Tuple(_) => Ok(ColumnType::MYSQL_TYPE_VARCHAR),
                 DataType::Variant => Ok(ColumnType::MYSQL_TYPE_VARCHAR),
+                DataType::Geometry => Ok(ColumnType::MYSQL_TYPE_GEOMETRY),
+                DataType::Geography => Ok(ColumnType::MYSQL_TYPE_GEOMETRY),
                 DataType::Decimal(_) => Ok(ColumnType::MYSQL_TYPE_DECIMAL),
                 _ => Err(ErrorCode::Unimplemented(format!(
                     "Unsupported column type:{:?}",
@@ -199,7 +213,7 @@ impl<'a, W: AsyncWrite + Send + Unpin> DFQueryResultWriter<'a, W> {
 
         let _tz = format.timezone;
         match convert_schema(&query_result.schema) {
-            Err(error) => Self::err(&error, dataset_writer).await,
+            Err(error) => self.err(&error, dataset_writer).await,
             Ok(columns) => {
                 let mut row_writer = dataset_writer.start(&columns).await?;
                 let blocks = &mut query_result.blocks;
@@ -208,6 +222,7 @@ impl<'a, W: AsyncWrite + Send + Unpin> DFQueryResultWriter<'a, W> {
                     let block = match block {
                         Err(e) => {
                             error!("result row write failed: {:?}", e);
+                            self.session.txn_mgr().lock().set_fail();
                             row_writer
                                 .finish_error(
                                     ErrorKind::ER_UNKNOWN_ERROR,
@@ -220,18 +235,22 @@ impl<'a, W: AsyncWrite + Send + Unpin> DFQueryResultWriter<'a, W> {
                     };
 
                     let num_rows = block.num_rows();
-                    let encoder = FieldEncoderValues::create_for_mysql_handler(format.timezone);
+                    let encoder = FieldEncoderValues::create_for_mysql_handler(
+                        format.jiff_timezone.clone(),
+                        format.timezone,
+                        format.geometry_format,
+                    );
                     let mut buf = Vec::<u8>::new();
 
                     let columns = block
-                        .convert_to_full()
+                        .consume_convert_to_full()
                         .columns()
                         .iter()
                         .map(|column| column.value.clone().into_column().unwrap())
                         .collect::<Vec<_>>();
 
                     for row_index in 0..num_rows {
-                        for (_col_index, column) in columns.iter().enumerate() {
+                        for column in columns.iter() {
                             let value = unsafe { column.index_unchecked(row_index) };
                             match value {
                                 ScalarRef::Null => {
@@ -304,7 +323,8 @@ impl<'a, W: AsyncWrite + Send + Unpin> DFQueryResultWriter<'a, W> {
     }
 
     #[async_backtrace::framed]
-    async fn err(error: &ErrorCode, writer: QueryResultWriter<'a, W>) -> Result<()> {
+    async fn err(&self, error: &ErrorCode, writer: QueryResultWriter<'a, W>) -> Result<()> {
+        self.session.txn_mgr().lock().set_fail();
         if error.code() != ErrorCode::ABORTED_QUERY && error.code() != ErrorCode::ABORTED_SESSION {
             error!("OnQuery Error: {:?}", error);
             writer

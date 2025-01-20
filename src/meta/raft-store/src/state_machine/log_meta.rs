@@ -14,11 +14,12 @@
 
 use std::fmt;
 
-use common_meta_sled_store::sled;
-use common_meta_sled_store::SledBytesError;
-use common_meta_sled_store::SledOrderedSerde;
-use common_meta_types::anyerror::AnyError;
-use common_meta_types::LogId;
+use databend_common_meta_sled_store::sled;
+use databend_common_meta_sled_store::SledBytesError;
+use databend_common_meta_sled_store::SledOrderedSerde;
+use databend_common_meta_sled_store::SledSerde;
+use databend_common_meta_types::anyerror::AnyError;
+use databend_common_meta_types::raft_types::LogId;
 use serde::Deserialize;
 use serde::Serialize;
 use sled::IVec;
@@ -37,8 +38,16 @@ pub enum LogMetaValue {
     LogId(LogId),
 }
 
+impl LogMetaValue {
+    pub fn log_id(&self) -> LogId {
+        match self {
+            LogMetaValue::LogId(log_id) => *log_id,
+        }
+    }
+}
+
 impl fmt::Display for LogMetaKey {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
             LogMetaKey::LastPurged => {
                 write!(f, "last-purged")
@@ -67,40 +76,10 @@ impl SledOrderedSerde for LogMetaKey {
     }
 }
 
-pub(crate) mod compat_with_07 {
-    use common_meta_sled_store::SledBytesError;
-    use common_meta_sled_store::SledSerde;
-    use common_meta_types::compat07;
-    use openraft::compat::Upgrade;
-
-    use super::LogMetaValue;
-
-    #[derive(Debug, serde::Serialize, serde::Deserialize)]
-    pub enum LogMetaValueCompat {
-        LogId(compat07::LogId),
-    }
-
-    impl Upgrade<LogMetaValue> for LogMetaValueCompat {
-        #[rustfmt::skip]
-        fn upgrade(self) -> LogMetaValue {
-            let Self::LogId(lid) = self;
-            LogMetaValue::LogId(lid.upgrade())
-        }
-    }
-
-    impl SledSerde for LogMetaValueCompat {
-        fn de<T: AsRef<[u8]>>(v: T) -> Result<Self, SledBytesError>
-        where Self: Sized {
-            let s = serde_json::from_slice(v.as_ref())?;
-            Ok(s)
-        }
-    }
-
-    impl SledSerde for LogMetaValue {
-        fn de<T: AsRef<[u8]>>(v: T) -> Result<Self, SledBytesError>
-        where Self: Sized {
-            let s = serde_json::from_slice(v.as_ref())?;
-            Ok(s)
-        }
+impl SledSerde for LogMetaValue {
+    fn de<T: AsRef<[u8]>>(v: T) -> Result<Self, SledBytesError>
+    where Self: Sized {
+        let s = serde_json::from_slice(v.as_ref())?;
+        Ok(s)
     }
 }

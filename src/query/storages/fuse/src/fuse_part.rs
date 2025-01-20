@@ -22,25 +22,28 @@ use std::sync::Arc;
 
 use chrono::DateTime;
 use chrono::Utc;
-use common_arrow::parquet::metadata::ColumnDescriptor;
-use common_catalog::plan::PartInfo;
-use common_catalog::plan::PartInfoPtr;
-use common_exception::ErrorCode;
-use common_exception::Result;
-use common_expression::ColumnId;
-use common_expression::Scalar;
-use storages_common_pruner::BlockMetaIndex;
-use storages_common_table_meta::meta::ColumnMeta;
-use storages_common_table_meta::meta::Compression;
+use databend_common_catalog::plan::PartInfo;
+use databend_common_catalog::plan::PartInfoPtr;
+use databend_common_catalog::plan::PartInfoType;
+use databend_common_exception::ErrorCode;
+use databend_common_exception::Result;
+use databend_common_expression::ColumnId;
+use databend_common_expression::Scalar;
+use databend_storages_common_pruner::BlockMetaIndex;
+use databend_storages_common_table_meta::meta::ColumnMeta;
+use databend_storages_common_table_meta::meta::ColumnStatistics;
+use databend_storages_common_table_meta::meta::Compression;
+use databend_storages_common_table_meta::meta::Location;
 
+/// Fuse table partition information.
 #[derive(serde::Serialize, serde::Deserialize, PartialEq, Debug)]
-pub struct FusePartInfo {
+pub struct FuseBlockPartInfo {
     pub location: String,
 
     pub create_on: Option<DateTime<Utc>>,
     pub nums_rows: usize,
     pub columns_meta: HashMap<ColumnId, ColumnMeta>,
-    pub virtual_columns_meta: Option<HashMap<String, VirtualColumnMeta>>,
+    pub columns_stat: Option<HashMap<ColumnId, ColumnStatistics>>,
     pub compression: Compression,
 
     pub sort_min_max: Option<(Scalar, Scalar)>,
@@ -48,14 +51,14 @@ pub struct FusePartInfo {
 }
 
 #[typetag::serde(name = "fuse")]
-impl PartInfo for FusePartInfo {
+impl PartInfo for FuseBlockPartInfo {
     fn as_any(&self) -> &dyn Any {
         self
     }
 
     fn equals(&self, info: &Box<dyn PartInfo>) -> bool {
         info.as_any()
-            .downcast_ref::<FusePartInfo>()
+            .downcast_ref::<FuseBlockPartInfo>()
             .is_some_and(|other| self == other)
     }
 
@@ -64,38 +67,42 @@ impl PartInfo for FusePartInfo {
         self.location.hash(&mut s);
         s.finish()
     }
+
+    fn part_type(&self) -> PartInfoType {
+        PartInfoType::BlockLevel
+    }
 }
 
-impl FusePartInfo {
+impl FuseBlockPartInfo {
     #[allow(clippy::too_many_arguments)]
     pub fn create(
         location: String,
         rows_count: u64,
         columns_meta: HashMap<ColumnId, ColumnMeta>,
-        virtual_columns_meta: Option<HashMap<String, VirtualColumnMeta>>,
+        columns_stat: Option<HashMap<ColumnId, ColumnStatistics>>,
         compression: Compression,
         sort_min_max: Option<(Scalar, Scalar)>,
         block_meta_index: Option<BlockMetaIndex>,
         create_on: Option<DateTime<Utc>>,
     ) -> Arc<Box<dyn PartInfo>> {
-        Arc::new(Box::new(FusePartInfo {
+        Arc::new(Box::new(FuseBlockPartInfo {
             location,
             create_on,
             columns_meta,
-            virtual_columns_meta,
             nums_rows: rows_count as usize,
             compression,
             sort_min_max,
             block_meta_index,
+            columns_stat,
         }))
     }
 
-    pub fn from_part(info: &PartInfoPtr) -> Result<&FusePartInfo> {
+    pub fn from_part(info: &PartInfoPtr) -> Result<&FuseBlockPartInfo> {
         info.as_any()
-            .downcast_ref::<FusePartInfo>()
-            .ok_or(ErrorCode::Internal(
-                "Cannot downcast from PartInfo to FusePartInfo.",
-            ))
+            .downcast_ref::<FuseBlockPartInfo>()
+            .ok_or_else(|| {
+                ErrorCode::Internal("Cannot downcast from PartInfo to FuseBlockPartInfo.")
+            })
     }
 
     pub fn range(&self) -> Option<&Range<usize>> {
@@ -116,9 +123,51 @@ impl FusePartInfo {
     }
 }
 
-#[derive(serde::Serialize, serde::Deserialize, PartialEq, Debug, Clone)]
-pub struct VirtualColumnMeta {
-    pub index: usize,
-    pub meta: ColumnMeta,
-    pub desc: ColumnDescriptor,
+/// Fuse table lazy partition information.
+/// Lazy partition is a partition that only contains the partition location.
+/// The partition data will be loaded when the partition is used.
+#[derive(serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct FuseLazyPartInfo {
+    pub segment_index: usize,
+    pub segment_location: Location,
+}
+
+#[typetag::serde(name = "fuse_lazy")]
+impl PartInfo for FuseLazyPartInfo {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn equals(&self, info: &Box<dyn PartInfo>) -> bool {
+        info.as_any()
+            .downcast_ref::<FuseLazyPartInfo>()
+            .is_some_and(|other| self == other)
+    }
+
+    fn hash(&self) -> u64 {
+        let mut s = DefaultHasher::new();
+        self.segment_location.0.hash(&mut s);
+        s.finish()
+    }
+
+    fn part_type(&self) -> PartInfoType {
+        PartInfoType::LazyLevel
+    }
+}
+
+impl FuseLazyPartInfo {
+    pub fn create(idx: usize, segment_location: Location) -> PartInfoPtr {
+        Arc::new(Box::new(FuseLazyPartInfo {
+            segment_index: idx,
+            segment_location,
+        }))
+    }
+
+    pub fn from_part(info: &PartInfoPtr) -> Result<&FuseLazyPartInfo> {
+        info.as_any()
+            .downcast_ref::<FuseLazyPartInfo>()
+            .ok_or_else(|| {
+                ErrorCode::Internal("Cannot downcast from PartInfo to FuseLazyPartInfo.")
+            })
+    }
 }

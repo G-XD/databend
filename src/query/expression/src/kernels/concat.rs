@@ -12,33 +12,35 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use common_exception::ErrorCode;
-use common_exception::Result;
+use std::iter::TrustedLen;
+use std::sync::Arc;
+
+use arrow_array::Array;
+use databend_common_column::bitmap::Bitmap;
+use databend_common_column::buffer::Buffer;
+use databend_common_exception::ErrorCode;
+use databend_common_exception::Result;
+use ethnum::i256;
 use itertools::Itertools;
 
 use crate::types::array::ArrayColumnBuilder;
+use crate::types::decimal::Decimal;
 use crate::types::decimal::DecimalColumn;
 use crate::types::map::KvColumnBuilder;
 use crate::types::nullable::NullableColumn;
 use crate::types::number::NumberColumn;
-use crate::types::string::StringColumnBuilder;
 use crate::types::AnyType;
-use crate::types::ArgType;
 use crate::types::ArrayType;
-use crate::types::BitmapType;
 use crate::types::BooleanType;
+use crate::types::DataType;
 use crate::types::DateType;
-use crate::types::EmptyArrayType;
-use crate::types::EmptyMapType;
+use crate::types::DecimalType;
+use crate::types::IntervalType;
 use crate::types::MapType;
-use crate::types::NullType;
-use crate::types::NullableType;
 use crate::types::NumberType;
-use crate::types::StringType;
 use crate::types::TimestampType;
 use crate::types::ValueType;
-use crate::types::VariantType;
-use crate::with_decimal_type;
+use crate::with_decimal_mapped_type;
 use crate::with_number_mapped_type;
 use crate::BlockEntry;
 use crate::Column;
@@ -51,93 +53,124 @@ impl DataBlock {
         if blocks.is_empty() {
             return Err(ErrorCode::EmptyData("Can't concat empty blocks"));
         }
+        let block_refs = blocks.iter().collect::<Vec<_>>();
 
         if blocks.len() == 1 {
             return Ok(blocks[0].clone());
         }
 
-        let concat_columns = (0..blocks[0].num_columns())
-            .map(|i| {
-                debug_assert!(
-                    blocks
-                        .iter()
-                        .map(|block| &block.get_by_offset(i).data_type)
-                        .all_equal()
-                );
-
-                let columns = blocks
-                    .iter()
-                    .map(|block| {
-                        let entry = &block.get_by_offset(i);
-                        match &entry.value {
-                            Value::Scalar(s) => ColumnBuilder::repeat(
-                                &s.as_ref(),
-                                block.num_rows(),
-                                &entry.data_type,
-                            )
-                            .build(),
-                            Value::Column(c) => c.clone(),
-                        }
-                    })
-                    .collect::<Vec<_>>();
-
-                BlockEntry::new(
-                    blocks[0].get_by_offset(i).data_type.clone(),
-                    Value::Column(Column::concat(&columns)),
-                )
-            })
-            .collect();
+        let num_columns = blocks[0].num_columns();
+        let mut concat_columns = Vec::with_capacity(num_columns);
+        for i in 0..num_columns {
+            concat_columns.push(BlockEntry::new(
+                blocks[0].get_by_offset(i).data_type.clone(),
+                Self::concat_columns(&block_refs, i)?,
+            ))
+        }
 
         let num_rows = blocks.iter().map(|c| c.num_rows()).sum();
 
         Ok(DataBlock::new(concat_columns, num_rows))
     }
+
+    pub fn concat_columns(blocks: &[&DataBlock], column_index: usize) -> Result<Value<AnyType>> {
+        debug_assert!(blocks
+            .iter()
+            .map(|block| &block.get_by_offset(column_index).data_type)
+            .all_equal());
+
+        let entry0 = blocks[0].get_by_offset(column_index);
+        if matches!(entry0.value, Value::Scalar(_))
+            && blocks
+                .iter()
+                .all(|b| b.get_by_offset(column_index) == entry0)
+        {
+            return Ok(entry0.value.clone());
+        }
+
+        let columns_iter = blocks.iter().map(|block| {
+            let entry = &block.get_by_offset(column_index);
+            match &entry.value {
+                Value::Scalar(s) => {
+                    ColumnBuilder::repeat(&s.as_ref(), block.num_rows(), &entry.data_type).build()
+                }
+                Value::Column(c) => c.clone(),
+            }
+        });
+        Ok(Value::Column(Column::concat_columns(columns_iter)?))
+    }
 }
 
 impl Column {
-    pub fn concat(columns: &[Column]) -> Column {
-        if columns.len() == 1 {
-            return columns[0].clone();
+    pub fn concat_columns<I: Iterator<Item = Column> + TrustedLen + Clone>(
+        columns: I,
+    ) -> Result<Column> {
+        let (_, size) = columns.size_hint();
+        match size {
+            Some(0) => Err(ErrorCode::EmptyData("Can't concat empty columns")),
+            _ => Self::concat_columns_impl(columns),
         }
-        let capacity = columns.iter().map(|c| c.len()).sum();
+    }
 
-        match &columns[0] {
-            Column::Null { .. } => Self::concat_arg_types::<NullType>(columns),
-            Column::EmptyArray { .. } => Self::concat_arg_types::<EmptyArrayType>(columns),
-            Column::EmptyMap { .. } => Self::concat_arg_types::<EmptyMapType>(columns),
+    pub fn concat_columns_impl<I: Iterator<Item = Column> + TrustedLen + Clone>(
+        columns: I,
+    ) -> Result<Column> {
+        let mut columns_iter_clone = columns.clone();
+        let first_column = match columns_iter_clone.next() {
+            // Even if `columns.size_hint()`'s upper bound is `Some(a)` (a != 0),
+            // it's possible that `columns`'s len is 0.
+            None => return Err(ErrorCode::EmptyData("Can't concat empty columns")),
+            Some(col) => col,
+        };
+        let capacity = columns_iter_clone.fold(first_column.len(), |acc, x| acc + x.len());
+        let column = match first_column {
+            Column::Null { .. } => Column::Null { len: capacity },
+            Column::EmptyArray { .. } => Column::EmptyArray { len: capacity },
+            Column::EmptyMap { .. } => Column::EmptyMap { len: capacity },
             Column::Number(col) => with_number_mapped_type!(|NUM_TYPE| match col {
                 NumberColumn::NUM_TYPE(_) => {
-                    Self::concat_arg_types::<NumberType<NUM_TYPE>>(columns)
+                    type NType = NumberType<NUM_TYPE>;
+                    let buffer = Self::concat_primitive_types(
+                        columns.map(|col| NType::try_downcast_column(&col).unwrap()),
+                        capacity,
+                    );
+                    NType::upcast_column(buffer)
                 }
             }),
-            Column::Decimal(col) => with_decimal_type!(|DECIMAL_TYPE| match col {
+            Column::Decimal(col) => with_decimal_mapped_type!(|DECIMAL_TYPE| match col {
                 DecimalColumn::DECIMAL_TYPE(_, size) => {
-                    let mut builder = Vec::with_capacity(capacity);
-                    for c in columns {
-                        match c {
-                            Column::Decimal(DecimalColumn::DECIMAL_TYPE(col, size)) => {
-                                debug_assert_eq!(size, size);
-                                builder.extend_from_slice(col);
-                            }
-                            _ => unreachable!(),
-                        }
-                    }
-                    Column::Decimal(DecimalColumn::DECIMAL_TYPE(builder.into(), *size))
+                    type DType = DecimalType<DECIMAL_TYPE>;
+                    let buffer = Self::concat_primitive_types(
+                        columns.map(|col| DType::try_downcast_column(&col).unwrap()),
+                        capacity,
+                    );
+                    DECIMAL_TYPE::upcast_column(buffer, size)
                 }
             }),
-            Column::Boolean(_) => Self::concat_arg_types::<BooleanType>(columns),
-            Column::String(_) => {
-                let data_capacity = columns.iter().map(|c| c.memory_size() - c.len() * 8).sum();
-                let builder = StringColumnBuilder::with_capacity(capacity, data_capacity);
-                Self::concat_value_types::<StringType>(builder, columns)
-            }
+            Column::Boolean(_) => Column::Boolean(Self::concat_boolean_types(
+                columns.map(|col| col.into_boolean().unwrap()),
+                capacity,
+            )),
             Column::Timestamp(_) => {
-                let builder = Vec::with_capacity(capacity);
-                Self::concat_value_types::<TimestampType>(builder, columns)
+                let buffer = Self::concat_primitive_types(
+                    columns.map(|col| TimestampType::try_downcast_column(&col).unwrap()),
+                    capacity,
+                );
+                Column::Timestamp(buffer)
             }
             Column::Date(_) => {
-                let builder = Vec::with_capacity(capacity);
-                Self::concat_value_types::<DateType>(builder, columns)
+                let buffer = Self::concat_primitive_types(
+                    columns.map(|col| DateType::try_downcast_column(&col).unwrap()),
+                    capacity,
+                );
+                Column::Date(buffer)
+            }
+            Column::Interval(_) => {
+                let buffer = Self::concat_primitive_types(
+                    columns.map(|col| IntervalType::try_downcast_column(&col).unwrap()),
+                    capacity,
+                );
+                Column::Interval(buffer)
             }
             Column::Array(col) => {
                 let mut offsets = Vec::with_capacity(capacity + 1);
@@ -154,7 +187,7 @@ impl Column {
                 );
                 let (key_builder, val_builder) = match builder {
                     ColumnBuilder::Tuple(fields) => (fields[0].clone(), fields[1].clone()),
-                    _ => unreachable!(),
+                    ty => unreachable!("ty: {}", ty.data_type()),
                 };
                 let builder = KvColumnBuilder {
                     keys: key_builder,
@@ -163,65 +196,80 @@ impl Column {
                 let builder = ArrayColumnBuilder { builder, offsets };
                 Self::concat_value_types::<MapType<AnyType, AnyType>>(builder, columns)
             }
-            Column::Bitmap(_) => {
-                let data_capacity = columns.iter().map(|c| c.memory_size() - c.len() * 8).sum();
-                let builder = StringColumnBuilder::with_capacity(capacity, data_capacity);
-                Self::concat_value_types::<BitmapType>(builder, columns)
-            }
             Column::Nullable(_) => {
-                let mut bitmaps = Vec::with_capacity(columns.len());
-                let mut inners = Vec::with_capacity(columns.len());
-                for c in columns {
-                    let nullable_column = NullableType::<AnyType>::try_downcast_column(c).unwrap();
-                    inners.push(nullable_column.column);
-                    bitmaps.push(Column::Boolean(nullable_column.validity));
-                }
-
-                let column = Self::concat(&inners);
-                let validity = Self::concat_arg_types::<BooleanType>(&bitmaps);
+                let column: Vec<Column> = columns
+                    .clone()
+                    .map(|col| col.into_nullable().unwrap().column)
+                    .collect();
+                let column = Self::concat_columns_impl(column.into_iter())?;
+                let validity = Column::Boolean(Self::concat_boolean_types(
+                    columns.map(|col| col.into_nullable().unwrap().validity),
+                    capacity,
+                ));
                 let validity = BooleanType::try_downcast_column(&validity).unwrap();
-
-                Column::Nullable(Box::new(NullableColumn { column, validity }))
+                NullableColumn::new_column(column, validity)
             }
             Column::Tuple(fields) => {
                 let fields = (0..fields.len())
                     .map(|idx| {
-                        let cs: Vec<Column> = columns
-                            .iter()
-                            .map(|col| col.as_tuple().unwrap()[idx].clone())
+                        let column: Vec<Column> = columns
+                            .clone()
+                            .map(|col| col.into_tuple().unwrap()[idx].clone())
                             .collect();
-                        Self::concat(&cs)
+                        Self::concat_columns_impl(column.into_iter())
                     })
-                    .collect();
+                    .collect::<Result<_>>()?;
                 Column::Tuple(fields)
             }
-            Column::Variant(_) => {
-                let data_capacity = columns.iter().map(|c| c.memory_size() - c.len() * 8).sum();
-                let builder = StringColumnBuilder::with_capacity(capacity, data_capacity);
-                Self::concat_value_types::<VariantType>(builder, columns)
+            Column::Variant(_)
+            | Column::Geometry(_)
+            | Column::Geography(_)
+            | Column::Binary(_)
+            | Column::String(_)
+            | Column::Bitmap(_) => {
+                Self::concat_use_arrow(columns, first_column.data_type(), capacity)
             }
-        }
+        };
+        Ok(column)
     }
 
-    fn concat_arg_types<T: ArgType>(columns: &[Column]) -> Column {
-        let columns: Vec<T::Column> = columns
-            .iter()
-            .map(|c| T::try_downcast_column(c).unwrap())
-            .collect();
-        let iter = columns.iter().flat_map(|c| T::iter_column(c));
-        let result = T::column_from_ref_iter(iter, &[]);
-        T::upcast_column(result)
+    pub fn concat_primitive_types<T>(
+        cols: impl Iterator<Item = Buffer<T>>,
+        num_rows: usize,
+    ) -> Buffer<T>
+    where
+        T: Copy,
+    {
+        let mut builder: Vec<T> = Vec::with_capacity(num_rows);
+        for col in cols {
+            builder.extend(col.iter());
+        }
+        builder.into()
+    }
+
+    pub fn concat_use_arrow(
+        cols: impl Iterator<Item = Column>,
+        data_type: DataType,
+        _num_rows: usize,
+    ) -> Column {
+        let arrays: Vec<Arc<dyn Array>> = cols.map(|c| c.into_arrow_rs()).collect();
+        let arrays = arrays.iter().map(|c| c.as_ref()).collect::<Vec<_>>();
+        let result = arrow_select::concat::concat(&arrays).unwrap();
+        Column::from_arrow_rs(result, &data_type).unwrap()
+    }
+
+    pub fn concat_boolean_types(bitmaps: impl Iterator<Item = Bitmap>, num_rows: usize) -> Bitmap {
+        let cols = bitmaps.map(Column::Boolean);
+        Self::concat_use_arrow(cols, DataType::Boolean, num_rows)
+            .into_boolean()
+            .unwrap()
     }
 
     fn concat_value_types<T: ValueType>(
         mut builder: T::ColumnBuilder,
-        columns: &[Column],
+        columns: impl Iterator<Item = Column>,
     ) -> Column {
-        let columns: Vec<T::Column> = columns
-            .iter()
-            .map(|c| T::try_downcast_column(c).unwrap())
-            .collect();
-
+        let columns = columns.map(|c| T::try_downcast_column(&c).unwrap());
         for col in columns {
             T::append_column(&mut builder, &col);
         }

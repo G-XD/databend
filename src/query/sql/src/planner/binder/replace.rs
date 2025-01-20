@@ -12,23 +12,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::str::FromStr;
 use std::sync::Arc;
 
-use common_ast::ast::InsertSource;
-use common_ast::ast::ReplaceStmt;
-use common_ast::ast::Statement;
-use common_exception::Result;
-use common_meta_app::principal::FileFormatOptionsAst;
-use common_meta_app::principal::OnErrorMode;
+use databend_common_ast::ast::InsertSource;
+use databend_common_ast::ast::ReplaceStmt;
+use databend_common_ast::ast::Statement;
+use databend_common_catalog::lock::LockTableOption;
+use databend_common_exception::Result;
 
 use crate::binder::Binder;
 use crate::normalize_identifier;
-use crate::optimizer::optimize;
-use crate::optimizer::OptimizerConfig;
-use crate::optimizer::OptimizerContext;
 use crate::plans::CopyIntoTableMode;
 use crate::plans::InsertInputSource;
+use crate::plans::InsertValue;
 use crate::plans::Plan;
 use crate::plans::Replace;
 use crate::BindContext;
@@ -46,18 +42,25 @@ impl Binder {
             on_conflict_columns,
             columns,
             source,
-            ..
+            delete_when,
+            hints: _,
         } = stmt;
 
-        let catalog_name = catalog.as_ref().map_or_else(
-            || self.ctx.get_current_catalog(),
-            |ident| normalize_identifier(ident, &self.name_resolution_ctx).name,
-        );
-        let database_name = database.as_ref().map_or_else(
-            || self.ctx.get_current_database(),
-            |ident| normalize_identifier(ident, &self.name_resolution_ctx).name,
-        );
-        let table_name = normalize_identifier(table, &self.name_resolution_ctx).name;
+        let (catalog_name, database_name, table_name) =
+            self.normalize_object_identifier_triple(catalog, database, table);
+
+        // Add table lock before execution.
+        let lock_guard = self
+            .ctx
+            .clone()
+            .acquire_table_lock(
+                &catalog_name,
+                &database_name,
+                &table_name,
+                &LockTableOption::LockWithRetry,
+            )
+            .await?;
+
         let table = self
             .ctx
             .get_table(&catalog_name, &database_name, &table_name)
@@ -82,39 +85,30 @@ impl Binder {
             .map(|ident| {
                 schema
                     .field_with_name(&normalize_identifier(ident, &self.name_resolution_ctx).name)
-                    .map(|v| v.clone())
+                    .cloned()
             })
             .collect::<Result<Vec<_>>>()?;
 
         let input_source: Result<InsertInputSource> = match source.clone() {
-            InsertSource::Streaming {
-                format,
-                rest_str,
-                start,
-            } => {
-                if format.to_uppercase() == "VALUES" {
-                    let data = rest_str.trim_end_matches(';').trim_start().to_owned();
-                    Ok(InsertInputSource::Values(data))
-                } else {
-                    Ok(InsertInputSource::StreamingWithFormat(format, start, None))
+            InsertSource::Values { rows } => {
+                let mut new_rows = Vec::with_capacity(rows.len());
+                for row in rows {
+                    let new_row = bind_context
+                        .exprs_to_scalar(
+                            &row,
+                            &Arc::new(schema.clone().into()),
+                            self.ctx.clone(),
+                            &self.name_resolution_ctx,
+                            self.metadata.clone(),
+                        )
+                        .await?;
+                    new_rows.push(new_row);
                 }
+                Ok(InsertInputSource::Values(InsertValue::Values {
+                    rows: new_rows,
+                }))
             }
-            InsertSource::StreamingV2 {
-                settings,
-                on_error_mode,
-                start,
-            } => {
-                let params = FileFormatOptionsAst { options: settings }.try_into()?;
-                Ok(InsertInputSource::StreamingWithFileFormat {
-                    format: params,
-                    start,
-                    on_error_mode: OnErrorMode::from_str(
-                        &on_error_mode.unwrap_or("abort".to_string()),
-                    )?,
-                    input_context_option: None,
-                })
-            }
-            InsertSource::Values { rest_str } => {
+            InsertSource::RawValues { rest_str, start } => {
                 let values_str = rest_str.trim_end_matches(';').trim_start().to_owned();
                 match self.ctx.get_stage_attachment() {
                     Some(attachment) => {
@@ -132,18 +126,16 @@ impl Binder {
                             .await?;
                         Ok(InsertInputSource::Stage(Box::new(plan)))
                     }
-                    None => Ok(InsertInputSource::Values(values_str)),
+                    None => Ok(InsertInputSource::Values(InsertValue::RawValues {
+                        data: values_str,
+                        start,
+                    })),
                 }
             }
             InsertSource::Select { query } => {
                 let statement = Statement::Query(query);
                 let select_plan = self.bind_statement(bind_context, &statement).await?;
-                let enable_distributed_optimization = false;
-                let opt_ctx = Arc::new(OptimizerContext::new(OptimizerConfig {
-                    enable_distributed_optimization,
-                }));
-                let optimized_plan = optimize(self.ctx.clone(), opt_ctx, select_plan)?;
-                Ok(InsertInputSource::SelectPlan(Box::new(optimized_plan)))
+                Ok(InsertInputSource::SelectPlan(Box::new(select_plan)))
             }
         };
 
@@ -155,6 +147,8 @@ impl Binder {
             on_conflict_fields,
             schema,
             source: input_source?,
+            delete_when: delete_when.clone(),
+            lock_guard,
         };
 
         Ok(Plan::Replace(Box::new(plan)))

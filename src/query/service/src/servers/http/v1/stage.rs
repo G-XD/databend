@@ -12,12 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use common_meta_app::principal::StageInfo;
-use common_storages_stage::StageTable;
-use common_users::UserApiProvider;
+use async_compat::CompatExt;
+use databend_common_meta_app::principal::StageInfo;
+use databend_common_storages_stage::StageTable;
+use databend_common_users::UserApiProvider;
+use futures_util::io;
+use futures_util::AsyncWriteExt;
+use http::StatusCode;
 use poem::error::InternalServerError;
 use poem::error::Result as PoemResult;
-use poem::http::StatusCode;
 use poem::web::Json;
 use poem::web::Multipart;
 use poem::Request;
@@ -36,6 +39,48 @@ pub struct UploadToStageResponse {
     pub files: Vec<String>,
 }
 
+#[derive(Debug)]
+struct UploadToStageArgs {
+    stage_name: String,
+    relative_path: String,
+}
+
+impl UploadToStageArgs {
+    pub fn parse(req: &Request) -> PoemResult<UploadToStageArgs> {
+        let stage_name = Self::read_arg(req, "stage-name")
+            .ok_or_else(|| {
+                poem::Error::from_string(
+                    "Parse stage_name error, please check your arguments".to_string(),
+                    StatusCode::BAD_REQUEST,
+                )
+            })?
+            .to_string();
+
+        let relative_path = Self::read_arg(req, "relative-path")
+            .unwrap_or("")
+            .trim_matches('/')
+            .to_string();
+
+        Ok(UploadToStageArgs {
+            stage_name,
+            relative_path,
+        })
+    }
+
+    // read_arg parses the http request to retrieve the arguments. In the before, we use
+    // argument like `stage_name` in the header, but having underscore in the header is
+    // not a good practice. So we change the argument to `x-databend-stage-name` in the
+    // header, but we still need to support the old argument for backward compatibility.
+    fn read_arg<'a>(req: &'a Request, name: &str) -> Option<&'a str> {
+        let mut arg = req.headers().get(format!("x-databend-{}", name).as_str());
+        // if "x-databend-stage-name" is not found, try "stage_name", which is for backward compatibility
+        if arg.is_none() {
+            arg = req.headers().get(name.replace('-', "_").as_str());
+        }
+        arg.and_then(|v| v.to_str().ok())
+    }
+}
+
 #[poem::handler]
 #[async_backtrace::framed]
 pub async fn upload_to_stage(
@@ -43,24 +88,14 @@ pub async fn upload_to_stage(
     req: &Request,
     mut multipart: Multipart,
 ) -> PoemResult<Json<UploadToStageResponse>> {
-    let session = ctx.get_session(SessionType::HTTPAPI("UploadToStage".to_string()));
+    let session = ctx.upgrade_session(SessionType::HTTPAPI("UploadToStage".to_string()))?;
     let context = session
         .create_query_context()
         .await
         .map_err(InternalServerError)?;
+    let args = UploadToStageArgs::parse(req)?;
 
-    let stage_name = req
-        .headers()
-        .get("stage_name")
-        .and_then(|v| v.to_str().ok())
-        .ok_or_else(|| {
-            poem::Error::from_string(
-                "Parse stage_name error, not found".to_string(),
-                StatusCode::BAD_REQUEST,
-            )
-        })?;
-
-    let stage = if stage_name == "~" {
+    let stage = if args.stage_name == "~" {
         StageInfo::new_user_stage(
             context
                 .get_current_user()
@@ -70,20 +105,12 @@ pub async fn upload_to_stage(
         )
     } else {
         UserApiProvider::instance()
-            .get_stage(context.get_tenant().as_str(), stage_name)
+            .get_stage(&context.get_tenant(), &args.stage_name)
             .await
             .map_err(InternalServerError)?
     };
 
     let op = StageTable::get_op(&stage).map_err(InternalServerError)?;
-
-    let relative_path = req
-        .headers()
-        .get("relative_path")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .trim_matches('/')
-        .to_string();
 
     let mut files = vec![];
     while let Ok(Some(field)) = multipart.next_field().await {
@@ -91,14 +118,24 @@ pub async fn upload_to_stage(
             Some(name) => name.to_string(),
             None => uuid::Uuid::new_v4().to_string(),
         };
-        let bytes = field.bytes().await.map_err(InternalServerError)?;
-        let file_path = format!("{relative_path}/{name}")
+        let file_path = format!("{}/{}", args.relative_path, name)
             .trim_start_matches('/')
             .to_string();
-        let _ = op
-            .write(&file_path, bytes)
+
+        // Read field with 1MiB buf.
+        let mut r = io::BufReader::with_capacity(1024 * 1024, field.into_async_read().compat());
+        // Upload in 16MiB chunks.
+        let mut w = op
+            .writer_with(&file_path)
+            .chunk(16 * 1024 * 1024)
+            .await
+            .map_err(InternalServerError)?
+            .into_futures_async_write();
+
+        io::copy_buf(&mut r, &mut w)
             .await
             .map_err(InternalServerError)?;
+        w.close().await.map_err(InternalServerError)?;
 
         files.push(name.clone());
     }
@@ -106,7 +143,7 @@ pub async fn upload_to_stage(
     let mut id = uuid::Uuid::new_v4().to_string();
     Ok(Json(UploadToStageResponse {
         id,
-        stage_name: stage_name.to_string(),
+        stage_name: args.stage_name,
         state: "SUCCESS".to_string(),
         files,
     }))

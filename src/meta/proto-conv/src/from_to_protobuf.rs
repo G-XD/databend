@@ -12,12 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::fmt;
 use std::sync::Arc;
 
 /// Defines API to convert from/to protobuf meta type.
 pub trait FromToProto {
     /// The corresponding protobuf defined type.
-    type PB;
+    type PB: prost::Message + Default;
 
     /// Get the version encoded in a protobuf message.
     fn get_pb_ver(p: &Self::PB) -> u64;
@@ -30,10 +31,49 @@ pub trait FromToProto {
     fn to_pb(&self) -> Result<Self::PB, Incompatible>;
 }
 
+/// Defines API to convert from/to protobuf Enumeration.
+pub trait FromToProtoEnum {
+    /// The corresponding protobuf defined type.
+    type PBEnum;
+
+    /// Convert to rust type from protobuf enum type.
+    fn from_pb_enum(p: Self::PBEnum) -> Result<Self, Incompatible>
+    where Self: Sized;
+
+    /// Convert from rust type to protobuf type.
+    fn to_pb_enum(&self) -> Result<Self::PBEnum, Incompatible>;
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("Incompatible: {reason}")]
 pub struct Incompatible {
+    pub context: String,
     pub reason: String,
+}
+
+impl fmt::Display for Incompatible {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{}", self.reason)?;
+
+        if !self.context.is_empty() {
+            write!(f, "; when:({})", self.context)?;
+        }
+        Ok(())
+    }
+}
+
+impl Incompatible {
+    pub fn new(reason: impl Into<String>) -> Self {
+        Self {
+            context: "".into(),
+            reason: reason.into(),
+        }
+    }
+
+    /// Set the context of the error.
+    pub fn with_context(mut self, context: impl Into<String>) -> Self {
+        self.context = context.into();
+        self
+    }
 }
 
 impl<T> FromToProto for Arc<T>

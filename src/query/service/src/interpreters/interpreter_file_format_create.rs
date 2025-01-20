@@ -14,10 +14,10 @@
 
 use std::sync::Arc;
 
-use common_exception::Result;
-use common_meta_app::principal::UserDefinedFileFormat;
-use common_sql::plans::CreateFileFormatPlan;
-use common_users::UserApiProvider;
+use databend_common_exception::Result;
+use databend_common_meta_app::principal::UserDefinedFileFormat;
+use databend_common_sql::plans::CreateFileFormatPlan;
+use databend_common_users::UserApiProvider;
 use log::debug;
 
 use crate::interpreters::Interpreter;
@@ -43,7 +43,11 @@ impl Interpreter for CreateFileFormatInterpreter {
         "CreateFileFormatInterpreter"
     }
 
-    #[minitrace::trace]
+    fn is_ddl(&self) -> bool {
+        true
+    }
+
+    #[fastrace::trace]
     #[async_backtrace::framed]
     async fn execute2(&self) -> Result<PipelineBuildResult> {
         debug!("ctx.id" = self.ctx.get_id().as_str(); "create_file_format_execute");
@@ -58,7 +62,7 @@ impl Interpreter for CreateFileFormatInterpreter {
 
         let tenant = self.ctx.get_tenant();
         let _create_file_format = user_mgr
-            .add_file_format(&tenant, user_defined_file_format, plan.if_not_exists)
+            .add_file_format(&tenant, user_defined_file_format, &plan.create_option)
             .await?;
 
         Ok(PipelineBuildResult::create())

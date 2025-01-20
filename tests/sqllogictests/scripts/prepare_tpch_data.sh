@@ -5,12 +5,13 @@
 # shellcheck disable=SC2034
 data_dir="tests/sqllogictests/data"
 
-db="tpch"
+db=${1:-"tpch_test"}
 
-echo "CREATE DATABASE IF NOT EXISTS tpch" | $MYSQL_CLIENT_CONNECT
+echo "DROP DATABASE if EXISTS ${db}" | $BENDSQL_CLIENT_CONNECT
+echo "CREATE DATABASE ${db}" | $BENDSQL_CLIENT_CONNECT
 
 for t in customer lineitem nation orders partsupp part region supplier; do
-    echo "DROP TABLE IF EXISTS ${db}.$t" | $MYSQL_CLIENT_CONNECT
+    echo "DROP TABLE IF EXISTS ${db}.$t" | $BENDSQL_CLIENT_CONNECT
 done
 
 # create tpch tables
@@ -20,14 +21,14 @@ echo "CREATE TABLE IF NOT EXISTS ${db}.nation
     n_name       STRING not null,
     n_regionkey  INTEGER not null,
     n_comment    STRING
-) CLUSTER BY (n_nationkey)" | $MYSQL_CLIENT_CONNECT
+) CLUSTER BY (n_nationkey)" | $BENDSQL_CLIENT_CONNECT
 
 echo "CREATE TABLE IF NOT EXISTS ${db}.region
 (
     r_regionkey  INTEGER not null,
     r_name       STRING not null,
     r_comment    STRING
-) CLUSTER BY (r_regionkey)" | $MYSQL_CLIENT_CONNECT
+) CLUSTER BY (r_regionkey)" | $BENDSQL_CLIENT_CONNECT
 
 echo "CREATE TABLE IF NOT EXISTS ${db}.part
 (
@@ -40,7 +41,7 @@ echo "CREATE TABLE IF NOT EXISTS ${db}.part
     p_container   STRING not null,
     p_retailprice DECIMAL(15, 2) not null,
     p_comment     STRING not null
-) CLUSTER BY (p_partkey)" | $MYSQL_CLIENT_CONNECT
+) CLUSTER BY (p_partkey)" | $BENDSQL_CLIENT_CONNECT
 
 echo "CREATE TABLE IF NOT EXISTS ${db}.supplier
 (
@@ -51,7 +52,7 @@ echo "CREATE TABLE IF NOT EXISTS ${db}.supplier
     s_phone       STRING not null,
     s_acctbal     DECIMAL(15, 2) not null,
     s_comment     STRING not null
-) CLUSTER BY (s_suppkey)" | $MYSQL_CLIENT_CONNECT
+) CLUSTER BY (s_suppkey)" | $BENDSQL_CLIENT_CONNECT
 
 echo "CREATE TABLE IF NOT EXISTS ${db}.partsupp
 (
@@ -60,7 +61,7 @@ echo "CREATE TABLE IF NOT EXISTS ${db}.partsupp
     ps_availqty    BIGINT not null,
     ps_supplycost  DECIMAL(15, 2)  not null,
     ps_comment     STRING not null
-) CLUSTER BY (ps_partkey)" | $MYSQL_CLIENT_CONNECT
+) CLUSTER BY (ps_partkey)" | $BENDSQL_CLIENT_CONNECT
 
 echo "CREATE TABLE IF NOT EXISTS ${db}.customer
 (
@@ -72,7 +73,7 @@ echo "CREATE TABLE IF NOT EXISTS ${db}.customer
     c_acctbal     DECIMAL(15, 2)   not null,
     c_mktsegment  STRING not null,
     c_comment     STRING not null
-) CLUSTER BY (c_custkey)" | $MYSQL_CLIENT_CONNECT
+) CLUSTER BY (c_custkey)" | $BENDSQL_CLIENT_CONNECT
 
 echo "CREATE TABLE IF NOT EXISTS ${db}.orders
 (
@@ -85,7 +86,7 @@ echo "CREATE TABLE IF NOT EXISTS ${db}.orders
     o_clerk          STRING not null,
     o_shippriority   INTEGER not null,
     o_comment        STRING not null
-) CLUSTER BY (o_orderkey, o_orderdate)" | $MYSQL_CLIENT_CONNECT
+) CLUSTER BY (o_orderkey, o_orderdate)" | $BENDSQL_CLIENT_CONNECT
 
 echo "CREATE TABLE IF NOT EXISTS ${db}.lineitem
 (
@@ -105,24 +106,26 @@ echo "CREATE TABLE IF NOT EXISTS ${db}.lineitem
     l_shipinstruct STRING not null,
     l_shipmode     STRING not null,
     l_comment      STRING not null
-) CLUSTER BY(l_shipdate, l_orderkey)" | $MYSQL_CLIENT_CONNECT
-
+) CLUSTER BY(l_shipdate, l_orderkey)" | $BENDSQL_CLIENT_CONNECT
 
 #download data
-mkdir -p  $data_dir
-if [ ! -d ${data_dir}/tpch.tar.gz ];then
-    curl -s -o ${data_dir}/tpch.tar.gz  http://repo.databend.rs/dataset/stateful/tpch.tar.gz
+mkdir -p $data_dir
+if [ ! -d ${data_dir}/tpch.tar.gz ]; then
+    curl -s -o ${data_dir}/tpch.tar.gz https://ci.databend.com/dataset/stateful/tpch.tar.gz
 fi
 
 tar -zxf ${data_dir}/tpch.tar.gz -C $data_dir
 
+stmt "drop stage if exists s1"
+stmt "create stage s1 url='fs://${PWD}/${data_dir}/'"
+
 # insert data to tables
-for t in customer lineitem nation orders partsupp part region supplier
-do
+for t in customer lineitem nation orders partsupp part region supplier; do
     echo "$t"
-    insert_sql="insert into ${db}.$t file_format = (type = CSV skip_header = 0 field_delimiter = '|' record_delimiter = '\n')"
-    curl -s -u root: -XPUT "http://localhost:${QUERY_HTTP_HANDLER_PORT}/v1/streaming_load" -H "insert_sql: ${insert_sql}" -F 'upload=@"'${data_dir}'/tests/suites/0_stateless/13_tpch/data/'$t'.tbl"' > /dev/null 2>&1
+    sub_path="tests/suites/0_stateless/13_tpch/data/$t.tbl"
+   	stmt "copy into ${db}.$t from @s1/${sub_path} file_format = (type = CSV skip_header = 0 field_delimiter = '|' record_delimiter = '\n')"
 done
+
 
 if [ -d "tests/sqllogictests/data" ]; then
     rm -rf tests/sqllogictests/data

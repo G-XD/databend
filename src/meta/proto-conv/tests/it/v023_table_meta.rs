@@ -17,10 +17,11 @@ use std::sync::Arc;
 
 use chrono::TimeZone;
 use chrono::Utc;
-use common_expression as ex;
-use common_expression::types::NumberDataType;
-use common_meta_app::schema as mt;
-use common_meta_app::storage::StorageParams;
+use databend_common_expression as ex;
+use databend_common_expression::types::NumberDataType;
+use databend_common_meta_app::schema as mt;
+use databend_common_meta_app::storage::StorageParams;
+use fastrace::func_name;
 use maplit::btreemap;
 
 use crate::common;
@@ -34,7 +35,7 @@ use crate::common;
 // * or be removed when an old version is no longer supported. *
 // *************************************************************
 //
-// The message bytes are built from the output of `test_build_pb_buf()`
+// The message bytes are built from the output of `test_pb_from_to()`
 #[test]
 fn test_decode_v23_table_meta() -> anyhow::Result<()> {
     let bytes: Vec<u8> = vec![
@@ -129,15 +130,13 @@ fn test_decode_v23_table_meta() -> anyhow::Result<()> {
             ],
             btreemap! {s("a") => s("b")},
         )),
-        catalog: "never-gonna-give-you-up".to_string(),
         engine: "44".to_string(),
         engine_options: btreemap! {s("abc") => s("def")},
         storage_params: Some(StorageParams::default()),
         part_prefix: "lulu_".to_string(),
         options: btreemap! {s("xyz") => s("foo")},
-        default_cluster_key: Some("(a + 2, b)".to_string()),
-        cluster_keys: vec!["(a + 2, b)".to_string()],
-        default_cluster_key_id: Some(0),
+        cluster_key: Some("(a + 2, b)".to_string()),
+        cluster_key_seq: 0,
         created_on: Utc.with_ymd_and_hms(2014, 11, 28, 12, 0, 9).unwrap(),
         updated_on: Utc.with_ymd_and_hms(2014, 11, 29, 12, 0, 10).unwrap(),
         comment: s("table_comment"),
@@ -146,6 +145,7 @@ fn test_decode_v23_table_meta() -> anyhow::Result<()> {
         statistics: Default::default(),
         shared_by: BTreeSet::new(),
         column_mask_policy: None,
+        indexes: btreemap! {},
     };
 
     common::test_pb_from_to(func_name!(), want())?;

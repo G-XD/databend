@@ -15,38 +15,37 @@
 use std::any::Any;
 use std::sync::Arc;
 
-use chrono::NaiveDateTime;
-use chrono::TimeZone;
-use chrono::Utc;
-use common_catalog::catalog::CATALOG_DEFAULT;
-use common_catalog::plan::DataSourcePlan;
-use common_catalog::plan::PartStatistics;
-use common_catalog::plan::Partitions;
-use common_catalog::plan::PushDownInfo;
-use common_catalog::table_args::TableArgs;
-use common_catalog::table_function::TableFunction;
-use common_config::GlobalConfig;
-use common_exception::ErrorCode;
-use common_exception::Result;
-use common_expression::types::StringType;
-use common_expression::DataBlock;
-use common_expression::FromData;
-use common_expression::TableDataType;
-use common_expression::TableField;
-use common_expression::TableSchema;
-use common_meta_app::schema::TableIdent;
-use common_meta_app::schema::TableInfo;
-use common_meta_app::schema::TableMeta;
-use common_openai::OpenAI;
-use common_pipeline_core::processors::port::OutputPort;
-use common_pipeline_core::processors::processor::ProcessorPtr;
-use common_pipeline_core::Pipeline;
-use common_pipeline_sources::AsyncSource;
-use common_pipeline_sources::AsyncSourcer;
-use common_storages_factory::Table;
-use common_storages_fuse::table_functions::string_literal;
-use common_storages_fuse::TableContext;
-use common_storages_view::view_table::VIEW_ENGINE;
+use chrono::DateTime;
+use databend_common_catalog::catalog::CATALOG_DEFAULT;
+use databend_common_catalog::plan::DataSourcePlan;
+use databend_common_catalog::plan::PartStatistics;
+use databend_common_catalog::plan::Partitions;
+use databend_common_catalog::plan::PushDownInfo;
+use databend_common_catalog::table_args::TableArgs;
+use databend_common_catalog::table_function::TableFunction;
+use databend_common_config::GlobalConfig;
+use databend_common_exception::ErrorCode;
+use databend_common_exception::Result;
+use databend_common_expression::types::StringType;
+use databend_common_expression::DataBlock;
+use databend_common_expression::FromData;
+use databend_common_expression::TableDataType;
+use databend_common_expression::TableField;
+use databend_common_expression::TableSchema;
+use databend_common_meta_app::schema::TableIdent;
+use databend_common_meta_app::schema::TableInfo;
+use databend_common_meta_app::schema::TableMeta;
+use databend_common_openai::OpenAI;
+use databend_common_pipeline_core::processors::OutputPort;
+use databend_common_pipeline_core::processors::ProcessorPtr;
+use databend_common_pipeline_core::Pipeline;
+use databend_common_pipeline_sources::AsyncSource;
+use databend_common_pipeline_sources::AsyncSourcer;
+use databend_common_storages_factory::Table;
+use databend_common_storages_fuse::table_functions::string_literal;
+use databend_common_storages_fuse::TableContext;
+use databend_common_storages_stream::stream_table::STREAM_ENGINE;
+use databend_common_storages_view::view_table::VIEW_ENGINE;
 use log::info;
 
 pub struct GPT2SQLTable {
@@ -63,12 +62,10 @@ impl GPT2SQLTable {
     ) -> Result<Arc<dyn TableFunction>> {
         // Check args.
         let args = table_args.expect_all_positioned(table_func_name, Some(1))?;
-        let prompt = String::from_utf8(
-            args[0]
-                .clone()
-                .into_string()
-                .map_err(|_| ErrorCode::BadArguments("Expected string argument."))?,
-        )?;
+        let prompt = args[0]
+            .clone()
+            .into_string()
+            .map_err(|_| ErrorCode::BadArguments("Expected string argument."))?;
 
         let schema = TableSchema::new(vec![
             TableField::new("database", TableDataType::String),
@@ -83,10 +80,8 @@ impl GPT2SQLTable {
                 engine: String::from(table_func_name),
                 // Assuming that created_on is unnecessary for function table,
                 // we could make created_on fixed to pass test_shuffle_action_try_into.
-                created_on: Utc
-                    .from_utc_datetime(&NaiveDateTime::from_timestamp_opt(0, 0).unwrap()),
-                updated_on: Utc
-                    .from_utc_datetime(&NaiveDateTime::from_timestamp_opt(0, 0).unwrap()),
+                created_on: DateTime::from_timestamp(0, 0).unwrap(),
+                updated_on: DateTime::from_timestamp(0, 0).unwrap(),
                 ..Default::default()
             },
             ..Default::default()
@@ -139,6 +134,7 @@ impl Table for GPT2SQLTable {
         ctx: Arc<dyn TableContext>,
         _plan: &DataSourcePlan,
         pipeline: &mut Pipeline,
+        _put_cache: bool,
     ) -> Result<()> {
         pipeline.add_source(
             |output| GPT2SQLSource::create(ctx.clone(), output, self.prompt.clone()),
@@ -172,7 +168,6 @@ impl GPT2SQLSource {
 impl AsyncSource for GPT2SQLSource {
     const NAME: &'static str = "gpt_to_sql";
 
-    #[async_trait::unboxed_simple]
     #[async_backtrace::framed]
     async fn generate(&mut self) -> Result<Option<DataBlock>> {
         if self.finished {
@@ -189,14 +184,21 @@ impl AsyncSource for GPT2SQLSource {
         // SELECT
         let database = self.ctx.get_current_database();
         let tenant = self.ctx.get_tenant();
-        let catalog = self.ctx.get_catalog(CATALOG_DEFAULT).await?;
+
+        // Disable table info refreshing.
+        // Attached tables may not be able to refresh table info successfully.
+        let catalog = self
+            .ctx
+            .get_catalog(CATALOG_DEFAULT)
+            .await?
+            .disable_table_info_refresh()?;
 
         let mut template = vec![];
         template.push("### Postgres SQL tables, with their properties:".to_string());
         template.push("#".to_string());
 
-        for table in catalog.list_tables(tenant.as_str(), &database).await? {
-            let fields = if table.engine() == VIEW_ENGINE {
+        for table in catalog.list_tables(&tenant, &database).await? {
+            let fields = if matches!(table.engine(), VIEW_ENGINE | STREAM_ENGINE) {
                 continue;
             } else {
                 table.schema().fields().clone()
@@ -246,8 +248,8 @@ impl AsyncSource for GPT2SQLSource {
         let sql = format!("SELECT {}", sql);
         info!("openai response sql: {}", sql);
         let database = self.ctx.get_current_database();
-        let database: Vec<Vec<u8>> = vec![database.into_bytes()];
-        let sql: Vec<Vec<u8>> = vec![sql.into_bytes()];
+        let database: Vec<String> = vec![database];
+        let sql: Vec<String> = vec![sql];
 
         // Mark done.
         self.finished = true;

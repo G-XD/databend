@@ -17,14 +17,15 @@ use std::collections::VecDeque;
 use std::marker::PhantomData;
 use std::sync::Arc;
 
-use common_exception::Result;
-use common_expression::BlockMetaInfo;
-use common_expression::BlockMetaInfoDowncast;
-use common_expression::DataBlock;
-use common_pipeline_core::processors::port::InputPort;
-use common_pipeline_core::processors::port::OutputPort;
-use common_pipeline_core::processors::processor::Event;
-use common_pipeline_core::processors::Processor;
+use databend_common_base::runtime::drop_guard;
+use databend_common_exception::Result;
+use databend_common_expression::BlockMetaInfo;
+use databend_common_expression::BlockMetaInfoDowncast;
+use databend_common_expression::DataBlock;
+use databend_common_pipeline_core::processors::Event;
+use databend_common_pipeline_core::processors::InputPort;
+use databend_common_pipeline_core::processors::OutputPort;
+use databend_common_pipeline_core::processors::Processor;
 
 pub trait AccumulatingTransform: Send {
     const NAME: &'static str;
@@ -34,6 +35,8 @@ pub trait AccumulatingTransform: Send {
     fn on_finish(&mut self, _output: bool) -> Result<Vec<DataBlock>> {
         Ok(vec![])
     }
+
+    fn interrupt(&self) {}
 }
 
 pub struct AccumulatingTransformer<T: AccumulatingTransform + 'static> {
@@ -61,9 +64,12 @@ impl<T: AccumulatingTransform + 'static> AccumulatingTransformer<T> {
 
 impl<T: AccumulatingTransform + 'static> Drop for AccumulatingTransformer<T> {
     fn drop(&mut self) {
-        if !self.called_on_finish {
-            self.inner.on_finish(false).unwrap();
-        }
+        drop_guard(move || {
+            if !self.called_on_finish {
+                self.called_on_finish = true;
+                self.inner.on_finish(false).unwrap();
+            }
+        })
     }
 }
 
@@ -133,6 +139,10 @@ impl<T: AccumulatingTransform + 'static> Processor for AccumulatingTransformer<T
 
         Ok(())
     }
+
+    fn interrupt(&self) {
+        self.inner.interrupt();
+    }
 }
 
 pub trait BlockMetaAccumulatingTransform<B: BlockMetaInfo>: Send + 'static {
@@ -177,9 +187,11 @@ impl<B: BlockMetaInfo, T: BlockMetaAccumulatingTransform<B>> Drop
     for BlockMetaAccumulatingTransformer<B, T>
 {
     fn drop(&mut self) {
-        if !self.called_on_finish {
-            self.inner.on_finish(false).unwrap();
-        }
+        drop_guard(move || {
+            if !self.called_on_finish {
+                self.inner.on_finish(false).unwrap();
+            }
+        })
     }
 }
 

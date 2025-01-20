@@ -16,14 +16,18 @@ use std::fmt::Debug;
 use std::fmt::Display;
 use std::fmt::Formatter;
 
-use chrono_tz::Tz;
 use comfy_table::Cell;
 use comfy_table::Table;
-use common_io::display_decimal_128;
-use common_io::display_decimal_256;
-use croaring::treemap::NativeSerializer;
-use croaring::Treemap;
+use databend_common_ast::ast::quote::display_ident;
+use databend_common_ast::parser::Dialect;
+use databend_common_io::deserialize_bitmap;
+use databend_common_io::display_decimal_128;
+use databend_common_io::display_decimal_256;
+use databend_common_io::ewkb_to_geo;
+use databend_common_io::geo_to_ewkt;
+use geozero::wkb::Ewkb;
 use itertools::Itertools;
+use jiff::tz::TimeZone;
 use num_traits::FromPrimitive;
 use rust_decimal::Decimal;
 use rust_decimal::RoundingStrategy;
@@ -41,6 +45,7 @@ use crate::types::decimal::DecimalColumn;
 use crate::types::decimal::DecimalDataType;
 use crate::types::decimal::DecimalDomain;
 use crate::types::decimal::DecimalScalar;
+use crate::types::interval::interval_to_string;
 use crate::types::map::KvPair;
 use crate::types::nullable::NullableDomain;
 use crate::types::number::NumberColumn;
@@ -48,16 +53,15 @@ use crate::types::number::NumberDataType;
 use crate::types::number::NumberDomain;
 use crate::types::number::NumberScalar;
 use crate::types::number::SimpleDomain;
-use crate::types::string::StringColumn;
 use crate::types::string::StringDomain;
 use crate::types::timestamp::timestamp_to_string;
 use crate::types::AnyType;
 use crate::types::DataType;
+use crate::types::NumberClass;
 use crate::types::ValueType;
 use crate::values::Scalar;
 use crate::values::ScalarRef;
 use crate::values::Value;
-use crate::values::ValueRef;
 use crate::with_integer_mapped_type;
 use crate::Column;
 use crate::ColumnIndex;
@@ -67,7 +71,7 @@ use crate::TableDataType;
 const FLOAT_NUM_FRAC_DIGITS: u32 = 10;
 
 impl Debug for DataBlock {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
         let mut table = Table::new();
         table.load_preset("||--+-++|    ++++++");
 
@@ -86,7 +90,7 @@ impl Debug for DataBlock {
 }
 
 impl Display for DataBlock {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         let mut table = Table::new();
         table.load_preset("||--+-++|    ++++++");
 
@@ -96,7 +100,7 @@ impl Display for DataBlock {
             let row: Vec<_> = self
                 .columns()
                 .iter()
-                .map(|entry| entry.value.as_ref().index(index).unwrap().to_string())
+                .map(|entry| entry.value.index(index).unwrap().to_string())
                 .map(Cell::new)
                 .collect();
             table.add_row(row);
@@ -105,8 +109,8 @@ impl Display for DataBlock {
     }
 }
 
-impl<'a> Debug for ScalarRef<'a> {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+impl Debug for ScalarRef<'_> {
+    fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
         match self {
             ScalarRef::Null => write!(f, "NULL"),
             ScalarRef::EmptyArray => write!(f, "[] :: Array(Nothing)"),
@@ -114,18 +118,19 @@ impl<'a> Debug for ScalarRef<'a> {
             ScalarRef::Number(val) => write!(f, "{val:?}"),
             ScalarRef::Decimal(val) => write!(f, "{val:?}"),
             ScalarRef::Boolean(val) => write!(f, "{val}"),
-            ScalarRef::String(s) => match std::str::from_utf8(s) {
-                Ok(v) => write!(f, "{:?}", v),
-                Err(_e) => {
-                    write!(f, "0x")?;
-                    for c in *s {
-                        write!(f, "{:02x}", c)?;
-                    }
-                    Ok(())
+            ScalarRef::Binary(s) => {
+                for c in *s {
+                    write!(f, "{:02X}", c)?;
                 }
-            },
+                Ok(())
+            }
+            ScalarRef::String(s) => write!(f, "{s:?}"),
             ScalarRef::Timestamp(t) => write!(f, "{t:?}"),
             ScalarRef::Date(d) => write!(f, "{d:?}"),
+            ScalarRef::Interval(i) => {
+                let interval = interval_to_string(i);
+                write!(f, "{interval}")
+            }
             ScalarRef::Array(col) => write!(f, "[{}]", col.iter().join(", ")),
             ScalarRef::Map(col) => {
                 write!(f, "{{")?;
@@ -141,7 +146,7 @@ impl<'a> Debug for ScalarRef<'a> {
                 write!(f, "}}")
             }
             ScalarRef::Bitmap(bits) => {
-                let rb = Treemap::deserialize(bits).unwrap();
+                let rb = deserialize_bitmap(bits).unwrap();
                 write!(f, "{rb:?}")
             }
             ScalarRef::Tuple(fields) => {
@@ -157,13 +162,31 @@ impl<'a> Debug for ScalarRef<'a> {
                 }
                 write!(f, ")")
             }
-            ScalarRef::Variant(s) => write!(f, "0x{}", &hex::encode(s)),
+            ScalarRef::Variant(s) => {
+                write!(f, "0x")?;
+                for c in *s {
+                    write!(f, "{c:02x}")?;
+                }
+                Ok(())
+            }
+            ScalarRef::Geometry(s) => {
+                let geom = ewkb_to_geo(&mut Ewkb(s))
+                    .and_then(|(geo, srid)| geo_to_ewkt(geo, srid))
+                    .unwrap_or_else(|e| format!("GeozeroError: {:?}", e));
+                write!(f, "{geom:?}")
+            }
+            ScalarRef::Geography(v) => {
+                let geog = ewkb_to_geo(&mut Ewkb(v.0))
+                    .and_then(|(geo, srid)| geo_to_ewkt(geo, srid))
+                    .unwrap_or_else(|e| format!("GeozeroError: {:?}", e));
+                write!(f, "{geog:?}")
+            }
         }
     }
 }
 
 impl Debug for Column {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
         match self {
             Column::Null { len } => f.debug_struct("Null").field("len", len).finish(),
             Column::EmptyArray { len } => f.debug_struct("EmptyArray").field("len", len).finish(),
@@ -171,21 +194,25 @@ impl Debug for Column {
             Column::Number(col) => write!(f, "{col:?}"),
             Column::Decimal(col) => write!(f, "{col:?}"),
             Column::Boolean(col) => f.debug_tuple("Boolean").field(col).finish(),
+            Column::Binary(col) => write!(f, "{col:?}"),
             Column::String(col) => write!(f, "{col:?}"),
             Column::Timestamp(col) => write!(f, "{col:?}"),
             Column::Date(col) => write!(f, "{col:?}"),
+            Column::Interval(col) => write!(f, "{col:?}"),
             Column::Array(col) => write!(f, "{col:?}"),
             Column::Map(col) => write!(f, "{col:?}"),
             Column::Bitmap(col) => write!(f, "{col:?}"),
             Column::Nullable(col) => write!(f, "{col:?}"),
             Column::Tuple(fields) => f.debug_tuple("Tuple").field(fields).finish(),
             Column::Variant(col) => write!(f, "{col:?}"),
+            Column::Geometry(col) => write!(f, "{col:?}"),
+            Column::Geography(col) => write!(f, "{col:?}"),
         }
     }
 }
 
-impl<'a> Display for ScalarRef<'a> {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+impl Display for ScalarRef<'_> {
+    fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
         match self {
             ScalarRef::Null => write!(f, "NULL"),
             ScalarRef::EmptyArray => write!(f, "[]"),
@@ -193,18 +220,16 @@ impl<'a> Display for ScalarRef<'a> {
             ScalarRef::Number(val) => write!(f, "{val}"),
             ScalarRef::Decimal(val) => write!(f, "{val}"),
             ScalarRef::Boolean(val) => write!(f, "{val}"),
-            ScalarRef::String(s) => match std::str::from_utf8(s) {
-                Ok(v) => write!(f, "'{}'", v),
-                Err(_e) => {
-                    write!(f, "0x")?;
-                    for c in *s {
-                        write!(f, "{:02x}", c)?;
-                    }
-                    Ok(())
+            ScalarRef::Binary(s) => {
+                for c in *s {
+                    write!(f, "{c:02X}")?;
                 }
-            },
-            ScalarRef::Timestamp(t) => write!(f, "'{}'", timestamp_to_string(*t, Tz::UTC)),
-            ScalarRef::Date(d) => write!(f, "'{}'", date_to_string(*d as i64, Tz::UTC)),
+                Ok(())
+            }
+            ScalarRef::String(s) => write!(f, "'{s}'"),
+            ScalarRef::Timestamp(t) => write!(f, "'{}'", timestamp_to_string(*t, &TimeZone::UTC)),
+            ScalarRef::Date(d) => write!(f, "'{}'", date_to_string(*d as i64, &TimeZone::UTC)),
+            ScalarRef::Interval(interval) => write!(f, "{}", interval_to_string(interval)),
             ScalarRef::Array(col) => write!(f, "[{}]", col.iter().join(", ")),
             ScalarRef::Map(col) => {
                 write!(f, "{{")?;
@@ -220,8 +245,8 @@ impl<'a> Display for ScalarRef<'a> {
                 write!(f, "}}")
             }
             ScalarRef::Bitmap(bits) => {
-                let rb = Treemap::deserialize(bits).unwrap();
-                write!(f, "{rb:?}")
+                let rb = deserialize_bitmap(bits).unwrap();
+                write!(f, "'{}'", rb.into_iter().join(","))
             }
             ScalarRef::Tuple(fields) => {
                 write!(f, "(")?;
@@ -238,20 +263,32 @@ impl<'a> Display for ScalarRef<'a> {
             }
             ScalarRef::Variant(s) => {
                 let value = jsonb::to_string(s);
-                write!(f, "{value}")
+                write!(f, "'{value}'")
+            }
+            ScalarRef::Geometry(s) => {
+                let geom = ewkb_to_geo(&mut Ewkb(s))
+                    .and_then(|(geo, srid)| geo_to_ewkt(geo, srid))
+                    .unwrap_or_else(|e| format!("GeozeroError: {:?}", e));
+                write!(f, "'{geom}'")
+            }
+            ScalarRef::Geography(v) => {
+                let geog = ewkb_to_geo(&mut Ewkb(v.0))
+                    .and_then(|(geo, srid)| geo_to_ewkt(geo, srid))
+                    .unwrap_or_else(|e| format!("GeozeroError: {:?}", e));
+                write!(f, "'{geog}'")
             }
         }
     }
 }
 
 impl Display for Scalar {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
         write!(f, "{}", self.as_ref())
     }
 }
 
 impl Debug for NumberScalar {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
         match self {
             NumberScalar::UInt8(val) => write!(f, "{val}_u8"),
             NumberScalar::UInt16(val) => write!(f, "{val}_u16"),
@@ -268,7 +305,7 @@ impl Debug for NumberScalar {
 }
 
 impl Display for NumberScalar {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
         match self {
             NumberScalar::UInt8(val) => write!(f, "{val}"),
             NumberScalar::UInt16(val) => write!(f, "{val}"),
@@ -285,7 +322,7 @@ impl Display for NumberScalar {
 }
 
 impl Debug for DecimalScalar {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
         match self {
             DecimalScalar::Decimal128(val, size) => {
                 write!(
@@ -310,7 +347,7 @@ impl Debug for DecimalScalar {
 }
 
 impl Display for DecimalScalar {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
         match self {
             DecimalScalar::Decimal128(val, size) => {
                 write!(f, "{}", display_decimal_128(*val, size.scale))
@@ -323,7 +360,7 @@ impl Display for DecimalScalar {
 }
 
 impl Debug for NumberColumn {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
         match self {
             NumberColumn::UInt8(val) => f.debug_tuple("UInt8").field(val).finish(),
             NumberColumn::UInt16(val) => f.debug_tuple("UInt16").field(val).finish(),
@@ -352,7 +389,7 @@ impl Debug for NumberColumn {
 }
 
 impl Debug for DecimalColumn {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
         match self {
             DecimalColumn::Decimal128(val, size) => f
                 .debug_tuple("Decimal128")
@@ -376,20 +413,8 @@ impl Debug for DecimalColumn {
     }
 }
 
-impl Debug for StringColumn {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("StringColumn")
-            .field(
-                "data",
-                &format_args!("0x{}", &hex::encode(self.data().as_slice())),
-            )
-            .field("offsets", &self.offsets())
-            .finish()
-    }
-}
-
 impl<Index: ColumnIndex> Display for RawExpr<Index> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match self {
             RawExpr::Constant { scalar, .. } => write!(f, "{scalar}"),
             RawExpr::ColumnRef {
@@ -434,6 +459,24 @@ impl<Index: ColumnIndex> Display for RawExpr<Index> {
                 }
                 write!(f, ")")
             }
+            RawExpr::LambdaFunctionCall {
+                name,
+                args,
+                lambda_display,
+                ..
+            } => {
+                write!(f, "{name}")?;
+                write!(f, "(")?;
+                for (i, arg) in args.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{arg}")?;
+                }
+                write!(f, ", ")?;
+                write!(f, "{lambda_display}")?;
+                write!(f, ")")
+            }
         }
     }
 }
@@ -442,11 +485,13 @@ impl Display for DataType {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> Result<(), std::fmt::Error> {
         match &self {
             DataType::Boolean => write!(f, "Boolean"),
+            DataType::Binary => write!(f, "Binary"),
             DataType::String => write!(f, "String"),
             DataType::Number(num) => write!(f, "{num}"),
             DataType::Decimal(decimal) => write!(f, "{decimal}"),
             DataType::Timestamp => write!(f, "Timestamp"),
             DataType::Date => write!(f, "Date"),
+            DataType::Interval => write!(f, "Interval"),
             DataType::Null => write!(f, "NULL"),
             DataType::Nullable(inner) => write!(f, "{inner} NULL"),
             DataType::EmptyArray => write!(f, "Array(Nothing)"),
@@ -473,6 +518,8 @@ impl Display for DataType {
                 write!(f, ")")
             }
             DataType::Variant => write!(f, "Variant"),
+            DataType::Geometry => write!(f, "Geometry"),
+            DataType::Geography => write!(f, "Geography"),
             DataType::Generic(index) => write!(f, "T{index}"),
         }
     }
@@ -482,6 +529,7 @@ impl Display for TableDataType {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> Result<(), std::fmt::Error> {
         match &self {
             TableDataType::Boolean => write!(f, "Boolean"),
+            TableDataType::Binary => write!(f, "Binary"),
             TableDataType::String => write!(f, "String"),
             TableDataType::Number(num) => write!(f, "{num}"),
             TableDataType::Decimal(decimal) => write!(f, "{decimal}"),
@@ -519,6 +567,9 @@ impl Display for TableDataType {
                 write!(f, ")")
             }
             TableDataType::Variant => write!(f, "Variant"),
+            TableDataType::Interval => write!(f, "Interval"),
+            TableDataType::Geometry => write!(f, "Geometry"),
+            TableDataType::Geography => write!(f, "Geography"),
         }
     }
 }
@@ -553,8 +604,27 @@ impl Display for DecimalDataType {
     }
 }
 
+impl Display for NumberClass {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> Result<(), std::fmt::Error> {
+        match &self {
+            NumberClass::UInt8 => write!(f, "UInt8"),
+            NumberClass::UInt16 => write!(f, "UInt16"),
+            NumberClass::UInt32 => write!(f, "UInt32"),
+            NumberClass::UInt64 => write!(f, "UInt64"),
+            NumberClass::Int8 => write!(f, "Int8"),
+            NumberClass::Int16 => write!(f, "Int16"),
+            NumberClass::Int32 => write!(f, "Int32"),
+            NumberClass::Int64 => write!(f, "Int64"),
+            NumberClass::Decimal128 => write!(f, "Decimal128"),
+            NumberClass::Decimal256 => write!(f, "Decimal256"),
+            NumberClass::Float32 => write!(f, "Float32"),
+            NumberClass::Float64 => write!(f, "Float64"),
+        }
+    }
+}
+
 impl<Index: ColumnIndex> Display for Expr<Index> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match self {
             Expr::Constant { scalar, .. } => write!(f, "{:?}", scalar.as_ref()),
             Expr::ColumnRef { display_name, .. } => write!(f, "{display_name}"),
@@ -618,6 +688,24 @@ impl<Index: ColumnIndex> Display for Expr<Index> {
                 }
                 write!(f, ")")
             }
+            Expr::LambdaFunctionCall {
+                name,
+                args,
+                lambda_display,
+                ..
+            } => {
+                write!(f, "{name}")?;
+                write!(f, "(")?;
+                for (i, arg) in args.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{arg}")?;
+                }
+                write!(f, ", ")?;
+                write!(f, "{lambda_display}")?;
+                write!(f, ")")
+            }
         }
     }
 }
@@ -644,7 +732,7 @@ impl<Index: ColumnIndex> Expr<Index> {
             precedence: usize,
             min_precedence: usize,
         ) -> String {
-            if precedence < min_precedence {
+            if precedence < min_precedence || matches!(op, "AND" | "OR") {
                 format!(
                     "({} {op} {})",
                     write_expr(lhs, precedence),
@@ -659,9 +747,33 @@ impl<Index: ColumnIndex> Expr<Index> {
             }
         }
 
+        #[recursive::recursive]
         fn write_expr<Index: ColumnIndex>(expr: &Expr<Index>, min_precedence: usize) -> String {
             match expr {
-                Expr::Constant { scalar, .. } => scalar.as_ref().to_string(),
+                Expr::Constant { scalar, .. } => match scalar {
+                    s @ Scalar::Binary(_) => format!("from_hex('{s}')::string"),
+                    Scalar::Number(NumberScalar::Float32(f)) if f.is_nan() => {
+                        "'nan'::Float32".to_string()
+                    }
+                    Scalar::Number(NumberScalar::Float64(f)) if f.is_nan() => {
+                        "'nan'::Float64".to_string()
+                    }
+                    Scalar::Number(NumberScalar::Float32(f)) if f.is_infinite() => {
+                        if *f != f32::NEG_INFINITY {
+                            "'inf'::Float32".to_string()
+                        } else {
+                            "'-inf'::Float32".to_string()
+                        }
+                    }
+                    Scalar::Number(NumberScalar::Float64(f)) if f.is_infinite() => {
+                        if *f != f64::NEG_INFINITY {
+                            "'inf'::Float64".to_string()
+                        } else {
+                            "'-inf'::Float64".to_string()
+                        }
+                    }
+                    other => other.as_ref().to_string(),
+                },
                 Expr::ColumnRef { display_name, .. } => display_name.clone(),
                 Expr::Cast {
                     is_try,
@@ -750,6 +862,26 @@ impl<Index: ColumnIndex> Expr<Index> {
                         s
                     }
                 },
+                Expr::LambdaFunctionCall {
+                    name,
+                    args,
+                    lambda_display,
+                    ..
+                } => {
+                    let mut s = String::new();
+                    s += name;
+                    s += "(";
+                    for (i, arg) in args.iter().enumerate() {
+                        if i > 0 {
+                            s += ", ";
+                        }
+                        s += &arg.sql_display();
+                    }
+                    s += ", ";
+                    s += lambda_display;
+                    s += ")";
+                    s
+                }
             }
         }
 
@@ -766,23 +898,14 @@ impl<T: ValueType> Display for Value<T> {
     }
 }
 
-impl<'a, T: ValueType> Display for ValueRef<'a, T> {
-    fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
-        match self {
-            ValueRef::Scalar(scalar) => write!(f, "{:?}", scalar),
-            ValueRef::Column(col) => write!(f, "{:?}", col),
-        }
-    }
-}
-
 impl Debug for Function {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         write!(f, "{:?}", self.signature)
     }
 }
 
 impl Debug for FunctionEval {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match self {
             FunctionEval::Scalar { .. } => write!(f, "FunctionEval::Scalar"),
             FunctionEval::SRF { .. } => write!(f, "FunctionEval::SRF"),
@@ -791,7 +914,7 @@ impl Debug for FunctionEval {
 }
 
 impl Display for FunctionSignature {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         write!(
             f,
             "{}({}) :: {}",
@@ -803,7 +926,7 @@ impl Display for FunctionSignature {
 }
 
 impl Display for FunctionProperty {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         let mut properties = Vec::new();
         if self.non_deterministic {
             properties.push("non_deterministic");
@@ -845,14 +968,9 @@ impl Display for BooleanDomain {
 impl Display for StringDomain {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         if let Some(max) = &self.max {
-            write!(
-                f,
-                "{{{:?}..={:?}}}",
-                String::from_utf8_lossy(&self.min),
-                String::from_utf8_lossy(max)
-            )
+            write!(f, "{{{:?}..={:?}}}", &self.min, max)
         } else {
-            write!(f, "{{{:?}..}}", String::from_utf8_lossy(&self.min))
+            write!(f, "{{{:?}..}}", &self.min)
         }
     }
 }
@@ -907,6 +1025,7 @@ impl Display for Domain {
             Domain::String(domain) => write!(f, "{domain}"),
             Domain::Timestamp(domain) => write!(f, "{domain}"),
             Domain::Date(domain) => write!(f, "{domain}"),
+            Domain::Interval(domain) => write!(f, "{:?}", domain),
             Domain::Nullable(domain) => write!(f, "{domain}"),
             Domain::Array(None) => write!(f, "[]"),
             Domain::Array(Some(domain)) => write!(f, "[{domain}]"),
@@ -921,7 +1040,10 @@ impl Display for Domain {
                 write!(f, ")")
             }
             Domain::Map(None) => write!(f, "{{}}"),
-            Domain::Map(Some((key_domain, val_domain))) => {
+            Domain::Map(Some(domain)) => {
+                let inner_domain = domain.as_tuple().unwrap();
+                let key_domain = &inner_domain[0];
+                let val_domain = &inner_domain[1];
                 write!(f, "{{[{key_domain}], [{val_domain}]}}")
             }
             Domain::Undefined => write!(f, "Undefined"),
@@ -951,4 +1073,9 @@ fn display_f64(num: f64) -> String {
             .to_string(),
         None => num.to_string(),
     }
+}
+
+/// Display a tuple field name, if it contains uppercase letters or special characters, add quotes.
+pub fn display_tuple_field_name(field_name: &str) -> String {
+    display_ident(field_name, true, Dialect::PostgreSQL)
 }

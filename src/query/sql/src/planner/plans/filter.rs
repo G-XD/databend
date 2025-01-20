@@ -16,14 +16,11 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use common_catalog::table_context::TableContext;
-use common_exception::Result;
+use databend_common_exception::Result;
 
 use crate::optimizer::ColumnSet;
-use crate::optimizer::PhysicalProperty;
 use crate::optimizer::RelExpr;
 use crate::optimizer::RelationalProperty;
-use crate::optimizer::RequiredProperty;
 use crate::optimizer::SelectivityEstimator;
 use crate::optimizer::StatInfo;
 use crate::optimizer::Statistics;
@@ -35,8 +32,6 @@ use crate::plans::ScalarExpr;
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Filter {
     pub predicates: Vec<ScalarExpr>,
-    // True if the plan represents having, else the plan represents where
-    pub is_having: bool,
 }
 
 impl Filter {
@@ -52,20 +47,6 @@ impl Filter {
 impl Operator for Filter {
     fn rel_op(&self) -> RelOp {
         RelOp::Filter
-    }
-
-    fn derive_physical_prop(&self, rel_expr: &RelExpr) -> Result<PhysicalProperty> {
-        rel_expr.derive_physical_prop_child(0)
-    }
-
-    fn compute_required_prop_child(
-        &self,
-        _ctx: Arc<dyn TableContext>,
-        _rel_expr: &RelExpr,
-        _child_index: usize,
-        required: &RequiredProperty,
-    ) -> Result<RequiredProperty> {
-        Ok(required.clone())
     }
 
     fn derive_relational_prop(&self, rel_expr: &RelExpr) -> Result<Arc<RelationalProperty>> {
@@ -88,19 +69,25 @@ impl Operator for Filter {
         let mut used_columns = self.used_columns()?;
         used_columns.extend(input_prop.used_columns.clone());
 
+        // Derive orderings
+        let orderings = input_prop.orderings.clone();
+        let partition_orderings = input_prop.partition_orderings.clone();
+
         Ok(Arc::new(RelationalProperty {
             output_columns,
             outer_columns,
             used_columns,
+            orderings,
+            partition_orderings,
         }))
     }
 
-    fn derive_cardinality(&self, rel_expr: &RelExpr) -> Result<Arc<StatInfo>> {
+    fn derive_stats(&self, rel_expr: &RelExpr) -> Result<Arc<StatInfo>> {
         let stat_info = rel_expr.derive_cardinality_child(0)?;
         let (input_cardinality, mut statistics) =
             (stat_info.cardinality, stat_info.statistics.clone());
         // Derive cardinality
-        let mut sb = SelectivityEstimator::new(&mut statistics, HashSet::new());
+        let mut sb = SelectivityEstimator::new(&mut statistics, input_cardinality, HashSet::new());
         let mut selectivity = MAX_SELECTIVITY;
         for pred in self.predicates.iter() {
             // Compute selectivity for each conjunction

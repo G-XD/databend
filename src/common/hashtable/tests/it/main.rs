@@ -1,4 +1,4 @@
-// Copyright 2021 Datafuse Labs.
+// Copyright 2021 Datafuse Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,19 +12,23 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#![allow(clippy::arc_with_non_send_sync)]
+
 use std::ptr::NonNull;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use bumpalo::Bump;
-use common_hashtable::DictionaryKeys;
-use common_hashtable::DictionaryStringHashMap;
-use common_hashtable::HashMap;
-use common_hashtable::HashtableEntryMutRefLike;
-use common_hashtable::HashtableLike;
-use common_hashtable::ShortStringHashMap;
-use common_hashtable::StackHashMap;
+use databend_common_hashtable::fast_memcmp;
+use databend_common_hashtable::DictionaryKeys;
+use databend_common_hashtable::DictionaryStringHashMap;
+use databend_common_hashtable::HashMap;
+use databend_common_hashtable::HashtableEntryMutRefLike;
+use databend_common_hashtable::HashtableLike;
+use databend_common_hashtable::ShortStringHashMap;
+use databend_common_hashtable::StackHashMap;
+use rand::distributions::Alphanumeric;
 use rand::Rng;
 
 macro_rules! simple_test {
@@ -86,6 +90,30 @@ fn test_hash_map() {
 #[test]
 fn test_stack_hash_map() {
     simple_test!(StackHashMap);
+}
+
+#[test]
+fn test_fast_memcmp() {
+    let mut rng = rand::thread_rng();
+    for size in 1..129 {
+        let a: Vec<u8> = rand::thread_rng()
+            .sample_iter(&Alphanumeric)
+            .take(size)
+            .collect();
+        for _ in 0..1024 {
+            // change a random byte in b and cmpare with a
+            let mut b = a.clone();
+            let idx = rng.gen_range(0..size);
+            if b[idx] == u8::MAX {
+                b[idx] = 1;
+            } else {
+                b[idx] += 1;
+            }
+            assert!(!fast_memcmp(a.as_slice(), b.as_slice()));
+            b[idx] = a[idx];
+            assert!(fast_memcmp(a.as_slice(), b.as_slice()));
+        }
+    }
 }
 
 #[test]
@@ -170,11 +198,9 @@ fn test_dictionary_hash_map() {
                     NonNull::from(index1_str.as_bytes()),
                     NonNull::from(index2_str.as_bytes()),
                 ];
-                assert!(
-                    hashtable
-                        .insert_and_entry(&DictionaryKeys::create(&keys))
-                        .is_err()
-                );
+                assert!(hashtable
+                    .insert_and_entry(&DictionaryKeys::create(&keys))
+                    .is_err());
             }
         }
     }

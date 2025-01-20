@@ -1,4 +1,4 @@
-// Copyright 2021 Datafuse Labs.
+// Copyright 2021 Datafuse Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,42 +15,42 @@
 use std::io::Write;
 use std::sync::Arc;
 
-use common_base::base::tokio;
-use common_catalog::table::Table;
-use common_exception::Result;
-use common_expression::block_debug::pretty_format_blocks;
-use common_meta_app::principal::AuthInfo;
-use common_meta_app::principal::AuthType;
-use common_meta_app::principal::RoleInfo;
-use common_meta_app::principal::UserGrantSet;
-use common_meta_app::principal::UserInfo;
-use common_meta_app::principal::UserOption;
-use common_meta_app::principal::UserQuota;
-use common_meta_app::storage::StorageParams;
-use common_meta_app::storage::StorageS3Config;
-use common_metrics::init_default_metrics_recorder;
-use common_sql::executor::table_read_plan::ToReadDataSourcePlan;
-use common_storages_system::BuildOptionsTable;
-use common_storages_system::CachesTable;
-use common_storages_system::CatalogsTable;
-use common_storages_system::ClustersTable;
-use common_storages_system::ColumnsTable;
-use common_storages_system::ConfigsTable;
-use common_storages_system::ContributorsTable;
-use common_storages_system::CreditsTable;
-use common_storages_system::DatabasesTable;
-use common_storages_system::EnginesTable;
-use common_storages_system::FunctionsTable;
-use common_storages_system::MetricsTable;
-use common_storages_system::RolesTable;
-use common_storages_system::SettingsTable;
-use common_storages_system::TracingTable;
-use common_storages_system::UsersTable;
-use common_users::UserApiProvider;
+use databend_common_base::base::tokio;
+use databend_common_catalog::table::Table;
+use databend_common_exception::Result;
+use databend_common_expression::block_debug::box_render;
+use databend_common_expression::block_debug::pretty_format_blocks;
+use databend_common_meta_app::principal::AuthInfo;
+use databend_common_meta_app::principal::AuthType;
+use databend_common_meta_app::principal::RoleInfo;
+use databend_common_meta_app::principal::UserInfo;
+use databend_common_meta_app::schema::CreateOption;
+use databend_common_meta_app::storage::StorageFsConfig;
+use databend_common_meta_app::storage::StorageParams;
+use databend_common_meta_app::storage::StorageS3Config;
+use databend_common_sql::executor::table_read_plan::ToReadDataSourcePlan;
+use databend_common_storages_system::BuildOptionsTable;
+use databend_common_storages_system::CachesTable;
+use databend_common_storages_system::CatalogsTable;
+use databend_common_storages_system::ClustersTable;
+use databend_common_storages_system::ColumnsTable;
+use databend_common_storages_system::ConfigsTable;
+use databend_common_storages_system::ContributorsTable;
+use databend_common_storages_system::CreditsTable;
+use databend_common_storages_system::DatabasesTableWithHistory;
+use databend_common_storages_system::DatabasesTableWithoutHistory;
+use databend_common_storages_system::EnginesTable;
+use databend_common_storages_system::FunctionsTable;
+use databend_common_storages_system::MetricsTable;
+use databend_common_storages_system::RolesTable;
+use databend_common_storages_system::UsersTable;
+use databend_common_users::UserApiProvider;
 use databend_query::sessions::QueryContext;
 use databend_query::sessions::TableContext;
 use databend_query::stream::ReadDataBlockStream;
 use databend_query::test_kits::ClusterDescriptor;
+use databend_query::test_kits::ConfigBuilder;
+use databend_query::test_kits::TestFixture;
 use futures::TryStreamExt;
 use goldenfile::Mint;
 use wiremock::matchers::method;
@@ -67,7 +67,9 @@ async fn run_table_tests(
     let table_info = table.get_table_info();
     writeln!(file, "---------- TABLE INFO ------------").unwrap();
     writeln!(file, "{table_info}").unwrap();
-    let source_plan = table.read_plan(ctx.clone(), None, true).await?;
+    let source_plan = table
+        .read_plan(ctx.clone(), None, None, false, true)
+        .await?;
 
     let stream = table.read_data_block_stream(ctx, &source_plan).await?;
     let blocks = stream.try_collect::<Vec<_>>().await?;
@@ -84,7 +86,8 @@ async fn run_table_tests(
         actual_lines.retain(|&item| {
             !(item.contains("max_threads")
                 || item.contains("max_memory_usage")
-                || item.contains("max_storage_io_requests"))
+                || item.contains("max_storage_io_requests")
+                || item.contains("recluster_block_size"))
         });
     }
     for line in actual_lines {
@@ -96,59 +99,69 @@ async fn run_table_tests(
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_build_options_table() -> Result<()> {
-    let (_guard, ctx) = databend_query::test_kits::create_query_context().await?;
+    let fixture = TestFixture::setup().await?;
+    let ctx = fixture.new_query_ctx().await?;
 
     let table = BuildOptionsTable::create(1);
-    let source_plan = table.read_plan(ctx.clone(), None, true).await?;
+    let source_plan = table
+        .read_plan(ctx.clone(), None, None, false, true)
+        .await?;
 
     let stream = table.read_data_block_stream(ctx, &source_plan).await?;
     let result = stream.try_collect::<Vec<_>>().await?;
     let block = &result[0];
     assert_eq!(block.num_columns(), 2);
     assert!(block.num_rows() > 0);
+
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_columns_table() -> Result<()> {
-    let (_guard, ctx) = databend_query::test_kits::create_query_context().await?;
+    let fixture = TestFixture::setup().await?;
+    let ctx = fixture.new_query_ctx().await?;
 
     let mut mint = Mint::new("tests/it/storages/testdata");
     let file = &mut mint.new_goldenfile("columns_table.txt").unwrap();
     let table = ColumnsTable::create(1);
-
     run_table_tests(file, ctx, table).await?;
+
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_clusters_table() -> Result<()> {
-    let (_guard, ctx) = databend_query::test_kits::create_query_context().await?;
-    let table = ClustersTable::create(1);
+    let fixture = TestFixture::setup().await?;
+    let ctx = fixture.new_query_ctx().await?;
 
-    let source_plan = table.read_plan(ctx.clone(), None, true).await?;
+    let table = ClustersTable::create(1);
+    let source_plan = table
+        .read_plan(ctx.clone(), None, None, false, true)
+        .await?;
 
     let stream = table.read_data_block_stream(ctx, &source_plan).await?;
     let result = stream.try_collect::<Vec<_>>().await?;
     let block = &result[0];
-    assert_eq!(block.num_columns(), 4);
+    assert_eq!(block.num_columns(), 5);
 
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_configs_table_basic() -> Result<()> {
+    let mut config = ConfigBuilder::create().build();
+    config.storage.params = StorageParams::Fs(StorageFsConfig::default());
+    let fixture = TestFixture::setup_with_config(&config).await?;
+
+    let ctx = fixture.new_query_ctx().await?;
+    ctx.get_settings().set_max_threads(8)?;
+
     let mut mint = Mint::new("tests/it/storages/testdata");
     let file = &mut mint.new_goldenfile("configs_table_basic.txt").unwrap();
 
-    let conf = databend_query::test_kits::ConfigBuilder::create().config();
-    let (_guard, ctx) =
-        databend_query::test_kits::create_query_context_with_config(conf, None).await?;
-    ctx.get_settings().set_max_threads(8)?;
-
     let table = ConfigsTable::create(1);
-
     run_table_tests(file, ctx, table).await?;
+
     Ok(())
 }
 
@@ -173,13 +186,14 @@ async fn test_configs_table_redact() -> Result<()> {
         secret_access_key: "secret_access_key".to_string(),
         ..Default::default()
     });
-
-    let (_guard, ctx) =
-        databend_query::test_kits::create_query_context_with_config(conf, None).await?;
+    let fixture = TestFixture::setup_with_config(&conf).await?;
+    let ctx = fixture.new_query_ctx().await?;
     ctx.get_settings().set_max_threads(8)?;
 
     let table = ConfigsTable::create(1);
-    let source_plan = table.read_plan(ctx.clone(), None, true).await?;
+    let source_plan = table
+        .read_plan(ctx.clone(), None, None, false, true)
+        .await?;
 
     let stream = table.read_data_block_stream(ctx, &source_plan).await?;
     let result = stream.try_collect::<Vec<_>>().await?;
@@ -193,27 +207,37 @@ async fn test_configs_table_redact() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_contributors_table() -> Result<()> {
-    let (_guard, ctx) = databend_query::test_kits::create_query_context().await?;
+    let fixture = TestFixture::setup().await?;
+    let ctx = fixture.new_query_ctx().await?;
+
     let table = ContributorsTable::create(1);
-    let source_plan = table.read_plan(ctx.clone(), None, true).await?;
+    let source_plan = table
+        .read_plan(ctx.clone(), None, None, false, true)
+        .await?;
 
     let stream = table.read_data_block_stream(ctx, &source_plan).await?;
     let result = stream.try_collect::<Vec<_>>().await?;
     let block = &result[0];
     assert_eq!(block.num_columns(), 1);
+
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_credits_table() -> Result<()> {
-    let (_guard, ctx) = databend_query::test_kits::create_query_context().await?;
+    let fixture = TestFixture::setup().await?;
+    let ctx = fixture.new_query_ctx().await?;
+
     let table = CreditsTable::create(1);
-    let source_plan = table.read_plan(ctx.clone(), None, true).await?;
+    let source_plan = table
+        .read_plan(ctx.clone(), None, None, false, true)
+        .await?;
 
     let stream = table.read_data_block_stream(ctx, &source_plan).await?;
     let result = stream.try_collect::<Vec<_>>().await?;
     let block = &result[0];
     assert_eq!(block.num_columns(), 3);
+
     Ok(())
 }
 
@@ -222,60 +246,97 @@ async fn test_catalogs_table() -> Result<()> {
     let mut mint = Mint::new("tests/it/storages/testdata");
     let file = &mut mint.new_goldenfile("catalogs_table.txt").unwrap();
 
-    let (_guard, ctx) = databend_query::test_kits::create_query_context().await?;
-    let table = CatalogsTable::create(1);
+    let fixture = TestFixture::setup().await?;
+    let ctx = fixture.new_query_ctx().await?;
 
+    let table = CatalogsTable::create(1);
     run_table_tests(file, ctx, table).await?;
+
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_databases_table() -> Result<()> {
-    let (_guard, ctx) = databend_query::test_kits::create_query_context().await?;
-    let table = DatabasesTable::create(1);
+    let mut config = ConfigBuilder::create().build();
+    config.storage.params = StorageParams::Fs(StorageFsConfig::default());
+    let fixture = TestFixture::setup_with_config(&config).await?;
+    let ctx = fixture.new_query_ctx().await?;
+
+    let table = DatabasesTableWithoutHistory::create(1);
 
     let mut mint = Mint::new("tests/it/storages/testdata");
     let file = &mut mint.new_goldenfile("databases_table.txt").unwrap();
-
     run_table_tests(file, ctx, table).await?;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_databases_history_table() -> Result<()> {
+    let mut config = ConfigBuilder::create().build();
+    config.storage.params = StorageParams::Fs(StorageFsConfig::default());
+    let fixture = TestFixture::setup_with_config(&config).await?;
+    let ctx = fixture.new_query_ctx().await?;
+
+    let table = DatabasesTableWithHistory::create(1);
+
+    let mut mint = Mint::new("tests/it/storages/testdata");
+    let file = &mut mint
+        .new_goldenfile("databases_with_history_table.txt")
+        .unwrap();
+    run_table_tests(file, ctx, table).await?;
+
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_engines_table() -> Result<()> {
-    let (_guard, ctx) = databend_query::test_kits::create_query_context().await?;
-    let table = EnginesTable::create(1);
+    let fixture = TestFixture::setup().await?;
+    let ctx = fixture.new_query_ctx().await?;
 
+    let table = EnginesTable::create(1);
     let mut mint = Mint::new("tests/it/storages/testdata");
     let file = &mut mint.new_goldenfile("engines_table.txt").unwrap();
-
     run_table_tests(file, ctx, table).await?;
+
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_functions_table() -> Result<()> {
-    let (_guard, ctx) = databend_query::test_kits::create_query_context().await?;
+    let fixture = TestFixture::setup().await?;
+    let ctx = fixture.new_query_ctx().await?;
+
     let table = FunctionsTable::create(1);
-    let source_plan = table.read_plan(ctx.clone(), None, true).await?;
+    let source_plan = table
+        .read_plan(ctx.clone(), None, None, false, true)
+        .await?;
 
     let stream = table.read_data_block_stream(ctx, &source_plan).await?;
     let result = stream.try_collect::<Vec<_>>().await?;
     let block = &result[0];
-    assert_eq!(block.num_columns(), 8);
+    assert_eq!(block.num_columns(), 5);
+
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_metrics_table() -> Result<()> {
-    init_default_metrics_recorder();
-    let (_guard, ctx) = databend_query::test_kits::create_query_context().await?;
-    let table = MetricsTable::create(1);
-    let source_plan = table.read_plan(ctx.clone(), None, true).await?;
+    let fixture = TestFixture::setup().await?;
+    let ctx = fixture.new_query_ctx().await?;
 
-    metrics::counter!("test.test_metrics_table_count", 1);
-    #[cfg(feature = "enable_histogram")]
-    metrics::histogram!("test.test_metrics_table_histogram", 1.0);
+    let table = MetricsTable::create(1);
+    let source_plan = table
+        .read_plan(ctx.clone(), None, None, false, true)
+        .await?;
+    let counter1 =
+        databend_common_base::runtime::metrics::register_counter("test_metrics_table_count");
+    let histogram1 = databend_common_base::runtime::metrics::register_histogram_in_milliseconds(
+        "test_metrics_table_histogram",
+    );
+
+    counter1.inc();
+    histogram1.observe(2.0);
 
     let stream = table.read_data_block_stream(ctx, &source_plan).await?;
     let result = stream.try_collect::<Vec<_>>().await?;
@@ -283,22 +344,27 @@ async fn test_metrics_table() -> Result<()> {
     assert_eq!(block.num_columns(), 5);
     assert!(block.num_rows() >= 1);
 
-    let output = pretty_format_blocks(result.as_slice())?;
-    assert!(output.contains("test_test_metrics_table_count"));
-    #[cfg(feature = "enable_histogram")]
-    assert!(output.contains("test_test_metrics_table_histogram"));
+    let output = box_render(
+        &Arc::new(source_plan.output_schema.into()),
+        result.as_slice(),
+        1000,
+        1024,
+        30,
+        true,
+    )?;
+    assert!(output.contains("test_metrics_table_count"));
+    assert!(output.contains("test_metrics_table_histogram"));
 
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_roles_table() -> Result<()> {
-    let mut mint = Mint::new("tests/it/storages/testdata");
-    let file = &mut mint.new_goldenfile("roles_table.txt").unwrap();
-
-    let (_guard, ctx) = databend_query::test_kits::create_query_context().await?;
-    let tenant = ctx.get_tenant();
+    let fixture = TestFixture::setup().await?;
+    let ctx = fixture.new_query_ctx().await?;
     ctx.get_settings().set_max_threads(2)?;
+
+    let tenant = ctx.get_tenant();
 
     {
         let role_info = RoleInfo::new("test");
@@ -315,84 +381,74 @@ async fn test_roles_table() -> Result<()> {
             .await?;
     }
     let table = RolesTable::create(1);
-
-    run_table_tests(file, ctx, table).await?;
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn test_settings_table() -> Result<()> {
-    let mut mint = Mint::new("tests/it/storages/testdata");
-    let file = &mut mint.new_goldenfile("settings_table.txt").unwrap();
-
-    let (_guard, ctx) = databend_query::test_kits::create_query_context().await?;
-    ctx.get_settings().set_max_threads(2)?;
-    ctx.get_settings().set_max_memory_usage(1073741824)?;
-
-    let table = SettingsTable::create(1);
-
-    run_table_tests(file, ctx, table).await?;
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn test_tracing_table() -> Result<()> {
-    let (_guard, ctx) = databend_query::test_kits::create_query_context().await?;
-    let table: Arc<dyn Table> = Arc::new(TracingTable::create(1));
-    let source_plan = table.read_plan(ctx.clone(), None, true).await?;
-
+    let source_plan = table
+        .read_plan(ctx.clone(), None, None, false, true)
+        .await?;
     let stream = table.read_data_block_stream(ctx, &source_plan).await?;
     let result = stream.try_collect::<Vec<_>>().await?;
     let block = &result[0];
-    assert_eq!(block.num_columns(), 1);
-    assert!(block.num_rows() > 0);
+    assert_eq!(block.num_columns(), 5);
+    assert_eq!(block.num_rows(), 4);
+
+    let output = box_render(
+        &Arc::new(source_plan.output_schema.into()),
+        result.as_slice(),
+        1000,
+        1024,
+        30,
+        true,
+    )?;
+    assert!(output.contains("test"));
+    assert!(output.contains("test1"));
 
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_users_table() -> Result<()> {
-    let mut mint = Mint::new("tests/it/storages/testdata");
-    let file = &mut mint.new_goldenfile("users_table.txt").unwrap();
-
-    let (_guard, ctx) = databend_query::test_kits::create_query_context().await?;
-    let tenant = ctx.get_tenant();
+    let fixture = TestFixture::setup().await?;
+    let ctx = fixture.new_query_ctx().await?;
     ctx.get_settings().set_max_threads(2)?;
+
+    let tenant = ctx.get_tenant();
     let auth_data = AuthInfo::None;
+    let user_info = UserInfo::new("test", "%", auth_data);
     UserApiProvider::instance()
-        .add_user(
-            &tenant,
-            UserInfo {
-                auth_info: auth_data,
-                name: "test".to_string(),
-                hostname: "%".to_string(),
-                grants: UserGrantSet::empty(),
-                quota: UserQuota::no_limit(),
-                option: UserOption::default(),
-            },
-            false,
-        )
+        .add_user(&tenant, user_info, &CreateOption::Create)
         .await?;
-    let auth_data = AuthInfo::new(AuthType::Sha256Password, &Some("123456789".to_string()));
+    let auth_data = AuthInfo::new(
+        AuthType::Sha256Password,
+        &Some("123456789".to_string()),
+        false,
+    );
     assert!(auth_data.is_ok());
+    let mut user_info = UserInfo::new("test1", "%", auth_data?);
+    user_info.option.set_default_role(Some("role1".to_string()));
     UserApiProvider::instance()
-        .add_user(
-            &tenant,
-            UserInfo {
-                auth_info: auth_data.unwrap(),
-                name: "test1".to_string(),
-                hostname: "%".to_string(),
-                grants: UserGrantSet::empty(),
-                quota: UserQuota::no_limit(),
-                option: UserOption::default().with_default_role(Some("role1".to_string())),
-            },
-            false,
-        )
+        .add_user(&tenant, user_info, &CreateOption::Create)
         .await?;
 
     let table = UsersTable::create(1);
+    let source_plan = table
+        .read_plan(ctx.clone(), None, None, false, true)
+        .await?;
+    let stream = table.read_data_block_stream(ctx, &source_plan).await?;
+    let result = stream.try_collect::<Vec<_>>().await?;
+    let block = &result[0];
+    assert_eq!(block.num_columns(), 12);
+    assert!(block.num_rows() >= 2);
 
-    run_table_tests(file, ctx, table).await?;
+    let output = box_render(
+        &Arc::new(source_plan.output_schema.into()),
+        result.as_slice(),
+        1000,
+        1024,
+        30,
+        true,
+    )?;
+    assert!(output.contains("test"));
+    assert!(output.contains("test1"));
+
     Ok(())
 }
 
@@ -401,12 +457,14 @@ async fn test_caches_table() -> Result<()> {
     let mut mint = Mint::new("tests/it/storages/testdata");
     let file = &mut mint.new_goldenfile("caches_table.txt").unwrap();
 
+    let mut config = ConfigBuilder::create().build();
+    config.storage.params = StorageParams::Fs(StorageFsConfig::default());
+    let fixture = TestFixture::setup_with_config(&config).await?;
     let cluster_desc = ClusterDescriptor::new().with_local_id("test-node");
-    let (_guard, ctx) =
-        databend_query::test_kits::create_query_context_with_cluster(cluster_desc).await?;
+    let ctx = fixture.new_query_ctx_with_cluster(cluster_desc).await?;
 
     let table = CachesTable::create(1);
-
     run_table_tests(file, ctx, table).await?;
+
     Ok(())
 }

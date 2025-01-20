@@ -18,7 +18,8 @@ use std::intrinsics::assume;
 use std::mem;
 use std::ptr;
 
-use common_arrow::arrow::bitmap::MutableBitmap;
+use databend_common_base::runtime::drop_guard;
+use databend_common_column::bitmap::MutableBitmap;
 
 use crate::types::*;
 use crate::with_number_mapped_type;
@@ -67,10 +68,65 @@ impl TopKSorter {
                 if self.data.len() == self.limit {
                     self.make_heap();
                 }
-            } else if !self.push_value(value) {
+            } else if !self.push_value::<T>(value) {
                 bitmap.set(i, false);
             }
         }
+    }
+
+    // Push the column into this sorted and update the selection
+    // The selection could be used in filter
+    pub fn push_column_with_selection<const SELECT_ALL: bool>(
+        &mut self,
+        col: &Column,
+        selection: &mut [u32],
+        count: usize,
+    ) -> usize {
+        with_number_mapped_type!(|NUM_TYPE| match col.data_type() {
+            DataType::Number(NumberDataType::NUM_TYPE) => self
+                .push_column_with_selection_internal::<NumberType::<NUM_TYPE>, SELECT_ALL>(
+                    col, selection, count
+                ),
+            DataType::String => self.push_column_with_selection_internal::<StringType, SELECT_ALL>(
+                col, selection, count
+            ),
+            DataType::Timestamp => self
+                .push_column_with_selection_internal::<TimestampType, SELECT_ALL>(
+                    col, selection, count
+                ),
+            DataType::Date => self
+                .push_column_with_selection_internal::<DateType, SELECT_ALL>(col, selection, count),
+            _ => count,
+        })
+    }
+
+    fn push_column_with_selection_internal<T: ValueType, const SELECT_ALL: bool>(
+        &mut self,
+        col: &Column,
+        selection: &mut [u32],
+        count: usize,
+    ) -> usize
+    where
+        for<'a> T::ScalarRef<'a>: Ord,
+    {
+        let col = T::try_downcast_column(col).unwrap();
+        let mut result_count = 0;
+        for i in 0..count {
+            let idx = if SELECT_ALL { i as u32 } else { selection[i] };
+            let value = unsafe { T::index_column_unchecked(&col, idx as usize) };
+            if self.data.len() < self.limit {
+                self.data.push(T::upcast_scalar(T::to_owned_scalar(value)));
+                if self.data.len() == self.limit {
+                    self.make_heap();
+                }
+                selection[result_count] = idx;
+                result_count += 1;
+            } else if self.push_value::<T>(value) {
+                selection[result_count] = idx;
+                result_count += 1;
+            }
+        }
+        result_count
     }
 
     #[inline]
@@ -153,7 +209,11 @@ impl TopKSorter {
     }
 
     fn ordering(&self) -> Ordering {
-        if self.asc { Less } else { Less.reverse() }
+        if self.asc {
+            Less
+        } else {
+            Less.reverse()
+        }
     }
 }
 
@@ -233,14 +293,16 @@ where F: FnMut(&T, &T) -> bool {
 
     impl<T> Drop for InsertionHole<T> {
         fn drop(&mut self) {
-            // SAFETY:
-            // we ensure src/dest point to a properly initialized value of type T
-            // src is valid for reads of `count * size_of::()` bytes.
-            // dest is valid for reads of `count * size_of::()` bytes.
-            // Both `src` and `dst` are properly aligned.
-            unsafe {
-                ptr::copy_nonoverlapping(self.src, self.dest, 1);
-            }
+            drop_guard(move || {
+                // SAFETY:
+                // we ensure src/dest point to a properly initialized value of type T
+                // src is valid for reads of `count * size_of::()` bytes.
+                // dest is valid for reads of `count * size_of::()` bytes.
+                // Both `src` and `dst` are properly aligned.
+                unsafe {
+                    ptr::copy_nonoverlapping(self.src, self.dest, 1);
+                }
+            })
         }
     }
 }

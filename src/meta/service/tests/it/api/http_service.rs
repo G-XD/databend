@@ -1,4 +1,4 @@
-// Copyright 2021 Datafuse Labs.
+// Copyright 2021 Datafuse Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,7 +15,7 @@
 use std::fs::File;
 use std::io::Read;
 
-use common_base::base::Stoppable;
+use databend_common_base::base::Stoppable;
 use databend_meta::api::HttpService;
 use databend_meta::configs::Config;
 use databend_meta::meta_service::MetaNode;
@@ -30,7 +30,7 @@ use crate::tests::tls_constants::TEST_SERVER_KEY;
 
 // TODO(zhihanz) add tls fail case
 #[test(harness = meta_service_test_harness)]
-#[minitrace::trace]
+#[fastrace::trace]
 async fn test_http_service_tls_server() -> anyhow::Result<()> {
     let mut conf = Config::default();
     let addr_str = "127.0.0.1:30002";

@@ -14,22 +14,23 @@
 
 use std::collections::BTreeMap;
 
-use common_ast::ast::AlterDatabaseAction;
-use common_ast::ast::AlterDatabaseStmt;
-use common_ast::ast::CreateDatabaseStmt;
-use common_ast::ast::DatabaseEngine;
-use common_ast::ast::DropDatabaseStmt;
-use common_ast::ast::SQLProperty;
-use common_ast::ast::ShowCreateDatabaseStmt;
-use common_ast::ast::ShowDatabasesStmt;
-use common_ast::ast::ShowLimit;
-use common_ast::ast::UndropDatabaseStmt;
-use common_exception::Result;
-use common_expression::types::DataType;
-use common_expression::DataField;
-use common_expression::DataSchemaRefExt;
-use common_meta_app::schema::DatabaseMeta;
-use common_meta_app::share::ShareNameIdent;
+use databend_common_ast::ast::AlterDatabaseAction;
+use databend_common_ast::ast::AlterDatabaseStmt;
+use databend_common_ast::ast::CreateDatabaseStmt;
+use databend_common_ast::ast::DatabaseEngine;
+use databend_common_ast::ast::DatabaseRef;
+use databend_common_ast::ast::DropDatabaseStmt;
+use databend_common_ast::ast::SQLProperty;
+use databend_common_ast::ast::ShowCreateDatabaseStmt;
+use databend_common_ast::ast::ShowDatabasesStmt;
+use databend_common_ast::ast::ShowDropDatabasesStmt;
+use databend_common_ast::ast::ShowLimit;
+use databend_common_ast::ast::UndropDatabaseStmt;
+use databend_common_exception::Result;
+use databend_common_expression::types::DataType;
+use databend_common_expression::DataField;
+use databend_common_expression::DataSchemaRefExt;
+use databend_common_meta_app::schema::DatabaseMeta;
 use log::debug;
 
 use crate::binder::Binder;
@@ -70,10 +71,12 @@ impl Binder {
 
         if *full {
             select_builder.with_column("catalog AS Catalog");
+            select_builder.with_column("owner");
         }
         select_builder.with_column(format!("name AS `databases_in_{ctl}`"));
         select_builder.with_order_by("catalog");
         select_builder.with_order_by("name");
+
         match limit {
             Some(ShowLimit::Like { pattern }) => {
                 select_builder.with_filter(format!("name LIKE '{pattern}'"));
@@ -88,6 +91,47 @@ impl Binder {
         debug!("show databases rewrite to: {:?}", query);
 
         self.bind_rewrite_to_query(bind_context, query.as_str(), RewriteKind::ShowDatabases)
+            .await
+    }
+
+    #[async_backtrace::framed]
+    pub(in crate::planner::binder) async fn bind_show_drop_databases(
+        &mut self,
+        bind_context: &mut BindContext,
+        stmt: &ShowDropDatabasesStmt,
+    ) -> Result<Plan> {
+        let ShowDropDatabasesStmt { catalog, limit } = stmt;
+        let mut select_builder = SelectBuilder::from("system.databases_with_history");
+
+        let ctl = if let Some(ctl) = catalog {
+            normalize_identifier(ctl, &self.name_resolution_ctx).name
+        } else {
+            self.ctx.get_current_catalog().to_string()
+        };
+
+        select_builder.with_filter(format!("catalog = '{ctl}'"));
+
+        select_builder.with_column("catalog");
+        select_builder.with_column("name");
+        select_builder.with_column("database_id");
+        select_builder.with_column("dropped_on");
+
+        select_builder.with_order_by("catalog");
+        select_builder.with_order_by("name");
+
+        match limit {
+            Some(ShowLimit::Like { pattern }) => {
+                select_builder.with_filter(format!("name LIKE '{pattern}'"));
+            }
+            Some(ShowLimit::Where { selection }) => {
+                select_builder.with_filter(format!("({selection})"));
+            }
+            None => (),
+        }
+        let query = select_builder.build();
+        debug!("show databases rewrite to: {:?}", query);
+
+        self.bind_rewrite_to_query(bind_context, query.as_str(), RewriteKind::ShowDropDatabases)
             .await
     }
 
@@ -205,12 +249,10 @@ impl Binder {
         stmt: &CreateDatabaseStmt,
     ) -> Result<Plan> {
         let CreateDatabaseStmt {
-            if_not_exists,
-            catalog,
-            database,
+            create_option,
+            database: DatabaseRef { catalog, database },
             engine,
             options,
-            from_share,
         } = stmt;
 
         let tenant = self.ctx.get_tenant();
@@ -220,16 +262,10 @@ impl Binder {
             .unwrap_or_else(|| self.ctx.get_current_catalog());
         let database = normalize_identifier(database, &self.name_resolution_ctx).name;
 
-        // change the database engine to share if create from share
-        let engine = if from_share.is_some() {
-            &Some(DatabaseEngine::Share)
-        } else {
-            engine
-        };
-        let meta = self.database_meta(engine, options, from_share)?;
+        let meta = self.database_meta(engine, options)?;
 
         Ok(Plan::CreateDatabase(Box::new(CreateDatabasePlan {
-            if_not_exists: *if_not_exists,
+            create_option: create_option.clone().into(),
             tenant,
             catalog,
             database,
@@ -241,7 +277,6 @@ impl Binder {
         &self,
         engine: &Option<DatabaseEngine>,
         options: &[SQLProperty],
-        from_share: &Option<ShareNameIdent>,
     ) -> Result<DatabaseMeta> {
         let options = options
             .iter()
@@ -258,7 +293,6 @@ impl Binder {
             engine: engine.to_string(),
             engine_options,
             options,
-            from_share: from_share.clone(),
             ..Default::default()
         })
     }

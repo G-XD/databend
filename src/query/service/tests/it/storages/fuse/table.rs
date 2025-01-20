@@ -14,21 +14,22 @@
 
 use std::default::Default;
 
-use common_base::base::tokio;
-use common_exception::Result;
-use common_meta_app::schema::TableInfo;
-use common_sql::executor::table_read_plan::ToReadDataSourcePlan;
+use databend_common_base::base::tokio;
+use databend_common_exception::Result;
+use databend_common_meta_app::schema::TableInfo;
+use databend_common_sql::executor::table_read_plan::ToReadDataSourcePlan;
 use databend_query::storages::fuse::FuseTable;
 use databend_query::stream::ReadDataBlockStream;
-use databend_query::test_kits::table_test_fixture::TestFixture;
+use databend_query::test_kits::*;
+use databend_storages_common_table_meta::table::OPT_KEY_DATABASE_ID;
 use futures::TryStreamExt;
-use storages_common_table_meta::table::OPT_KEY_DATABASE_ID;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_fuse_table_normal_case() -> Result<()> {
-    let fixture = TestFixture::new().await;
-    let ctx = fixture.ctx();
+    let fixture = TestFixture::setup().await?;
+    let ctx = fixture.new_query_ctx().await?;
 
+    fixture.create_default_database().await?;
     fixture.create_default_table().await?;
 
     let mut table = fixture.latest_default_table().await?;
@@ -54,7 +55,9 @@ async fn test_fuse_table_normal_case() -> Result<()> {
         let (stats, _) = table.read_partitions(ctx.clone(), None, true).await?;
         assert_eq!(stats.read_rows, num_blocks * rows_per_block);
 
-        let plan = table.read_plan(ctx.clone(), None, true).await?;
+        let plan = table
+            .read_plan(ctx.clone(), None, None, false, true)
+            .await?;
 
         let stream = table.read_data_block_stream(ctx.clone(), &plan).await?;
         let blocks = stream.try_collect::<Vec<_>>().await?;
@@ -71,12 +74,15 @@ async fn test_fuse_table_normal_case() -> Result<()> {
             "| Column 0 | Column 1 |",
             "+----------+----------+",
             "| 1        | (2, 3)   |",
-            "| 1        | (2, 3)   |",
+            "| 2        | (2, 3)   |",
             "| 2        | (4, 6)   |",
-            "| 2        | (4, 6)   |",
+            "| 4        | (4, 6)   |",
             "+----------+----------+",
         ];
-        common_expression::block_debug::assert_blocks_sorted_eq(expected, blocks.as_slice());
+        databend_common_expression::block_debug::assert_blocks_sorted_eq(
+            expected,
+            blocks.as_slice(),
+        );
     }
 
     // test commit with overwrite
@@ -102,7 +108,9 @@ async fn test_fuse_table_normal_case() -> Result<()> {
         let (stats, _) = table.read_partitions(ctx.clone(), None, true).await?;
         assert_eq!(stats.read_rows, num_blocks * rows_per_block);
 
-        let plan = table.read_plan(ctx.clone(), None, true).await?;
+        let plan = table
+            .read_plan(ctx.clone(), None, None, false, true)
+            .await?;
         let stream = table.read_data_block_stream(ctx.clone(), &plan).await?;
 
         let blocks = stream.try_collect::<Vec<_>>().await?;
@@ -115,12 +123,15 @@ async fn test_fuse_table_normal_case() -> Result<()> {
             "| Column 0 | Column 1 |",
             "+----------+----------+",
             "| 2        | (4, 6)   |",
-            "| 2        | (4, 6)   |",
             "| 3        | (6, 9)   |",
-            "| 3        | (6, 9)   |",
+            "| 4        | (4, 6)   |",
+            "| 6        | (6, 9)   |",
             "+----------+----------+",
         ];
-        common_expression::block_debug::assert_blocks_sorted_eq(expected, blocks.as_slice());
+        databend_common_expression::block_debug::assert_blocks_sorted_eq(
+            expected,
+            blocks.as_slice(),
+        );
     }
 
     Ok(())
@@ -136,7 +147,7 @@ fn test_parse_storage_prefix() -> Result<()> {
         .meta
         .options
         .insert(OPT_KEY_DATABASE_ID.to_owned(), db_id.to_string());
-    let prefix = FuseTable::parse_storage_prefix(&tbl_info)?;
+    let prefix = FuseTable::parse_storage_prefix_from_table_info(&tbl_info)?;
     assert_eq!(format!("{}/{}", db_id, tbl_id), prefix);
     Ok(())
 }

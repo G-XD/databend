@@ -1,4 +1,4 @@
-// Copyright 2021 Datafuse Labs.
+// Copyright 2021 Datafuse Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,26 +14,30 @@
 
 use std::sync::Arc;
 
-use common_base::base::tokio;
-use common_exception::ErrorCode;
-use common_exception::Result;
-use common_management::*;
-use common_meta_app::principal::StageFile;
-use common_meta_app::principal::StageInfo;
-use common_meta_app::principal::StageParams;
-use common_meta_app::storage::StorageParams;
-use common_meta_app::storage::StorageS3Config;
-use common_meta_embedded::MetaEmbedded;
-use common_meta_kvapi::kvapi::KVApi;
-use common_meta_types::MatchSeq;
-use common_meta_types::SeqV;
+use databend_common_base::base::tokio;
+use databend_common_exception::ErrorCode;
+use databend_common_exception::Result;
+use databend_common_management::*;
+use databend_common_meta_app::principal::StageFile;
+use databend_common_meta_app::principal::StageInfo;
+use databend_common_meta_app::principal::StageParams;
+use databend_common_meta_app::schema::CreateOption;
+use databend_common_meta_app::storage::StorageParams;
+use databend_common_meta_app::storage::StorageS3Config;
+use databend_common_meta_app::tenant::Tenant;
+use databend_common_meta_embedded::MemMeta;
+use databend_common_meta_kvapi::kvapi::KVApi;
+use databend_common_meta_types::seq_value::SeqV;
+use fastrace::func_name;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn test_add_stage() -> Result<()> {
     let (kv_api, stage_api) = new_stage_api().await?;
 
     let stage_info = create_test_stage_info();
-    stage_api.add_stage(stage_info.clone()).await?;
+    stage_api
+        .add_stage(stage_info.clone(), &CreateOption::Create)
+        .await?;
     let value = kv_api.get_kv("__fd_stages/admin/mystage").await?;
 
     match value {
@@ -58,9 +62,14 @@ async fn test_already_exists_add_stage() -> Result<()> {
     let (_, stage_api) = new_stage_api().await?;
 
     let stage_info = create_test_stage_info();
-    stage_api.add_stage(stage_info.clone()).await?;
+    stage_api
+        .add_stage(stage_info.clone(), &CreateOption::Create)
+        .await?;
 
-    match stage_api.add_stage(stage_info.clone()).await {
+    match stage_api
+        .add_stage(stage_info.clone(), &CreateOption::Create)
+        .await
+    {
         Ok(_) => panic!("Already exists add stage must be return Err."),
         Err(cause) => assert_eq!(cause.code(), 2502),
     }
@@ -76,7 +85,9 @@ async fn test_successfully_get_stages() -> Result<()> {
     assert_eq!(stages, vec![]);
 
     let stage_info = create_test_stage_info();
-    stage_api.add_stage(stage_info.clone()).await?;
+    stage_api
+        .add_stage(stage_info.clone(), &CreateOption::Create)
+        .await?;
 
     let stages = stage_api.get_stages().await?;
     assert_eq!(stages[0], stage_info);
@@ -88,7 +99,9 @@ async fn test_successfully_drop_stage() -> Result<()> {
     let (_, stage_api) = new_stage_api().await?;
 
     let stage_info = create_test_stage_info();
-    stage_api.add_stage(stage_info.clone()).await?;
+    stage_api
+        .add_stage(stage_info.clone(), &CreateOption::Create)
+        .await?;
 
     let stages = stage_api.get_stages().await?;
     assert_eq!(stages, vec![stage_info.clone()]);
@@ -125,9 +138,12 @@ fn create_test_stage_info() -> StageInfo {
     }
 }
 
-async fn new_stage_api() -> Result<(Arc<MetaEmbedded>, StageMgr)> {
-    let test_api = Arc::new(MetaEmbedded::new_temp().await?);
-    let mgr = StageMgr::create(test_api.clone(), "admin")?;
+async fn new_stage_api() -> Result<(Arc<MemMeta>, StageMgr)> {
+    let test_api = Arc::new(MemMeta::default());
+    let mgr = StageMgr::create(
+        test_api.clone(),
+        &Tenant::new_or_err("admin", func_name!()).unwrap(),
+    );
     Ok((test_api, mgr))
 }
 
@@ -136,11 +152,10 @@ async fn test_add_stage_file() -> Result<()> {
     let (kv_api, stage_api) = new_stage_api().await?;
 
     let stage_info = create_test_stage_info();
-    let seq = stage_api.add_stage(stage_info.clone()).await?;
-    let mystage = stage_api
-        .get_stage("mystage", MatchSeq::Exact(seq))
-        .await?
-        .data;
+    stage_api
+        .add_stage(stage_info.clone(), &CreateOption::Create)
+        .await?;
+    let mystage = stage_api.get_stage("mystage").await?;
     assert_eq!(mystage.number_of_files, 0);
 
     let stage_file = StageFile {
@@ -167,7 +182,7 @@ async fn test_add_stage_file() -> Result<()> {
         catch => panic!("GetKVActionReply{:?}", catch),
     }
 
-    let new_mystage = stage_api.get_stage("mystage", MatchSeq::GE(0)).await?.data;
+    let new_mystage = stage_api.get_stage("mystage").await?;
     assert_eq!(mystage.number_of_files + 1, new_mystage.number_of_files);
     Ok(())
 }
@@ -176,11 +191,10 @@ async fn test_add_stage_file() -> Result<()> {
 async fn test_remove_files() -> Result<()> {
     let (_kv_api, stage_api) = new_stage_api().await?;
     let stage_info = create_test_stage_info();
-    let seq = stage_api.add_stage(stage_info.clone()).await?;
-    let mystage = stage_api
-        .get_stage("mystage", MatchSeq::Exact(seq))
-        .await?
-        .data;
+    stage_api
+        .add_stage(stage_info.clone(), &CreateOption::Create)
+        .await?;
+    let mystage = stage_api.get_stage("mystage").await?;
     assert_eq!(mystage.number_of_files, 0);
 
     stage_api
@@ -205,7 +219,7 @@ async fn test_remove_files() -> Result<()> {
     assert_eq!(files.len(), 1);
     assert_eq!(files[0].path, "test/books.csv".to_string());
 
-    let new_mystage = stage_api.get_stage("mystage", MatchSeq::GE(0)).await?.data;
+    let new_mystage = stage_api.get_stage("mystage").await?;
     assert_eq!(new_mystage.number_of_files, 1);
     Ok(())
 }

@@ -12,34 +12,60 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::collections::HashSet;
 use std::sync::Arc;
+use std::time::Duration;
 use std::time::SystemTime;
 
-use common_catalog::plan::PushDownInfo;
-use common_exception::ErrorCode;
-use common_exception::Result;
-use log::info;
+use databend_common_ast::ast::Query;
+use databend_common_ast::ast::Statement;
+use databend_common_catalog::lock::LockTableOption;
+use databend_common_exception::ErrorCode;
+use databend_common_exception::Result;
+use databend_common_sql::executor::PhysicalPlanBuilder;
+use databend_common_sql::optimizer::SExpr;
+use databend_common_sql::plans::set_update_stream_columns;
+use databend_common_sql::plans::Plan;
+use databend_common_sql::plans::Recluster;
+use databend_common_sql::MetadataRef;
+use databend_common_sql::Planner;
+use log::error;
+use log::warn;
 
+use crate::interpreters::hook::vacuum_hook::hook_disk_temp_dir;
+use crate::interpreters::hook::vacuum_hook::hook_vacuum_temp_files;
 use crate::interpreters::Interpreter;
 use crate::interpreters::InterpreterClusteringHistory;
 use crate::pipelines::executor::ExecutorSettings;
 use crate::pipelines::executor::PipelineCompleteExecutor;
-use crate::pipelines::Pipeline;
 use crate::pipelines::PipelineBuildResult;
+use crate::schedulers::build_query_pipeline_without_render_result_set;
 use crate::sessions::QueryContext;
 use crate::sessions::TableContext;
-use crate::sql::plans::ReclusterTablePlan;
-
-const MAX_RECLUSTER_TIMES: usize = 1000;
 
 pub struct ReclusterTableInterpreter {
     ctx: Arc<QueryContext>,
-    plan: ReclusterTablePlan,
+    s_expr: SExpr,
+    hilbert_query: Option<Box<Query>>,
+    lock_opt: LockTableOption,
+    is_final: bool,
 }
 
 impl ReclusterTableInterpreter {
-    pub fn try_create(ctx: Arc<QueryContext>, plan: ReclusterTablePlan) -> Result<Self> {
-        Ok(Self { ctx, plan })
+    pub fn try_create(
+        ctx: Arc<QueryContext>,
+        s_expr: SExpr,
+        hilbert_query: Option<Box<Query>>,
+        lock_opt: LockTableOption,
+        is_final: bool,
+    ) -> Result<Self> {
+        Ok(Self {
+            ctx,
+            s_expr,
+            hilbert_query,
+            lock_opt,
+            is_final,
+        })
     }
 }
 
@@ -49,104 +75,161 @@ impl Interpreter for ReclusterTableInterpreter {
         "ReclusterTableInterpreter"
     }
 
+    fn is_ddl(&self) -> bool {
+        true
+    }
+
     #[async_backtrace::framed]
     async fn execute2(&self) -> Result<PipelineBuildResult> {
-        let plan = &self.plan;
         let ctx = self.ctx.clone();
-        let settings = ctx.get_settings();
-        let tenant = ctx.get_tenant();
-        let start = SystemTime::now();
+        let recluster_timeout_secs = ctx.get_settings().get_recluster_timeout_secs()?;
 
-        // Build extras via push down scalar
-        let extras = if let Some(scalar) = &plan.push_downs {
-            let filter = scalar
-                .as_expr()?
-                .project_column_ref(|col| col.column_name.clone())
-                .as_remote_expr();
-
-            Some(PushDownInfo {
-                filter: Some(filter),
-                ..PushDownInfo::default()
-            })
-        } else {
-            None
-        };
-
-        // Status.
-        {
-            let status = "recluster: begin to run recluster";
-            ctx.set_status_info(status);
-            info!("{}", status);
-        }
         let mut times = 0;
-        let mut block_count = 0;
-        let max_threads = settings.get_max_threads()?;
+        let start = SystemTime::now();
+        let timeout = Duration::from_secs(recluster_timeout_secs);
+        let plan: Recluster = self.s_expr.plan().clone().try_into()?;
         loop {
-            let table = self
-                .ctx
-                .get_catalog(&plan.catalog)
-                .await?
-                .get_table(tenant.as_str(), &plan.database, &plan.table)
-                .await?;
-
-            // check if the table is locked.
-            let catalog = self.ctx.get_catalog(&self.plan.catalog).await?;
-            let reply = catalog
-                .list_table_lock_revs(table.get_table_info().ident.table_id)
-                .await?;
-            if !reply.is_empty() {
-                return Err(ErrorCode::TableAlreadyLocked(format!(
-                    "table '{}' is locked, please retry recluster later",
-                    self.plan.table
-                )));
+            if let Err(err) = ctx.check_aborting() {
+                error!(
+                    "execution of recluster statement aborted. server is shutting down or the query was killed",
+                );
+                return Err(err.with_context("failed to execute"));
             }
 
-            let mut pipeline = Pipeline::create();
-            let reclustered_block_count = table
-                .recluster(ctx.clone(), extras.clone(), plan.limit, &mut pipeline)
-                .await?;
-            if pipeline.is_empty() {
-                break;
-            };
+            let res = self.execute_recluster(plan.clone()).await;
 
-            block_count += reclustered_block_count;
-            let max_threads = std::cmp::min(max_threads, reclustered_block_count) as usize;
-            pipeline.set_max_threads(max_threads);
+            match res {
+                Ok(is_break) => {
+                    if is_break {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    if self.is_final
+                        && matches!(
+                            e.code(),
+                            ErrorCode::TABLE_LOCK_EXPIRED
+                                | ErrorCode::TABLE_ALREADY_LOCKED
+                                | ErrorCode::TABLE_VERSION_MISMATCHED
+                                | ErrorCode::UNRESOLVABLE_CONFLICT
+                        )
+                    {
+                        warn!("Execute recluster error: {:?}", e);
+                    } else {
+                        return Err(e);
+                    }
+                }
+            }
 
-            let query_id = ctx.get_id();
-            let executor_settings = ExecutorSettings::try_create(&settings, query_id)?;
-            let executor = PipelineCompleteExecutor::try_create(pipeline, executor_settings)?;
-
-            ctx.set_executor(executor.get_inner())?;
-            executor.execute()?;
-
+            let elapsed_time = SystemTime::now().duration_since(start).unwrap();
             times += 1;
             // Status.
             {
                 let status = format!(
-                    "recluster: run recluster tasks:{} times, cost:{} sec",
-                    times,
-                    start.elapsed().map_or(0, |d| d.as_secs())
+                    "recluster: run recluster tasks:{} times, cost:{:?}",
+                    times, elapsed_time
                 );
                 ctx.set_status_info(&status);
-                info!("{}", &status);
             }
 
-            if !plan.is_final || times >= MAX_RECLUSTER_TIMES {
+            if !self.is_final {
                 break;
             }
-        }
 
-        if block_count != 0 {
-            InterpreterClusteringHistory::write_log(
-                &ctx,
-                start,
-                &plan.database,
-                &plan.table,
-                block_count,
-            )?;
+            if elapsed_time >= timeout {
+                warn!(
+                    "Recluster stopped because the runtime was over {:?}",
+                    timeout
+                );
+                break;
+            }
+
+            self.ctx.clear_selected_segment_locations();
+            self.ctx
+                .evict_table_from_cache(&plan.catalog, &plan.database, &plan.table)?;
         }
 
         Ok(PipelineBuildResult::create())
+    }
+}
+
+impl ReclusterTableInterpreter {
+    async fn execute_recluster(&self, op: Recluster) -> Result<bool> {
+        let start = SystemTime::now();
+
+        // try to add lock table.
+        let lock_guard = self
+            .ctx
+            .clone()
+            .acquire_table_lock(&op.catalog, &op.database, &op.table, &self.lock_opt)
+            .await?;
+
+        let tbl = self
+            .ctx
+            .get_table(&op.catalog, &op.database, &op.table)
+            .await?;
+        let (s_expr, metadata, required) = if let Some(hilbert) = &self.hilbert_query {
+            let mut planner = Planner::new(self.ctx.clone());
+            let plan = planner
+                .plan_stmt(&Statement::Query(hilbert.clone()), false)
+                .await?;
+            let Plan::Query {
+                mut s_expr,
+                metadata,
+                bind_context,
+                ..
+            } = plan
+            else {
+                unreachable!()
+            };
+            if tbl.change_tracking_enabled() {
+                *s_expr = set_update_stream_columns(&s_expr)?;
+            }
+            let s_expr = self.s_expr.replace_children(vec![Arc::new(*s_expr)]);
+            (s_expr, metadata, bind_context.column_set())
+        } else {
+            (self.s_expr.clone(), MetadataRef::default(), HashSet::new())
+        };
+
+        let mut builder = PhysicalPlanBuilder::new(metadata, self.ctx.clone(), false);
+        let physical_plan = match builder.build(&s_expr, required).await {
+            Ok(res) => res,
+            Err(e) => {
+                return if e.code() == ErrorCode::NO_NEED_TO_RECLUSTER {
+                    Ok(true)
+                } else {
+                    Err(e)
+                };
+            }
+        };
+
+        let mut build_res =
+            build_query_pipeline_without_render_result_set(&self.ctx, &physical_plan).await?;
+        debug_assert!(build_res.main_pipeline.is_complete_pipeline()?);
+
+        let max_threads = self.ctx.get_settings().get_max_threads()? as usize;
+        build_res.set_max_threads(max_threads);
+
+        let executor_settings = ExecutorSettings::try_create(self.ctx.clone())?;
+
+        let mut pipelines = build_res.sources_pipelines;
+        pipelines.push(build_res.main_pipeline);
+
+        let complete_executor =
+            PipelineCompleteExecutor::from_pipelines(pipelines, executor_settings)?;
+        self.ctx.clear_written_segment_locations()?;
+        self.ctx.set_executor(complete_executor.get_inner())?;
+        complete_executor.execute()?;
+        // make sure the executor is dropped before the next loop.
+        drop(complete_executor);
+        // make sure the lock guard is dropped before the next loop.
+        drop(lock_guard);
+
+        // vacuum temp files.
+        hook_vacuum_temp_files(&self.ctx)?;
+        hook_disk_temp_dir(&self.ctx)?;
+
+        InterpreterClusteringHistory::write_log(&self.ctx, start, &op.database, &op.table)?;
+        Ok(false)
     }
 }

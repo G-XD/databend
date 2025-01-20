@@ -15,10 +15,10 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use common_catalog::catalog::CatalogManager;
-use common_exception::Result;
-use common_sql::plans::DropCatalogPlan;
-use common_storages_fuse::TableContext;
+use databend_common_catalog::catalog::CatalogManager;
+use databend_common_exception::Result;
+use databend_common_sql::plans::DropCatalogPlan;
+use databend_common_storages_fuse::TableContext;
 use log::debug;
 
 use super::Interpreter;
@@ -42,7 +42,11 @@ impl Interpreter for DropCatalogInterpreter {
         "DropCatalogInterpreter"
     }
 
-    #[minitrace::trace]
+    fn is_ddl(&self) -> bool {
+        true
+    }
+
+    #[fastrace::trace]
     #[async_backtrace::framed]
     async fn execute2(&self) -> Result<PipelineBuildResult> {
         debug!("ctx.id" = self.ctx.get_id().as_str(); "drop_catalog_execute");

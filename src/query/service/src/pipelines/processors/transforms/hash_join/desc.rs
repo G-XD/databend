@@ -12,13 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use common_exception::Result;
-use common_expression::type_check::check_function;
-use common_expression::Expr;
-use common_expression::RemoteExpr;
-use common_functions::BUILTIN_FUNCTIONS;
-use common_hashtable::RowPtr;
-use common_sql::executor::HashJoin;
+use databend_common_exception::Result;
+use databend_common_expression::type_check::check_function;
+use databend_common_expression::Expr;
+use databend_common_expression::RemoteExpr;
+use databend_common_functions::BUILTIN_FUNCTIONS;
+use databend_common_sql::executor::cast_expr_to_non_null_boolean;
+use databend_common_sql::executor::physical_plans::HashJoin;
+use databend_common_sql::IndexType;
 use parking_lot::RwLock;
 
 use crate::sql::plans::JoinType;
@@ -32,27 +33,24 @@ pub struct MarkJoinDesc {
     pub(crate) has_null: RwLock<bool>,
 }
 
-pub struct JoinState {
-    pub(crate) _build_indexes: RwLock<Vec<RowPtr>>,
-}
-
-impl JoinState {
-    pub fn create() -> Result<Self> {
-        Ok(JoinState {
-            _build_indexes: RwLock::new(Vec::with_capacity(1)),
-        })
-    }
-}
-
 pub struct HashJoinDesc {
     pub(crate) build_keys: Vec<Expr>,
     pub(crate) probe_keys: Vec<Expr>,
+    pub(crate) is_null_equal: Vec<bool>,
     pub(crate) join_type: JoinType,
+    pub(crate) single_to_inner: Option<JoinType>,
+    /// when we have non-equal conditions for hash join,
+    /// for example `a = b and c = d and e > f`, we will use `and_filters`
+    /// to wrap `e > f` as a other_predicate to do next step's check.
     pub(crate) other_predicate: Option<Expr>,
     pub(crate) marker_join_desc: MarkJoinDesc,
     /// Whether the Join are derived from correlated subquery.
     pub(crate) from_correlated_subquery: bool,
-    pub(crate) join_state: JoinState,
+    pub(crate) probe_keys_rt: Vec<Option<(Expr<String>, IndexType)>>,
+    // Under cluster, mark if the join is broadcast join.
+    pub broadcast: bool,
+    // If enable bloom runtime filter
+    pub enable_bloom_runtime_filter: bool,
 }
 
 impl HashJoinDesc {
@@ -70,26 +68,50 @@ impl HashJoinDesc {
             .map(|k| k.as_expr(&BUILTIN_FUNCTIONS))
             .collect();
 
+        let probe_keys_rt: Vec<Option<(Expr<String>, IndexType)>> = join
+            .probe_keys_rt
+            .iter()
+            .map(|probe_key_rt| {
+                probe_key_rt
+                    .as_ref()
+                    .map(|(expr, idx)| (expr.as_expr(&BUILTIN_FUNCTIONS), *idx))
+            })
+            .collect();
+
         Ok(HashJoinDesc {
             join_type: join.join_type.clone(),
             build_keys,
             probe_keys,
+            is_null_equal: join.is_null_equal.clone(),
             other_predicate,
             marker_join_desc: MarkJoinDesc {
                 has_null: RwLock::new(false),
                 // marker_index: join.marker_index,
             },
             from_correlated_subquery: join.from_correlated_subquery,
-            join_state: JoinState::create()?,
+            probe_keys_rt,
+            broadcast: join.broadcast,
+            single_to_inner: join.single_to_inner.clone(),
+            enable_bloom_runtime_filter: join.enable_bloom_runtime_filter,
         })
     }
 
     fn join_predicate(non_equi_conditions: &[RemoteExpr]) -> Result<Option<Expr>> {
-        non_equi_conditions
+        let expr = non_equi_conditions
             .iter()
             .map(|expr| expr.as_expr(&BUILTIN_FUNCTIONS))
             .try_reduce(|lhs, rhs| {
                 check_function(None, "and_filters", &[], &[lhs, rhs], &BUILTIN_FUNCTIONS)
-            })
+            });
+        // For RIGHT MARK join, we can't use is_true to cast filter into non_null boolean
+        match expr {
+            Ok(Some(expr)) => match expr {
+                Expr::Constant { ref scalar, .. } if !scalar.is_null() => {
+                    Ok(Some(cast_expr_to_non_null_boolean(expr)?))
+                }
+                _ => Ok(Some(expr)),
+            },
+            other => other,
+        }
     }
 }

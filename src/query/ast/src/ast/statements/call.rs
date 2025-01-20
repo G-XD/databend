@@ -15,18 +15,21 @@
 use std::fmt::Display;
 use std::fmt::Formatter;
 
-use crate::ast::write_comma_separated_list;
+use derive_visitor::Drive;
+use derive_visitor::DriveMut;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+use crate::ast::write_comma_separated_string_list;
+
+#[derive(Debug, Clone, PartialEq, Eq, Drive, DriveMut)]
 pub struct CallStmt {
     pub name: String,
     pub args: Vec<String>,
 }
 
 impl Display for CallStmt {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
         write!(f, "CALL {}(", self.name)?;
-        write_comma_separated_list(f, self.args.clone())?;
+        write_comma_separated_string_list(f, self.args.clone())?;
         write!(f, ")")?;
         Ok(())
     }

@@ -12,14 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::any::Any;
-
 use ahash::HashSet;
-use common_exception::ErrorCode;
-use common_expression::BlockMetaInfo;
-use common_expression::BlockMetaInfoDowncast;
-use common_expression::DataBlock;
-use common_expression::Scalar;
+use databend_common_exception::ErrorCode;
+use databend_common_expression::BlockMetaInfo;
+use databend_common_expression::BlockMetaInfoDowncast;
+use databend_common_expression::DataBlock;
+use databend_common_expression::Scalar;
 
 // This mod need to be refactored, since it not longer aiming to be
 // used in the implementation of `MERGE INTO` statement in the future.
@@ -47,14 +45,8 @@ pub struct DeletionByColumn {
 
 #[typetag::serde(name = "merge_into_operation_meta")]
 impl BlockMetaInfo for MergeIntoOperation {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn equals(&self, info: &Box<dyn BlockMetaInfo>) -> bool {
-        info.as_any()
-            .downcast_ref::<MergeIntoOperation>()
-            .is_some_and(|other| self == other)
+        Self::downcast_ref_from(info).is_some_and(|other| self == other)
     }
 
     fn clone_self(&self) -> Box<dyn BlockMetaInfo> {

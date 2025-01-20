@@ -12,11 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use common_meta_app::principal::UserDefinedFunction;
+use databend_common_meta_app::principal::UserDefinedFunction;
+use databend_common_meta_app::schema::CreateOption;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CreateUDFPlan {
-    pub if_not_exists: bool,
+    pub create_option: CreateOption,
     pub udf: UserDefinedFunction,
 }
 
@@ -28,5 +29,5 @@ pub struct AlterUDFPlan {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DropUDFPlan {
     pub if_exists: bool,
-    pub name: String,
+    pub udf: String,
 }

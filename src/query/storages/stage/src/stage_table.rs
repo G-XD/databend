@@ -13,60 +13,55 @@
 // limitations under the License.
 
 use std::any::Any;
-use std::ops::Deref;
-use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 
-use common_base::base::uuid;
-use common_catalog::plan::DataSourceInfo;
-use common_catalog::plan::DataSourcePlan;
-use common_catalog::plan::PartInfo;
-use common_catalog::plan::PartStatistics;
-use common_catalog::plan::Partitions;
-use common_catalog::plan::PartitionsShuffleKind;
-use common_catalog::plan::Projection;
-use common_catalog::plan::PushDownInfo;
-use common_catalog::plan::StageTableInfo;
-use common_catalog::table::AppendMode;
-use common_catalog::table::Table;
-use common_catalog::table_context::TableContext;
-use common_exception::ErrorCode;
-use common_exception::Result;
-use common_expression::BlockThresholds;
-use common_expression::TableSchemaRefExt;
-use common_meta_app::principal::FileFormatParams;
-use common_meta_app::principal::StageInfo;
-use common_meta_app::schema::TableInfo;
-use common_pipeline_core::Pipeline;
-use common_pipeline_sources::input_formats::InputContext;
-use common_pipeline_sources::input_formats::SplitInfo;
-use common_storage::init_stage_operator;
-use common_storage::StageFileInfo;
-use dashmap::DashMap;
-use log::debug;
+use databend_common_catalog::plan::DataSourceInfo;
+use databend_common_catalog::plan::DataSourcePlan;
+use databend_common_catalog::plan::PartInfo;
+use databend_common_catalog::plan::PartStatistics;
+use databend_common_catalog::plan::Partitions;
+use databend_common_catalog::plan::PartitionsShuffleKind;
+use databend_common_catalog::plan::PushDownInfo;
+use databend_common_catalog::plan::StageTableInfo;
+use databend_common_catalog::table::DistributionLevel;
+use databend_common_catalog::table::Table;
+use databend_common_catalog::table_context::TableContext;
+use databend_common_exception::ErrorCode;
+use databend_common_exception::Result;
+use databend_common_meta_app::principal::FileFormatParams;
+use databend_common_meta_app::principal::StageInfo;
+use databend_common_meta_app::schema::TableInfo;
+use databend_common_pipeline_core::Pipeline;
+use databend_common_storage::init_stage_operator;
+use databend_common_storage::StageFileInfo;
+use databend_common_storages_orc::OrcTableForCopy;
+use databend_common_storages_parquet::ParquetTableForCopy;
+use databend_storages_common_stage::SingleFilePartition;
 use opendal::Operator;
-use parking_lot::Mutex;
 
-use crate::parquet_file::append_data_to_parquet_files;
-use crate::row_based_file::append_data_to_row_based_files;
+use crate::read::row_based::RowBasedReadPipelineBuilder;
+
 /// TODO: we need to track the data metrics in stage table.
 pub struct StageTable {
-    table_info: StageTableInfo,
+    pub(crate) table_info: StageTableInfo,
     // This is no used but a placeholder.
     // But the Table trait need it:
     // fn get_table_info(&self) -> &TableInfo).
     table_info_placeholder: TableInfo,
-    block_compact_threshold: Mutex<Option<BlockThresholds>>,
 }
 
 impl StageTable {
     pub fn try_create(table_info: StageTableInfo) -> Result<Arc<dyn Table>> {
-        let table_info_placeholder = TableInfo::default().set_schema(table_info.schema());
+        let table_info_placeholder = TableInfo {
+            // `system.stage` is used to forbid the user to select * from text files.
+            name: "stage".to_string(),
+            ..Default::default()
+        }
+        .set_schema(table_info.schema());
 
         Ok(Arc::new(Self {
             table_info,
             table_info_placeholder,
-            block_compact_threshold: Default::default(),
         }))
     }
 
@@ -78,14 +73,53 @@ impl StageTable {
     #[async_backtrace::framed]
     pub async fn list_files(
         stage_info: &StageTableInfo,
+        thread_num: usize,
         max_files: Option<usize>,
     ) -> Result<Vec<StageFileInfo>> {
-        stage_info.list_files(max_files).await
+        stage_info.list_files(thread_num, max_files).await
     }
 
-    fn get_block_compact_thresholds_with_default(&self) -> BlockThresholds {
-        let guard = self.block_compact_threshold.lock();
-        guard.deref().unwrap_or_default()
+    pub async fn read_partitions_simple(
+        &self,
+        ctx: Arc<dyn TableContext>,
+        stage_table_info: &StageTableInfo,
+    ) -> Result<(PartStatistics, Partitions)> {
+        let thread_num = ctx.get_settings().get_max_threads()? as usize;
+
+        let files = if let Some(files) = &stage_table_info.files_to_copy {
+            files.clone()
+        } else {
+            StageTable::list_files(stage_table_info, thread_num, None).await?
+        };
+        let size = files.iter().map(|f| f.size as usize).sum();
+        // assuming all fields are empty
+        let max_rows = std::cmp::max(size / (stage_table_info.schema.fields.len() + 1), 1);
+        let statistics = PartStatistics {
+            snapshot: None,
+            read_rows: max_rows,
+            read_bytes: size,
+            partitions_scanned: files.len(),
+            partitions_total: files.len(),
+            is_exact: false,
+            pruning_stats: Default::default(),
+        };
+
+        let partitions = files
+            .into_iter()
+            .map(|v| {
+                let part = SingleFilePartition {
+                    path: v.path.clone(),
+                    size: v.size as usize,
+                };
+                let part_info: Box<dyn PartInfo> = Box::new(part);
+                Arc::new(part_info)
+            })
+            .collect::<Vec<_>>();
+
+        Ok((
+            statistics,
+            Partitions::create(PartitionsShuffleKind::Seq, partitions),
+        ))
     }
 }
 
@@ -111,35 +145,27 @@ impl Table for StageTable {
         _push_downs: Option<PushDownInfo>,
         _dry_run: bool,
     ) -> Result<(PartStatistics, Partitions)> {
-        let stage_info = &self.table_info;
-        // User set the files.
-        let files = if let Some(files) = &stage_info.files_to_copy {
-            files.clone()
-        } else {
-            StageTable::list_files(stage_info, None).await?
-        };
-        let format = InputContext::get_input_format(&stage_info.stage_info.file_format_params)?;
-        let operator = StageTable::get_op(&stage_info.stage_info)?;
-        let splits = format
-            .get_splits(
-                files,
-                &stage_info.stage_info,
-                &operator,
-                &ctx.get_settings(),
-            )
-            .await?;
+        let stage_table_info = &self.table_info;
+        match stage_table_info.stage_info.file_format_params {
+            FileFormatParams::Parquet(_) => {
+                ParquetTableForCopy::do_read_partitions(stage_table_info, ctx, _push_downs).await
+            }
 
-        let partitions = splits
-            .into_iter()
-            .map(|v| {
-                let part_info: Box<dyn PartInfo> = Box::new((*v).clone());
-                Arc::new(part_info)
-            })
-            .collect::<Vec<_>>();
-        Ok((
-            PartStatistics::default(),
-            Partitions::create_nolazy(PartitionsShuffleKind::Seq, partitions),
-        ))
+            FileFormatParams::Orc(_) => {
+                OrcTableForCopy::do_read_partitions(stage_table_info, ctx, _push_downs).await
+            }
+            FileFormatParams::Csv(_) | FileFormatParams::NdJson(_) | FileFormatParams::Tsv(_) => {
+                self.read_partitions_simple(ctx, stage_table_info).await
+            }
+            _ => unreachable!(
+                "unexpected format {} in StageTable::read_partition",
+                stage_table_info.stage_info.file_format_params
+            ),
+        }
+    }
+
+    fn distribution_level(&self) -> DistributionLevel {
+        DistributionLevel::Cluster
     }
 
     fn read_data(
@@ -147,159 +173,45 @@ impl Table for StageTable {
         ctx: Arc<dyn TableContext>,
         plan: &DataSourcePlan,
         pipeline: &mut Pipeline,
+        _put_cache: bool,
     ) -> Result<()> {
-        let projection = if let Some(PushDownInfo {
-            projection: Some(Projection::Columns(columns)),
-            ..
-        }) = &plan.push_downs
-        {
-            Some(columns.clone())
-        } else {
-            None
-        };
         let stage_table_info =
             if let DataSourceInfo::StageSource(stage_table_info) = &plan.source_info {
                 stage_table_info
             } else {
                 return Err(ErrorCode::Internal(""));
             };
-
-        let mut splits = vec![];
-        for part in &plan.parts.partitions {
-            if let Some(split) = part.as_any().downcast_ref::<SplitInfo>() {
-                splits.push(Arc::new(split.clone()));
+        match stage_table_info.stage_info.file_format_params {
+            FileFormatParams::Parquet(_) => {
+                ParquetTableForCopy::do_read_data(ctx, plan, pipeline, _put_cache)
             }
+            FileFormatParams::Orc(_) => {
+                OrcTableForCopy::do_read_data(ctx, plan, pipeline, _put_cache)
+            }
+            FileFormatParams::Csv(_) | FileFormatParams::NdJson(_) | FileFormatParams::Tsv(_) => {
+                let compact_threshold = ctx.get_read_block_thresholds();
+                RowBasedReadPipelineBuilder {
+                    stage_table_info,
+                    compact_threshold,
+                }
+                .read_data(ctx, plan, pipeline)
+            }
+            _ => unreachable!(
+                "unexpected format {} in StageTable::read_partition",
+                stage_table_info.stage_info.file_format_params
+            ),
         }
-
-        //  Build copy pipeline.
-        let settings = ctx.get_settings();
-        let fields = stage_table_info
-            .schema
-            .fields()
-            .iter()
-            .filter(|f| f.computed_expr().is_none())
-            .cloned()
-            .collect::<Vec<_>>();
-        let schema = TableSchemaRefExt::create(fields);
-        let stage_info = stage_table_info.stage_info.clone();
-        let operator = StageTable::get_op(&stage_table_info.stage_info)?;
-        let compact_threshold = self.get_block_compact_thresholds_with_default();
-        let on_error_map = ctx.get_on_error_map().unwrap_or_else(|| {
-            let m = Arc::new(DashMap::new());
-            ctx.set_on_error_map(m.clone());
-            m
-        });
-        let input_ctx = Arc::new(InputContext::try_create_from_copy(
-            operator,
-            settings,
-            schema,
-            stage_info,
-            splits,
-            ctx.get_scan_progress(),
-            compact_threshold,
-            on_error_map,
-            self.table_info.is_select,
-            projection,
-        )?);
-        debug!("start copy splits feeder in {}", ctx.get_cluster().local_id);
-        input_ctx.format.exec_copy(input_ctx.clone(), pipeline)?;
-        Ok(())
     }
 
-    fn append_data(
-        &self,
-        ctx: Arc<dyn TableContext>,
-        pipeline: &mut Pipeline,
-        _: AppendMode,
-    ) -> Result<()> {
-        let settings = ctx.get_settings();
-
-        let single = self.table_info.stage_info.copy_options.single;
-        let max_file_size = if single {
-            usize::MAX
-        } else {
-            let max_file_size = self.table_info.stage_info.copy_options.max_file_size;
-            if max_file_size == 0 {
-                // 256M per file by default.
-                256 * 1024 * 1024
-            } else {
-                let mem_limit = (settings.get_max_memory_usage()? / 2) as usize;
-                max_file_size.min(mem_limit)
-            }
-        };
-        let max_threads = settings.get_max_threads()? as usize;
-
-        let op = StageTable::get_op(&self.table_info.stage_info)?;
-        let fmt = self.table_info.stage_info.file_format_params.clone();
-        let uuid = uuid::Uuid::new_v4().to_string();
-        let group_id = AtomicUsize::new(0);
-        match fmt {
-            FileFormatParams::Parquet(_) => append_data_to_parquet_files(
-                pipeline,
-                ctx.clone(),
-                self.table_info.clone(),
-                op,
-                max_file_size,
-                max_threads,
-                uuid,
-                &group_id,
-            )?,
-            _ => append_data_to_row_based_files(
-                pipeline,
-                ctx.clone(),
-                self.table_info.clone(),
-                op,
-                max_file_size,
-                max_threads,
-                uuid,
-                &group_id,
-            )?,
-        };
-        Ok(())
+    fn append_data(&self, ctx: Arc<dyn TableContext>, pipeline: &mut Pipeline) -> Result<()> {
+        self.do_append_data(ctx, pipeline)
     }
 
     // Truncate the stage file.
     #[async_backtrace::framed]
-    async fn truncate(&self, _ctx: Arc<dyn TableContext>, _: bool) -> Result<()> {
+    async fn truncate(&self, _ctx: Arc<dyn TableContext>, _pipeline: &mut Pipeline) -> Result<()> {
         Err(ErrorCode::Unimplemented(
             "S3 external table truncate() unimplemented yet!",
         ))
-    }
-
-    fn get_block_thresholds(&self) -> BlockThresholds {
-        let guard = self.block_compact_threshold.lock();
-        (*guard).expect("must success")
-    }
-
-    fn set_block_thresholds(&self, thresholds: BlockThresholds) {
-        let mut guard = self.block_compact_threshold.lock();
-        (*guard) = Some(thresholds)
-    }
-}
-
-pub fn unload_path(
-    stage_table_info: &StageTableInfo,
-    uuid: &str,
-    group_id: usize,
-    batch_id: usize,
-) -> String {
-    let format_name = format!(
-        "{:?}",
-        stage_table_info.stage_info.file_format_params.get_type()
-    )
-    .to_ascii_lowercase();
-
-    let path = &stage_table_info.files_info.path;
-
-    if path.ends_with("data_") {
-        format!(
-            "{}{}_{:0>4}_{:0>8}.{}",
-            path, uuid, group_id, batch_id, format_name
-        )
-    } else {
-        format!(
-            "{}/data_{}_{:0>4}_{:0>8}.{}",
-            path, uuid, group_id, batch_id, format_name
-        )
     }
 }

@@ -14,13 +14,13 @@
 
 use std::sync::Arc;
 
-use aggregating_index::get_agg_index_handler;
-use common_exception::Result;
-use common_license::license::Feature;
-use common_license::license_manager::get_license_manager;
-use common_meta_app::schema::DropIndexReq;
-use common_meta_app::schema::IndexNameIdent;
-use common_sql::plans::DropIndexPlan;
+use databend_common_exception::Result;
+use databend_common_license::license::Feature;
+use databend_common_license::license_manager::LicenseManagerSwitch;
+use databend_common_meta_app::schema::DropIndexReq;
+use databend_common_meta_app::schema::IndexNameIdent;
+use databend_common_sql::plans::DropIndexPlan;
+use databend_enterprise_aggregating_index::get_agg_index_handler;
 
 use crate::interpreters::Interpreter;
 use crate::pipelines::PipelineBuildResult;
@@ -44,15 +44,16 @@ impl Interpreter for DropIndexInterpreter {
         "DropIndexInterpreter"
     }
 
+    fn is_ddl(&self) -> bool {
+        true
+    }
+
     #[async_backtrace::framed]
     async fn execute2(&self) -> Result<PipelineBuildResult> {
         let tenant = self.ctx.get_tenant();
-        let license_manager = get_license_manager();
-        license_manager.manager.check_enterprise_enabled(
-            &self.ctx.get_settings(),
-            tenant.clone(),
-            Feature::AggregateIndex,
-        )?;
+
+        LicenseManagerSwitch::instance()
+            .check_enterprise_enabled(self.ctx.get_license_key(), Feature::AggregateIndex)?;
 
         let index_name = self.plan.index.clone();
         let catalog = self
@@ -61,7 +62,7 @@ impl Interpreter for DropIndexInterpreter {
             .await?;
         let drop_index_req = DropIndexReq {
             if_exists: self.plan.if_exists,
-            name_ident: IndexNameIdent { tenant, index_name },
+            name_ident: IndexNameIdent::new(tenant, index_name),
         };
 
         let handler = get_agg_index_handler();

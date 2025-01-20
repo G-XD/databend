@@ -1,4 +1,4 @@
-// Copyright 2021 Datafuse Labs.
+// Copyright 2021 Datafuse Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,4 +19,5 @@ pub mod service;
 pub mod tls_constants;
 
 pub use service::start_metasrv;
+pub use service::start_metasrv_cluster;
 pub use service::start_metasrv_with_context;

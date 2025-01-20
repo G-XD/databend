@@ -14,21 +14,19 @@
 
 use std::sync::Arc;
 
-use common_expression::types::nullable::NullableColumn;
-use common_expression::types::nullable::NullableDomain;
-use common_expression::types::DataType;
-use common_expression::Column;
-use common_expression::ColumnBuilder;
-use common_expression::Domain;
-use common_expression::Function;
-use common_expression::FunctionDomain;
-use common_expression::FunctionEval;
-use common_expression::FunctionRegistry;
-use common_expression::FunctionSignature;
-use common_expression::Scalar;
-use common_expression::ScalarRef;
-use common_expression::Value;
-use common_expression::ValueRef;
+use databend_common_expression::types::nullable::NullableColumn;
+use databend_common_expression::types::nullable::NullableDomain;
+use databend_common_expression::types::DataType;
+use databend_common_expression::Column;
+use databend_common_expression::ColumnBuilder;
+use databend_common_expression::Domain;
+use databend_common_expression::Function;
+use databend_common_expression::FunctionDomain;
+use databend_common_expression::FunctionEval;
+use databend_common_expression::FunctionRegistry;
+use databend_common_expression::FunctionSignature;
+use databend_common_expression::Scalar;
+use databend_common_expression::Value;
 
 pub fn register(registry: &mut FunctionRegistry) {
     registry.register_function_factory("tuple", |_, args_type| {
@@ -48,7 +46,7 @@ pub fn register(registry: &mut FunctionRegistry) {
                 }),
                 eval: Box::new(move |args, _| {
                     let len = args.iter().find_map(|arg| match arg {
-                        ValueRef::Column(col) => Some(col.len()),
+                        Value::Column(col) => Some(col.len()),
                         _ => None,
                     });
                     if let Some(len) = len {
@@ -56,10 +54,10 @@ pub fn register(registry: &mut FunctionRegistry) {
                             .iter()
                             .zip(&args_type)
                             .map(|(arg, ty)| match arg {
-                                ValueRef::Scalar(scalar) => {
-                                    ColumnBuilder::repeat(scalar, len, ty).build()
+                                Value::Scalar(scalar) => {
+                                    ColumnBuilder::repeat(&scalar.as_ref(), len, ty).build()
                                 }
-                                ValueRef::Column(col) => col.clone(),
+                                Value::Column(col) => col.clone(),
                             })
                             .collect();
                         Value::Column(Column::Tuple(fields))
@@ -68,8 +66,8 @@ pub fn register(registry: &mut FunctionRegistry) {
                         let fields = args
                             .iter()
                             .map(|arg| match arg {
-                                ValueRef::Scalar(scalar) => (*scalar).to_owned(),
-                                ValueRef::Column(_) => unreachable!(),
+                                Value::Scalar(scalar) => scalar.clone(),
+                                Value::Column(_) => unreachable!(),
                             })
                             .collect();
                         Value::Scalar(Scalar::Tuple(fields))
@@ -81,8 +79,9 @@ pub fn register(registry: &mut FunctionRegistry) {
 
     registry.register_function_factory("get", |params, args_type| {
         // Tuple index starts from 1
-        let idx = params.first()?.checked_sub(1)?;
-        let fields_ty = match args_type.get(0)? {
+        let idx = (params.first()?.get_i64()? as usize).checked_sub(1)?;
+
+        let fields_ty = match args_type.first()? {
             DataType::Tuple(tys) => tys,
             _ => return None,
         };
@@ -103,12 +102,8 @@ pub fn register(registry: &mut FunctionRegistry) {
                     FunctionDomain::Domain(args_domain[0].as_tuple().unwrap()[idx].clone())
                 }),
                 eval: Box::new(move |args, _| match &args[0] {
-                    ValueRef::Scalar(ScalarRef::Tuple(fields)) => {
-                        Value::Scalar(fields[idx].to_owned())
-                    }
-                    ValueRef::Column(Column::Tuple(fields)) => {
-                        Value::Column(fields[idx].to_owned())
-                    }
+                    Value::Scalar(Scalar::Tuple(fields)) => Value::Scalar(fields[idx].to_owned()),
+                    Value::Column(Column::Tuple(fields)) => Value::Column(fields[idx].to_owned()),
                     _ => unreachable!(),
                 }),
             },
@@ -117,8 +112,8 @@ pub fn register(registry: &mut FunctionRegistry) {
 
     registry.register_function_factory("get", |params, args_type| {
         // Tuple index starts from 1
-        let idx = params.first()?.checked_sub(1)?;
-        let fields_ty = match args_type.get(0)? {
+        let idx = usize::try_from(params.first()?.get_i64()? - 1).ok()?;
+        let fields_ty = match args_type.first()? {
             DataType::Nullable(box DataType::Tuple(tys)) => tys,
             _ => return None,
         };
@@ -157,19 +152,17 @@ pub fn register(registry: &mut FunctionRegistry) {
                     }
                 }),
                 eval: Box::new(move |args, _| match &args[0] {
-                    ValueRef::Scalar(ScalarRef::Null) => Value::Scalar(Scalar::Null),
-                    ValueRef::Scalar(ScalarRef::Tuple(fields)) => {
-                        Value::Scalar(fields[idx].to_owned())
-                    }
-                    ValueRef::Column(Column::Nullable(box NullableColumn {
+                    Value::Scalar(Scalar::Null) => Value::Scalar(Scalar::Null),
+                    Value::Scalar(Scalar::Tuple(fields)) => Value::Scalar(fields[idx].to_owned()),
+                    Value::Column(Column::Nullable(box NullableColumn {
                         column: Column::Tuple(fields),
                         validity,
                     })) => {
                         let field_col = fields[idx].as_nullable().unwrap();
-                        Value::Column(Column::Nullable(Box::new(NullableColumn {
-                            column: field_col.column.clone(),
-                            validity: (&field_col.validity) & validity,
-                        })))
+                        Value::Column(NullableColumn::new_column(
+                            field_col.column.clone(),
+                            (&field_col.validity) & validity,
+                        ))
                     }
                     _ => unreachable!(),
                 }),
@@ -179,8 +172,8 @@ pub fn register(registry: &mut FunctionRegistry) {
 
     registry.register_function_factory("get", |params, args_type| {
         // Tuple index starts from 1
-        let idx = params.first()?.checked_sub(1)?;
-        let fields_ty = match args_type.get(0)? {
+        let idx = usize::try_from(params.first()?.get_i64()? - 1).ok()?;
+        let fields_ty = match args_type.first()? {
             DataType::Nullable(box DataType::Tuple(tys)) => tys,
             _ => return None,
         };

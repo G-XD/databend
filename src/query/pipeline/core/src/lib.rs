@@ -12,16 +12,37 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#![feature(once_cell_try)]
+#![feature(variant_count)]
+#![feature(associated_type_defaults)]
+#![allow(clippy::arc_with_non_send_sync)]
+#![allow(clippy::useless_asref)]
+
 pub mod processors;
 
-pub mod input_error;
-pub mod pipe;
-pub mod pipeline;
-pub mod pipeline_display;
-pub mod unsafe_cell_wrap;
+mod finished_chain;
+mod input_error;
+mod lock_guard;
+mod pipe;
+mod pipeline;
+mod pipeline_display;
+mod unsafe_cell_wrap;
 
+pub use finished_chain::always_callback;
+pub use finished_chain::basic_callback;
+pub use finished_chain::Callback;
+pub use finished_chain::ExecutionInfo;
+pub use finished_chain::FinishedCallbackChain;
 pub use input_error::InputError;
+pub use lock_guard::LockGuard;
+pub use lock_guard::UnlockApi;
+pub use pipe::Pipe;
+pub use pipe::PipeItem;
 pub use pipe::SinkPipeBuilder;
 pub use pipe::SourcePipeBuilder;
 pub use pipe::TransformPipeBuilder;
+pub use pipeline::DynTransformBuilder;
 pub use pipeline::Pipeline;
+pub use processors::PlanProfile;
+pub use processors::PlanScope;
+pub use processors::PlanScopeGuard;

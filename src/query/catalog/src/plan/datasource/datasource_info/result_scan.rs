@@ -14,14 +14,17 @@
 
 use std::sync::Arc;
 
-use common_expression::TableSchema;
-use common_meta_app::schema::TableInfo;
+use arrow_schema::Schema;
+use databend_common_expression::TableSchema;
+use databend_common_meta_app::schema::TableInfo;
 
 #[derive(serde::Serialize, serde::Deserialize, Clone, PartialEq, Eq, Debug)]
 pub struct ResultScanTableInfo {
     pub table_info: TableInfo,
     pub query_id: String,
-    pub block_raw_data: Vec<u8>,
+    pub location: String,
+    pub schema: Schema,
+    pub file_size: u64,
 }
 
 impl ResultScanTableInfo {

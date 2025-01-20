@@ -14,13 +14,52 @@
 
 use std::fmt::Display;
 use std::fmt::Formatter;
+use std::sync::LazyLock;
 
-use common_exception::Result;
+use databend_common_exception::Result;
 use num_derive::FromPrimitive;
 use num_derive::ToPrimitive;
 
+use crate::optimizer::extract::Matcher;
 use crate::optimizer::rule::TransformResult;
 use crate::optimizer::SExpr;
+
+pub static DEFAULT_REWRITE_RULES: LazyLock<Vec<RuleID>> = LazyLock::new(|| {
+    vec![
+        RuleID::EliminateSort,
+        RuleID::EliminateUnion,
+        RuleID::MergeEvalScalar,
+        // Filter
+        RuleID::FilterNulls,
+        RuleID::EliminateFilter,
+        RuleID::MergeFilter,
+        RuleID::NormalizeScalarFilter,
+        RuleID::PushDownFilterUnion,
+        RuleID::PushDownFilterAggregate,
+        RuleID::PushDownFilterWindow,
+        RuleID::PushDownFilterWindowTopN,
+        RuleID::PushDownFilterSort,
+        RuleID::PushDownFilterEvalScalar,
+        RuleID::PushDownFilterJoin,
+        RuleID::PushDownFilterProjectSet,
+        // Limit
+        RuleID::PushDownLimit,
+        RuleID::PushDownLimitUnion,
+        RuleID::PushDownSortEvalScalar,
+        RuleID::PushDownLimitEvalScalar,
+        RuleID::PushDownLimitSort,
+        RuleID::PushDownLimitWindow,
+        RuleID::RulePushDownRankLimitAggregate,
+        RuleID::PushDownLimitOuterJoin,
+        RuleID::PushDownLimitScan,
+        RuleID::SemiToInnerJoin,
+        RuleID::FoldCountAggregate,
+        RuleID::TryApplyAggIndex,
+        RuleID::PushDownFilterScan,
+        RuleID::PushDownPrewhere, /* PushDownPrwhere should be after all rules except PushDownFilterScan */
+        RuleID::PushDownSortScan, // PushDownSortScan should be after PushDownPrewhere
+    ]
+});
 
 pub type RulePtr = Box<dyn Rule>;
 
@@ -29,7 +68,7 @@ pub trait Rule {
 
     fn apply(&self, s_expr: &SExpr, state: &mut TransformResult) -> Result<()>;
 
-    fn patterns(&self) -> &Vec<SExpr>;
+    fn matchers(&self) -> &[Matcher];
 
     fn transformation(&self) -> bool {
         true
@@ -41,24 +80,32 @@ pub trait Rule {
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Hash, FromPrimitive, ToPrimitive)]
 pub enum RuleID {
     // Rewrite rules
+    EliminateUnion,
     NormalizeScalarFilter,
-    NormalizeDisjunctiveFilter,
     PushDownFilterAggregate,
     PushDownFilterEvalScalar,
+    FilterNulls,
     PushDownFilterUnion,
     PushDownFilterJoin,
     PushDownFilterScan,
     PushDownFilterSort,
     PushDownFilterProjectSet,
+    PushDownFilterWindow,
+    PushDownFilterWindowTopN,
+    PushDownLimit,
     PushDownLimitUnion,
     PushDownLimitOuterJoin,
-    RulePushDownLimitExpression,
+    PushDownLimitEvalScalar,
     PushDownLimitSort,
-    PushDownLimitAggregate,
+    PushDownLimitWindow,
+    RulePushDownRankLimitAggregate,
     PushDownLimitScan,
+    PushDownSortEvalScalar,
     PushDownSortScan,
+    SemiToInnerJoin,
     EliminateEvalScalar,
     EliminateFilter,
+    EliminateSort,
     MergeEvalScalar,
     MergeFilter,
     SplitAggregate,
@@ -74,29 +121,35 @@ pub enum RuleID {
 }
 
 impl Display for RuleID {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
         match self {
+            RuleID::FilterNulls => write!(f, "FilterNulls"),
             RuleID::PushDownFilterUnion => write!(f, "PushDownFilterUnion"),
             RuleID::PushDownFilterEvalScalar => write!(f, "PushDownFilterEvalScalar"),
             RuleID::PushDownFilterJoin => write!(f, "PushDownFilterJoin"),
             RuleID::PushDownFilterScan => write!(f, "PushDownFilterScan"),
             RuleID::PushDownFilterSort => write!(f, "PushDownFilterSort"),
             RuleID::PushDownFilterProjectSet => write!(f, "PushDownFilterProjectSet"),
+            RuleID::PushDownLimit => write!(f, "PushDownLimit"),
             RuleID::PushDownLimitUnion => write!(f, "PushDownLimitUnion"),
             RuleID::PushDownLimitOuterJoin => write!(f, "PushDownLimitOuterJoin"),
-            RuleID::RulePushDownLimitExpression => write!(f, "PushDownLimitExpression"),
+            RuleID::PushDownLimitEvalScalar => write!(f, "PushDownLimitEvalScalar"),
             RuleID::PushDownLimitSort => write!(f, "PushDownLimitSort"),
-            RuleID::PushDownLimitAggregate => write!(f, "PushDownLimitAggregate"),
+            RuleID::RulePushDownRankLimitAggregate => write!(f, "RulePushDownRankLimitAggregate"),
             RuleID::PushDownFilterAggregate => write!(f, "PushDownFilterAggregate"),
             RuleID::PushDownLimitScan => write!(f, "PushDownLimitScan"),
             RuleID::PushDownSortScan => write!(f, "PushDownSortScan"),
+            RuleID::PushDownSortEvalScalar => write!(f, "PushDownSortEvalScalar"),
+            RuleID::PushDownLimitWindow => write!(f, "PushDownLimitWindow"),
+            RuleID::PushDownFilterWindow => write!(f, "PushDownFilterWindow"),
+            RuleID::PushDownFilterWindowTopN => write!(f, "PushDownFilterWindowTopN"),
             RuleID::EliminateEvalScalar => write!(f, "EliminateEvalScalar"),
             RuleID::EliminateFilter => write!(f, "EliminateFilter"),
+            RuleID::EliminateSort => write!(f, "EliminateSort"),
             RuleID::MergeEvalScalar => write!(f, "MergeEvalScalar"),
             RuleID::MergeFilter => write!(f, "MergeFilter"),
             RuleID::NormalizeScalarFilter => write!(f, "NormalizeScalarFilter"),
             RuleID::SplitAggregate => write!(f, "SplitAggregate"),
-            RuleID::NormalizeDisjunctiveFilter => write!(f, "NormalizeDisjunctiveFilter"),
             RuleID::FoldCountAggregate => write!(f, "FoldCountAggregate"),
             RuleID::PushDownPrewhere => write!(f, "PushDownPrewhere"),
 
@@ -105,6 +158,8 @@ impl Display for RuleID {
             RuleID::LeftExchangeJoin => write!(f, "LeftExchangeJoin"),
             RuleID::EagerAggregation => write!(f, "EagerAggregation"),
             RuleID::TryApplyAggIndex => write!(f, "TryApplyAggIndex"),
+            RuleID::SemiToInnerJoin => write!(f, "SemiToInnerJoin"),
+            RuleID::EliminateUnion => write!(f, "EliminateUnion"),
         }
     }
 }

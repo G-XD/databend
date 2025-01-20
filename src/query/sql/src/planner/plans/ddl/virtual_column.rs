@@ -14,58 +14,66 @@
 
 use std::sync::Arc;
 
-use common_expression::DataSchema;
-use common_expression::DataSchemaRef;
+use databend_common_expression::DataSchema;
+use databend_common_expression::DataSchemaRef;
+use databend_common_expression::TableDataType;
+use databend_common_meta_app::schema::CreateOption;
+use databend_storages_common_table_meta::meta::Location;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CreateVirtualColumnsPlan {
+pub struct CreateVirtualColumnPlan {
+    pub create_option: CreateOption,
     pub catalog: String,
     pub database: String,
     pub table: String,
-    pub virtual_columns: Vec<String>,
+    pub virtual_columns: Vec<(String, TableDataType)>,
 }
 
-impl CreateVirtualColumnsPlan {
+impl CreateVirtualColumnPlan {
     pub fn schema(&self) -> DataSchemaRef {
         Arc::new(DataSchema::empty())
     }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct AlterVirtualColumnsPlan {
+pub struct AlterVirtualColumnPlan {
+    pub if_exists: bool,
     pub catalog: String,
     pub database: String,
     pub table: String,
-    pub virtual_columns: Vec<String>,
+    pub virtual_columns: Vec<(String, TableDataType)>,
 }
 
-impl AlterVirtualColumnsPlan {
+impl AlterVirtualColumnPlan {
     pub fn schema(&self) -> DataSchemaRef {
         Arc::new(DataSchema::empty())
     }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct DropVirtualColumnsPlan {
+pub struct DropVirtualColumnPlan {
+    pub if_exists: bool,
     pub catalog: String,
     pub database: String,
     pub table: String,
 }
 
-impl DropVirtualColumnsPlan {
+impl DropVirtualColumnPlan {
     pub fn schema(&self) -> DataSchemaRef {
         Arc::new(DataSchema::empty())
     }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct GenerateVirtualColumnsPlan {
+pub struct RefreshVirtualColumnPlan {
     pub catalog: String,
     pub database: String,
     pub table: String,
+    pub virtual_columns: Vec<(String, TableDataType)>,
+    pub segment_locs: Option<Vec<Location>>,
 }
 
-impl GenerateVirtualColumnsPlan {
+impl RefreshVirtualColumnPlan {
     pub fn schema(&self) -> DataSchemaRef {
         Arc::new(DataSchema::empty())
     }

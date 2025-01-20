@@ -15,13 +15,16 @@
 use std::fmt::Display;
 use std::fmt::Formatter;
 
-use common_meta_app::share::ShareNameIdent;
+use derive_visitor::Drive;
+use derive_visitor::DriveMut;
 
 use crate::ast::statements::show::ShowLimit;
-use crate::ast::write_period_separated_list;
+use crate::ast::write_dot_separated_list;
+use crate::ast::CreateOption;
+use crate::ast::DatabaseRef;
 use crate::ast::Identifier;
 
-#[derive(Debug, Clone, PartialEq)] // Databases
+#[derive(Debug, Clone, PartialEq, Drive, DriveMut)]
 pub struct ShowDatabasesStmt {
     pub catalog: Option<Identifier>,
     pub full: bool,
@@ -29,7 +32,7 @@ pub struct ShowDatabasesStmt {
 }
 
 impl Display for ShowDatabasesStmt {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
         write!(f, "SHOW ")?;
         if self.full {
             write!(f, "FULL ")?;
@@ -46,54 +49,72 @@ impl Display for ShowDatabasesStmt {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Drive, DriveMut)]
+pub struct ShowDropDatabasesStmt {
+    pub catalog: Option<Identifier>,
+    pub limit: Option<ShowLimit>,
+}
+
+impl Display for ShowDropDatabasesStmt {
+    fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
+        write!(f, "SHOW DROP DATABASES")?;
+        if let Some(catalog) = &self.catalog {
+            write!(f, " FROM {catalog}")?;
+        }
+        if let Some(limit) = &self.limit {
+            write!(f, " {limit}")?;
+        }
+
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Drive, DriveMut)]
 pub struct ShowCreateDatabaseStmt {
     pub catalog: Option<Identifier>,
     pub database: Identifier,
 }
 
 impl Display for ShowCreateDatabaseStmt {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
         write!(f, "SHOW CREATE DATABASE ")?;
-        write_period_separated_list(f, self.catalog.iter().chain(Some(&self.database)))?;
+        write_dot_separated_list(f, self.catalog.iter().chain(Some(&self.database)))?;
 
         Ok(())
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Drive, DriveMut)]
 pub struct CreateDatabaseStmt {
-    pub if_not_exists: bool,
-    pub catalog: Option<Identifier>,
-    pub database: Identifier,
+    pub create_option: CreateOption,
+    pub database: DatabaseRef,
     pub engine: Option<DatabaseEngine>,
     pub options: Vec<SQLProperty>,
-    pub from_share: Option<ShareNameIdent>,
 }
 
 impl Display for CreateDatabaseStmt {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "CREATE DATABASE ")?;
-        if self.if_not_exists {
+    fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
+        write!(f, "CREATE ")?;
+        if let CreateOption::CreateOrReplace = self.create_option {
+            write!(f, "OR REPLACE ")?;
+        }
+        write!(f, "DATABASE ")?;
+        if let CreateOption::CreateIfNotExists = self.create_option {
             write!(f, "IF NOT EXISTS ")?;
         }
-        write_period_separated_list(f, self.catalog.iter().chain(Some(&self.database)))?;
+
+        write!(f, "{}", self.database)?;
+
         if let Some(engine) = &self.engine {
             write!(f, " ENGINE = {engine}")?;
         }
-        if let Some(from_share) = &self.from_share {
-            write!(
-                f,
-                " FROM SHARE {}.{}",
-                from_share.tenant, from_share.share_name
-            )?;
-        }
+
         // TODO(leiysky): display rest information
         Ok(())
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Drive, DriveMut)]
 pub struct DropDatabaseStmt {
     pub if_exists: bool,
     pub catalog: Option<Identifier>,
@@ -101,32 +122,32 @@ pub struct DropDatabaseStmt {
 }
 
 impl Display for DropDatabaseStmt {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
         write!(f, "DROP DATABASE ")?;
         if self.if_exists {
             write!(f, "IF EXISTS ")?;
         }
-        write_period_separated_list(f, self.catalog.iter().chain(Some(&self.database)))?;
+        write_dot_separated_list(f, self.catalog.iter().chain(Some(&self.database)))?;
 
         Ok(())
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Drive, DriveMut)]
 pub struct UndropDatabaseStmt {
     pub catalog: Option<Identifier>,
     pub database: Identifier,
 }
 
 impl Display for UndropDatabaseStmt {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
         write!(f, "UNDROP DATABASE ")?;
-        write_period_separated_list(f, self.catalog.iter().chain(Some(&self.database)))?;
+        write_dot_separated_list(f, self.catalog.iter().chain(Some(&self.database)))?;
         Ok(())
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Drive, DriveMut)]
 pub struct AlterDatabaseStmt {
     pub if_exists: bool,
     pub catalog: Option<Identifier>,
@@ -135,12 +156,12 @@ pub struct AlterDatabaseStmt {
 }
 
 impl Display for AlterDatabaseStmt {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
         write!(f, "ALTER DATABASE ")?;
         if self.if_exists {
             write!(f, "IF EXISTS ")?;
         }
-        write_period_separated_list(f, self.catalog.iter().chain(Some(&self.database)))?;
+        write_dot_separated_list(f, self.catalog.iter().chain(Some(&self.database)))?;
         match &self.action {
             AlterDatabaseAction::RenameDatabase { new_db } => {
                 write!(f, " RENAME TO {new_db}")?;
@@ -151,19 +172,19 @@ impl Display for AlterDatabaseStmt {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Drive, DriveMut)]
 pub enum AlterDatabaseAction {
     RenameDatabase { new_db: Identifier },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Drive, DriveMut)]
 pub enum DatabaseEngine {
     Default,
     Share,
 }
 
 impl Display for DatabaseEngine {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
         match self {
             DatabaseEngine::Default => write!(f, "DEFAULT"),
             DatabaseEngine::Share => write!(f, "SHARE"),
@@ -171,7 +192,7 @@ impl Display for DatabaseEngine {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Drive, DriveMut)]
 pub struct SQLProperty {
     pub name: String,
     pub value: String,

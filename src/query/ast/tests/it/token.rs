@@ -15,8 +15,8 @@
 use std::fs::File;
 use std::io::Write;
 
-use common_ast::parser::token::*;
-use common_exception::Result;
+use databend_common_ast::parser::token::*;
+use databend_common_ast::Result;
 use goldenfile::Mint;
 
 fn run_lexer(file: &mut File, source: &str) {
@@ -34,7 +34,11 @@ fn run_lexer(file: &mut File, source: &str) {
             writeln!(file, "\n").unwrap();
         }
         Err(err) => {
-            let report = err.display_with_sql(source).message().trim().to_string();
+            let report = err
+                .display_with_source(source)
+                .to_string()
+                .trim()
+                .to_string();
             writeln!(file, "---------- Input ----------").unwrap();
             writeln!(file, "{}", source).unwrap();
             writeln!(file, "---------- Output ---------").unwrap();
@@ -51,6 +55,7 @@ fn test_lexer() {
 
     let cases = vec![
         r#""#,
+        r#"$$ab$cd$$  $$ab$$"#,
         r#"x'deadbeef' -- a hex string\n 'a string literal\n escape quote by '' or \\\'. '"#,
         r#"'中文' '日本語'"#,
         r#"@abc 123"#,

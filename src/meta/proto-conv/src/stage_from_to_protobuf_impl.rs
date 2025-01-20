@@ -19,13 +19,14 @@ use std::convert::TryFrom;
 
 use chrono::DateTime;
 use chrono::Utc;
-use common_meta_app as mt;
-use common_protos::pb;
+use databend_common_meta_app as mt;
+use databend_common_protos::pb;
+use mt::principal::FileFormatOptionsReader;
 use num::FromPrimitive;
 
 use crate::reader_check_msg;
-use crate::stage_from_to_protobuf_impl::mt::principal::FileFormatOptionsAst;
 use crate::FromToProto;
+use crate::FromToProtoEnum;
 use crate::Incompatible;
 use crate::MIN_READER_VER;
 use crate::VER;
@@ -39,9 +40,7 @@ impl FromToProto for mt::principal::StageParams {
     where Self: Sized {
         Ok(mt::principal::StageParams {
             storage: mt::storage::StorageParams::from_pb(p.storage.ok_or_else(|| {
-                Incompatible {
-                    reason: "pb::stage_info::StageParams.storage cannot be None".to_string(),
-                }
+                Incompatible::new("pb::stage_info::StageParams.storage cannot be None".to_string())
             })?)?,
         })
     }
@@ -77,9 +76,9 @@ impl FromToProto for mt::principal::OnErrorMode {
             Some(pb::stage_info::on_error_mode::Mode::AbortNum(n)) => {
                 Ok(mt::principal::OnErrorMode::AbortNum(n))
             }
-            None => Err(Incompatible {
-                reason: "OnErrorMode.mode cannot be None".to_string(),
-            }),
+            None => Err(Incompatible::new(
+                "OnErrorMode.mode cannot be None".to_string(),
+            )),
         }
     }
 
@@ -105,25 +104,33 @@ impl FromToProto for mt::principal::CopyOptions {
     }
     fn from_pb(p: pb::stage_info::CopyOptions) -> Result<Self, Incompatible>
     where Self: Sized {
-        let on_error =
-            mt::principal::OnErrorMode::from_pb(p.on_error.ok_or_else(|| Incompatible {
-                reason: "CopyOptions.on_error cannot be None".to_string(),
-            })?)?;
-        let size_limit = usize::try_from(p.size_limit).map_err(|err| Incompatible {
-            reason: format!("CopyOptions.size_limit cannot be convert to usize: {}", err),
+        let on_error = mt::principal::OnErrorMode::from_pb(p.on_error.ok_or_else(|| {
+            Incompatible::new("CopyOptions.on_error cannot be None".to_string())
+        })?)?;
+        let size_limit = usize::try_from(p.size_limit).map_err(|err| {
+            Incompatible::new(format!(
+                "CopyOptions.size_limit cannot be convert to usize: {}",
+                err
+            ))
         })?;
-        let max_files = usize::try_from(p.max_files).map_err(|err| Incompatible {
-            reason: format!("CopyOptions.max_files cannot be convert to usize: {}", err),
+        let max_files = usize::try_from(p.max_files).map_err(|err| {
+            Incompatible::new(format!(
+                "CopyOptions.max_files cannot be convert to usize: {}",
+                err
+            ))
         })?;
-        let split_size = usize::try_from(p.split_size).map_err(|err| Incompatible {
-            reason: format!("CopyOptions.split_size cannot be convert to usize: {}", err),
+        let split_size = usize::try_from(p.split_size).map_err(|err| {
+            Incompatible::new(format!(
+                "CopyOptions.split_size cannot be convert to usize: {}",
+                err
+            ))
         })?;
 
-        let max_file_size = usize::try_from(p.max_file_size).map_err(|err| Incompatible {
-            reason: format!(
+        let max_file_size = usize::try_from(p.max_file_size).map_err(|err| {
+            Incompatible::new(format!(
                 "CopyOptions.max_file_size cannot be convert to usize: {}",
                 err
-            ),
+            ))
         })?;
         Ok(mt::principal::CopyOptions {
             on_error,
@@ -134,25 +141,36 @@ impl FromToProto for mt::principal::CopyOptions {
             single: p.single,
             max_file_size,
             disable_variant_check: p.disable_variant_check,
+            return_failed_only: p.return_failed_only,
+            detailed_output: false,
         })
     }
 
     fn to_pb(&self) -> Result<pb::stage_info::CopyOptions, Incompatible> {
         let on_error = mt::principal::OnErrorMode::to_pb(&self.on_error)?;
-        let size_limit = u64::try_from(self.size_limit).map_err(|err| Incompatible {
-            reason: format!("CopyOptions.size_limit cannot be convert to u64: {}", err),
+        let size_limit = u64::try_from(self.size_limit).map_err(|err| {
+            Incompatible::new(format!(
+                "CopyOptions.size_limit cannot be convert to u64: {}",
+                err
+            ))
         })?;
-        let max_files = u64::try_from(self.max_files).map_err(|err| Incompatible {
-            reason: format!("CopyOptions.max_files cannot be convert to u64: {}", err),
+        let max_files = u64::try_from(self.max_files).map_err(|err| {
+            Incompatible::new(format!(
+                "CopyOptions.max_files cannot be convert to u64: {}",
+                err
+            ))
         })?;
-        let split_size = u64::try_from(self.split_size).map_err(|err| Incompatible {
-            reason: format!("CopyOptions.split_size cannot be convert to u64: {}", err),
+        let split_size = u64::try_from(self.split_size).map_err(|err| {
+            Incompatible::new(format!(
+                "CopyOptions.split_size cannot be convert to u64: {}",
+                err
+            ))
         })?;
-        let max_file_size = u64::try_from(self.max_file_size).map_err(|err| Incompatible {
-            reason: format!(
+        let max_file_size = u64::try_from(self.max_file_size).map_err(|err| {
+            Incompatible::new(format!(
                 "CopyOptions.max_file_size cannot be convert to u64: {}",
                 err
-            ),
+            ))
         })?;
         Ok(pb::stage_info::CopyOptions {
             on_error: Some(on_error),
@@ -163,6 +181,7 @@ impl FromToProto for mt::principal::CopyOptions {
             single: self.single,
             max_file_size,
             disable_variant_check: self.disable_variant_check,
+            return_failed_only: self.return_failed_only,
         })
     }
 }
@@ -181,41 +200,36 @@ impl FromToProto for mt::principal::StageInfo {
             },
             (None, Some(p)) => {
                 let options = mt::principal::FileFormatOptions::from_pb(p)?;
-                let options = FileFormatOptionsAst{options: options.to_map()};
-                mt::principal::FileFormatParams::try_from_ast(options, true).map_err(|e| Incompatible {
-                    reason: format!("fail to convert StageInfo.file_format_options to StageInfo.file_format_params: {e:?}"),
-                })?
+                let reader = FileFormatOptionsReader::from_map(options.to_map());
+                mt::principal::FileFormatParams::try_from_reader(reader, true).map_err(|e| Incompatible::new(format!("fail to convert StageInfo.file_format_options to StageInfo.file_format_params: {e:?}")))?
             },
-            (None, None) => Err(Incompatible {
-                reason: "StageInfo.file_format_params and StageInfo.file_format_options cannot be both None".to_string(),
-            })?,
-            (Some(_), Some(_)) => Err(Incompatible {
-                reason: "StageInfo.file_format_params and StageInfo.file_format_options cannot be both set".to_string(),
-            })?,
+            (None, None) => Err(Incompatible::new("StageInfo.file_format_params and StageInfo.file_format_options cannot be both None".to_string()))?,
+            (Some(_), Some(_)) => Err(Incompatible::new("StageInfo.file_format_params and StageInfo.file_format_options cannot be both set".to_string()))?,
         };
         Ok(mt::principal::StageInfo {
             stage_name: p.stage_name.clone(),
-            stage_type: mt::principal::StageType::from_pb(
-                FromPrimitive::from_i32(p.stage_type).ok_or_else(|| Incompatible {
-                    reason: format!("invalid StageType: {}", p.stage_type),
+            stage_type: mt::principal::StageType::from_pb_enum(
+                FromPrimitive::from_i32(p.stage_type).ok_or_else(|| {
+                    Incompatible::new(format!("invalid StageType: {}", p.stage_type))
                 })?,
             )?,
             stage_params: mt::principal::StageParams::from_pb(p.stage_params.ok_or_else(
-                || Incompatible {
-                    reason: "StageInfo.stage_params cannot be None".to_string(),
-                },
+                || Incompatible::new("StageInfo.stage_params cannot be None".to_string()),
             )?)?,
+            is_temporary: false,
             file_format_params,
             copy_options: mt::principal::CopyOptions::from_pb(p.copy_options.ok_or_else(
-                || Incompatible {
-                    reason: "StageInfo.copy_options cannot be None".to_string(),
-                },
+                || Incompatible::new("StageInfo.copy_options cannot be None".to_string()),
             )?)?,
             comment: p.comment,
             number_of_files: p.number_of_files,
             creator: match p.creator {
                 Some(c) => Some(mt::principal::UserIdentity::from_pb(c)?),
                 None => None,
+            },
+            created_on: match p.created_on {
+                Some(c) => DateTime::<Utc>::from_pb(c)?,
+                None => DateTime::<Utc>::default(),
             },
         })
     }
@@ -225,7 +239,7 @@ impl FromToProto for mt::principal::StageInfo {
             ver: VER,
             min_reader_ver: MIN_READER_VER,
             stage_name: self.stage_name.clone(),
-            stage_type: mt::principal::StageType::to_pb(&self.stage_type)? as i32,
+            stage_type: mt::principal::StageType::to_pb_enum(&self.stage_type)? as i32,
             stage_params: Some(mt::principal::StageParams::to_pb(&self.stage_params)?),
             file_format_params: Some(mt::principal::FileFormatParams::to_pb(
                 &self.file_format_params,
@@ -238,6 +252,7 @@ impl FromToProto for mt::principal::StageInfo {
                 Some(c) => Some(mt::principal::UserIdentity::to_pb(c)?),
                 None => None,
             },
+            created_on: Some(self.created_on.to_pb()?),
         })
     }
 }
@@ -280,12 +295,9 @@ impl FromToProto for mt::principal::StageFile {
     }
 }
 
-impl FromToProto for mt::principal::StageType {
-    type PB = pb::stage_info::StageType;
-    fn get_pb_ver(_p: &Self::PB) -> u64 {
-        0
-    }
-    fn from_pb(p: pb::stage_info::StageType) -> Result<Self, Incompatible>
+impl FromToProtoEnum for mt::principal::StageType {
+    type PBEnum = pb::stage_info::StageType;
+    fn from_pb_enum(p: pb::stage_info::StageType) -> Result<Self, Incompatible>
     where Self: Sized {
         match p {
             pb::stage_info::StageType::LegacyInternal => {
@@ -297,7 +309,7 @@ impl FromToProto for mt::principal::StageType {
         }
     }
 
-    fn to_pb(&self) -> Result<pb::stage_info::StageType, Incompatible> {
+    fn to_pb_enum(&self) -> Result<pb::stage_info::StageType, Incompatible> {
         match *self {
             mt::principal::StageType::LegacyInternal => {
                 Ok(pb::stage_info::StageType::LegacyInternal)

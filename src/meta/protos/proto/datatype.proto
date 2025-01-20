@@ -51,6 +51,7 @@ message DataType {
     Empty    null_t        = 31;
     Empty    empty_array_t = 32;
     Empty    bool_t        = 33;
+    Empty    binary_t      = 46;
     Empty    string_t      = 34;
     Number   number_t      = 35;
     Empty    timestamp_t   = 36;
@@ -63,6 +64,9 @@ message DataType {
     Decimal  decimal_t     = 43;
     Empty    empty_map_t   = 44;
     Empty    bitmap_t      = 45;
+    Empty    geometry_t    = 47;
+    Empty    geography_t   = 48;
+    Empty    interval_t        = 49;
   }
 }
 

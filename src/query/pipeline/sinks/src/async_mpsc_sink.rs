@@ -16,12 +16,11 @@ use std::any::Any;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use async_trait::unboxed_simple;
-use common_exception::Result;
-use common_expression::DataBlock;
-use common_pipeline_core::processors::port::InputPort;
-use common_pipeline_core::processors::processor::Event;
-use common_pipeline_core::processors::Processor;
+use databend_common_exception::Result;
+use databend_common_expression::DataBlock;
+use databend_common_pipeline_core::processors::Event;
+use databend_common_pipeline_core::processors::InputPort;
+use databend_common_pipeline_core::processors::Processor;
 
 /// Sink with multiple inputs.
 #[async_trait]
@@ -38,7 +37,6 @@ pub trait AsyncMpscSink: Send {
         Ok(())
     }
 
-    #[unboxed_simple]
     async fn consume(&mut self, data_block: DataBlock) -> Result<bool>;
 }
 

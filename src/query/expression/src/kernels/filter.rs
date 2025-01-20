@@ -12,29 +12,20 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use common_arrow::arrow::bitmap::utils::BitChunkIterExact;
-use common_arrow::arrow::bitmap::utils::BitChunksExact;
-use common_arrow::arrow::bitmap::Bitmap;
-use common_arrow::arrow::bitmap::MutableBitmap;
-use common_arrow::arrow::buffer::Buffer;
-use common_exception::Result;
+use binary::BinaryColumnBuilder;
+use databend_common_column::bitmap::utils::SlicesIterator;
+use databend_common_column::bitmap::Bitmap;
+use databend_common_column::bitmap::MutableBitmap;
+use databend_common_column::bitmap::TrueIdxIter;
+use databend_common_column::buffer::Buffer;
+use databend_common_exception::Result;
+use string::StringColumnBuilder;
 
-use crate::types::array::ArrayColumn;
-use crate::types::array::ArrayColumnBuilder;
-use crate::types::decimal::DecimalColumn;
-use crate::types::map::KvColumnBuilder;
+use crate::types::binary::BinaryColumn;
 use crate::types::nullable::NullableColumn;
-use crate::types::number::NumberColumn;
 use crate::types::string::StringColumn;
-use crate::types::string::StringColumnBuilder;
-use crate::types::AnyType;
-use crate::types::ArrayType;
-use crate::types::BooleanType;
-use crate::types::MapType;
-use crate::types::ValueType;
-use crate::types::VariantType;
-use crate::with_decimal_type;
-use crate::with_number_type;
+use crate::types::*;
+use crate::visitor::ValueVisitor;
 use crate::BlockEntry;
 use crate::Column;
 use crate::ColumnBuilder;
@@ -47,25 +38,33 @@ impl DataBlock {
             return Ok(self);
         }
 
-        let count_zeros = bitmap.unset_bits();
+        let count_zeros = bitmap.null_count();
         match count_zeros {
             0 => Ok(self),
             _ => {
                 if count_zeros == self.num_rows() {
                     return Ok(self.slice(0..0));
                 }
+
+                let mut filter_visitor = FilterVisitor::new(bitmap);
                 let after_columns = self
                     .columns()
                     .iter()
-                    .map(|entry| match &entry.value {
-                        Value::Column(c) => {
-                            let value = Value::Column(Column::filter(c, bitmap));
-                            BlockEntry::new(entry.data_type.clone(), value)
-                        }
-                        _ => entry.clone(),
+                    .map(|entry| {
+                        filter_visitor.visit_value(entry.value.clone())?;
+                        let result = filter_visitor.result.take().unwrap();
+                        Ok(BlockEntry {
+                            value: result,
+                            data_type: entry.data_type.clone(),
+                        })
                     })
-                    .collect();
-                Ok(DataBlock::new(after_columns, self.num_rows() - count_zeros))
+                    .collect::<Result<Vec<_>>>()?;
+
+                Ok(DataBlock::new_with_meta(
+                    after_columns,
+                    filter_visitor.filter_rows,
+                    self.get_meta().cloned(),
+                ))
             }
         }
     }
@@ -89,311 +88,288 @@ impl DataBlock {
 }
 
 impl Column {
-    pub fn filter(&self, filter: &Bitmap) -> Column {
-        let length = filter.len() - filter.unset_bits();
-        if length == self.len() {
-            return self.clone();
+    pub fn filter(&self, bitmap: &Bitmap) -> Column {
+        let mut filter_visitor = FilterVisitor::new(bitmap);
+        filter_visitor
+            .visit_value(Value::Column(self.clone()))
+            .unwrap();
+        filter_visitor
+            .result
+            .take()
+            .unwrap()
+            .as_column()
+            .unwrap()
+            .clone()
+    }
+}
+
+/// The iteration strategy used to evaluate [`FilterVisitor`]
+#[derive(Debug)]
+pub enum IterationStrategy {
+    None,
+    All,
+    /// Range iterator
+    SlicesIterator,
+    /// True index iterator
+    IndexIterator,
+}
+
+/// based on <https://dl.acm.org/doi/abs/10.1145/3465998.3466009>
+pub const SELECTIVITY_THRESHOLD: f64 = 0.8;
+
+impl IterationStrategy {
+    fn default_strategy(length: usize, true_count: usize) -> Self {
+        if length == 0 || true_count == 0 {
+            return IterationStrategy::None;
         }
+        if length == true_count {
+            return IterationStrategy::All;
+        }
+        let selectivity_frac = true_count as f64 / length as f64;
+        if selectivity_frac > SELECTIVITY_THRESHOLD {
+            return IterationStrategy::SlicesIterator;
+        }
+        IterationStrategy::IndexIterator
+    }
+}
 
-        match self {
-            Column::Null { .. } | Column::EmptyArray { .. } | Column::EmptyMap { .. } => {
-                self.slice(0..length)
-            }
-            Column::Number(column) => with_number_type!(|NUM_TYPE| match column {
-                NumberColumn::NUM_TYPE(values) => {
-                    Column::Number(NumberColumn::NUM_TYPE(Self::filter_primitive_types(
-                        values, filter,
-                    )))
+pub struct FilterVisitor<'a> {
+    filter: &'a Bitmap,
+    result: Option<Value<AnyType>>,
+    filter_rows: usize,
+    original_rows: usize,
+    strategy: IterationStrategy,
+}
+
+impl<'a> FilterVisitor<'a> {
+    pub fn new(filter: &'a Bitmap) -> Self {
+        let filter_rows = filter.len() - filter.null_count();
+        let strategy = IterationStrategy::default_strategy(filter.len(), filter_rows);
+        Self {
+            filter,
+            result: None,
+            filter_rows,
+            original_rows: filter.len(),
+            strategy,
+        }
+    }
+
+    pub fn with_strategy(mut self, strategy: IterationStrategy) -> Self {
+        self.strategy = strategy;
+        self
+    }
+
+    pub fn take_result(&mut self) -> Option<Value<AnyType>> {
+        self.result.take()
+    }
+}
+
+impl ValueVisitor for FilterVisitor<'_> {
+    fn visit_value(&mut self, value: Value<AnyType>) -> Result<()> {
+        match value {
+            Value::Scalar(c) => self.visit_scalar(c),
+            Value::Column(c) => {
+                assert_eq!(c.len(), self.original_rows);
+                match self.strategy {
+                    IterationStrategy::None => self.result = Some(Value::Column(c.slice(0..0))),
+                    IterationStrategy::All => self.result = Some(Value::Column(c)),
+                    IterationStrategy::SlicesIterator | IterationStrategy::IndexIterator => {
+                        self.visit_column(c)?
+                    }
                 }
-            }),
-            Column::Decimal(column) => with_decimal_type!(|DECIMAL_TYPE| match column {
-                DecimalColumn::DECIMAL_TYPE(values, size) => {
-                    Column::Decimal(DecimalColumn::DECIMAL_TYPE(
-                        Self::filter_primitive_types(values, filter),
-                        *size,
-                    ))
-                }
-            }),
-            Column::Boolean(bm) => Self::filter_scalar_types::<BooleanType>(
-                bm,
-                MutableBitmap::with_capacity(length),
-                filter,
-            ),
-            Column::String(column) => {
-                let column = Self::filter_string_scalars(column, filter);
-                Column::String(column)
-            }
-            Column::Timestamp(column) => {
-                let ts = Self::filter_primitive_types(column, filter);
-                Column::Timestamp(ts)
-            }
-            Column::Date(column) => {
-                let d = Self::filter_primitive_types(column, filter);
-                Column::Date(d)
-            }
-            Column::Array(column) => {
-                let mut offsets = Vec::with_capacity(length + 1);
-                offsets.push(0);
-                let builder = ColumnBuilder::with_capacity(&column.values.data_type(), length);
-                let builder = ArrayColumnBuilder { builder, offsets };
-                Self::filter_scalar_types::<ArrayType<AnyType>>(column, builder, filter)
-            }
-            Column::Map(column) => {
-                let mut offsets = Vec::with_capacity(length + 1);
-                offsets.push(0);
-                let builder = ColumnBuilder::from_column(
-                    ColumnBuilder::with_capacity(&column.values.data_type(), length).build(),
-                );
-                let (key_builder, val_builder) = match builder {
-                    ColumnBuilder::Tuple(fields) => (fields[0].clone(), fields[1].clone()),
-                    _ => unreachable!(),
-                };
-                let builder = KvColumnBuilder {
-                    keys: key_builder,
-                    values: val_builder,
-                };
-                let builder = ArrayColumnBuilder { builder, offsets };
-                let column = ArrayColumn::try_downcast(column).unwrap();
-                Self::filter_scalar_types::<MapType<AnyType, AnyType>>(&column, builder, filter)
-            }
-            Column::Bitmap(column) => {
-                let column = Self::filter_string_scalars(column, filter);
-                Column::Bitmap(column)
-            }
-
-            Column::Nullable(c) => {
-                let column = Self::filter(&c.column, filter);
-                let validity = Self::filter_scalar_types::<BooleanType>(
-                    &c.validity,
-                    MutableBitmap::with_capacity(length),
-                    filter,
-                );
-                Column::Nullable(Box::new(NullableColumn {
-                    column,
-                    validity: BooleanType::try_downcast_column(&validity).unwrap(),
-                }))
-            }
-            Column::Tuple(fields) => {
-                let fields = fields.iter().map(|c| c.filter(filter)).collect();
-                Column::Tuple(fields)
-            }
-            Column::Variant(column) => {
-                let bytes_per_row = column.data().len() / filter.len().max(1);
-                let data_capacity = (filter.len() - filter.unset_bits()) * bytes_per_row;
-
-                Self::filter_scalar_types::<VariantType>(
-                    column,
-                    StringColumnBuilder::with_capacity(length, data_capacity),
-                    filter,
-                )
+                Ok(())
             }
         }
     }
 
-    fn filter_scalar_types<T: ValueType>(
-        col: &T::Column,
-        mut builder: T::ColumnBuilder,
-        filter: &Bitmap,
-    ) -> Column {
-        const CHUNK_SIZE: usize = 64;
-        let (mut slice, offset, mut length) = filter.as_slice();
-        let mut start_index: usize = 0;
-
-        if offset > 0 {
-            let n = 8 - offset;
-            start_index += n;
-            filter
-                .iter()
-                .enumerate()
-                .take(n)
-                .for_each(|(index, is_selected)| {
-                    if is_selected {
-                        T::push_item(&mut builder, T::index_column(col, index).unwrap());
-                    }
-                });
-            slice = &slice[1..];
-            length -= n;
-        }
-
-        let mut mask_chunks = BitChunksExact::<u64>::new(slice, length);
-
-        mask_chunks
-            .by_ref()
-            .enumerate()
-            .for_each(|(mask_index, mut mask)| {
-                while mask != 0 {
-                    let n = mask.trailing_zeros() as usize;
-                    let index = mask_index * CHUNK_SIZE + n + start_index;
-                    T::push_item(&mut builder, T::index_column(col, index).unwrap());
-                    mask = mask & (mask - 1);
-                }
-            });
-
-        let remainder_start = length - length % CHUNK_SIZE;
-        mask_chunks
-            .remainder_iter()
-            .enumerate()
-            .for_each(|(mask_index, is_selected)| {
-                if is_selected {
-                    let index = mask_index + remainder_start + start_index;
-                    T::push_item(&mut builder, T::index_column(col, index).unwrap());
-                }
-            });
-
-        T::upcast_column(T::build_column(builder))
+    fn visit_scalar(&mut self, scalar: crate::Scalar) -> Result<()> {
+        self.result = Some(Value::Scalar(scalar));
+        Ok(())
     }
 
-    // low-level API using unsafe to improve performance
-    fn filter_primitive_types<T: Copy>(values: &Buffer<T>, filter: &Bitmap) -> Buffer<T> {
-        debug_assert_eq!(values.len(), filter.len());
-        let selected = filter.len() - filter.unset_bits();
-        if selected == values.len() {
-            return values.clone();
-        }
-        let mut values = values.as_slice();
-        let mut new = Vec::<T>::with_capacity(selected);
-        let mut dst = new.as_mut_ptr();
+    fn visit_nullable(&mut self, column: Box<NullableColumn<AnyType>>) -> Result<()> {
+        self.visit_boolean(column.validity.clone())?;
+        let validity =
+            BooleanType::try_downcast_column(self.result.take().unwrap().as_column().unwrap())
+                .unwrap();
 
-        let (mut slice, offset, mut length) = filter.as_slice();
-        if offset > 0 {
-            // Consume the offset
-            let n = 8 - offset;
-            values
-                .iter()
-                .zip(filter.iter())
-                .take(n)
-                .for_each(|(value, is_selected)| {
-                    if is_selected {
-                        unsafe {
-                            dst.write(*value);
-                            dst = dst.add(1);
-                        }
-                    }
+        self.visit_column(column.column)?;
+        let result = self.result.take().unwrap();
+        let result = result.as_column().unwrap();
+        self.result = Some(Value::Column(NullableColumn::new_column(
+            result.clone(),
+            validity,
+        )));
+        Ok(())
+    }
+
+    fn visit_typed_column<T: ValueType>(&mut self, column: <T as ValueType>::Column) -> Result<()> {
+        let c = T::upcast_column(column.clone());
+        let builder = ColumnBuilder::with_capacity(&c.data_type(), c.len());
+        let mut builder = T::try_downcast_owned_builder(builder).unwrap();
+        match self.strategy {
+            IterationStrategy::IndexIterator => {
+                let iter = TrueIdxIter::new(self.original_rows, Some(self.filter));
+                iter.for_each(|index| {
+                    T::push_item(&mut builder, unsafe {
+                        T::index_column_unchecked(&column, index)
+                    })
                 });
-            slice = &slice[1..];
-            length -= n;
-            values = &values[n..];
+            }
+            _ => {
+                let iter = SlicesIterator::new(self.filter);
+                iter.for_each(|(start, len)| {
+                    T::append_column(&mut builder, &T::slice_column(&column, start..start + len))
+                });
+            }
         }
 
-        const CHUNK_SIZE: usize = 64;
-        let mut chunks = values.chunks_exact(CHUNK_SIZE);
-        let mut mask_chunks = BitChunksExact::<u64>::new(slice, length);
+        self.result = Some(Value::Column(T::upcast_column(T::build_column(builder))));
+        Ok(())
+    }
 
-        chunks
-            .by_ref()
-            .zip(mask_chunks.by_ref())
-            .for_each(|(chunk, mut mask)| {
-                if mask == u64::MAX {
+    fn visit_number<T: Number>(
+        &mut self,
+        buffer: <NumberType<T> as ValueType>::Column,
+    ) -> Result<()> {
+        self.result = Some(Value::Column(NumberType::<T>::upcast_column(
+            self.filter_primitive_types(buffer),
+        )));
+        Ok(())
+    }
+
+    fn visit_timestamp(&mut self, buffer: Buffer<i64>) -> Result<()> {
+        self.result = Some(Value::Column(TimestampType::upcast_column(
+            self.filter_primitive_types(buffer),
+        )));
+        Ok(())
+    }
+
+    fn visit_date(&mut self, buffer: Buffer<i32>) -> Result<()> {
+        self.result = Some(Value::Column(DateType::upcast_column(
+            self.filter_primitive_types(buffer),
+        )));
+        Ok(())
+    }
+
+    fn visit_decimal<T: crate::types::Decimal>(
+        &mut self,
+        buffer: Buffer<T>,
+        size: DecimalSize,
+    ) -> Result<()> {
+        self.result = Some(Value::Column(T::upcast_column(
+            self.filter_primitive_types(buffer),
+            size,
+        )));
+        Ok(())
+    }
+
+    fn visit_boolean(&mut self, mut bitmap: Bitmap) -> Result<()> {
+        // faster path for all bits set
+        if bitmap.null_count() == 0 {
+            bitmap.slice(0, self.filter_rows);
+            self.result = Some(Value::Column(BooleanType::upcast_column(bitmap)));
+            return Ok(());
+        }
+
+        let bitmap = match self.strategy {
+            IterationStrategy::IndexIterator => {
+                let iter = TrueIdxIter::new(self.original_rows, Some(self.filter));
+                MutableBitmap::from_trusted_len_iter(iter.map(|index| bitmap.get_bit(index))).into()
+            }
+            _ => {
+                let src = bitmap.values();
+                let offset = bitmap.offset();
+
+                let mut builder = MutableBitmap::with_capacity(self.filter_rows);
+                let iter = SlicesIterator::new(self.filter);
+                iter.for_each(|(start, len)| {
+                    builder.append_packed_range(start + offset..start + len + offset, src)
+                });
+                builder.into()
+            }
+        };
+
+        self.result = Some(Value::Column(BooleanType::upcast_column(bitmap)));
+        Ok(())
+    }
+
+    fn visit_binary(&mut self, col: BinaryColumn) -> Result<()> {
+        self.result = Some(Value::Column(BinaryType::upcast_column(
+            self.filter_binary_types(&col),
+        )));
+        Ok(())
+    }
+
+    fn visit_string(&mut self, column: StringColumn) -> Result<()> {
+        self.result = Some(Value::Column(StringType::upcast_column(
+            self.filter_string_types(&column),
+        )));
+        Ok(())
+    }
+
+    fn visit_variant(&mut self, column: BinaryColumn) -> Result<()> {
+        self.result = Some(Value::Column(VariantType::upcast_column(
+            self.filter_binary_types(&column),
+        )));
+        Ok(())
+    }
+}
+
+impl FilterVisitor<'_> {
+    fn filter_primitive_types<T: Copy>(&mut self, buffer: Buffer<T>) -> Buffer<T> {
+        match self.strategy {
+            IterationStrategy::IndexIterator => {
+                let iter = TrueIdxIter::new(self.original_rows, Some(self.filter));
+                Vec::from_iter(iter.map(|index| buffer[index])).into()
+            }
+            _ => {
+                let mut builder = Vec::with_capacity(self.filter_rows);
+                let iter = SlicesIterator::new(self.filter);
+                iter.for_each(|(start, len)| {
+                    builder.extend_from_slice(&buffer[start..start + len]);
+                });
+                builder.into()
+            }
+        }
+    }
+
+    fn filter_string_types(&mut self, values: &StringColumn) -> StringColumn {
+        match self.strategy {
+            IterationStrategy::IndexIterator => {
+                let mut builder = StringColumnBuilder::with_capacity(self.filter_rows);
+
+                let iter = TrueIdxIter::new(self.original_rows, Some(self.filter));
+                for i in iter {
                     unsafe {
-                        std::ptr::copy(chunk.as_ptr(), dst, CHUNK_SIZE);
-                        dst = dst.add(CHUNK_SIZE);
-                    }
-                } else {
-                    while mask != 0 {
-                        let n = mask.trailing_zeros() as usize;
-                        unsafe {
-                            dst.write(chunk[n]);
-                            dst = dst.add(1);
-                        }
-                        mask = mask & (mask - 1);
+                        builder.put_and_commit(values.value_unchecked(i));
                     }
                 }
-            });
-
-        chunks
-            .remainder()
-            .iter()
-            .zip(mask_chunks.remainder_iter())
-            .for_each(|(value, is_selected)| {
-                if is_selected {
-                    unsafe {
-                        dst.write(*value);
-                        dst = dst.add(1);
-                    }
+                builder.build()
+            }
+            _ => {
+                // reuse the buffers
+                let new_views = self.filter_primitive_types(values.views().clone());
+                unsafe {
+                    StringColumn::new_unchecked_unknown_md(
+                        new_views,
+                        values.data_buffers().clone(),
+                        None,
+                    )
                 }
-            });
-
-        unsafe { new.set_len(selected) };
-        new.into()
+            }
+        }
     }
 
-    // low-level API using unsafe to improve performance
-    fn filter_string_scalars(values: &StringColumn, filter: &Bitmap) -> StringColumn {
-        debug_assert_eq!(values.len(), filter.len());
-        let selected = filter.len() - filter.unset_bits();
-        if selected == values.len() {
-            return values.clone();
-        }
-        let data = values.data().as_slice();
-        let offsets = values.offsets().as_slice();
-
-        let mut res_offsets = Vec::with_capacity(selected + 1);
-        res_offsets.push(0);
-
-        let mut res_data = vec![];
-        let hint_size = data.len() / (values.len() + 1) * selected;
-
-        static MAX_HINT_SIZE: usize = 1000000000;
-        if hint_size < MAX_HINT_SIZE && values.len() < MAX_HINT_SIZE {
-            res_data.reserve(hint_size)
-        }
-
-        let mut pos = 0;
-
-        let (mut slice, offset, mut length) = filter.as_slice();
-        if offset > 0 {
-            // Consume the offset
-            let n = 8 - offset;
-            values
-                .iter()
-                .zip(filter.iter())
-                .take(n)
-                .for_each(|(value, is_selected)| {
-                    if is_selected {
-                        res_data.extend_from_slice(value);
-                        res_offsets.push(res_data.len() as u64);
-                    }
-                });
-            slice = &slice[1..];
-            length -= n;
-            pos += n;
-        }
-
-        const CHUNK_SIZE: usize = 64;
-        let mut mask_chunks = BitChunksExact::<u64>::new(slice, length);
-
-        for mut mask in mask_chunks.by_ref() {
-            if mask == u64::MAX {
-                let data = &data[offsets[pos] as usize..offsets[pos + CHUNK_SIZE] as usize];
-                res_data.extend_from_slice(data);
-
-                let mut last_len = *res_offsets.last().unwrap();
-                for i in 0..CHUNK_SIZE {
-                    last_len += offsets[pos + i + 1] - offsets[pos + i];
-                    res_offsets.push(last_len);
-                }
-            } else {
-                while mask != 0 {
-                    let n = mask.trailing_zeros() as usize;
-                    let data = &data[offsets[pos + n] as usize..offsets[pos + n + 1] as usize];
-                    res_data.extend_from_slice(data);
-                    res_offsets.push(res_data.len() as u64);
-
-                    mask = mask & (mask - 1);
-                }
+    fn filter_binary_types(&mut self, values: &BinaryColumn) -> BinaryColumn {
+        let mut builder = BinaryColumnBuilder::with_capacity(self.filter_rows, 0);
+        let iter = TrueIdxIter::new(self.original_rows, Some(self.filter));
+        for i in iter {
+            unsafe {
+                builder.put_slice(values.index_unchecked(i));
+                builder.commit_row();
             }
-            pos += CHUNK_SIZE;
         }
-
-        for is_select in mask_chunks.remainder_iter() {
-            if is_select {
-                let data = &data[offsets[pos] as usize..offsets[pos + 1] as usize];
-                res_data.extend_from_slice(data);
-                res_offsets.push(res_data.len() as u64);
-            }
-            pos += 1;
-        }
-
-        StringColumn::new(res_data.into(), res_offsets.into())
+        builder.build()
     }
 }

@@ -14,9 +14,12 @@
 
 use std::sync::Arc;
 
-use common_exception::Result;
-use common_sql::plans::CreateUDFPlan;
-use common_users::UserApiProvider;
+use databend_common_exception::Result;
+use databend_common_management::RoleApi;
+use databend_common_meta_app::principal::OwnershipObject;
+use databend_common_sql::plans::CreateUDFPlan;
+use databend_common_users::RoleCacheManager;
+use databend_common_users::UserApiProvider;
 use log::debug;
 
 use crate::interpreters::Interpreter;
@@ -25,24 +28,28 @@ use crate::sessions::QueryContext;
 use crate::sessions::TableContext;
 
 #[derive(Debug)]
-pub struct CreateUserUDFInterpreter {
+pub struct CreateUserUDFScript {
     ctx: Arc<QueryContext>,
     plan: CreateUDFPlan,
 }
 
-impl CreateUserUDFInterpreter {
+impl CreateUserUDFScript {
     pub fn try_create(ctx: Arc<QueryContext>, plan: CreateUDFPlan) -> Result<Self> {
-        Ok(CreateUserUDFInterpreter { ctx, plan })
+        Ok(CreateUserUDFScript { ctx, plan })
     }
 }
 
 #[async_trait::async_trait]
-impl Interpreter for CreateUserUDFInterpreter {
+impl Interpreter for CreateUserUDFScript {
     fn name(&self) -> &str {
-        "CreateUserUDFInterpreter"
+        "CreateUserUDFScript"
     }
 
-    #[minitrace::trace]
+    fn is_ddl(&self) -> bool {
+        true
+    }
+
+    #[fastrace::trace]
     #[async_backtrace::framed]
     async fn execute2(&self) -> Result<PipelineBuildResult> {
         debug!("ctx.id" = self.ctx.get_id().as_str(); "create_user_udf_execute");
@@ -51,8 +58,22 @@ impl Interpreter for CreateUserUDFInterpreter {
         let tenant = self.ctx.get_tenant();
         let udf = plan.udf;
         let _ = UserApiProvider::instance()
-            .add_udf(&tenant, udf, plan.if_not_exists)
+            .add_udf(&tenant, udf, &plan.create_option)
             .await?;
+
+        // Grant ownership as the current role
+        if let Some(current_role) = self.ctx.get_current_role() {
+            let role_api = UserApiProvider::instance().role_api(&tenant);
+            role_api
+                .grant_ownership(
+                    &OwnershipObject::UDF {
+                        name: self.plan.udf.name.clone(),
+                    },
+                    &current_role.name,
+                )
+                .await?;
+            RoleCacheManager::instance().invalidate_cache(&tenant);
+        }
 
         Ok(PipelineBuildResult::create())
     }

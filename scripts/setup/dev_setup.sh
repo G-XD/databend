@@ -98,9 +98,45 @@ function install_build_essentials {
 	esac
 }
 
+function install_ziglang {
+	PACKAGE_MANAGER=$1
+
+	if zig version; then
+		echo "==> ziglang is already installed"
+		return
+	fi
+	echo "==> installing ziglang..."
+
+	arch=$(uname -m)
+	case "$PACKAGE_MANAGER" in
+	apt-get | yum | dnf | pacman)
+		curl -sSfLo /tmp/zig.tar.xz "https://ziglang.org/download/0.11.0/zig-linux-${arch}-0.11.0.tar.xz"
+		tar -xf /tmp/zig.tar.xz -C /tmp
+		"${PRE_COMMAND[@]}" mv "/tmp/zig-linux-${arch}-0.11.0/zig" /usr/local/bin/
+		"${PRE_COMMAND[@]}" chmod +x /usr/local/bin/zig
+		"${PRE_COMMAND[@]}" mv "/tmp/zig-linux-${arch}-0.11.0/lib" /usr/local/lib/zig
+		rm -rf /tmp/zig*
+		;;
+	brew)
+		install_pkg zig "$PACKAGE_MANAGER"
+		;;
+	apk)
+		echo "TODO: install ziglang for alpine"
+		;;
+	*)
+		echo "Unable to install ziglang with package manager: $PACKAGE_MANAGER"
+		exit 1
+		;;
+	esac
+}
+
 function install_python3 {
 	PACKAGE_MANAGER=$1
 
+	if python3 --version; then
+		echo "==> python3 is already installed"
+		return
+	fi
 	echo "==> installing python3..."
 
 	case "$PACKAGE_MANAGER" in
@@ -162,45 +198,6 @@ function install_openssl {
 	esac
 }
 
-function install_sccache {
-	PACKAGE_MANAGER=$1
-
-	if sccache --version; then
-		echo "==> sccache is already installed"
-		return
-	fi
-	echo "==> installing sccache..."
-
-	case "$PACKAGE_MANAGER" in
-	brew)
-		install_pkg sccache "$PACKAGE_MANAGER"
-		;;
-	*)
-
-		arch=$(uname -m)
-		case "$arch" in
-		amd64)
-			arch="x86_64"
-			;;
-		arm64)
-			arch="aarch64"
-			;;
-		esac
-		download_version="v0.5.3"
-		download_target="sccache-${download_version}-${arch}-unknown-linux-musl"
-		SCCACHE_RELEASE="https://github.com/mozilla/sccache/releases/"
-		curl -fLo sccache.tar.gz "${SCCACHE_RELEASE}/download/${download_version}/${download_target}.tar.gz"
-		tar -xzf sccache.tar.gz
-		"${PRE_COMMAND[@]}" cp "${download_target}/sccache" /usr/local/bin/
-		"${PRE_COMMAND[@]}" chmod +x /usr/local/bin/sccache
-		rm -rf "${download_target}"
-		rm sccache.tar.gz
-		;;
-	esac
-
-	sccache --version
-}
-
 function install_protobuf {
 	PACKAGE_MANAGER=$1
 
@@ -211,11 +208,12 @@ function install_protobuf {
 	echo "==> installing protobuf compiler..."
 
 	case "$PACKAGE_MANAGER" in
-	brew)
+	brew | apk)
 		install_pkg protobuf "$PACKAGE_MANAGER"
 		;;
 	*)
 		arch=$(uname -m)
+		arch=${arch/aarch64/aarch_64}
 		PB_REL="https://github.com/protocolbuffers/protobuf/releases"
 		curl -LO $PB_REL/download/v3.15.8/protoc-3.15.8-linux-${arch}.zip
 		unzip protoc-3.15.8-linux-${arch}.zip -d protoc-3.15.8
@@ -226,38 +224,6 @@ function install_protobuf {
 	esac
 
 	protoc --version
-}
-
-function install_thrift {
-	PACKAGE_MANAGER=$1
-
-	echo "==> installing thrift compiler..."
-
-	case "$PACKAGE_MANAGER" in
-	apt-get)
-		install_pkg thrift-compiler "$PACKAGE_MANAGER"
-		;;
-	pacman)
-		install_pkg thrift "$PACKAGE_MANAGER"
-		;;
-
-	apk)
-		install_pkg thrift "$PACKAGE_MANAGER"
-		;;
-	yum)
-		install_pkg thrift "$PACKAGE_MANAGER"
-		;;
-	dnf)
-		install_pkg thrift "$PACKAGE_MANAGER"
-		;;
-	brew)
-		install_pkg thrift "$PACKAGE_MANAGER"
-		;;
-	*)
-		echo "Unable to install thrif with package manager: $PACKAGE_MANAGER"
-		exit 1
-		;;
-	esac
 }
 
 function install_jdk {
@@ -369,6 +335,86 @@ function install_mysql_client {
 	esac
 }
 
+function install_sqlite3 {
+	PACKAGE_MANAGER=$1
+
+	echo "==> installing sqlite3..."
+
+	case "$PACKAGE_MANAGER" in
+	apt-get)
+		install_pkg libsqlite3-dev "$PACKAGE_MANAGER"
+		install_pkg sqlite3 "$PACKAGE_MANAGER"
+		;;
+	pacman)
+		install_pkg sqlite "$PACKAGE_MANAGER"
+		;;
+	apk)
+		install_pkg sqlite-dev "$PACKAGE_MANAGER"
+		;;
+	yum | dnf)
+		install_pkg sqlite-devel "$PACKAGE_MANAGER"
+		install_pkg sqlite "$PACKAGE_MANAGER"
+		;;
+	brew)
+		install_pkg sqlite "$PACKAGE_MANAGER"
+		;;
+	*)
+		echo "Unable to install sqlite3 with package manager: $PACKAGE_MANAGER"
+		exit 1
+		;;
+	esac
+}
+
+function install_libtiff {
+	PACKAGE_MANAGER=$1
+
+	echo "==> installing libtiff..."
+
+	case "$PACKAGE_MANAGER" in
+	apt-get)
+		install_pkg libtiff-dev "$PACKAGE_MANAGER"
+		;;
+	pacman)
+		install_pkg libtiff "$PACKAGE_MANAGER"
+		;;
+	apk)
+		install_pkg tiff-dev "$PACKAGE_MANAGER"
+		;;
+	yum | dnf)
+		install_pkg libtiff-devel "$PACKAGE_MANAGER"
+		;;
+	brew)
+		install_pkg libtiff "$PACKAGE_MANAGER"
+		;;
+	*)
+		echo "Unable to install libtiff with package manager: $PACKAGE_MANAGER"
+		exit 1
+		;;
+	esac
+}
+
+function install_binutils {
+	PACKAGE_MANAGER=$1
+
+	echo "==> installing binutils..."
+
+	case "$PACKAGE_MANAGER" in
+	apt-get)
+		install_pkg binutils "$PACKAGE_MANAGER"
+		;;
+	yum | dnf)
+		install_pkg binutils "$PACKAGE_MANAGER"
+		;;
+	brew)
+		# skip
+		;;
+	*)
+		echo "Unable to install binutils with package manager: $PACKAGE_MANAGER"
+		exit 1
+		;;
+	esac
+}
+
 function install_rustup {
 	RUST_TOOLCHAIN=$1
 
@@ -382,20 +428,6 @@ function install_rustup {
 	fi
 
 	rustup show
-}
-
-function install_cargo_binary {
-	BIN_NAME=$1
-	VERSION=$2
-	if cargo install --list | grep "${BIN_NAME}" &>/dev/null; then
-		echo "${BIN_NAME} is already installed"
-	else
-		if [ -z "$VERSION" ]; then
-			cargo install "${BIN_NAME}"
-		else
-			cargo install --version "${VERSION}" "${BIN_NAME}"
-		fi
-	fi
 }
 
 function usage {
@@ -431,7 +463,6 @@ Build tools (since -b or no option was provided):
   * pkg-config
   * libssl-dev
   * protobuf-compiler
-  * thrift-compiler
   * openjdk
   * python3-dev
 EOF
@@ -451,7 +482,6 @@ Development tools (since -d was provided):
   * mysql client
   * python3 (boto3, black, yamllint, ...)
   * python database drivers (mysql-connector-python, pymysql, sqlalchemy, clickhouse_driver)
-  * fuzz test dependencies (fuzzingbook)
 EOF
 	fi
 
@@ -606,27 +636,33 @@ if [[ "$INSTALL_BUILD_TOOLS" == "true" ]]; then
 	install_pkg_config "$PACKAGE_MANAGER"
 	install_openssl "$PACKAGE_MANAGER"
 	install_protobuf "$PACKAGE_MANAGER"
-	install_thrift "$PACKAGE_MANAGER"
 	install_jdk "$PACKAGE_MANAGER"
 	install_lapack "$PACKAGE_MANAGER"
 
 	install_pkg cmake "$PACKAGE_MANAGER"
 	install_pkg clang "$PACKAGE_MANAGER"
 	install_pkg llvm "$PACKAGE_MANAGER"
+	install_ziglang "$PACKAGE_MANAGER"
 	install_python3 "$PACKAGE_MANAGER"
+	install_sqlite3 "$PACKAGE_MANAGER"
+	install_libtiff "$PACKAGE_MANAGER"
+	install_binutils "$PACKAGE_MANAGER"
 
 	# Any call to cargo will make rustup install the correct toolchain
 	cargo version
+	cargo install cargo-quickinstall
+	cargo quickinstall cargo-binstall
+	cargo binstall -y sccache
+	cargo binstall -y cargo-zigbuild
+	cargo binstall -y cargo-nextest
 
-	# Install tools that needed in build
-	install_sccache "$PACKAGE_MANAGER"
 fi
 
 if [[ "$INSTALL_CHECK_TOOLS" == "true" ]]; then
 	if [[ -f scripts/setup/rust-tools.txt ]]; then
-		export RUSTFLAGS="-C target-feature=-crt-static"
-		while IFS='@' read -r tool version; do
-			install_cargo_binary "$tool" "$version"
+		while read -r tool; do
+			# Use cargo install to prevent downloading the tools with incompatible GLIBC
+			cargo install "$tool"
 		done <scripts/setup/rust-tools.txt
 	fi
 
@@ -645,14 +681,15 @@ if [[ "$INSTALL_DEV_TOOLS" == "true" ]]; then
 		# for killall & timeout
 		install_pkg psmisc "$PACKAGE_MANAGER"
 		install_pkg coreutils "$PACKAGE_MANAGER"
+		# for graphviz, that fuzzingbook depends on
+		install_pkg graphviz "$PACKAGE_MANAGER"
+		install_pkg graphviz-dev "$PACKAGE_MANAGER"
 	fi
 	python3 -m pip install --quiet boto3 "moto[all]" black shfmt-py toml yamllint
 	# drivers
 	python3 -m pip install --quiet pymysql sqlalchemy clickhouse_driver
 	# sqllogic dependencies
 	python3 -m pip install --quiet mysql-connector-python==8.0.30
-	# fuzz dependencies
-	python3 -m pip install --quiet fuzzingbook
 fi
 
 if [[ "$INSTALL_CODEGEN" == "true" ]]; then

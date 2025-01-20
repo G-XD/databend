@@ -14,21 +14,21 @@
 
 use std::sync::Arc;
 
-use common_catalog::table::Table;
-use common_catalog::table_context::TableContext;
-use common_exception::Result;
-use common_expression::types::number::NumberScalar;
-use common_expression::types::DataType;
-use common_expression::types::NumberDataType;
-use common_expression::ColumnBuilder;
-use common_expression::DataBlock;
-use common_expression::Scalar;
-use common_expression::TableDataType;
-use common_expression::TableField;
-use common_expression::TableSchemaRefExt;
-use common_meta_app::schema::TableIdent;
-use common_meta_app::schema::TableInfo;
-use common_meta_app::schema::TableMeta;
+use databend_common_catalog::table::Table;
+use databend_common_catalog::table_context::TableContext;
+use databend_common_exception::Result;
+use databend_common_expression::types::number::NumberScalar;
+use databend_common_expression::types::DataType;
+use databend_common_expression::types::NumberDataType;
+use databend_common_expression::ColumnBuilder;
+use databend_common_expression::DataBlock;
+use databend_common_expression::Scalar;
+use databend_common_expression::TableDataType;
+use databend_common_expression::TableField;
+use databend_common_expression::TableSchemaRefExt;
+use databend_common_meta_app::schema::TableIdent;
+use databend_common_meta_app::schema::TableInfo;
+use databend_common_meta_app::schema::TableMeta;
 
 use crate::SyncOneBlockSystemTable;
 use crate::SyncSystemTable;
@@ -48,6 +48,7 @@ impl SyncSystemTable for ClustersTable {
         let cluster_nodes = ctx.get_cluster().nodes.clone();
 
         let mut names = ColumnBuilder::with_capacity(&DataType::String, cluster_nodes.len());
+        let mut clusters = ColumnBuilder::with_capacity(&DataType::String, cluster_nodes.len());
         let mut addresses = ColumnBuilder::with_capacity(&DataType::String, cluster_nodes.len());
         let mut addresses_port = ColumnBuilder::with_capacity(
             &DataType::Number(NumberDataType::UInt16),
@@ -58,14 +59,22 @@ impl SyncSystemTable for ClustersTable {
         for cluster_node in &cluster_nodes {
             let (ip, port) = cluster_node.ip_port()?;
 
-            names.push(Scalar::String(cluster_node.id.as_bytes().to_vec()).as_ref());
-            addresses.push(Scalar::String(ip.as_bytes().to_vec()).as_ref());
+            names.push(Scalar::String(cluster_node.id.clone()).as_ref());
+            clusters.push(
+                Scalar::String(format!(
+                    "{}/{}",
+                    cluster_node.warehouse_id, cluster_node.cluster_id
+                ))
+                .as_ref(),
+            );
+            addresses.push(Scalar::String(ip).as_ref());
             addresses_port.push(Scalar::Number(NumberScalar::UInt16(port)).as_ref());
-            versions.push(Scalar::String(cluster_node.binary_version.as_bytes().to_vec()).as_ref());
+            versions.push(Scalar::String(cluster_node.binary_version.clone()).as_ref());
         }
 
         Ok(DataBlock::new_from_columns(vec![
             names.build(),
+            clusters.build(),
             addresses.build(),
             addresses_port.build(),
             versions.build(),
@@ -77,6 +86,7 @@ impl ClustersTable {
     pub fn create(table_id: u64) -> Arc<dyn Table> {
         let schema = TableSchemaRefExt::create(vec![
             TableField::new("name", TableDataType::String),
+            TableField::new("cluster", TableDataType::String),
             TableField::new("host", TableDataType::String),
             TableField::new("port", TableDataType::Number(NumberDataType::UInt16)),
             TableField::new("version", TableDataType::String),

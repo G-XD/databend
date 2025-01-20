@@ -19,8 +19,8 @@ use anyerror::AnyError;
 use cbordata::Cbor;
 use cbordata::FromCbor;
 use cbordata::IntoCbor;
-use common_exception::ErrorCode;
-use common_expression::types::DataType;
+use databend_common_exception::ErrorCode;
+use databend_common_expression::types::DataType;
 use xorfilter::Xor8;
 
 use crate::filters::Filter;
@@ -35,7 +35,7 @@ pub struct Xor8Builder {
 }
 
 pub struct Xor8Filter {
-    filter: Xor8,
+    pub filter: Xor8,
 }
 
 #[derive(thiserror::Error, serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -129,6 +129,21 @@ impl Filter for Xor8Filter {
 impl Index for Xor8Filter {
     fn supported_type(data_type: &DataType) -> bool {
         let inner_type = data_type.remove_nullable();
+        if let DataType::Map(box inner_ty) = inner_type {
+            match inner_ty {
+                DataType::Tuple(kv_tys) => {
+                    return matches!(
+                        kv_tys[1].remove_nullable(),
+                        DataType::Number(_)
+                            | DataType::String
+                            | DataType::Variant
+                            | DataType::Timestamp
+                            | DataType::Date
+                    );
+                }
+                _ => unreachable!(),
+            };
+        }
         matches!(
             inner_type,
             DataType::Number(_) | DataType::String | DataType::Timestamp | DataType::Date

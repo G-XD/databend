@@ -19,23 +19,24 @@ use std::time::Duration;
 use chrono::TimeZone;
 use chrono::Utc;
 use chrono_tz::Tz;
-use common_base::base::tokio;
-use common_base::base::tokio::sync::mpsc::Sender;
-use common_base::base::tokio::sync::Mutex;
-use common_exception::Result;
-use common_meta_app::background::BackgroundJobIdent;
-use common_meta_app::background::BackgroundJobInfo;
-use common_meta_app::background::BackgroundJobParams;
-use common_meta_app::background::BackgroundJobStatus;
-use common_meta_app::principal::UserIdentity;
-use databend_query::test_kits::TestFixture;
-use enterprise_query::background_service::Job;
-use enterprise_query::background_service::JobScheduler;
+use databend_common_base::base::tokio;
+use databend_common_base::base::tokio::sync::mpsc::Sender;
+use databend_common_base::base::tokio::sync::Mutex;
+use databend_common_exception::Result;
+use databend_common_meta_app::background::BackgroundJobIdent;
+use databend_common_meta_app::background::BackgroundJobInfo;
+use databend_common_meta_app::background::BackgroundJobParams;
+use databend_common_meta_app::background::BackgroundJobStatus;
+use databend_common_meta_app::principal::UserIdentity;
+use databend_common_meta_app::tenant::Tenant;
+use databend_common_meta_types::SeqV;
+use databend_enterprise_query::background_service::Job;
+use databend_enterprise_query::background_service::JobScheduler;
 
 #[derive(Clone)]
 struct TestJob {
     counter: Arc<AtomicUsize>,
-    info: BackgroundJobInfo,
+    info: SeqV<BackgroundJobInfo>,
     finish_tx: Arc<Mutex<Sender<u64>>>,
 }
 
@@ -60,15 +61,12 @@ impl Job for TestJob {
         let _ = self.finish_tx.clone().lock().await.send(1).await;
     }
 
-    async fn get_info(&self) -> Result<BackgroundJobInfo> {
+    async fn get_info(&self) -> Result<SeqV<BackgroundJobInfo>> {
         Ok(self.info.clone())
     }
 
     fn get_name(&self) -> BackgroundJobIdent {
-        BackgroundJobIdent {
-            tenant: "test".to_string(),
-            name: "test".to_string(),
-        }
+        BackgroundJobIdent::new(Tenant::new_literal("test"), "test")
     }
 
     async fn update_job_status(&mut self, _status: BackgroundJobStatus) -> Result<()> {
@@ -86,9 +84,12 @@ async fn test_one_shot_job() -> Result<()> {
     let counter = Arc::new(AtomicUsize::new(0));
     let job = TestJob {
         counter: counter.clone(),
-        info: BackgroundJobInfo::new_compactor_job(
-            BackgroundJobParams::new_one_shot_job(),
-            UserIdentity::default(),
+        info: SeqV::new(
+            0,
+            BackgroundJobInfo::new_compactor_job(
+                BackgroundJobParams::new_one_shot_job(),
+                UserIdentity::default(),
+            ),
         ),
         finish_tx: scheduler.finish_tx.clone(),
     };
@@ -104,22 +105,23 @@ async fn test_one_shot_job() -> Result<()> {
 // test interval job behavior with suspend support
 #[tokio::test(flavor = "multi_thread")]
 async fn test_interval_job() -> Result<()> {
-    let _ = TestFixture::new().await;
-
     let mut scheduler = JobScheduler::new();
     scheduler.job_tick_interval = Duration::from_millis(5);
     let counter = Arc::new(AtomicUsize::new(0));
     let job = TestJob {
         counter: counter.clone(),
-        info: BackgroundJobInfo::new_compactor_job(
-            BackgroundJobParams::new_interval_job(Duration::from_millis(10)),
-            UserIdentity::default(),
+        info: SeqV::new(
+            0,
+            BackgroundJobInfo::new_compactor_job(
+                BackgroundJobParams::new_interval_job(Duration::from_millis(10)),
+                UserIdentity::default(),
+            ),
         ),
         finish_tx: scheduler.finish_tx.clone(),
     };
     scheduler.add_job(job.clone()).await?;
     let suspend_tx = scheduler.suspend_tx.clone();
-    tokio::spawn(async move {
+    databend_common_base::runtime::spawn(async move {
         tokio::time::sleep(Duration::from_millis(100)).await;
         let _ = suspend_tx.lock().await.send(()).await;
     });

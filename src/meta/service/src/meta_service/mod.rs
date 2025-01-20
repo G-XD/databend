@@ -12,16 +12,22 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub use meta_service_impl::RaftServiceImpl;
-pub use raftmeta::MetaNode;
+mod errors;
+mod forwarder;
+mod meta_node_kv_api_impl;
+
+pub(crate) mod snapshot_receiver_v1;
+
+pub mod meta_leader;
+pub mod meta_node;
+pub mod meta_node_status;
+pub mod raft_service_impl;
+
+pub use forwarder::MetaForwarder;
+pub use meta_node::MetaNode;
+pub use raft_service_impl::RaftServiceImpl;
 
 pub use crate::message::ForwardRequest;
 pub use crate::message::ForwardRequestBody;
 pub use crate::message::JoinRequest;
 pub use crate::message::LeaveRequest;
-
-mod errors;
-pub mod meta_leader;
-mod meta_node_kv_api_impl;
-pub mod meta_service_impl;
-pub mod raftmeta;

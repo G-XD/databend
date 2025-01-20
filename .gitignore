@@ -1,5 +1,5 @@
 # IntelliJ project files
-.idea/*
+**/.idea/*
 
 # visual studio code files
 .vscode
@@ -44,6 +44,7 @@ dist/
 test/
 tests/longrun/_*.csv
 tests/longrun/**/_*.csv
+tests/sqllogictests/data/*
 
 # fuzz
 hfuzz_target/
@@ -73,5 +74,5 @@ benchmark/clickbench/results
 # direnv test files
 .envrc
 
-# z3
-**/.z3-trace
+# lychee
+.lycheecache

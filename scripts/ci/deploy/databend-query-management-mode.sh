@@ -19,10 +19,13 @@ for bin in databend-query databend-meta; do
 	fi
 done
 
+# Wait for killed process to cleanup resources
+sleep 1
+
 echo 'Start databend-meta...'
-nohup target/${BUILD_PROFILE}/databend-meta --single --log-level=ERROR &
+nohup target/${BUILD_PROFILE}/databend-meta --single --log-level=INFO &
 echo "Waiting on databend-meta 10 seconds..."
-python3 scripts/ci/wait_tcp.py --timeout 10 --port 9191
+python3 scripts/ci/wait_tcp.py --timeout 30 --port 9191
 
 echo 'Start databend-query management-mode node'
 nohup target/${BUILD_PROFILE}/databend-query -c scripts/ci/deploy/config/databend-query-management-mode.toml &

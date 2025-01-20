@@ -14,39 +14,61 @@
 
 use std::collections::HashSet;
 
-use common_ast::ast::ColumnID;
-use common_ast::ast::Expr;
-use common_ast::ast::Identifier;
-use common_ast::ast::Lambda;
-use common_ast::ast::Literal;
-use common_ast::ast::Window;
-use common_ast::walk_expr;
-use common_ast::Visitor;
-use common_exception::ErrorCode;
-use common_exception::Result;
-use common_exception::Span;
-use common_functions::is_builtin_function;
+use databend_common_ast::ast::ColumnRef;
+use databend_common_ast::ast::Expr;
+use databend_common_ast::ast::FunctionCall;
+use databend_common_ast::ast::Lambda;
+use databend_common_config::GlobalConfig;
+use databend_common_exception::ErrorCode;
+use databend_common_exception::Result;
+use databend_common_exception::ToErrorCode;
+use databend_common_functions::is_builtin_function;
+use derive_visitor::Drive;
+use derive_visitor::Visitor;
 
-#[derive(Default)]
+#[derive(Default, Visitor)]
+#[visitor(ColumnRef(enter), FunctionCall(enter), Lambda(enter))]
 pub struct UDFValidator {
     pub name: String,
     pub parameters: Vec<String>,
+    pub lambda_parameters: Vec<String>,
 
     pub expr_params: HashSet<String>,
     pub has_recursive: bool,
 }
 
 impl UDFValidator {
+    fn enter_column_ref(&mut self, column: &ColumnRef) {
+        self.expr_params.insert(column.column.name().to_string());
+    }
+
+    fn enter_function_call(&mut self, func: &FunctionCall) {
+        let name = &func.name.name;
+        if !is_builtin_function(name) && self.name.eq_ignore_ascii_case(name) {
+            self.has_recursive = true;
+        }
+    }
+
+    fn enter_lambda(&mut self, lambda: &Lambda) {
+        self.lambda_parameters
+            .extend(lambda.params.iter().map(|v| v.name.clone()));
+    }
+
     pub fn verify_definition_expr(&mut self, definition_expr: &Expr) -> Result<()> {
         self.expr_params.clear();
 
-        walk_expr(self, definition_expr);
+        definition_expr.drive(self);
 
         if self.has_recursive {
             return Err(ErrorCode::SyntaxException("Recursive UDF is not supported"));
         }
         let expr_params = &self.expr_params;
-        let parameters = self.parameters.iter().cloned().collect::<HashSet<_>>();
+        let parameters = self
+            .parameters
+            .iter()
+            .chain(self.lambda_parameters.iter())
+            .cloned()
+            .collect::<HashSet<_>>();
 
         let params_not_declared: HashSet<_> = expr_params.difference(&parameters).collect();
         let params_not_used: HashSet<_> = parameters.difference(expr_params).collect();
@@ -69,61 +91,38 @@ impl UDFValidator {
             },
         )))
     }
-}
 
-impl<'ast> Visitor<'ast> for UDFValidator {
-    fn visit_column_ref(
-        &mut self,
-        _span: Span,
-        _database: &'ast Option<Identifier>,
-        _table: &'ast Option<Identifier>,
-        column: &'ast ColumnID,
-    ) {
-        self.expr_params.insert(column.to_string());
-    }
-
-    fn visit_function_call(
-        &mut self,
-        _span: Span,
-        _distinct: bool,
-        name: &'ast Identifier,
-        args: &'ast [Expr],
-        _params: &'ast [Literal],
-        over: &'ast Option<Window>,
-        lambda: &'ast Option<Lambda>,
-    ) {
-        let name = name.to_string();
-        if !is_builtin_function(&name) && self.name.eq_ignore_ascii_case(&name) {
-            self.has_recursive = true;
-            return;
+    pub fn is_udf_server_allowed(address: &str) -> Result<()> {
+        if !GlobalConfig::instance().query.enable_udf_server {
+            return Err(ErrorCode::Unimplemented(
+                "UDF server is not allowed, you can enable it by setting 'enable_udf_server = true' in query node config",
+            ));
         }
 
-        for arg in args {
-            walk_expr(self, arg);
+        let url_addr = url::Url::parse(address)
+            .map_err_to_code(ErrorCode::InvalidArgument, || {
+                format!("udf server address '{address}' is invalid, please check the address",)
+            })?;
+
+        let udf_server_allow_insecure = GlobalConfig::instance().query.udf_server_allow_insecure;
+        if !udf_server_allow_insecure && url_addr.scheme() != "https" {
+            return Err(ErrorCode::Unimplemented(
+                "Insecure UDF server is not allowed, you can enable it by setting 'udf_server_allow_insecure = true' in query node config",
+            ));
         }
 
-        if let Some(over) = over {
-            match over {
-                Window::WindowSpec(spec) => {
-                    spec.partition_by
-                        .iter()
-                        .for_each(|expr| walk_expr(self, expr));
-                    spec.order_by
-                        .iter()
-                        .for_each(|expr| walk_expr(self, &expr.expr));
-
-                    if let Some(frame) = &spec.window_frame {
-                        self.visit_frame_bound(&frame.start_bound);
-                        self.visit_frame_bound(&frame.end_bound);
-                    }
-                }
-                Window::WindowReference(reference) => {
-                    self.visit_identifier(&reference.window_name);
-                }
+        let udf_server_allow_list = &GlobalConfig::instance().query.udf_server_allow_list;
+        if udf_server_allow_list.iter().all(|allow_url| {
+            if let Ok(allow_url) = url::Url::parse(allow_url) {
+                allow_url.host_str() != url_addr.host_str()
+            } else {
+                true
             }
+        }) {
+            return Err(ErrorCode::InvalidArgument(format!(
+                "Unallowed UDF server address, '{address}' is not in udf_server_allow_list"
+            )));
         }
-        if let Some(lambda) = lambda {
-            walk_expr(self, &lambda.expr)
-        }
+        Ok(())
     }
 }

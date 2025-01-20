@@ -14,22 +14,25 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::time::Duration;
 
-use common_ast::ast::Engine;
-use common_ast::ast::ModifyColumnAction;
-use common_catalog::table::NavigationPoint;
-use common_expression::types::DataType;
-use common_expression::types::NumberDataType;
-use common_expression::DataField;
-use common_expression::DataSchema;
-use common_expression::DataSchemaRef;
-use common_expression::DataSchemaRefExt;
-use common_expression::TableField;
-use common_expression::TableSchema;
-use common_expression::TableSchemaRef;
-use common_meta_app::schema::TableNameIdent;
-use common_meta_app::schema::UndropTableReq;
-use common_meta_app::storage::StorageParams;
+use databend_common_ast::ast::Engine;
+use databend_common_expression::types::DataType;
+use databend_common_expression::types::NumberDataType;
+use databend_common_expression::DataField;
+use databend_common_expression::DataSchema;
+use databend_common_expression::DataSchemaRef;
+use databend_common_expression::DataSchemaRefExt;
+use databend_common_expression::TableField;
+use databend_common_expression::TableSchema;
+use databend_common_expression::TableSchemaRef;
+use databend_common_meta_app::schema::CreateOption;
+use databend_common_meta_app::schema::TableIndex;
+use databend_common_meta_app::schema::TableNameIdent;
+use databend_common_meta_app::schema::UndropTableReq;
+use databend_common_meta_app::storage::StorageParams;
+use databend_common_meta_app::tenant::Tenant;
+use databend_common_pipeline_core::LockGuard;
 
 use crate::plans::Plan;
 
@@ -37,20 +40,21 @@ pub type TableOptions = BTreeMap<String, String>;
 
 #[derive(Clone, Debug)]
 pub struct CreateTablePlan {
-    pub if_not_exists: bool,
-    pub tenant: String,
+    pub create_option: CreateOption,
+    pub tenant: Tenant,
     pub catalog: String,
     pub database: String,
     pub table: String,
 
     pub schema: TableSchemaRef,
     pub engine: Engine,
+    pub engine_options: TableOptions,
     pub storage_params: Option<StorageParams>,
-    pub part_prefix: String,
     pub options: TableOptions,
     pub field_comments: Vec<String>,
     pub cluster_key: Option<String>,
     pub as_select: Option<Box<Plan>>,
+    pub inverted_indexes: Option<BTreeMap<String, TableIndex>>,
 }
 
 impl CreateTablePlan {
@@ -60,7 +64,7 @@ impl CreateTablePlan {
 }
 
 /// Desc.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct DescribeTablePlan {
     pub catalog: String,
     pub database: String,
@@ -77,10 +81,10 @@ impl DescribeTablePlan {
 }
 
 /// Drop.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct DropTablePlan {
     pub if_exists: bool,
-    pub tenant: String,
+    pub tenant: Tenant,
     pub catalog: String,
     pub database: String,
     /// The table name
@@ -95,7 +99,7 @@ impl DropTablePlan {
 }
 
 /// Vacuum
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct VacuumTablePlan {
     pub catalog: String,
     pub database: String,
@@ -105,69 +109,93 @@ pub struct VacuumTablePlan {
 
 impl VacuumTablePlan {
     pub fn schema(&self) -> DataSchemaRef {
-        if self.option.dry_run.is_some() {
-            Arc::new(DataSchema::new(vec![DataField::new(
-                "Files",
-                DataType::String,
-            )]))
+        if let Some(summary) = self.option.dry_run {
+            if summary {
+                Arc::new(DataSchema::new(vec![
+                    DataField::new("total_files", DataType::Number(NumberDataType::UInt64)),
+                    DataField::new("total_size", DataType::Number(NumberDataType::UInt64)),
+                ]))
+            } else {
+                Arc::new(DataSchema::new(vec![
+                    DataField::new("file", DataType::String),
+                    DataField::new("file_size", DataType::Number(NumberDataType::UInt64)),
+                ]))
+            }
         } else {
-            Arc::new(DataSchema::empty())
+            Arc::new(DataSchema::new(vec![
+                DataField::new("snapshot_files", DataType::Number(NumberDataType::UInt64)),
+                DataField::new("snapshot_size", DataType::Number(NumberDataType::UInt64)),
+                DataField::new("segments_files", DataType::Number(NumberDataType::UInt64)),
+                DataField::new("segments_size", DataType::Number(NumberDataType::UInt64)),
+                DataField::new("block_files", DataType::Number(NumberDataType::UInt64)),
+                DataField::new("block_size", DataType::Number(NumberDataType::UInt64)),
+                DataField::new("index_files", DataType::Number(NumberDataType::UInt64)),
+                DataField::new("index_size", DataType::Number(NumberDataType::UInt64)),
+                DataField::new("total_files", DataType::Number(NumberDataType::UInt64)),
+                DataField::new("total_size", DataType::Number(NumberDataType::UInt64)),
+            ]))
         }
     }
 }
 
 /// Vacuum drop table
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct VacuumDropTablePlan {
     pub catalog: String,
     pub database: String,
-    pub option: VacuumTableOption,
+    pub option: VacuumDropTableOption,
 }
 
 impl VacuumDropTablePlan {
     pub fn schema(&self) -> DataSchemaRef {
-        if self.option.dry_run.is_some() {
-            Arc::new(DataSchema::new(vec![
-                DataField::new("Table", DataType::String),
-                DataField::new("File", DataType::String),
-            ]))
+        if let Some(summary) = self.option.dry_run {
+            if summary {
+                Arc::new(DataSchema::new(vec![
+                    DataField::new("table", DataType::String),
+                    DataField::new("total_files", DataType::Number(NumberDataType::UInt64)),
+                    DataField::new("total_size", DataType::Number(NumberDataType::UInt64)),
+                ]))
+            } else {
+                Arc::new(DataSchema::new(vec![
+                    DataField::new("table", DataType::String),
+                    DataField::new("file", DataType::String),
+                    DataField::new("file_size", DataType::Number(NumberDataType::UInt64)),
+                ]))
+            }
         } else {
             Arc::new(DataSchema::empty())
         }
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct VacuumTableOption {
-    pub retain_hours: Option<usize>,
-    pub dry_run: Option<()>,
+#[derive(Clone, Debug)]
+pub struct VacuumTemporaryFilesPlan {
+    pub limit: Option<u64>,
+    pub retain: Option<Duration>,
 }
 
-/// Optimize.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct OptimizeTablePlan {
-    pub catalog: String,
-    pub database: String,
-    pub table: String,
-    pub action: OptimizeTableAction,
-    pub limit: Option<usize>,
-}
-
-impl OptimizeTablePlan {
+impl crate::plans::VacuumTemporaryFilesPlan {
     pub fn schema(&self) -> DataSchemaRef {
-        Arc::new(DataSchema::empty())
+        Arc::new(DataSchema::new(vec![DataField::new(
+            "Files",
+            DataType::Number(NumberDataType::UInt64),
+        )]))
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum OptimizeTableAction {
-    All,
-    Purge(Option<NavigationPoint>),
-    CompactBlocks,
-    CompactSegments,
+#[derive(Debug, Clone)]
+pub struct VacuumDropTableOption {
+    // Some(true) means dry run with summary option
+    pub dry_run: Option<bool>,
+    pub limit: Option<usize>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug, Clone)]
+pub struct VacuumTableOption {
+    pub dry_run: Option<bool>,
+}
+
+#[derive(Clone, Debug)]
 pub struct AnalyzeTablePlan {
     pub catalog: String,
     pub database: String,
@@ -181,9 +209,9 @@ impl AnalyzeTablePlan {
 }
 
 /// Rename.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct RenameTablePlan {
-    pub tenant: String,
+    pub tenant: Tenant,
     pub if_exists: bool,
     pub catalog: String,
     pub database: String,
@@ -198,8 +226,23 @@ impl RenameTablePlan {
     }
 }
 
+/// Modify table comment.
+#[derive(Clone, Debug)]
+pub struct ModifyTableCommentPlan {
+    pub new_comment: String,
+    pub catalog: String,
+    pub database: String,
+    pub table: String,
+}
+
+impl ModifyTableCommentPlan {
+    pub fn schema(&self) -> DataSchemaRef {
+        Arc::new(DataSchema::empty())
+    }
+}
+
 /// SetOptions
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct SetOptionsPlan {
     pub set_options: TableOptions,
     pub catalog: String,
@@ -213,16 +256,31 @@ impl SetOptionsPlan {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct UnsetOptionsPlan {
+    pub options: Vec<String>,
+    pub catalog: String,
+    pub database: String,
+    pub table: String,
+}
+
+impl UnsetOptionsPlan {
+    pub fn schema(&self) -> DataSchemaRef {
+        Arc::new(DataSchema::empty())
+    }
+}
+
 // Table add column
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct AddTableColumnPlan {
-    pub tenant: String,
+    pub tenant: Tenant,
     pub catalog: String,
     pub database: String,
     pub table: String,
     pub field: TableField,
     pub comment: String,
     pub option: AddColumnOption,
+    pub is_deterministic: bool,
 }
 
 impl AddTableColumnPlan {
@@ -231,7 +289,7 @@ impl AddTableColumnPlan {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 pub enum AddColumnOption {
     First,
     After(String),
@@ -239,9 +297,9 @@ pub enum AddColumnOption {
 }
 
 // Table rename column
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct RenameTableColumnPlan {
-    pub tenant: String,
+    pub tenant: Tenant,
     pub catalog: String,
     pub database: String,
     pub table: String,
@@ -257,7 +315,7 @@ impl RenameTableColumnPlan {
 }
 
 // Table drop column
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct DropTableColumnPlan {
     pub catalog: String,
     pub database: String,
@@ -271,13 +329,27 @@ impl DropTableColumnPlan {
     }
 }
 
+// ModifyColumnAction after name resolved, used in ModifyTableColumnPlan
+#[derive(Debug, Clone)]
+pub enum ModifyColumnAction {
+    // (column name, masking policy name)
+    SetMaskingPolicy(String, String),
+    // column name
+    UnsetMaskingPolicy(String),
+    // modify column table field, field comments
+    SetDataType(Vec<(TableField, String)>),
+    // column name
+    ConvertStoredComputedColumn(String),
+}
+
 // Table modify column
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone)]
 pub struct ModifyTableColumnPlan {
     pub catalog: String,
     pub database: String,
     pub table: String,
     pub action: ModifyColumnAction,
+    pub lock_guard: Option<Arc<LockGuard>>,
 }
 
 impl ModifyTableColumnPlan {
@@ -286,8 +358,19 @@ impl ModifyTableColumnPlan {
     }
 }
 
+impl std::fmt::Debug for ModifyTableColumnPlan {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.debug_struct("ModifyTableColumn")
+            .field("catalog", &self.catalog)
+            .field("database", &self.database)
+            .field("table", &self.table)
+            .field("action", &self.action)
+            .finish()
+    }
+}
+
 /// Show.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct ShowCreateTablePlan {
     /// The catalog name
     pub catalog: String,
@@ -306,13 +389,12 @@ impl ShowCreateTablePlan {
 }
 
 /// Truncate.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
 pub struct TruncateTablePlan {
     pub catalog: String,
     pub database: String,
     /// The table name
     pub table: String,
-    pub purge: bool,
 }
 
 impl TruncateTablePlan {
@@ -322,9 +404,9 @@ impl TruncateTablePlan {
 }
 
 /// Undrop.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct UndropTablePlan {
-    pub tenant: String,
+    pub tenant: Tenant,
     pub catalog: String,
     pub database: String,
     pub table: String,
@@ -350,7 +432,7 @@ impl From<UndropTablePlan> for UndropTableReq {
 }
 
 /// Exists table.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct ExistsTablePlan {
     pub catalog: String,
     pub database: String,
@@ -367,13 +449,14 @@ impl ExistsTablePlan {
 }
 
 /// Cluster key.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct AlterTableClusterKeyPlan {
-    pub tenant: String,
+    pub tenant: Tenant,
     pub catalog: String,
     pub database: String,
     pub table: String,
     pub cluster_keys: Vec<String>,
+    pub cluster_type: String,
 }
 
 impl AlterTableClusterKeyPlan {
@@ -382,9 +465,9 @@ impl AlterTableClusterKeyPlan {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct DropTableClusterKeyPlan {
-    pub tenant: String,
+    pub tenant: Tenant,
     pub catalog: String,
     pub database: String,
     pub table: String,

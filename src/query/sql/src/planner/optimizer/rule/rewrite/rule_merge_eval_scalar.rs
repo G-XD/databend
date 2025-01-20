@@ -14,8 +14,9 @@
 
 use std::sync::Arc;
 
-use common_exception::Result;
+use databend_common_exception::Result;
 
+use crate::optimizer::extract::Matcher;
 use crate::optimizer::rule::Rule;
 use crate::optimizer::rule::RuleID;
 use crate::optimizer::rule::TransformResult;
@@ -23,13 +24,12 @@ use crate::optimizer::ColumnSet;
 use crate::optimizer::RelExpr;
 use crate::optimizer::SExpr;
 use crate::plans::EvalScalar;
-use crate::plans::PatternPlan;
 use crate::plans::RelOp;
 
 // Merge two adjacent `EvalScalar`s into one
 pub struct RuleMergeEvalScalar {
     id: RuleID,
-    patterns: Vec<SExpr>,
+    matchers: Vec<Matcher>,
 }
 
 impl RuleMergeEvalScalar {
@@ -41,28 +41,13 @@ impl RuleMergeEvalScalar {
             //  EvalScalar
             //  \
             //   *
-            patterns: vec![SExpr::create_unary(
-                Arc::new(
-                    PatternPlan {
-                        plan_type: RelOp::EvalScalar,
-                    }
-                    .into(),
-                ),
-                Arc::new(SExpr::create_unary(
-                    Arc::new(
-                        PatternPlan {
-                            plan_type: RelOp::EvalScalar,
-                        }
-                        .into(),
-                    ),
-                    Arc::new(SExpr::create_leaf(Arc::new(
-                        PatternPlan {
-                            plan_type: RelOp::Pattern,
-                        }
-                        .into(),
-                    ))),
-                )),
-            )],
+            matchers: vec![Matcher::MatchOp {
+                op_type: RelOp::EvalScalar,
+                children: vec![Matcher::MatchOp {
+                    op_type: RelOp::EvalScalar,
+                    children: vec![Matcher::Leaf],
+                }],
+            }],
         }
     }
 }
@@ -75,7 +60,6 @@ impl Rule for RuleMergeEvalScalar {
     fn apply(&self, s_expr: &SExpr, state: &mut TransformResult) -> Result<()> {
         let up_eval_scalar: EvalScalar = s_expr.plan().clone().try_into()?;
         let down_eval_scalar: EvalScalar = s_expr.child(0)?.plan().clone().try_into()?;
-
         let mut used_columns = ColumnSet::new();
         for item in up_eval_scalar.items.iter() {
             used_columns = used_columns
@@ -86,14 +70,13 @@ impl Rule for RuleMergeEvalScalar {
 
         let rel_expr = RelExpr::with_s_expr(s_expr.child(0)?);
         let input_prop = rel_expr.derive_relational_prop_child(0)?;
-
         // Check if the up EvalScalar depends on the down EvalScalar
         if used_columns.is_subset(&input_prop.output_columns) {
             // TODO(leiysky): eliminate duplicated scalars
             let items = up_eval_scalar
                 .items
                 .into_iter()
-                .chain(down_eval_scalar.items.into_iter())
+                .chain(down_eval_scalar.items)
                 .collect();
             let merged = EvalScalar { items };
 
@@ -107,7 +90,7 @@ impl Rule for RuleMergeEvalScalar {
         Ok(())
     }
 
-    fn patterns(&self) -> &Vec<SExpr> {
-        &self.patterns
+    fn matchers(&self) -> &[Matcher] {
+        &self.matchers
     }
 }

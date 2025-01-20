@@ -12,26 +12,34 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::ops::Deref;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::LazyLock;
 
 use arrow_flight::FlightData;
 use arrow_flight::SchemaAsIpc;
 use arrow_ipc::writer;
 use arrow_ipc::writer::IpcWriteOptions;
+use arrow_ipc::MessageBuilder;
+use arrow_ipc::MessageHeader;
+use arrow_ipc::MetadataVersion;
 use arrow_schema::Schema as ArrowSchema;
-use common_base::base::tokio;
-use common_exception::ErrorCode;
-use common_exception::Result;
-use common_expression::DataBlock;
-use common_expression::DataSchema;
-use common_sql::plans::Plan;
-use common_sql::PlanExtras;
-use common_sql::Planner;
-use common_storages_fuse::TableContext;
+use bytes::Bytes;
+use databend_common_base::base::tokio;
+use databend_common_exception::ErrorCode;
+use databend_common_exception::Result;
+use databend_common_expression::DataBlock;
+use databend_common_expression::DataSchema;
+use databend_common_sql::get_query_kind;
+use databend_common_sql::plans::Plan;
+use databend_common_sql::PlanExtras;
+use databend_common_sql::Planner;
+use databend_common_storages_fuse::TableContext;
 use futures::Stream;
 use futures::StreamExt;
+use prost::bytes;
 use serde::Deserialize;
 use serde::Serialize;
 use tonic::Status;
@@ -46,6 +54,29 @@ use crate::sessions::Session;
 /// A app_metakey which indicates the data is a progress type
 static H_PROGRESS: u8 = 0x01;
 
+/// The generated app metadata for our progress.
+static APP_METADATA_PROGRESS: LazyLock<Bytes> = LazyLock::new(|| Bytes::from(vec![H_PROGRESS]));
+
+/// The data header for our progress.
+///
+/// This build process is inspired from [arrow_ipc::writer::IpcDataGenerator](https://docs.rs/arrow-ipc/51.0.0/arrow_ipc/writer/struct.IpcDataGenerator.html#method.schema_to_bytes)
+static DATA_HEADER_PROGRESS: LazyLock<Bytes> = LazyLock::new(|| {
+    let mut fbb = flatbuffers::FlatBufferBuilder::new();
+
+    let mut builder = MessageBuilder::new(&mut fbb);
+    // Use the same version with arrow_ipc.
+    builder.add_version(MetadataVersion::V5);
+    // Use NONE as the header type.
+    builder.add_header_type(MessageHeader::NONE);
+    // We don't have other data to write in this message, just finish.
+    let data = builder.finish();
+
+    // finish the flat buffers.
+    fbb.finish(data, None);
+
+    Bytes::copy_from_slice(fbb.finished_data())
+});
+
 impl FlightSqlServiceImpl {
     pub(crate) fn schema_to_flight_data(data_schema: DataSchema) -> FlightData {
         let arrow_schema = ArrowSchema::from(&data_schema);
@@ -55,7 +86,7 @@ impl FlightSqlServiceImpl {
 
     pub fn block_to_flight_data(block: DataBlock, data_schema: &DataSchema) -> Result<FlightData> {
         let batch = block
-            .to_record_batch(data_schema)
+            .to_record_batch_with_dataschema(data_schema)
             .map_err(|e| ErrorCode::Internal(format!("{e:?}")))?;
         let options = IpcWriteOptions::default();
         let data_gen = writer::IpcDataGenerator::default();
@@ -66,6 +97,16 @@ impl FlightSqlServiceImpl {
             .map_err(|e| ErrorCode::Internal(format!("{e:?}")))?;
 
         Ok(encoded_batch.into())
+    }
+
+    fn progress_to_flight_data(progress: &ProgressValue) -> Result<FlightData> {
+        let progress = serde_json::to_vec(&progress)
+            .map_err(|e| ErrorCode::Internal(format!("encode progress into json failed: {e:?}")))?;
+
+        Ok(FlightData::new()
+            .with_app_metadata(APP_METADATA_PROGRESS.deref().clone())
+            .with_data_header(DATA_HEADER_PROGRESS.deref().clone())
+            .with_data_body(Bytes::from(progress)))
     }
 
     #[async_backtrace::framed]
@@ -95,7 +136,10 @@ impl FlightSqlServiceImpl {
             .await
             .map_err(|e| status!("Could not create_query_context", e))?;
 
-        context.attach_query_str(plan.to_string(), plan_extras.statement.to_mask_sql());
+        context.attach_query_str(
+            get_query_kind(&plan_extras.statement),
+            plan_extras.statement.to_mask_sql(),
+        );
         let interpreter = InterpreterFactory::get(context.clone(), plan).await?;
 
         let mut blocks = interpreter.execute(context.clone()).await?;
@@ -120,10 +164,13 @@ impl FlightSqlServiceImpl {
             .await
             .map_err(|e| status!("Could not create_query_context", e))?;
 
-        context.attach_query_str(plan.to_string(), plan_extras.statement.to_mask_sql());
+        context.attach_query_str(
+            get_query_kind(&plan_extras.statement),
+            plan_extras.statement.to_mask_sql(),
+        );
         let interpreter = InterpreterFactory::get(context.clone(), plan).await?;
 
-        let data_schema = interpreter.schema();
+        let data_schema = plan.schema();
         let data_stream = interpreter.execute(context.clone()).await?;
 
         let is_finished = Arc::new(AtomicBool::new(false));
@@ -134,7 +181,7 @@ impl FlightSqlServiceImpl {
             .await;
 
         let s1 = sender.clone();
-        tokio::spawn(async move {
+        databend_common_base::runtime::spawn(async move {
             let mut data_stream = data_stream;
 
             while let Some(block) = data_stream.next().await {
@@ -160,7 +207,7 @@ impl FlightSqlServiceImpl {
         });
 
         if is_native_client {
-            tokio::spawn(async move {
+            databend_common_base::runtime::spawn(async move {
                 let total_scan_value = context.get_total_scan_value();
                 let mut current_scan_value = context.get_scan_progress_value();
 
@@ -204,12 +251,7 @@ impl FlightSqlServiceImpl {
                             progress.write_bytes = write_progress.bytes;
                         }
 
-                        let progress = serde_json::to_vec(&progress).unwrap();
-                        Some(FlightData {
-                            app_metadata: vec![H_PROGRESS].into(),
-                            data_body: progress.into(),
-                            ..Default::default()
-                        })
+                        Some(Self::progress_to_flight_data(&progress).unwrap())
                     };
 
                 while !is_finished.load(Ordering::SeqCst) {

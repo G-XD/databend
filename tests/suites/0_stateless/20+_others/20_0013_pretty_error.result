@@ -1,54 +1,48 @@
-ERROR 1105 (HY000) at line 1: SemanticError. Code: 1065, Text = error: 
+Error: APIError: QueryFailed: [1065]error: 
   --> SQL:1:8
   |
 1 | select *
-  |        ^ SELECT * with no tables specified is not valid
+  |        ^ 'SELECT *' is used without specifying any tables in the FROM clause.
 
-.
-ERROR 1105 (HY000) at line 1: UnknownTable. Code: 1025, Text = error: 
+
+Error: APIError: QueryFailed: [1025]error: 
   --> SQL:1:15
   |
 1 | select * from t
-  |               ^ Unknown table 't'
+  |               ^ Unknown table "default"."default".t .
 
-.
-ERROR 1105 (HY000) at line 1: UnknownFunction. Code: 1008, Text = error: 
+
+Error: APIError: QueryFailed: [1008]error: 
   --> SQL:1:8
   |
 1 | select base64(1)
   |        ^^^^^^^^^ no function matches the given name: 'base64', do you mean 'to_base64'?
 
-.
-ERROR 1105 (HY000) at line 1: SemanticError. Code: 1065, Text = error: 
+
+Error: APIError: QueryFailed: [1065]error: 
   --> SQL:1:8
   |
 1 | select to_base64(1)
-  |        ^^^^^^^^^^^^ no overload satisfies `to_base64(UInt8)`
+  |        ^^^^^^^^^^^^ no function matches signature `to_base64(UInt8)`, you might need to add explicit type casts.
 
-has tried possible overloads:
-  to_base64(String) :: String            : unable to unify `UInt8` with `String`
-  to_base64(String NULL) :: String NULL  : unable to unify `UInt8` with `String`
+candidate functions:
+  to_base64(Binary) :: String            : unable to unify `UInt8` with `Binary`
+  to_base64(Binary NULL) :: String NULL  : unable to unify `UInt8` with `Binary`
 
-.
-ERROR 1105 (HY000) at line 1: Internal. Code: 1001, Text = error: 
-  --> SQL:1:12
-  |
-1 | select 1 + 'a'
-  |            ^^^ invalid digit found in string while evaluating function `to_uint8('a')`
 
-.
-ERROR 1105 (HY000) at line 1: UnknownTable. Code: 1025, Text = error: 
+Error: APIError: QueryFailed: [1006]invalid digit found in string while evaluating function `to_uint64('a')` in expr `to_uint64('a')`, during run expr: `1 + to_uint64('a')`
+Error: APIError: QueryFailed: [1025]error: 
   --> SQL:1:20
   |
 1 | select t1.a:z from t
-  |                    ^ Unknown table 't'
+  |                    ^ Unknown table "default"."default".t .
 
-.
-ERROR 1105 (HY000) at line 1: SemanticError. Code: 1065, Text = error: 
+
+Error: APIError: QueryFailed: [1065]error: 
   --> SQL:1:33
   |
 1 | select * from t2 join t3 using (c)
   |                                 ^ column c specified in USING clause does not exist in left table
 
-.
-ERROR 1105 (HY000) at line 1: UnknownTable. Code: 1025, Text = unknown table default.t.
+
+Error: APIError: QueryFailed: [1025]Unknown table 't'

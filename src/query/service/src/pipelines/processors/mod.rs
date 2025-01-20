@@ -12,24 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub use common_pipeline_core::processors::*;
-pub(crate) mod transforms;
+pub use databend_common_pipeline_core::processors::*;
+pub mod transforms;
 
-pub use transforms::AggregatorParams;
-pub use transforms::BlockCompactor;
+pub use transforms::HashJoinBuildState;
 pub use transforms::HashJoinDesc;
 pub use transforms::HashJoinState;
-pub use transforms::JoinHashTable;
-pub use transforms::SinkRuntimeFilterSource;
-pub use transforms::TransformBlockCompact;
+pub use transforms::TransformAddStreamColumns;
 pub use transforms::TransformCastSchema;
-pub use transforms::TransformCompact;
 pub use transforms::TransformCreateSets;
-pub use transforms::TransformExpandGroupingSets;
-pub use transforms::TransformHashJoinBuild;
-pub use transforms::TransformHashJoinProbe;
 pub use transforms::TransformLimit;
+pub use transforms::TransformNullIf;
 pub use transforms::TransformResortAddOn;
-pub use transforms::TransformRuntimeFilter;
-pub use transforms::TransformSortPartial;
-pub use transforms::TransformWindow;
+pub use transforms::TransformResortAddOnWithoutSourceSchema;

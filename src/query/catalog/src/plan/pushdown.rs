@@ -12,14 +12,21 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::collections::BTreeMap;
+use std::collections::HashSet;
 use std::fmt::Debug;
 
-use common_expression::types::DataType;
-use common_expression::RemoteExpr;
-use common_expression::Scalar;
-use common_expression::TableDataType;
-use common_expression::TableField;
-use common_expression::TableSchema;
+use databend_common_ast::ast::SampleConfig;
+use databend_common_expression::types::DataType;
+use databend_common_expression::types::F32;
+use databend_common_expression::DataSchema;
+use databend_common_expression::RemoteExpr;
+use databend_common_expression::Scalar;
+use databend_common_expression::TableDataType;
+use databend_common_expression::TableField;
+use databend_common_expression::TableSchema;
+use databend_common_expression::TableSchemaRef;
+use databend_storages_common_table_meta::table::ChangeType;
 
 use super::AggIndexInfo;
 use crate::plan::Projection;
@@ -29,14 +36,37 @@ use crate::plan::Projection;
 /// Generated from the source column by the paths.
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct VirtualColumnInfo {
-    /// Source column name
+    /// The schema of virtual columns.
+    pub schema: TableSchemaRef,
+    /// The source column ids of virtual columns.
+    /// If the virtual columns are not generated,
+    /// we can read data from source column to generate them.
+    pub source_column_ids: HashSet<u32>,
+    /// The virtual column fields info.
+    pub virtual_column_fields: Vec<VirtualColumnField>,
+}
+
+/// The virtual column field info.
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct VirtualColumnField {
+    /// The source column id.
+    pub source_column_id: u32,
+    /// The source column name.
     pub source_name: String,
-    /// Virtual column name
+    /// The virtual column id, it is not a real column,
+    /// but is used to identify a virtual column when reading data.
+    pub column_id: u32,
+    /// The virtual column name.
     pub name: String,
-    /// Paths to generate virtual column from source column
-    pub paths: Vec<Scalar>,
-    /// Virtual column data type
+    /// Paths to generate virtual column from source column.
+    pub key_paths: Scalar,
+    /// optional cast function name, used to cast value to other type.
+    pub cast_func_name: Option<String>,
+    /// Virtual column data type.
     pub data_type: Box<TableDataType>,
+    /// Is the virtual column is created,
+    /// if not, reminder user to create it.
+    pub is_created: bool,
 }
 
 /// Information about prewhere optimization.
@@ -63,8 +93,49 @@ pub struct PrewhereInfo {
     /// filter for prewhere
     /// Assumption: expression's data type must be `DataType::Boolean`.
     pub filter: RemoteExpr<String>,
-    /// Optional prewhere virtual columns
-    pub virtual_columns: Option<Vec<VirtualColumnInfo>>,
+    /// Optional prewhere virtual column ids
+    pub virtual_column_ids: Option<Vec<u32>>,
+}
+
+/// Inverted index option for additional search functions configuration.
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct InvertedIndexOption {
+    /// Fuzzy query match terms within Levenshtein distance
+    /// https://en.wikipedia.org/wiki/Levenshtein_distance
+    /// For example: if fuzziness is 1, and query text if `fox`,
+    /// the term `box` will be matched.
+    pub fuzziness: Option<u8>,
+    /// Operator: true is AND, false is OR, default is OR.
+    /// For example: query text `happy tax payer` is equals to `happy OR tax OR payer`,
+    /// but if operator is true, it will equals to `happy AND tax AND payer`.
+    pub operator: bool,
+    /// Parse a query leniently, ignore invalid query, default is false.
+    pub lenient: bool,
+}
+
+/// Information about inverted index.
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct InvertedIndexInfo {
+    /// The index name.
+    pub index_name: String,
+    /// The index version.
+    pub index_version: String,
+    /// The index options: tokenizer, filters, etc.
+    pub index_options: BTreeMap<String, String>,
+    /// The index schema.
+    pub index_schema: DataSchema,
+    /// The query field names and optional boost value,
+    /// if boost is set, the score for the field is multiplied by the boost value.
+    /// For example, if set `title^5.0, description^2.0`,
+    /// it means that the score for `title` field is multiplied by 5.0,
+    /// and the score for `description` field is multiplied by 2.0.
+    pub query_fields: Vec<(String, Option<F32>)>,
+    /// The search query text with query syntax.
+    pub query_text: String,
+    /// Whether search with score function.
+    pub has_score: bool,
+    /// Optional search configuration option, like fuzziness, lenient, ..
+    pub inverted_index_option: Option<InvertedIndexOption>,
 }
 
 /// Extras is a wrapper for push down items.
@@ -77,23 +148,34 @@ pub struct PushDownInfo {
     /// The difference with `projection` is the removal of the source columns
     /// which were only used to generate virtual columns.
     pub output_columns: Option<Projection>,
-    /// Optional filter expression plan
+    /// Optional filter and reverse filter expression plan
     /// Assumption: expression's data type must be `DataType::Boolean`.
-    pub filter: Option<RemoteExpr<String>>,
+    pub filters: Option<Filters>,
     pub is_deterministic: bool,
-    /// Optional prewhere information
-    /// used for prewhere optimization
+    /// Optional prewhere information used for prewhere optimization.
     pub prewhere: Option<PrewhereInfo>,
-    /// Optional limit to skip read
+    /// Optional limit to skip read.
     pub limit: Option<usize>,
-    /// Optional order_by expression plan, asc, null_first
+    /// Optional order_by expression plan, asc, null_first.
     pub order_by: Vec<(RemoteExpr<String>, bool, bool)>,
     /// Optional virtual columns
-    pub virtual_columns: Option<Vec<VirtualColumnInfo>>,
+    pub virtual_column: Option<VirtualColumnInfo>,
     /// If lazy materialization is enabled in this query.
     pub lazy_materialization: bool,
     /// Aggregating index information.
     pub agg_index: Option<AggIndexInfo>,
+    /// Identifies the type of data change we are looking for
+    pub change_type: Option<ChangeType>,
+    /// Optional inverted index
+    pub inverted_index: Option<InvertedIndexInfo>,
+    /// Used by table sample
+    pub sample: Option<SampleConfig>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct Filters {
+    pub filter: RemoteExpr<String>,
+    pub inverted_filter: RemoteExpr<String>,
 }
 
 /// TopK is a wrapper for topk push down items.
@@ -101,57 +183,58 @@ pub struct PushDownInfo {
 #[derive(Debug, Clone)]
 pub struct TopK {
     pub limit: usize,
-    pub order_by: TableField,
+    /// Record the leaf field of the topk column.
+    /// - The `name` of `field` will be used to track column in the read block.
+    /// - The `column_id` of `field` will be used to retrieve column stats from block meta
+    ///   (only used for fuse engine, for parquet table, we will use `leaf_id`).
+    pub field: TableField,
     pub asc: bool,
-    pub column_id: u32,
+    /// The index in `table_schema.leaf_fields()`.
+    /// It's only used for external parquet files reading.
+    pub leaf_id: usize,
 }
 
+impl TopK {
+    fn support_type(data_type: &DataType) -> bool {
+        matches!(
+            data_type,
+            DataType::Number(_)
+                | DataType::Date
+                | DataType::Timestamp
+                | DataType::String
+                | DataType::Decimal(_)
+        )
+    }
+}
+
+pub const TOPK_PUSHDOWN_THRESHOLD: usize = 1000;
+
 impl PushDownInfo {
-    pub fn top_k(
-        &self,
-        schema: &TableSchema,
-        cluster_key: Option<&String>,
-        support: fn(&DataType) -> bool,
-    ) -> Option<TopK> {
+    pub fn top_k(&self, schema: &TableSchema) -> Option<TopK> {
         if !self.order_by.is_empty() && self.limit.is_some() {
             let order = &self.order_by[0];
             let limit = self.limit.unwrap();
 
-            const MAX_TOPK_LIMIT: usize = 1000;
-            if limit > MAX_TOPK_LIMIT {
+            if limit > TOPK_PUSHDOWN_THRESHOLD {
                 return None;
             }
 
-            if let RemoteExpr::<String>::ColumnRef { id, .. } = &order.0 {
+            if let RemoteExpr::<String>::ColumnRef { id, data_type, .. } = &order.0 {
                 // TODO: support sub column of nested type.
-                let field = schema.field_with_name(id).ok()?;
-                if !support(&field.data_type().into()) {
+                if !TopK::support_type(data_type) {
                     return None;
                 }
-
-                // Only do topk in storage for cluster key.
-                if let Some(cluster_key) = cluster_key.as_ref() {
-                    if !cluster_key.contains(id) {
-                        return None;
-                    }
-                } else {
-                    return None;
-                }
-
                 let leaf_fields = schema.leaf_fields();
-                let column_id = leaf_fields
+                leaf_fields
                     .iter()
-                    .find(|&p| p == field)
-                    .unwrap()
-                    .column_id();
-
-                let top_k = TopK {
-                    limit: self.limit.unwrap(),
-                    order_by: field.clone(),
-                    asc: order.1,
-                    column_id,
-                };
-                Some(top_k)
+                    .enumerate()
+                    .find(|&(_, p)| p.name() == id)
+                    .map(|(leaf_id, f)| TopK {
+                        limit: self.limit.unwrap(),
+                        field: f.clone(),
+                        asc: order.1,
+                        leaf_id,
+                    })
             } else {
                 None
             }
@@ -160,7 +243,7 @@ impl PushDownInfo {
         }
     }
 
-    pub fn prewhere_of_push_downs(push_downs: &Option<PushDownInfo>) -> Option<PrewhereInfo> {
+    pub fn prewhere_of_push_downs(push_downs: Option<&PushDownInfo>) -> Option<PrewhereInfo> {
         if let Some(PushDownInfo { prewhere, .. }) = push_downs {
             prewhere.clone()
         } else {
@@ -170,7 +253,7 @@ impl PushDownInfo {
 
     pub fn projection_of_push_downs(
         schema: &TableSchema,
-        push_downs: &Option<PushDownInfo>,
+        push_downs: Option<&PushDownInfo>,
     ) -> Projection {
         if let Some(PushDownInfo {
             projection: Some(prj),
@@ -186,31 +269,9 @@ impl PushDownInfo {
 
     pub fn virtual_columns_of_push_downs(
         push_downs: &Option<PushDownInfo>,
-    ) -> Option<Vec<VirtualColumnInfo>> {
-        if let Some(PushDownInfo {
-            virtual_columns,
-            prewhere,
-            ..
-        }) = push_downs
-        {
-            if let Some(PrewhereInfo {
-                virtual_columns: prewhere_virtual_columns,
-                ..
-            }) = prewhere
-            {
-                match (virtual_columns, prewhere_virtual_columns) {
-                    (Some(virtual_columns), Some(prewhere_virtual_columns)) => {
-                        let mut virtual_columns = virtual_columns.clone();
-                        let mut prewhere_virtual_columns = prewhere_virtual_columns.clone();
-                        virtual_columns.append(&mut prewhere_virtual_columns);
-                        Some(virtual_columns)
-                    }
-                    (None, Some(_)) => prewhere_virtual_columns.clone(),
-                    (_, _) => virtual_columns.clone(),
-                }
-            } else {
-                virtual_columns.clone()
-            }
+    ) -> Option<VirtualColumnInfo> {
+        if let Some(PushDownInfo { virtual_column, .. }) = push_downs {
+            virtual_column.clone()
         } else {
             None
         }

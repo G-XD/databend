@@ -16,17 +16,20 @@ use std::sync::Arc;
 
 use chrono::DateTime;
 use chrono::Utc;
-use common_base::base::GlobalInstance;
-use common_catalog::table::Table;
-use common_catalog::table_context::TableContext;
-use common_exception::Result;
-use common_storages_fuse::FuseTable;
-use vacuum_handler::VacuumHandler;
-use vacuum_handler::VacuumHandlerWrapper;
+use databend_common_base::base::GlobalInstance;
+use databend_common_catalog::table::Table;
+use databend_common_catalog::table_context::AbortChecker;
+use databend_common_catalog::table_context::TableContext;
+use databend_common_exception::Result;
+use databend_common_storages_fuse::FuseTable;
+use databend_enterprise_vacuum_handler::vacuum_handler::VacuumDropTablesResult;
+use databend_enterprise_vacuum_handler::vacuum_handler::VacuumTempOptions;
+use databend_enterprise_vacuum_handler::VacuumHandler;
+use databend_enterprise_vacuum_handler::VacuumHandlerWrapper;
 
 use crate::storages::fuse::do_vacuum;
-use crate::storages::fuse::do_vacuum_drop_tables;
-
+use crate::storages::fuse::operations::vacuum_temporary_files::do_vacuum_temporary_files;
+use crate::storages::fuse::vacuum_drop_tables;
 pub struct RealVacuumHandler {}
 
 #[async_trait::async_trait]
@@ -43,10 +46,21 @@ impl VacuumHandler for RealVacuumHandler {
 
     async fn do_vacuum_drop_tables(
         &self,
+        threads_nums: usize,
         tables: Vec<Arc<dyn Table>>,
         dry_run_limit: Option<usize>,
-    ) -> Result<Option<Vec<(String, String)>>> {
-        do_vacuum_drop_tables(tables, dry_run_limit).await
+    ) -> VacuumDropTablesResult {
+        vacuum_drop_tables(threads_nums, tables, dry_run_limit).await
+    }
+
+    async fn do_vacuum_temporary_files(
+        &self,
+        abort_checker: AbortChecker,
+        temporary_dir: String,
+        options: &VacuumTempOptions,
+        vacuum_limit: usize,
+    ) -> Result<usize> {
+        do_vacuum_temporary_files(abort_checker, temporary_dir, options, vacuum_limit).await
     }
 }
 

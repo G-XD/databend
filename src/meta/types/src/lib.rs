@@ -13,7 +13,7 @@
 // limitations under the License.
 
 #![allow(clippy::uninlined_format_args)]
-#![feature(provide_any)]
+#![allow(non_local_definitions)]
 #![feature(no_sanitize)]
 
 //! This crate defines data types used in meta data storage service.
@@ -21,24 +21,32 @@
 mod applied_state;
 mod change;
 mod cluster;
-mod cmd;
-pub mod config;
 mod endpoint;
-pub mod errors;
+mod eval_expire_time;
 mod grpc_config;
+mod grpc_helper;
 mod log_entry;
 mod match_seq;
 mod message;
+mod non_empty;
 mod operation;
 mod raft_snapshot_data;
 mod raft_txid;
-mod raft_types;
 mod seq_errors;
 mod seq_num;
-mod seq_value;
+mod time;
 mod with;
 
 mod proto_display;
+mod proto_ext;
+
+pub mod cmd;
+pub mod config;
+pub mod errors;
+pub mod raft_types;
+pub mod seq_value;
+pub mod snapshot_db;
+pub mod sys_data;
 
 // reexport
 
@@ -55,8 +63,7 @@ pub use applied_state::AppliedState;
 pub use change::Change;
 pub use cluster::Node;
 pub use cluster::NodeInfo;
-pub use cmd::Cmd;
-pub use cmd::UpsertKV;
+pub use cluster::NodeType;
 pub use endpoint::Endpoint;
 pub use errors::meta_api_errors::MetaAPIError;
 pub use errors::meta_api_errors::MetaDataError;
@@ -73,12 +80,14 @@ pub use errors::meta_network_errors::MetaNetworkError;
 pub use errors::meta_network_errors::MetaNetworkResult;
 pub use errors::meta_startup_errors::MetaStartupError;
 pub use errors::rpc_errors::ForwardRPCError;
+pub use eval_expire_time::EvalExpireTime;
 pub use grpc_config::GrpcConfig;
 pub use log_entry::LogEntry;
 pub use match_seq::MatchSeq;
 pub use match_seq::MatchSeqExt;
 pub use operation::MetaId;
 pub use operation::Operation;
+pub use proto_display::VecDisplay;
 pub use protobuf::txn_condition;
 pub use protobuf::txn_condition::ConditionResult;
 pub use protobuf::txn_op;
@@ -99,116 +108,18 @@ pub use protobuf::TxnRequest;
 pub use raft_txid::RaftTxId;
 pub use seq_errors::ConflictSeq;
 pub use seq_num::SeqNum;
-pub use seq_value::IntoSeqV;
 pub use seq_value::KVMeta;
 pub use seq_value::SeqV;
 pub use seq_value::SeqValue;
+pub use time::Interval;
+pub use time::Time;
 pub use with::With;
 
+pub use crate::cmd::Cmd;
+pub use crate::cmd::CmdContext;
+pub use crate::cmd::MetaSpec;
+pub use crate::cmd::UpsertKV;
+pub use crate::grpc_helper::GrpcHelper;
+pub use crate::non_empty::NonEmptyStr;
+pub use crate::non_empty::NonEmptyString;
 pub use crate::raft_snapshot_data::SnapshotData;
-pub use crate::raft_types::compat07;
-pub use crate::raft_types::new_log_id;
-pub use crate::raft_types::AppendEntriesRequest;
-pub use crate::raft_types::AppendEntriesResponse;
-pub use crate::raft_types::ChangeMembershipError;
-pub use crate::raft_types::ClientWriteError;
-pub use crate::raft_types::CommittedLeaderId;
-pub use crate::raft_types::Entry;
-pub use crate::raft_types::EntryPayload;
-pub use crate::raft_types::ErrorSubject;
-pub use crate::raft_types::Fatal;
-pub use crate::raft_types::ForwardToLeader;
-pub use crate::raft_types::InstallSnapshotError;
-pub use crate::raft_types::InstallSnapshotRequest;
-pub use crate::raft_types::InstallSnapshotResponse;
-pub use crate::raft_types::LogId;
-pub use crate::raft_types::LogIndex;
-pub use crate::raft_types::Membership;
-pub use crate::raft_types::MembershipNode;
-pub use crate::raft_types::NetworkError;
-pub use crate::raft_types::NodeId;
-pub use crate::raft_types::RPCError;
-pub use crate::raft_types::RaftError;
-pub use crate::raft_types::RaftMetrics;
-pub use crate::raft_types::Snapshot;
-pub use crate::raft_types::SnapshotMeta;
-pub use crate::raft_types::StorageError;
-pub use crate::raft_types::StorageIOError;
-pub use crate::raft_types::StoredMembership;
-pub use crate::raft_types::Term;
-pub use crate::raft_types::TypeConfig;
-pub use crate::raft_types::Vote;
-pub use crate::raft_types::VoteRequest;
-pub use crate::raft_types::VoteResponse;
-// pub use crate::raft_types::InitializeError;
-// pub use crate::raft_types::RaftChangeMembershipError;
-// pub use crate::raft_types::RaftWriteError;
-
-impl TxnCondition {
-    /// Create a txn condition that checks if the `seq` matches.
-    pub fn eq_seq(key: impl ToString, seq: u64) -> Self {
-        Self {
-            key: key.to_string(),
-            expected: ConditionResult::Eq as i32,
-            target: Some(txn_condition::Target::Seq(seq)),
-        }
-    }
-}
-
-impl TxnOp {
-    /// Create a txn operation that puts a record.
-    pub fn put(key: impl ToString, value: Vec<u8>) -> TxnOp {
-        Self::put_with_expire(key, value, None)
-    }
-
-    /// Create a txn operation that puts a record with expiration time.
-    pub fn put_with_expire(key: impl ToString, value: Vec<u8>, expire_at: Option<u64>) -> TxnOp {
-        TxnOp {
-            request: Some(txn_op::Request::Put(TxnPutRequest {
-                key: key.to_string(),
-                value,
-                prev_value: true,
-                expire_at,
-            })),
-        }
-    }
-
-    /// Create a new `TxnOp` with a `Delete` operation.
-    pub fn delete(key: impl ToString) -> Self {
-        Self::delete_exact(key, None)
-    }
-
-    /// Create a new `TxnOp` with a `Delete` operation that will be executed only when the `seq` matches.
-    pub fn delete_exact(key: impl ToString, seq: Option<u64>) -> Self {
-        TxnOp {
-            request: Some(txn_op::Request::Delete(TxnDeleteRequest {
-                key: key.to_string(),
-                prev_value: true,
-                match_seq: seq,
-            })),
-        }
-    }
-}
-
-impl TxnOpResponse {
-    /// Create a new `TxnOpResponse` of a `Delete` operation.
-    pub fn delete(key: impl ToString, success: bool, prev_value: Option<protobuf::SeqV>) -> Self {
-        TxnOpResponse {
-            response: Some(txn_op_response::Response::Delete(TxnDeleteResponse {
-                key: key.to_string(),
-                success,
-                prev_value,
-            })),
-        }
-    }
-
-    /// Create a new `TxnOpResponse` of a `Put` operation.
-    pub fn put(key: impl ToString, prev_value: Option<protobuf::SeqV>) -> Self {
-        TxnOpResponse {
-            response: Some(txn_op_response::Response::Put(TxnPutResponse {
-                key: key.to_string(),
-                prev_value,
-            })),
-        }
-    }
-}

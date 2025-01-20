@@ -44,6 +44,11 @@ impl Progress {
             .fetch_add(progress_values.bytes, Ordering::Relaxed);
     }
 
+    pub fn set(&self, progress_values: &ProgressValues) {
+        self.rows.store(progress_values.rows, Ordering::Relaxed);
+        self.bytes.store(progress_values.bytes, Ordering::Relaxed);
+    }
+
     pub fn fetch(&self) -> ProgressValues {
         let rows = self.rows.fetch_min(0, Ordering::SeqCst);
         let bytes = self.bytes.fetch_min(0, Ordering::SeqCst);
@@ -55,5 +60,22 @@ impl Progress {
         let rows = self.rows.load(Ordering::Relaxed);
         let bytes = self.bytes.load(Ordering::Relaxed);
         ProgressValues { rows, bytes }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct SpillProgress {
+    pub file_nums: usize,
+    pub bytes: usize,
+}
+
+impl SpillProgress {
+    pub fn new(file_nums: usize, bytes: usize) -> Self {
+        Self { file_nums, bytes }
+    }
+
+    pub fn incr(&mut self, other: &SpillProgress) {
+        self.file_nums += other.file_nums;
+        self.bytes += other.bytes;
     }
 }

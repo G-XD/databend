@@ -15,16 +15,16 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use common_exception::ErrorCode;
-use common_exception::Result;
-use common_meta_app::schema::CreateTableReq;
-use common_meta_app::schema::TableMeta;
-use common_meta_app::schema::TableNameIdent;
-use common_sql::plans::CreateViewPlan;
-use common_sql::plans::Plan;
-use common_sql::Planner;
-use common_storages_view::view_table::QUERY;
-use common_storages_view::view_table::VIEW_ENGINE;
+use databend_common_exception::ErrorCode;
+use databend_common_exception::Result;
+use databend_common_meta_app::schema::CreateTableReq;
+use databend_common_meta_app::schema::TableMeta;
+use databend_common_meta_app::schema::TableNameIdent;
+use databend_common_sql::plans::CreateViewPlan;
+use databend_common_sql::plans::Plan;
+use databend_common_sql::Planner;
+use databend_common_storages_view::view_table::QUERY;
+use databend_common_storages_view::view_table::VIEW_ENGINE;
 
 use crate::interpreters::Interpreter;
 use crate::pipelines::PipelineBuildResult;
@@ -48,20 +48,15 @@ impl Interpreter for CreateViewInterpreter {
         "CreateViewInterpreter"
     }
 
+    fn is_ddl(&self) -> bool {
+        true
+    }
+
     #[async_backtrace::framed]
     async fn execute2(&self) -> Result<PipelineBuildResult> {
         let catalog = self.ctx.get_catalog(&self.plan.catalog).await?;
         let tenant = self.ctx.get_tenant();
         let table_function = catalog.list_table_functions();
-        if catalog
-            .exists_table(tenant.as_str(), &self.plan.database, &self.plan.view_name)
-            .await?
-        {
-            return Err(ErrorCode::ViewAlreadyExists(format!(
-                "{}.{} as view Already Exists",
-                self.plan.database, self.plan.view_name
-            )));
-        }
         let mut options = BTreeMap::new();
         let mut planner = Planner::new(self.ctx.clone());
         let (plan, _) = planner.plan_sql(&self.plan.subquery.clone()).await?;
@@ -72,14 +67,16 @@ impl Interpreter for CreateViewInterpreter {
                     let database_name = table.database();
                     let table_name = table.name();
                     if !catalog
-                        .exists_table(tenant.as_str(), database_name, table_name)
+                        .exists_table(&tenant, database_name, table_name)
                         .await?
                         && !table_function.contains(&table_name.to_string())
                         && !table.table().is_stage_table()
                     {
-                        return Err(common_exception::ErrorCode::UnknownTable(format!(
-                            "VIEW QUERY: {}.{} not exists",
-                            database_name, table_name,
+                        return Err(databend_common_exception::ErrorCode::UnknownTable(format!(
+                            "VIEW QUERY: table `{}`.`{}` not exists in catalog '{}'",
+                            database_name,
+                            table_name,
+                            &catalog.name()
                         )));
                     }
                 }
@@ -110,7 +107,7 @@ impl Interpreter for CreateViewInterpreter {
         options.insert(QUERY.to_string(), subquery);
 
         let plan = CreateTableReq {
-            if_not_exists: self.plan.if_not_exists,
+            create_option: self.plan.create_option,
             name_ident: TableNameIdent {
                 tenant: self.plan.tenant.clone(),
                 db_name: self.plan.database.clone(),
@@ -121,6 +118,7 @@ impl Interpreter for CreateViewInterpreter {
                 options,
                 ..Default::default()
             },
+            as_dropped: false,
         };
         catalog.create_table(plan).await?;
 

@@ -12,21 +12,26 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::cmp::Ordering;
 use std::fmt::Display;
 use std::io::Cursor;
 use std::ops::Range;
 
-use chrono::DateTime;
-use chrono_tz::Tz;
-use common_arrow::arrow::buffer::Buffer;
-use common_io::cursor_ext::BufferReadDateTimeExt;
-use common_io::cursor_ext::DateTimeResType;
-use common_io::cursor_ext::ReadBytesExt;
+use databend_common_column::buffer::Buffer;
+use databend_common_exception::ErrorCode;
+use databend_common_io::cursor_ext::BufferReadDateTimeExt;
+use databend_common_io::cursor_ext::DateTimeResType;
+use databend_common_io::cursor_ext::ReadBytesExt;
+use jiff::fmt::strtime;
+use jiff::tz::TimeZone;
+use jiff::Zoned;
+use log::error;
 
 use super::number::SimpleDomain;
 use crate::property::Domain;
 use crate::types::ArgType;
 use crate::types::DataType;
+use crate::types::DecimalSize;
 use crate::types::GenericMap;
 use crate::types::ValueType;
 use crate::utils::arrow::buffer_into_mut;
@@ -42,22 +47,23 @@ pub const TIMESTAMP_MIN: i64 = -30610224000000000;
 /// Maximum valid timestamp `9999-12-31 23:59:59.999999`, represented by the microsecs offset from 1970-01-01.
 pub const TIMESTAMP_MAX: i64 = 253402300799999999;
 
-pub const MICROS_IN_A_SEC: i64 = 1_000_000;
-pub const MICROS_IN_A_MILLI: i64 = 1_000;
+pub const MICROS_PER_SEC: i64 = 1_000_000;
+pub const MICROS_PER_MILLI: i64 = 1_000;
 
 pub const PRECISION_MICRO: u8 = 6;
 pub const PRECISION_MILLI: u8 = 3;
 pub const PRECISION_SEC: u8 = 0;
 
 /// Check if the timestamp value is valid.
+/// If timestamp is invalid convert to TIMESTAMP_MIN.
 #[inline]
-pub fn check_timestamp(micros: i64) -> Result<i64, String> {
-    if (TIMESTAMP_MIN..=TIMESTAMP_MAX).contains(&micros) {
-        Ok(micros)
-    } else {
-        Err("timestamp is out of range".to_string())
+pub fn clamp_timestamp(micros: &mut i64) {
+    if !(TIMESTAMP_MIN..=TIMESTAMP_MAX).contains(micros) {
+        error!("{}", format!("timestamp {} is out of range", micros));
+        *micros = TIMESTAMP_MIN;
     }
 }
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TimestampType;
 
@@ -74,11 +80,11 @@ impl ValueType for TimestampType {
         long
     }
 
-    fn to_owned_scalar<'a>(scalar: Self::ScalarRef<'a>) -> Self::Scalar {
+    fn to_owned_scalar(scalar: Self::ScalarRef<'_>) -> Self::Scalar {
         scalar
     }
 
-    fn to_scalar_ref<'a>(scalar: &'a Self::Scalar) -> Self::ScalarRef<'a> {
+    fn to_scalar_ref(scalar: &Self::Scalar) -> Self::ScalarRef<'_> {
         *scalar
     }
 
@@ -89,7 +95,7 @@ impl ValueType for TimestampType {
         }
     }
 
-    fn try_downcast_column<'a>(col: &'a Column) -> Option<Self::Column> {
+    fn try_downcast_column(col: &Column) -> Option<Self::Column> {
         match col {
             Column::Timestamp(column) => Some(column.clone()),
             _ => None,
@@ -97,16 +103,28 @@ impl ValueType for TimestampType {
     }
 
     fn try_downcast_domain(domain: &Domain) -> Option<SimpleDomain<i64>> {
-        domain.as_timestamp().map(SimpleDomain::clone)
+        domain.as_timestamp().cloned()
     }
 
-    fn try_downcast_builder<'a>(
-        builder: &'a mut ColumnBuilder,
-    ) -> Option<&'a mut Self::ColumnBuilder> {
+    fn try_downcast_builder(builder: &mut ColumnBuilder) -> Option<&mut Self::ColumnBuilder> {
         match builder {
             ColumnBuilder::Timestamp(builder) => Some(builder),
             _ => None,
         }
+    }
+
+    fn try_downcast_owned_builder(builder: ColumnBuilder) -> Option<Self::ColumnBuilder> {
+        match builder {
+            ColumnBuilder::Timestamp(builder) => Some(builder),
+            _ => None,
+        }
+    }
+
+    fn try_upcast_column_builder(
+        builder: Self::ColumnBuilder,
+        _decimal_size: Option<DecimalSize>,
+    ) -> Option<ColumnBuilder> {
+        Some(ColumnBuilder::Timestamp(builder))
     }
 
     fn upcast_scalar(scalar: Self::Scalar) -> Scalar {
@@ -121,26 +139,26 @@ impl ValueType for TimestampType {
         Domain::Timestamp(domain)
     }
 
-    fn column_len<'a>(col: &'a Self::Column) -> usize {
+    fn column_len(col: &Self::Column) -> usize {
         col.len()
     }
 
-    fn index_column<'a>(col: &'a Self::Column, index: usize) -> Option<Self::ScalarRef<'a>> {
+    fn index_column(col: &Self::Column, index: usize) -> Option<Self::ScalarRef<'_>> {
         col.get(index).cloned()
     }
 
-    unsafe fn index_column_unchecked<'a>(
-        col: &'a Self::Column,
-        index: usize,
-    ) -> Self::ScalarRef<'a> {
+    #[inline(always)]
+    unsafe fn index_column_unchecked(col: &Self::Column, index: usize) -> Self::ScalarRef<'_> {
+        debug_assert!(index < col.len());
+
         *col.get_unchecked(index)
     }
 
-    fn slice_column<'a>(col: &'a Self::Column, range: Range<usize>) -> Self::Column {
+    fn slice_column(col: &Self::Column, range: Range<usize>) -> Self::Column {
         col.clone().sliced(range.start, range.end - range.start)
     }
 
-    fn iter_column<'a>(col: &'a Self::Column) -> Self::ColumnIterator<'a> {
+    fn iter_column(col: &Self::Column) -> Self::ColumnIterator<'_> {
         col.iter().cloned()
     }
 
@@ -154,6 +172,10 @@ impl ValueType for TimestampType {
 
     fn push_item(builder: &mut Self::ColumnBuilder, item: Self::Scalar) {
         builder.push(item);
+    }
+
+    fn push_item_repeat(builder: &mut Self::ColumnBuilder, item: Self::ScalarRef<'_>, n: usize) {
+        builder.resize(builder.len() + n, item);
     }
 
     fn push_default(builder: &mut Self::ColumnBuilder) {
@@ -171,6 +193,41 @@ impl ValueType for TimestampType {
     fn build_scalar(builder: Self::ColumnBuilder) -> Self::Scalar {
         assert_eq!(builder.len(), 1);
         builder[0]
+    }
+
+    #[inline(always)]
+    fn compare(left: Self::ScalarRef<'_>, right: Self::ScalarRef<'_>) -> Ordering {
+        left.cmp(&right)
+    }
+
+    #[inline(always)]
+    fn equal(left: Self::ScalarRef<'_>, right: Self::ScalarRef<'_>) -> bool {
+        left == right
+    }
+
+    #[inline(always)]
+    fn not_equal(left: Self::ScalarRef<'_>, right: Self::ScalarRef<'_>) -> bool {
+        left != right
+    }
+
+    #[inline(always)]
+    fn greater_than(left: Self::ScalarRef<'_>, right: Self::ScalarRef<'_>) -> bool {
+        left > right
+    }
+
+    #[inline(always)]
+    fn greater_than_equal(left: Self::ScalarRef<'_>, right: Self::ScalarRef<'_>) -> bool {
+        left >= right
+    }
+
+    #[inline(always)]
+    fn less_than(left: Self::ScalarRef<'_>, right: Self::ScalarRef<'_>) -> bool {
+        left < right
+    }
+
+    #[inline(always)]
+    fn less_than_equal(left: Self::ScalarRef<'_>, right: Self::ScalarRef<'_>) -> bool {
+        left <= right
     }
 }
 
@@ -207,7 +264,7 @@ impl ArgType for TimestampType {
 }
 
 pub fn microseconds_to_seconds(micros: i64) -> i64 {
-    micros / MICROS_IN_A_SEC
+    micros / MICROS_PER_SEC
 }
 
 pub fn microseconds_to_days(micros: i64) -> i32 {
@@ -215,21 +272,28 @@ pub fn microseconds_to_days(micros: i64) -> i32 {
 }
 
 #[inline]
-pub fn string_to_timestamp(ts_str: impl AsRef<[u8]>, tz: Tz) -> Option<DateTime<Tz>> {
+pub fn string_to_timestamp(
+    ts_str: impl AsRef<[u8]>,
+    jiff_tz: &TimeZone,
+) -> databend_common_exception::Result<Zoned> {
     let mut reader = Cursor::new(std::str::from_utf8(ts_str.as_ref()).unwrap().as_bytes());
-    match reader.read_timestamp_text(&tz, false) {
+    match reader.read_timestamp_text(jiff_tz) {
         Ok(dt) => match dt {
             DateTimeResType::Datetime(dt) => match reader.must_eof() {
-                Ok(..) => Some(dt),
-                Err(_) => None,
+                Ok(..) => Ok(dt),
+                Err(_) => Err(ErrorCode::BadArguments("unexpected argument")),
             },
             _ => unreachable!(),
         },
-        Err(_) => None,
+        Err(e) => match e.code() {
+            ErrorCode::BAD_BYTES => Err(e),
+            _ => Err(ErrorCode::BadArguments("unexpected argument")),
+        },
     }
 }
 
 #[inline]
-pub fn timestamp_to_string(ts: i64, tz: Tz) -> impl Display {
-    ts.to_timestamp(tz).format(TIMESTAMP_FORMAT)
+pub fn timestamp_to_string(ts: i64, tz: &TimeZone) -> impl Display {
+    let zdt = ts.to_timestamp(tz.clone());
+    strtime::format(TIMESTAMP_FORMAT, &zdt).unwrap()
 }

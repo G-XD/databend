@@ -14,12 +14,12 @@
 
 use std::sync::Arc;
 
-use common_exception::Result;
-use common_license::license::Feature;
-use common_license::license_manager::get_license_manager;
-use common_sql::plans::DropDatamaskPolicyPlan;
-use common_users::UserApiProvider;
-use data_mask_feature::get_datamask_handler;
+use databend_common_exception::Result;
+use databend_common_license::license::Feature;
+use databend_common_license::license_manager::LicenseManagerSwitch;
+use databend_common_sql::plans::DropDatamaskPolicyPlan;
+use databend_common_users::UserApiProvider;
+use databend_enterprise_data_mask_feature::get_datamask_handler;
 
 use crate::interpreters::Interpreter;
 use crate::pipelines::PipelineBuildResult;
@@ -43,14 +43,14 @@ impl Interpreter for DropDataMaskInterpreter {
         "DropDataMaskInterpreter"
     }
 
+    fn is_ddl(&self) -> bool {
+        true
+    }
+
     #[async_backtrace::framed]
     async fn execute2(&self) -> Result<PipelineBuildResult> {
-        let license_manager = get_license_manager();
-        license_manager.manager.check_enterprise_enabled(
-            &self.ctx.get_settings(),
-            self.ctx.get_tenant(),
-            Feature::DataMask,
-        )?;
+        LicenseManagerSwitch::instance()
+            .check_enterprise_enabled(self.ctx.get_license_key(), Feature::DataMask)?;
         let meta_api = UserApiProvider::instance().get_meta_store_client();
         let handler = get_datamask_handler();
         handler

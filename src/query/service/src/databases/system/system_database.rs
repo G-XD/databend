@@ -15,43 +15,63 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use common_config::InnerConfig;
-use common_meta_app::schema::DatabaseIdent;
-use common_meta_app::schema::DatabaseInfo;
-use common_meta_app::schema::DatabaseMeta;
-use common_meta_app::schema::DatabaseNameIdent;
-use common_storages_system::BackgroundJobTable;
-use common_storages_system::BackgroundTaskTable;
-use common_storages_system::BacktraceTable;
-use common_storages_system::BuildOptionsTable;
-use common_storages_system::CachesTable;
-use common_storages_system::CatalogsTable;
-use common_storages_system::ClusteringHistoryTable;
-use common_storages_system::ClustersTable;
-use common_storages_system::ColumnsTable;
-use common_storages_system::ConfigsTable;
-use common_storages_system::ContributorsTable;
-use common_storages_system::CreditsTable;
-use common_storages_system::DatabasesTable;
-use common_storages_system::EnginesTable;
-use common_storages_system::FunctionsTable;
-use common_storages_system::IndexesTable;
-use common_storages_system::MallocStatsTable;
-use common_storages_system::MallocStatsTotalsTable;
-use common_storages_system::MetricsTable;
-use common_storages_system::OneTable;
-use common_storages_system::ProcessesTable;
-use common_storages_system::QueryCacheTable;
-use common_storages_system::QueryLogTable;
-use common_storages_system::QueryProfileTable;
-use common_storages_system::RolesTable;
-use common_storages_system::SettingsTable;
-use common_storages_system::StagesTable;
-use common_storages_system::TableFunctionsTable;
-use common_storages_system::TablesTableWithHistory;
-use common_storages_system::TablesTableWithoutHistory;
-use common_storages_system::TracingTable;
-use common_storages_system::UsersTable;
+use databend_common_config::InnerConfig;
+use databend_common_meta_app::schema::database_name_ident::DatabaseNameIdent;
+use databend_common_meta_app::schema::DatabaseId;
+use databend_common_meta_app::schema::DatabaseInfo;
+use databend_common_meta_app::schema::DatabaseMeta;
+use databend_common_meta_app::tenant::Tenant;
+use databend_common_meta_types::seq_value::SeqV;
+use databend_common_storages_system::BackgroundJobTable;
+use databend_common_storages_system::BackgroundTaskTable;
+use databend_common_storages_system::BacktraceTable;
+use databend_common_storages_system::BuildOptionsTable;
+use databend_common_storages_system::CachesTable;
+use databend_common_storages_system::CatalogsTable;
+use databend_common_storages_system::ClusteringHistoryTable;
+use databend_common_storages_system::ClustersTable;
+use databend_common_storages_system::ColumnsTable;
+use databend_common_storages_system::ConfigsTable;
+use databend_common_storages_system::ContributorsTable;
+use databend_common_storages_system::CreditsTable;
+use databend_common_storages_system::DatabasesTableWithHistory;
+use databend_common_storages_system::DatabasesTableWithoutHistory;
+use databend_common_storages_system::DictionariesTable;
+use databend_common_storages_system::EnginesTable;
+use databend_common_storages_system::FullStreamsTable;
+use databend_common_storages_system::FunctionsTable;
+use databend_common_storages_system::IndexesTable;
+use databend_common_storages_system::LocksTable;
+#[cfg(feature = "jemalloc")]
+use databend_common_storages_system::MallocStatsTable;
+#[cfg(feature = "jemalloc")]
+use databend_common_storages_system::MallocStatsTotalsTable;
+use databend_common_storages_system::MetricsTable;
+use databend_common_storages_system::NotificationHistoryTable;
+use databend_common_storages_system::NotificationsTable;
+use databend_common_storages_system::OneTable;
+use databend_common_storages_system::PasswordPoliciesTable;
+use databend_common_storages_system::ProceduresTable;
+use databend_common_storages_system::ProcessesTable;
+use databend_common_storages_system::QueriesProfilingTable;
+use databend_common_storages_system::QueryCacheTable;
+use databend_common_storages_system::QueryLogTable;
+use databend_common_storages_system::RolesTable;
+use databend_common_storages_system::SettingsTable;
+use databend_common_storages_system::StagesTable;
+use databend_common_storages_system::TableFunctionsTable;
+use databend_common_storages_system::TablesTableWithHistory;
+use databend_common_storages_system::TablesTableWithoutHistory;
+use databend_common_storages_system::TaskHistoryTable;
+use databend_common_storages_system::TasksTable;
+use databend_common_storages_system::TempFilesTable;
+use databend_common_storages_system::TemporaryTablesTable;
+use databend_common_storages_system::TerseStreamsTable;
+use databend_common_storages_system::UserFunctionsTable;
+use databend_common_storages_system::UsersTable;
+use databend_common_storages_system::ViewsTableWithHistory;
+use databend_common_storages_system::ViewsTableWithoutHistory;
+use databend_common_storages_system::VirtualColumnsTable;
 
 use crate::catalogs::InMemoryMetas;
 use crate::databases::Database;
@@ -67,9 +87,10 @@ impl SystemDatabase {
     fn disable_system_tables() -> HashMap<String, bool> {
         let mut map = HashMap::new();
         map.insert("configs".to_string(), true);
+        map.insert("tracing".to_string(), true);
         map.insert("clusters".to_string(), true);
-        // Add 2023-08-01 by BohuTANG
-        map.insert("users".to_string(), true);
+        map.insert("malloc_stats".to_string(), true);
+        map.insert("build_options".to_string(), true);
         map
     }
 
@@ -83,12 +104,16 @@ impl SystemDatabase {
             TablesTableWithoutHistory::create(sys_db_meta.next_table_id()),
             TablesTableWithHistory::create(sys_db_meta.next_table_id()),
             ClustersTable::create(sys_db_meta.next_table_id()),
-            DatabasesTable::create(sys_db_meta.next_table_id()),
-            Arc::new(TracingTable::create(sys_db_meta.next_table_id())),
+            DatabasesTableWithHistory::create(sys_db_meta.next_table_id()),
+            DatabasesTableWithoutHistory::create(sys_db_meta.next_table_id()),
+            FullStreamsTable::create(sys_db_meta.next_table_id()),
+            TerseStreamsTable::create(sys_db_meta.next_table_id()),
             ProcessesTable::create(sys_db_meta.next_table_id()),
             ConfigsTable::create(sys_db_meta.next_table_id()),
             MetricsTable::create(sys_db_meta.next_table_id()),
+            #[cfg(feature = "jemalloc")]
             MallocStatsTable::create(sys_db_meta.next_table_id()),
+            #[cfg(feature = "jemalloc")]
             MallocStatsTotalsTable::create(sys_db_meta.next_table_id()),
             ColumnsTable::create(sys_db_meta.next_table_id()),
             UsersTable::create(sys_db_meta.next_table_id()),
@@ -109,10 +134,24 @@ impl SystemDatabase {
             TableFunctionsTable::create(sys_db_meta.next_table_id()),
             CachesTable::create(sys_db_meta.next_table_id()),
             IndexesTable::create(sys_db_meta.next_table_id()),
-            QueryProfileTable::create(sys_db_meta.next_table_id()),
             BackgroundTaskTable::create(sys_db_meta.next_table_id()),
             BackgroundJobTable::create(sys_db_meta.next_table_id()),
             BacktraceTable::create(sys_db_meta.next_table_id()),
+            TempFilesTable::create(sys_db_meta.next_table_id()),
+            TasksTable::create(sys_db_meta.next_table_id()),
+            TaskHistoryTable::create(sys_db_meta.next_table_id()),
+            QueriesProfilingTable::create(sys_db_meta.next_table_id()),
+            LocksTable::create(sys_db_meta.next_table_id()),
+            VirtualColumnsTable::create(sys_db_meta.next_table_id()),
+            PasswordPoliciesTable::create(sys_db_meta.next_table_id()),
+            UserFunctionsTable::create(sys_db_meta.next_table_id()),
+            NotificationsTable::create(sys_db_meta.next_table_id()),
+            NotificationHistoryTable::create(sys_db_meta.next_table_id()),
+            ViewsTableWithHistory::create(sys_db_meta.next_table_id()),
+            ViewsTableWithoutHistory::create(sys_db_meta.next_table_id()),
+            TemporaryTablesTable::create(sys_db_meta.next_table_id()),
+            ProceduresTable::create(sys_db_meta.next_table_id()),
+            DictionariesTable::create(sys_db_meta.next_table_id()),
         ];
 
         let disable_tables = Self::disable_system_tables();
@@ -120,7 +159,7 @@ impl SystemDatabase {
             // Not load the disable system tables.
             if config.query.disable_system_table_load {
                 let name = tbl.name();
-                if disable_tables.get(name).is_none() {
+                if !disable_tables.contains_key(name) {
                     sys_db_meta.insert("system", tbl);
                 }
             } else {
@@ -129,18 +168,12 @@ impl SystemDatabase {
         }
 
         let db_info = DatabaseInfo {
-            ident: DatabaseIdent {
-                db_id: sys_db_meta.next_db_id(),
-                seq: 0,
-            },
-            name_ident: DatabaseNameIdent {
-                tenant: "".to_string(),
-                db_name: "system".to_string(),
-            },
-            meta: DatabaseMeta {
+            database_id: DatabaseId::new(sys_db_meta.next_db_id()),
+            name_ident: DatabaseNameIdent::new(Tenant::new_literal("dummy"), "system"),
+            meta: SeqV::new(0, DatabaseMeta {
                 engine: "SYSTEM".to_string(),
                 ..Default::default()
-            },
+            }),
         };
 
         Self { db_info }

@@ -15,9 +15,14 @@
 use std::fmt::Display;
 use std::fmt::Formatter;
 
-#[derive(Debug, Clone, PartialEq)]
+use derive_visitor::Drive;
+use derive_visitor::DriveMut;
+
+use crate::ast::CreateOption;
+
+#[derive(Debug, Clone, PartialEq, Eq, Drive, DriveMut)]
 pub struct CreateNetworkPolicyStmt {
-    pub if_not_exists: bool,
+    pub create_option: CreateOption,
     pub name: String,
     pub allowed_ip_list: Vec<String>,
     pub blocked_ip_list: Option<Vec<String>>,
@@ -26,8 +31,12 @@ pub struct CreateNetworkPolicyStmt {
 
 impl Display for CreateNetworkPolicyStmt {
     fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
-        write!(f, "CREATE NETWORK POLICY ")?;
-        if self.if_not_exists {
+        write!(f, "CREATE ")?;
+        if let CreateOption::CreateOrReplace = self.create_option {
+            write!(f, "OR REPLACE ")?;
+        }
+        write!(f, "NETWORK POLICY ")?;
+        if let CreateOption::CreateIfNotExists = self.create_option {
             write!(f, "IF NOT EXISTS ")?;
         }
         write!(f, "{}", self.name)?;
@@ -57,7 +66,7 @@ impl Display for CreateNetworkPolicyStmt {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq, Drive, DriveMut)]
 pub struct AlterNetworkPolicyStmt {
     pub if_exists: bool,
     pub name: String,
@@ -102,7 +111,7 @@ impl Display for AlterNetworkPolicyStmt {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq, Drive, DriveMut)]
 pub struct DropNetworkPolicyStmt {
     pub if_exists: bool,
     pub name: String,
@@ -120,7 +129,7 @@ impl Display for DropNetworkPolicyStmt {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq, Drive, DriveMut)]
 pub struct DescNetworkPolicyStmt {
     pub name: String,
 }

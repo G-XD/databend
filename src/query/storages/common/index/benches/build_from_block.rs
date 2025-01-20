@@ -19,23 +19,23 @@ extern crate criterion;
 
 use std::ops::Deref;
 
-use common_expression::types::number::NumberColumn;
-use common_expression::types::string::StringColumnBuilder;
-use common_expression::types::DataType;
-use common_expression::types::NumberDataType;
-use common_expression::types::UInt64Type;
-use common_expression::types::ValueType;
-use common_expression::Column;
-use common_expression::FunctionContext;
 use criterion::Criterion;
+use databend_common_expression::types::number::NumberColumn;
+use databend_common_expression::types::string::StringColumnBuilder;
+use databend_common_expression::types::DataType;
+use databend_common_expression::types::NumberDataType;
+use databend_common_expression::types::UInt64Type;
+use databend_common_expression::types::ValueType;
+use databend_common_expression::Column;
+use databend_common_expression::FunctionContext;
+use databend_storages_common_index::filters::Filter;
+use databend_storages_common_index::filters::FilterBuilder;
+use databend_storages_common_index::filters::Xor8Builder;
+use databend_storages_common_index::BloomIndex;
 use rand::prelude::random;
 use rand::rngs::StdRng;
 use rand::Rng;
 use rand::SeedableRng;
-use storages_common_index::filters::Filter;
-use storages_common_index::filters::FilterBuilder;
-use storages_common_index::filters::Xor8Builder;
-use storages_common_index::BloomIndex;
 
 /// Benchmark building BlockFilter from DataBlock.
 ///
@@ -50,7 +50,6 @@ use storages_common_index::BloomIndex;
 ///   Platform: MacBook Pro M1 MAX
 ///   i64:                       122ns/key
 ///   string of length 16 to 32: 123ns/key
-
 fn bench_u64(c: &mut Criterion) {
     let column = rand_i64_column(1_000_000);
 
@@ -198,7 +197,7 @@ fn rand_str_column(n: i32, len: i32) -> Column {
                             abcdefghijklmnopqrstuvwxyz\
                             0123456789)(*&^%$#@!~";
 
-    let mut builder = StringColumnBuilder::with_capacity(n as usize, 0);
+    let mut builder = StringColumnBuilder::with_capacity(n as usize);
     for _ in 0..n {
         for _ in (len / 2)..len {
             let idx = rng.gen_range(0..CHARSET.len());

@@ -17,13 +17,14 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
-use common_exception::ErrorCode;
+use databend_common_exception::ErrorCode;
 use futures::Future;
 use log::error;
 use log::info;
 use tokio::sync::broadcast;
 
 use super::Stoppable;
+use crate::runtime::drop_guard;
 
 /// Handle a group of `Stoppable` tasks.
 /// When a user press ctrl-c, it calls the `stop()` method on every task to close them.
@@ -55,7 +56,9 @@ impl<E: Error + Send + 'static> StopHandle<E> {
             .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
             .is_err()
         {
-            return Err(ErrorCode::AlreadyStopped("StopHandle is shutting down"));
+            return Err(ErrorCode::AlreadyStopped(
+                "StopHandle is already shutting down",
+            ));
         }
 
         let mut handles = vec![];
@@ -127,14 +130,16 @@ impl<E: Error + Send + 'static> StopHandle<E> {
 
 impl<E: Error + Send + 'static> Drop for StopHandle<E> {
     fn drop(&mut self) {
-        let (tx, _rx) = broadcast::channel::<()>(16);
+        drop_guard(move || {
+            let (tx, _rx) = broadcast::channel::<()>(16);
 
-        // let every task subscribe the channel, then send a force stop signal `()`
-        let fut = self.stop_all(Some(tx.clone()));
+            // let every task subscribe the channel, then send a force stop signal `()`
+            let fut = self.stop_all(Some(tx.clone()));
 
-        if let Ok(fut) = fut {
-            let _ = tx.send(());
-            futures::executor::block_on(fut);
-        }
+            if let Ok(fut) = fut {
+                let _ = tx.send(());
+                futures::executor::block_on(fut);
+            }
+        })
     }
 }

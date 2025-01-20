@@ -17,17 +17,16 @@ use std::time::Duration;
 
 use chrono::DateTime;
 use chrono::Utc;
-use common_base::base::tokio;
-use common_base::base::tokio::sync::mpsc::error::TryRecvError;
-use common_base::base::tokio::sync::mpsc::Receiver;
-use common_base::base::tokio::sync::mpsc::Sender;
-use common_base::base::tokio::sync::Mutex;
-use common_exception::Result;
-use common_meta_app::background::BackgroundJobInfo;
-use common_meta_app::background::BackgroundJobState;
-use common_meta_app::background::BackgroundJobType;
 use dashmap::DashMap;
-use log::as_debug;
+use databend_common_base::base::tokio;
+use databend_common_base::base::tokio::sync::mpsc::error::TryRecvError;
+use databend_common_base::base::tokio::sync::mpsc::Receiver;
+use databend_common_base::base::tokio::sync::mpsc::Sender;
+use databend_common_base::base::tokio::sync::Mutex;
+use databend_common_exception::Result;
+use databend_common_meta_app::background::BackgroundJobInfo;
+use databend_common_meta_app::background::BackgroundJobState;
+use databend_common_meta_app::background::BackgroundJobType;
 use log::info;
 
 use crate::background_service::job::BoxedJob;
@@ -80,11 +79,11 @@ impl JobScheduler {
         match info.job_params.as_ref().unwrap().job_type {
             BackgroundJobType::ONESHOT => {
                 self.one_shot_jobs
-                    .insert(job.get_name().name, Box::new(job) as BoxedJob);
+                    .insert(job.get_name().name().to_string(), Box::new(job) as BoxedJob);
             }
             BackgroundJobType::CRON | BackgroundJobType::INTERVAL => {
                 self.scheduled_jobs
-                    .insert(job.get_name().name, Box::new(job) as BoxedJob);
+                    .insert(job.get_name().name().to_string(), Box::new(job) as BoxedJob);
             }
         }
         Ok(())
@@ -160,12 +159,12 @@ impl JobScheduler {
             let mut status = info.job_status.clone().unwrap();
             status.next_task_scheduled_time = params.get_next_running_time(Utc::now());
             job.update_job_status(status.clone()).await?;
-            info!(background = true, next_scheduled_time = as_debug!(&status.next_task_scheduled_time); "Running job");
+            info!(background = true, next_scheduled_time:? = (&status.next_task_scheduled_time); "Running job");
         } else {
             info!(background = true; "Running execute job");
         }
 
-        tokio::spawn(async move { job.run().await });
+        databend_common_base::runtime::spawn(async move { job.run().await });
         Ok(())
     }
 

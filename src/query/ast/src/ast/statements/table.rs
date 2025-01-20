@@ -15,11 +15,17 @@
 use std::collections::BTreeMap;
 use std::fmt::Display;
 use std::fmt::Formatter;
+use std::time::Duration;
+
+use derive_visitor::Drive;
+use derive_visitor::DriveMut;
 
 use crate::ast::statements::show::ShowLimit;
 use crate::ast::write_comma_separated_list;
-use crate::ast::write_period_separated_list;
-use crate::ast::write_space_separated_map;
+use crate::ast::write_comma_separated_string_map;
+use crate::ast::write_dot_separated_list;
+use crate::ast::write_space_separated_string_map;
+use crate::ast::CreateOption;
 use crate::ast::Expr;
 use crate::ast::Identifier;
 use crate::ast::Query;
@@ -28,7 +34,7 @@ use crate::ast::TimeTravelPoint;
 use crate::ast::TypeName;
 use crate::ast::UriLocation;
 
-#[derive(Debug, Clone, PartialEq)] // Tables
+#[derive(Debug, Clone, PartialEq, Drive, DriveMut)]
 pub struct ShowTablesStmt {
     pub catalog: Option<Identifier>,
     pub database: Option<Identifier>,
@@ -62,7 +68,7 @@ impl Display for ShowTablesStmt {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Drive, DriveMut)]
 pub struct ShowCreateTableStmt {
     pub catalog: Option<Identifier>,
     pub database: Option<Identifier>,
@@ -72,7 +78,7 @@ pub struct ShowCreateTableStmt {
 impl Display for ShowCreateTableStmt {
     fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
         write!(f, "SHOW CREATE TABLE ")?;
-        write_period_separated_list(
+        write_dot_separated_list(
             f,
             self.catalog
                 .iter()
@@ -82,7 +88,7 @@ impl Display for ShowCreateTableStmt {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Drive, DriveMut)]
 pub struct ShowTablesStatusStmt {
     pub database: Option<Identifier>,
     pub limit: Option<ShowLimit>,
@@ -102,48 +108,105 @@ impl Display for ShowTablesStatusStmt {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Drive, DriveMut)]
 pub struct ShowDropTablesStmt {
     pub database: Option<Identifier>,
+    pub limit: Option<ShowLimit>,
 }
 
 impl Display for ShowDropTablesStmt {
     fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
-        write!(f, "SHOW DROP TABLE")?;
+        write!(f, "SHOW DROP TABLES")?;
         if let Some(database) = &self.database {
             write!(f, " FROM {database}")?;
+        }
+        if let Some(limit) = &self.limit {
+            write!(f, " {limit}")?;
         }
 
         Ok(())
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Drive, DriveMut)]
+pub enum ClusterType {
+    Linear,
+    Hilbert,
+}
+
+impl Display for ClusterType {
+    fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
+        match self {
+            ClusterType::Linear => write!(f, "LINEAR"),
+            ClusterType::Hilbert => write!(f, "HILBERT"),
+        }
+    }
+}
+
+impl std::str::FromStr for ClusterType {
+    type Err = ();
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "linear" => Ok(ClusterType::Linear),
+            "hilbert" => Ok(ClusterType::Hilbert),
+            _ => Err(()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Drive, DriveMut)]
+pub struct ClusterOption {
+    pub cluster_type: ClusterType,
+    pub cluster_exprs: Vec<Expr>,
+}
+
+impl Display for ClusterOption {
+    fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
+        write!(f, "CLUSTER BY {}(", self.cluster_type)?;
+        write_comma_separated_list(f, &self.cluster_exprs)?;
+        write!(f, ")")
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Drive, DriveMut)]
 pub struct CreateTableStmt {
-    pub if_not_exists: bool,
+    pub create_option: CreateOption,
     pub catalog: Option<Identifier>,
     pub database: Option<Identifier>,
     pub table: Identifier,
     pub source: Option<CreateTableSource>,
     pub engine: Option<Engine>,
     pub uri_location: Option<UriLocation>,
-    pub cluster_by: Vec<Expr>,
+    pub cluster_by: Option<ClusterOption>,
     pub table_options: BTreeMap<String, String>,
     pub as_query: Option<Box<Query>>,
-    pub transient: bool,
+    pub table_type: TableType,
+}
+
+#[derive(Debug, Clone, PartialEq, Drive, DriveMut)]
+pub enum TableType {
+    Normal,
+    Transient,
+    Temporary,
 }
 
 impl Display for CreateTableStmt {
     fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
-        write!(f, "CREATE ")?;
-        if self.transient {
-            write!(f, "TRANSIENT ")?;
+        write!(f, "CREATE")?;
+        if let CreateOption::CreateOrReplace = self.create_option {
+            write!(f, " OR REPLACE")?;
         }
-        write!(f, "TABLE ")?;
-        if self.if_not_exists {
-            write!(f, "IF NOT EXISTS ")?;
+        match self.table_type {
+            TableType::Normal => {}
+            TableType::Transient => write!(f, " TRANSIENT ")?,
+            TableType::Temporary => write!(f, " TEMPORARY ")?,
+        };
+        write!(f, " TABLE")?;
+        if let CreateOption::CreateIfNotExists = self.create_option {
+            write!(f, " IF NOT EXISTS")?;
         }
-        write_period_separated_list(
+        write!(f, " ")?;
+        write_dot_separated_list(
             f,
             self.catalog
                 .iter()
@@ -159,14 +222,20 @@ impl Display for CreateTableStmt {
             write!(f, " ENGINE = {engine}")?;
         }
 
-        if !self.cluster_by.is_empty() {
-            write!(f, " CLUSTER BY (")?;
-            write_comma_separated_list(f, &self.cluster_by)?;
-            write!(f, ")")?
+        if let Some(uri_location) = &self.uri_location {
+            write!(f, " {uri_location}")?;
+        }
+
+        if let Some(cluster_by) = &self.cluster_by {
+            write!(f, " {cluster_by}")?;
         }
 
         // Format table options
-        write_space_separated_map(f, self.table_options.iter())?;
+        if !self.table_options.is_empty() {
+            write!(f, " ")?;
+            write_space_separated_string_map(f, &self.table_options)?;
+        }
+
         if let Some(as_query) = &self.as_query {
             write!(f, " AS {as_query}")?;
         }
@@ -175,7 +244,7 @@ impl Display for CreateTableStmt {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Drive, DriveMut)]
 pub struct AttachTableStmt {
     pub catalog: Option<Identifier>,
     pub database: Option<Identifier>,
@@ -186,7 +255,7 @@ pub struct AttachTableStmt {
 impl Display for AttachTableStmt {
     fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
         write!(f, "ATTACH TABLE ")?;
-        write_period_separated_list(
+        write_dot_separated_list(
             f,
             self.catalog
                 .iter()
@@ -194,16 +263,15 @@ impl Display for AttachTableStmt {
                 .chain(Some(&self.table)),
         )?;
 
-        write!(f, " FROM {0}", self.uri_location)?;
+        write!(f, " {}", self.uri_location)?;
 
         Ok(())
     }
 }
 
-#[allow(clippy::large_enum_variant)]
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Drive, DriveMut)]
 pub enum CreateTableSource {
-    Columns(Vec<ColumnDefinition>),
+    Columns(Vec<ColumnDefinition>, Option<Vec<InvertedIndexDefinition>>),
     Like {
         catalog: Option<Identifier>,
         database: Option<Identifier>,
@@ -214,9 +282,13 @@ pub enum CreateTableSource {
 impl Display for CreateTableSource {
     fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
         match self {
-            CreateTableSource::Columns(columns) => {
+            CreateTableSource::Columns(columns, inverted_indexes) => {
                 write!(f, "(")?;
                 write_comma_separated_list(f, columns)?;
+                if let Some(inverted_indexes) = inverted_indexes {
+                    write!(f, ", ")?;
+                    write_comma_separated_list(f, inverted_indexes)?;
+                }
                 write!(f, ")")
             }
             CreateTableSource::Like {
@@ -225,13 +297,13 @@ impl Display for CreateTableSource {
                 table,
             } => {
                 write!(f, "LIKE ")?;
-                write_period_separated_list(f, catalog.iter().chain(database).chain(Some(table)))
+                write_dot_separated_list(f, catalog.iter().chain(database).chain(Some(table)))
             }
         }
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Drive, DriveMut)]
 pub struct DescribeTableStmt {
     pub catalog: Option<Identifier>,
     pub database: Option<Identifier>,
@@ -241,7 +313,7 @@ pub struct DescribeTableStmt {
 impl Display for DescribeTableStmt {
     fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
         write!(f, "DESCRIBE ")?;
-        write_period_separated_list(
+        write_dot_separated_list(
             f,
             self.catalog
                 .iter()
@@ -250,7 +322,7 @@ impl Display for DescribeTableStmt {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Drive, DriveMut)]
 pub struct DropTableStmt {
     pub if_exists: bool,
     pub catalog: Option<Identifier>,
@@ -265,7 +337,7 @@ impl Display for DropTableStmt {
         if self.if_exists {
             write!(f, "IF EXISTS ")?;
         }
-        write_period_separated_list(
+        write_dot_separated_list(
             f,
             self.catalog
                 .iter()
@@ -280,7 +352,7 @@ impl Display for DropTableStmt {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Drive, DriveMut)]
 pub struct UndropTableStmt {
     pub catalog: Option<Identifier>,
     pub database: Option<Identifier>,
@@ -290,7 +362,7 @@ pub struct UndropTableStmt {
 impl Display for UndropTableStmt {
     fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
         write!(f, "UNDROP TABLE ")?;
-        write_period_separated_list(
+        write_dot_separated_list(
             f,
             self.catalog
                 .iter()
@@ -300,7 +372,7 @@ impl Display for UndropTableStmt {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Drive, DriveMut)]
 pub struct AlterTableStmt {
     pub if_exists: bool,
     pub table_reference: TableReference,
@@ -309,16 +381,16 @@ pub struct AlterTableStmt {
 
 impl Display for AlterTableStmt {
     fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
-        write!(f, "ALTER TABLE ")?;
+        write!(f, "ALTER TABLE")?;
         if self.if_exists {
-            write!(f, "IF EXISTS ")?;
+            write!(f, " IF EXISTS")?;
         }
-        write!(f, "{}", self.table_reference)?;
+        write!(f, " {}", self.table_reference)?;
         write!(f, " {}", self.action)
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Drive, DriveMut)]
 pub enum AlterTableAction {
     RenameTable {
         new_table: Identifier,
@@ -331,6 +403,9 @@ pub enum AlterTableAction {
         old_column: Identifier,
         new_column: Identifier,
     },
+    ModifyTableComment {
+        new_comment: String,
+    },
     ModifyColumn {
         action: ModifyColumnAction,
     },
@@ -338,7 +413,7 @@ pub enum AlterTableAction {
         column: Identifier,
     },
     AlterTableClusterKey {
-        cluster_by: Vec<Expr>,
+        cluster_by: ClusterOption,
     },
     DropTableClusterKey,
     ReclusterTable {
@@ -346,11 +421,14 @@ pub enum AlterTableAction {
         selection: Option<Expr>,
         limit: Option<u64>,
     },
-    RevertTo {
+    FlashbackTo {
         point: TimeTravelPoint,
     },
     SetOptions {
         set_options: BTreeMap<String, String>,
+    },
+    UnsetOptions {
+        targets: Vec<Identifier>,
     },
 }
 
@@ -358,34 +436,37 @@ impl Display for AlterTableAction {
     fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
         match self {
             AlterTableAction::SetOptions { set_options } => {
-                write!(f, "SET OPTIONS: ").expect("Set Options Write Error ");
-                write_space_separated_map(f, set_options.iter())
+                write!(f, "SET OPTIONS (")?;
+                write_comma_separated_string_map(f, set_options)?;
+                write!(f, ")")?;
             }
+
             AlterTableAction::RenameTable { new_table } => {
-                write!(f, "RENAME TO {new_table}")
+                write!(f, "RENAME TO {new_table}")?;
+            }
+            AlterTableAction::ModifyTableComment { new_comment } => {
+                write!(f, "COMMENT='{new_comment}'")?;
             }
             AlterTableAction::RenameColumn {
                 old_column,
                 new_column,
             } => {
-                write!(f, "RENAME COLUMN {old_column} TO {new_column}")
+                write!(f, "RENAME COLUMN {old_column} TO {new_column}")?;
             }
             AlterTableAction::AddColumn { column, option } => {
                 write!(f, "ADD COLUMN {column}{option}")?;
-                Ok(())
             }
             AlterTableAction::ModifyColumn { action } => {
-                write!(f, "MODIFY COLUMN {action}")
+                write!(f, "MODIFY COLUMN {action}")?;
             }
             AlterTableAction::DropColumn { column } => {
-                write!(f, "DROP COLUMN {column}")
+                write!(f, "DROP COLUMN {column}")?;
             }
             AlterTableAction::AlterTableClusterKey { cluster_by } => {
-                write!(f, "CLUSTER BY ")?;
-                write_comma_separated_list(f, cluster_by)
+                write!(f, "{cluster_by}")?;
             }
             AlterTableAction::DropTableClusterKey => {
-                write!(f, "DROP CLUSTER KEY")
+                write!(f, "DROP CLUSTER KEY")?;
             }
             AlterTableAction::ReclusterTable {
                 is_final,
@@ -402,17 +483,28 @@ impl Display for AlterTableAction {
                 if let Some(limit) = limit {
                     write!(f, " LIMIT {limit}")?;
                 }
-                Ok(())
             }
-            AlterTableAction::RevertTo { point } => {
-                write!(f, "REVERT TO {}", point)?;
-                Ok(())
+            AlterTableAction::FlashbackTo { point } => {
+                write!(f, "FLASHBACK TO {}", point)?;
             }
-        }
+            AlterTableAction::UnsetOptions {
+                targets: unset_targets,
+            } => {
+                write!(f, "UNSET OPTIONS ")?;
+                if unset_targets.len() == 1 {
+                    write!(f, "{}", unset_targets[0])?;
+                } else {
+                    write!(f, "(")?;
+                    write_comma_separated_list(f, unset_targets)?;
+                    write!(f, ")")?;
+                }
+            }
+        };
+        Ok(())
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Drive, DriveMut)]
 pub enum AddColumnOption {
     End,
     First,
@@ -429,7 +521,7 @@ impl Display for AddColumnOption {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Drive, DriveMut)]
 pub struct RenameTableStmt {
     pub if_exists: bool,
     pub catalog: Option<Identifier>,
@@ -446,7 +538,7 @@ impl Display for RenameTableStmt {
         if self.if_exists {
             write!(f, "IF EXISTS ")?;
         }
-        write_period_separated_list(
+        write_dot_separated_list(
             f,
             self.catalog
                 .iter()
@@ -454,7 +546,7 @@ impl Display for RenameTableStmt {
                 .chain(Some(&self.table)),
         )?;
         write!(f, " TO ")?;
-        write_period_separated_list(
+        write_dot_separated_list(
             f,
             self.new_catalog
                 .iter()
@@ -464,33 +556,28 @@ impl Display for RenameTableStmt {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Drive, DriveMut)]
 pub struct TruncateTableStmt {
     pub catalog: Option<Identifier>,
     pub database: Option<Identifier>,
     pub table: Identifier,
-    pub purge: bool,
 }
 
 impl Display for TruncateTableStmt {
     fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
         write!(f, "TRUNCATE TABLE ")?;
-        write_period_separated_list(
+        write_dot_separated_list(
             f,
             self.catalog
                 .iter()
                 .chain(&self.database)
                 .chain(Some(&self.table)),
         )?;
-        if self.purge {
-            write!(f, " PURGE")?;
-        }
-
         Ok(())
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Drive, DriveMut)]
 pub struct VacuumTableStmt {
     pub catalog: Option<Identifier>,
     pub database: Option<Identifier>,
@@ -501,7 +588,7 @@ pub struct VacuumTableStmt {
 impl Display for VacuumTableStmt {
     fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
         write!(f, "VACUUM TABLE ")?;
-        write_period_separated_list(
+        write_dot_separated_list(
             f,
             self.catalog
                 .iter()
@@ -514,11 +601,11 @@ impl Display for VacuumTableStmt {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Drive, DriveMut)]
 pub struct VacuumDropTableStmt {
     pub catalog: Option<Identifier>,
     pub database: Option<Identifier>,
-    pub option: VacuumTableOption,
+    pub option: VacuumDropTableOption,
 }
 
 impl Display for VacuumDropTableStmt {
@@ -526,7 +613,7 @@ impl Display for VacuumDropTableStmt {
         write!(f, "VACUUM DROP TABLE ")?;
         if self.catalog.is_some() || self.database.is_some() {
             write!(f, "FROM ")?;
-            write_period_separated_list(f, self.catalog.iter().chain(&self.database))?;
+            write_dot_separated_list(f, self.catalog.iter().chain(&self.database))?;
             write!(f, " ")?;
         }
         write!(f, "{}", &self.option)?;
@@ -535,7 +622,36 @@ impl Display for VacuumDropTableStmt {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Drive, DriveMut)]
+pub struct VacuumTemporaryFiles {
+    pub limit: Option<u64>,
+    #[drive(skip)]
+    pub retain: Option<Duration>,
+}
+
+impl Display for crate::ast::VacuumTemporaryFiles {
+    fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
+        write!(f, "VACUUM TEMPORARY FILES ")?;
+        if let Some(retain) = &self.retain {
+            let days = Duration::from_secs(60 * 60 * 24);
+            if retain >= &days {
+                let days = retain.as_secs() / (60 * 60 * 24);
+                write!(f, "RETAIN {days} DAYS ")?;
+            } else {
+                let seconds = retain.as_secs();
+                write!(f, "RETAIN {seconds} SECONDS ")?;
+            }
+        }
+
+        if let Some(limit) = &self.limit {
+            write!(f, " LIMIT {limit}")?;
+        }
+
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Drive, DriveMut)]
 pub struct OptimizeTableStmt {
     pub catalog: Option<Identifier>,
     pub database: Option<Identifier>,
@@ -547,7 +663,7 @@ pub struct OptimizeTableStmt {
 impl Display for OptimizeTableStmt {
     fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
         write!(f, "OPTIMIZE TABLE ")?;
-        write_period_separated_list(
+        write_dot_separated_list(
             f,
             self.catalog
                 .iter()
@@ -563,7 +679,7 @@ impl Display for OptimizeTableStmt {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Drive, DriveMut)]
 pub struct AnalyzeTableStmt {
     pub catalog: Option<Identifier>,
     pub database: Option<Identifier>,
@@ -573,7 +689,7 @@ pub struct AnalyzeTableStmt {
 impl Display for AnalyzeTableStmt {
     fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
         write!(f, "ANALYZE TABLE ")?;
-        write_period_separated_list(
+        write_dot_separated_list(
             f,
             self.catalog
                 .iter()
@@ -585,7 +701,7 @@ impl Display for AnalyzeTableStmt {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Drive, DriveMut)]
 pub struct ExistsTableStmt {
     pub catalog: Option<Identifier>,
     pub database: Option<Identifier>,
@@ -595,7 +711,7 @@ pub struct ExistsTableStmt {
 impl Display for ExistsTableStmt {
     fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
         write!(f, "EXISTS TABLE ")?;
-        write_period_separated_list(
+        write_dot_separated_list(
             f,
             self.catalog
                 .iter()
@@ -605,13 +721,15 @@ impl Display for ExistsTableStmt {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Drive, DriveMut)]
 pub enum Engine {
     Null,
     Memory,
     Fuse,
     View,
     Random,
+    Iceberg,
+    Delta,
 }
 
 impl Display for Engine {
@@ -622,39 +740,74 @@ impl Display for Engine {
             Engine::Fuse => write!(f, "FUSE"),
             Engine::View => write!(f, "VIEW"),
             Engine::Random => write!(f, "RANDOM"),
+            Engine::Iceberg => write!(f, "ICEBERG"),
+            Engine::Delta => write!(f, "DELTA"),
         }
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+impl From<&str> for Engine {
+    fn from(s: &str) -> Self {
+        match s.to_lowercase().as_str() {
+            "null" => Engine::Null,
+            "memory" => Engine::Memory,
+            "fuse" => Engine::Fuse,
+            "view" => Engine::View,
+            "random" => Engine::Random,
+            "iceberg" => Engine::Iceberg,
+            "delta" => Engine::Delta,
+            _ => unreachable!("invalid engine: {}", s),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Drive, DriveMut)]
 pub enum CompactTarget {
     Block,
     Segment,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Drive, DriveMut)]
 pub struct VacuumTableOption {
-    pub retain_hours: Option<Expr>,
-    pub dry_run: Option<()>,
+    // Some(true) means dry run with summary option
+    pub dry_run: Option<bool>,
 }
 
 impl Display for VacuumTableOption {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        if let Some(retain_hours) = &self.retain_hours {
-            write!(f, "RETAIN {} HOURS", retain_hours)?;
-        }
-        if self.dry_run.is_some() {
-            if self.retain_hours.is_some() {
-                write!(f, " DRY RUN")?;
-            } else {
-                write!(f, "DRY RUN")?;
+        if let Some(summary) = self.dry_run {
+            write!(f, "DRY RUN")?;
+            if summary {
+                write!(f, " SUMMARY")?;
             }
         }
         Ok(())
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Drive, DriveMut)]
+pub struct VacuumDropTableOption {
+    // Some(true) means dry run with summary option
+    pub dry_run: Option<bool>,
+    pub limit: Option<usize>,
+}
+
+impl Display for VacuumDropTableOption {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        if let Some(summary) = self.dry_run {
+            write!(f, "DRY RUN")?;
+            if summary {
+                write!(f, " SUMMARY")?;
+            }
+        }
+        if let Some(limit) = self.limit {
+            write!(f, " LIMIT {}", limit)?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Drive, DriveMut)]
 pub enum OptimizeTableAction {
     All,
     Purge { before: Option<TimeTravelPoint> },
@@ -675,7 +828,7 @@ impl Display for OptimizeTableAction {
             OptimizeTableAction::Compact { target } => {
                 match target {
                     CompactTarget::Block => {
-                        write!(f, "COMPACT BLOCK")?;
+                        write!(f, "COMPACT")?;
                     }
                     CompactTarget::Segment => {
                         write!(f, "COMPACT SEGMENT")?;
@@ -687,7 +840,7 @@ impl Display for OptimizeTableAction {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Drive, DriveMut)]
 pub enum ColumnExpr {
     Default(Box<Expr>),
     Virtual(Box<Expr>),
@@ -711,7 +864,13 @@ impl Display for ColumnExpr {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Drive, DriveMut)]
+pub enum NullableConstraint {
+    Null,
+    NotNull,
+}
+
+#[derive(Debug, Clone, PartialEq, Drive, DriveMut)]
 pub struct ColumnDefinition {
     pub name: Identifier,
     pub data_type: TypeName,
@@ -722,11 +881,6 @@ pub struct ColumnDefinition {
 impl Display for ColumnDefinition {
     fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
         write!(f, "{} {}", self.name, self.data_type)?;
-
-        if !matches!(self.data_type, TypeName::Nullable(_)) {
-            write!(f, " NOT NULL")?;
-        }
-
         if let Some(expr) = &self.expr {
             write!(f, "{expr}")?;
         }
@@ -737,14 +891,62 @@ impl Display for ColumnDefinition {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Drive, DriveMut)]
+pub struct InvertedIndexDefinition {
+    pub index_name: Identifier,
+    pub columns: Vec<Identifier>,
+    pub sync_creation: bool,
+    pub index_options: BTreeMap<String, String>,
+}
+
+impl Display for InvertedIndexDefinition {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        if !self.sync_creation {
+            write!(f, "ASYNC ")?;
+        }
+        write!(f, "INVERTED INDEX")?;
+        write!(f, " {}", self.index_name)?;
+        write!(f, " (")?;
+        write_comma_separated_list(f, &self.columns)?;
+        write!(f, ")")?;
+
+        if !self.index_options.is_empty() {
+            write!(f, " ")?;
+            write_space_separated_string_map(f, &self.index_options)?;
+        }
+
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Drive, DriveMut)]
+pub enum CreateDefinition {
+    Column(ColumnDefinition),
+    InvertedIndex(InvertedIndexDefinition),
+}
+
+impl Display for CreateDefinition {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CreateDefinition::Column(column_def) => {
+                write!(f, "{}", column_def)?;
+            }
+            CreateDefinition::InvertedIndex(inverted_index_def) => {
+                write!(f, "{}", inverted_index_def)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Drive, DriveMut)]
 pub enum ModifyColumnAction {
     // (column name id, masking policy name)
     SetMaskingPolicy(Identifier, String),
     // column name id
     UnsetMaskingPolicy(Identifier),
-    // vec<(column name id, type name)>
-    SetDataType(Vec<(Identifier, TypeName)>),
+    // vec<ColumnDefinition>
+    SetDataType(Vec<ColumnDefinition>),
     // column name id
     ConvertStoredComputedColumn(Identifier),
 }
@@ -758,20 +960,8 @@ impl Display for ModifyColumnAction {
             ModifyColumnAction::UnsetMaskingPolicy(column) => {
                 write!(f, "{} UNSET MASKING POLICY", column)?
             }
-            ModifyColumnAction::SetDataType(column_type_name_vec) => {
-                let ret = column_type_name_vec
-                    .iter()
-                    .enumerate()
-                    .map(|(i, (column, type_name))| {
-                        if i > 0 {
-                            format!(" COLUMN {} {}", column, type_name)
-                        } else {
-                            format!("{} {}", column, type_name)
-                        }
-                    })
-                    .collect::<Vec<_>>()
-                    .join(",");
-                write!(f, "{}", ret)?
+            ModifyColumnAction::SetDataType(column_defs) => {
+                write_comma_separated_list(f, column_defs)?
             }
             ModifyColumnAction::ConvertStoredComputedColumn(column) => {
                 write!(f, "{} DROP STORED", column)?

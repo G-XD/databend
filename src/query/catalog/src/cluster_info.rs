@@ -14,10 +14,13 @@
 
 use std::sync::Arc;
 
-use common_meta_types::NodeInfo;
+use databend_common_meta_types::NodeInfo;
 
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct Cluster {
+    pub unassign: bool,
     pub local_id: String,
+
     pub nodes: Vec<Arc<NodeInfo>>,
 }
 

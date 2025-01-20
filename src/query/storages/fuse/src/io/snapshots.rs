@@ -20,24 +20,24 @@ use std::time::Instant;
 
 use chrono::DateTime;
 use chrono::Utc;
-use common_base::runtime::execute_futures_in_parallel;
-use common_catalog::table_context::TableContext;
-use common_exception::ErrorCode;
-use common_exception::Result;
+use databend_common_base::runtime::execute_futures_in_parallel;
+use databend_common_catalog::table_context::TableContext;
+use databend_common_exception::ErrorCode;
+use databend_common_exception::Result;
+use databend_storages_common_cache::LoadParams;
+use databend_storages_common_table_meta::meta::FormatVersion;
+use databend_storages_common_table_meta::meta::Location;
+use databend_storages_common_table_meta::meta::SnapshotId;
+use databend_storages_common_table_meta::meta::TableSnapshot;
+use databend_storages_common_table_meta::meta::TableSnapshotLite;
+use fastrace::func_path;
+use fastrace::prelude::*;
 use futures::stream::StreamExt;
 use futures_util::TryStreamExt;
 use log::info;
 use log::warn;
-use minitrace::prelude::*;
 use opendal::EntryMode;
-use opendal::Metakey;
 use opendal::Operator;
-use storages_common_cache::LoadParams;
-use storages_common_table_meta::meta::FormatVersion;
-use storages_common_table_meta::meta::Location;
-use storages_common_table_meta::meta::SnapshotId;
-use storages_common_table_meta::meta::TableSnapshot;
-use storages_common_table_meta::meta::TableSnapshotLite;
 
 use crate::io::MetaReaders;
 use crate::io::SnapshotHistoryReader;
@@ -72,18 +72,19 @@ impl SnapshotsIO {
     }
 
     #[async_backtrace::framed]
-    async fn read_snapshot(
+    pub async fn read_snapshot(
         snapshot_location: String,
         data_accessor: Operator,
     ) -> Result<(Arc<TableSnapshot>, FormatVersion)> {
         let reader = MetaReaders::table_snapshot_reader(data_accessor);
-        let ver = TableMetaLocationGenerator::snapshot_version(snapshot_location.as_str());
+        let ver: u64 = TableMetaLocationGenerator::snapshot_version(snapshot_location.as_str());
         let load_params = LoadParams {
             location: snapshot_location,
             len_hint: None,
             ver,
             put_cache: true,
         };
+        info!("read_snapshot will read: {:?}", load_params);
         let snapshot = reader.read(&load_params).await?;
         Ok((snapshot, ver))
     }
@@ -120,8 +121,8 @@ impl SnapshotsIO {
         Ok(TableSnapshotLite::from((snapshot.as_ref(), ver)))
     }
 
-    #[minitrace::trace]
     #[async_backtrace::framed]
+    #[fastrace::trace]
     async fn read_snapshot_lites(
         &self,
         snapshot_files: &[String],
@@ -136,16 +137,16 @@ impl SnapshotsIO {
                     self.operator.clone(),
                     min_snapshot_timestamp,
                 )
-                .in_span(Span::enter_with_local_parent("read_snapshot"))
+                .in_span(Span::enter_with_local_parent(func_path!()))
             })
         });
 
         let threads_nums = self.ctx.get_settings().get_max_threads()? as usize;
-        let permit_nums = self.ctx.get_settings().get_max_storage_io_requests()? as usize;
+
         execute_futures_in_parallel(
             tasks,
             threads_nums,
-            permit_nums,
+            threads_nums * 2,
             "fuse-req-snapshots-worker".to_owned(),
         )
         .await
@@ -173,12 +174,12 @@ impl SnapshotsIO {
         }
 
         // 1. Get all the snapshot by chunks.
-        let max_io_requests = ctx.get_settings().get_max_storage_io_requests()? as usize;
+        let max_threads = ctx.get_settings().get_max_threads()? as usize;
         let mut snapshot_lites = Vec::with_capacity(snapshot_files.len());
 
         let start = Instant::now();
         let mut count = 0;
-        for chunk in snapshot_files.chunks(max_io_requests) {
+        for chunk in snapshot_files.chunks(max_threads) {
             let results = self
                 .read_snapshot_lites(chunk, min_snapshot_timestamp)
                 .await?;
@@ -191,10 +192,10 @@ impl SnapshotsIO {
             {
                 count += chunk.len();
                 let status = format!(
-                    "read snapshot files:{}/{}, cost:{} sec",
+                    "read snapshot files:{}/{}, cost:{:?}",
                     count,
                     snapshot_files.len(),
-                    start.elapsed().as_secs()
+                    start.elapsed()
                 );
                 info!("{}", status);
                 (status_callback)(status);
@@ -215,12 +216,12 @@ impl SnapshotsIO {
     #[async_backtrace::framed]
     pub async fn read_chained_snapshot_lites(
         &self,
+        dal: Operator,
         location_generator: TableMetaLocationGenerator,
         root_snapshot: String,
         limit: Option<usize>,
     ) -> Result<Vec<TableSnapshotLite>> {
-        let table_snapshot_reader =
-            MetaReaders::table_snapshot_reader(self.ctx.get_data_operator()?.operator());
+        let table_snapshot_reader = MetaReaders::table_snapshot_reader(dal);
         let format_version = TableMetaLocationGenerator::snapshot_version(root_snapshot.as_str());
         let lite_snapshot_stream = table_snapshot_reader
             .snapshot_history(root_snapshot, format_version, location_generator)
@@ -288,8 +289,8 @@ impl SnapshotsIO {
     }
 
     // If `ignore_timestamp` is true, ignore filter out snapshots which have larger (artificial)timestamp
-    #[minitrace::trace]
     #[async_backtrace::framed]
+    #[fastrace::trace]
     pub async fn read_snapshot_lite_extends(
         &self,
         snapshot_files: &[String],
@@ -306,16 +307,16 @@ impl SnapshotsIO {
                     root_snapshot.clone(),
                     ignore_timestamp,
                 )
-                .in_span(Span::enter_with_local_parent("read_snapshot"))
+                .in_span(Span::enter_with_local_parent(func_path!()))
             })
         });
 
         let threads_nums = self.ctx.get_settings().get_max_threads()? as usize;
-        let permit_nums = self.ctx.get_settings().get_max_storage_io_requests()? as usize;
+
         execute_futures_in_parallel(
             tasks,
             threads_nums,
-            permit_nums,
+            threads_nums * 2,
             "fuse-req-snapshots-worker".to_owned(),
         )
         .await
@@ -358,22 +359,25 @@ impl SnapshotsIO {
         exclude_file: Option<&str>,
     ) -> Result<Vec<String>> {
         let mut file_list = vec![];
-        let mut ds = op.list(prefix).await?;
+        let mut ds = op.lister_with(prefix).await?;
         while let Some(de) = ds.try_next().await? {
-            let meta = op
-                .metadata(&de, Metakey::Mode | Metakey::LastModified)
-                .await?;
+            let meta = de.metadata();
             match meta.mode() {
                 EntryMode::FILE => match exclude_file {
                     Some(path) if de.path() == path => continue,
                     _ => {
+                        let last_modified = if let Some(last_modified) = meta.last_modified() {
+                            Some(last_modified)
+                        } else {
+                            op.stat(de.path()).await?.last_modified()
+                        };
+
                         let location = de.path().to_string();
-                        let modified = meta.last_modified();
-                        file_list.push((location, modified));
+                        file_list.push((location, last_modified));
                     }
                 },
                 _ => {
-                    warn!("found not snapshot file in {:}, found: {:?}", prefix, de);
+                    warn!("non-file entry found in {:}, the entry: {:?}", prefix, de);
                     continue;
                 }
             }

@@ -17,7 +17,7 @@
 
 #![allow(clippy::uninlined_format_args)]
 #![feature(trusted_len)]
-#![feature(cursor_remaining)]
+#![feature(cursor_split)]
 
 mod data_field;
 mod data_schema;
@@ -28,7 +28,6 @@ mod variant_value;
 pub use data_field::*;
 pub use data_schema::*;
 pub use data_value::*;
-pub use prelude::*;
 pub use types::*;
 pub use variant_value::*;
 

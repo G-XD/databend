@@ -12,15 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use common_exception::ErrorCode;
-use common_exception::Range;
-use common_exception::Result;
 use logos::Lexer;
 use logos::Logos;
 use strum::IntoEnumIterator;
 use strum_macros::EnumIter;
 
 pub use self::TokenKind::*;
+use crate::ParseError;
+use crate::Range;
+use crate::Result;
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct Token<'a> {
@@ -43,8 +43,8 @@ impl<'a> Token<'a> {
     }
 }
 
-impl<'a> std::fmt::Debug for Token<'a> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl std::fmt::Debug for Token<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         write!(f, "{:?}({:?})", self.kind, self.span)
     }
 }
@@ -65,6 +65,16 @@ impl<'a> Tokenizer<'a> {
             prev_token: None,
         }
     }
+
+    pub fn contains_token(query: &str, target_kind: TokenKind) -> bool {
+        let mut tokenizer = Tokenizer::new(query);
+        while let Some(Ok(token)) = tokenizer.next() {
+            if token.kind == target_kind {
+                return true;
+            }
+        }
+        false
+    }
 }
 
 impl<'a> Iterator for Tokenizer<'a> {
@@ -72,10 +82,13 @@ impl<'a> Iterator for Tokenizer<'a> {
 
     fn next(&mut self) -> Option<Self::Item> {
         match self.lexer.next() {
-            Some(kind) if kind == TokenKind::Error => Some(Err(ErrorCode::SyntaxException(
-                "unable to recognize the rest tokens".to_string(),
-            )
-            .set_span(Some((self.lexer.span().start..self.source.len()).into())))),
+            Some(TokenKind::Error) => {
+                let span = Some((self.lexer.span().start..self.source.len()).into());
+                Some(Err(ParseError(
+                    span,
+                    "unable to recognize the rest tokens".to_string(),
+                )))
+            }
             Some(kind) => {
                 // Skip hint-like comment that is in the invalid position.
                 if !matches!(
@@ -143,23 +156,29 @@ pub enum TokenKind {
     #[regex(r#"[_a-zA-Z][_$a-zA-Z0-9]*"#)]
     Ident,
 
+    #[regex(r#"\$[_a-zA-Z][_$a-zA-Z0-9]*"#)]
+    IdentVariable,
+
     #[regex(r#"\$[0-9]+"#)]
     ColumnPosition,
 
     #[regex(r#"`[^`]*`"#)]
     #[regex(r#""([^"\\]|\\.|"")*""#)]
     #[regex(r#"'([^'\\]|\\.|'')*'"#)]
-    QuotedString,
+    LiteralString,
 
-    #[regex(r#"@([^\s`;'"]|\\\s|\\'|\\"|\\\\)+"#)]
-    AtString,
+    #[regex(r#"\$\$([^\$]|(\$[^\$]))*\$\$"#)]
+    LiteralCodeString,
+
+    #[regex(r#"@([^\s`;'"()]|\\\s|\\'|\\"|\\\\)+"#)]
+    LiteralAtString,
 
     #[regex(r"[xX]'[a-fA-F0-9]*'")]
     PGLiteralHex,
     #[regex(r"0[xX][a-fA-F0-9]+")]
     MySQLLiteralHex,
 
-    #[regex(r"[0-9]+")]
+    #[regex(r"[0-9]+(_|[0-9])*")]
     LiteralInteger,
 
     #[regex(r"[0-9]+[eE][+-]?[0-9]+")]
@@ -169,10 +188,8 @@ pub enum TokenKind {
     // Symbols
     #[token("/*+")]
     HintPrefix,
-
     #[token("*/")]
     HintSuffix,
-
     #[token("==")]
     DoubleEq,
     #[token("=")]
@@ -211,11 +228,13 @@ pub enum TokenKind {
     #[token(",")]
     Comma,
     #[token(".")]
-    Period,
+    Dot,
     #[token(":")]
     Colon,
     #[token("::")]
     DoubleColon,
+    #[token(":=")]
+    ColonEqual,
     #[token(";")]
     SemiColon,
     #[token("\\")]
@@ -230,10 +249,18 @@ pub enum TokenKind {
     LBrace,
     #[token("}")]
     RBrace,
+    #[token("$")]
+    Dollar,
     #[token("->")]
     RArrow,
+    #[token("->>")]
+    LongRArrow,
     #[token("=>")]
     FatRArrow,
+    #[token("#>")]
+    HashRArrow,
+    #[token("#>>")]
+    HashLongRArrow,
     /// A case insensitive match regular expression operator in PostgreSQL
     #[token("~*")]
     TildeAsterisk,
@@ -277,16 +304,39 @@ pub enum TokenKind {
     #[token("||/")]
     CubeRoot,
     /// Placeholder used in prepared stmt
+    /// Also used as JSON operator.
     #[token("?")]
     Placeholder,
+    /// Used as JSON operator.
+    #[token("?|")]
+    QuestionOr,
+    /// Used as JSON operator.
+    #[token("?&")]
+    QuestionAnd,
+    /// Used as JSON operator.
+    #[token("<@")]
+    ArrowAt,
+    /// Used as JSON operator.
+    #[token("@>")]
+    AtArrow,
+    /// Used as JSON operator.
+    #[token("@?")]
+    AtQuestion,
+    /// Used as JSON operator.
+    #[token("@@")]
+    AtAt,
+    /// Used as JSON operator.
+    #[token("#-")]
+    HashMinus,
 
     // Keywords
     //
     // Steps to add keyword:
     // 1. Add the keyword to token kind variants by alphabetical order.
-    // 2. Search in this file to see if the new keyword is a commented
-    //    out reserved keyword. If so, uncomment the keyword in the
-    //    reserved list.
+    // 2. Search in this file to see if the new keyword is a commented out reserved keyword. If
+    //    so, uncomment the keyword in the reserved list.
+    #[token("ACCOUNT", ignore(ascii_case))]
+    ACCOUNT,
     #[token("ALL", ignore(ascii_case))]
     ALL,
     #[token("ALLOWED_IP_LIST", ignore(ascii_case))]
@@ -299,6 +349,8 @@ pub enum TokenKind {
     AGGREGATING,
     #[token("ANY", ignore(ascii_case))]
     ANY,
+    #[token("APPEND_ONLY", ignore(ascii_case))]
+    APPEND_ONLY,
     #[token("ARGS", ignore(ascii_case))]
     ARGS,
     #[token("AUTO", ignore(ascii_case))]
@@ -325,6 +377,10 @@ pub enum TokenKind {
     ASC,
     #[token("ANTI", ignore(ascii_case))]
     ANTI,
+    #[token("ASYNC", ignore(ascii_case))]
+    ASYNC,
+    #[token("ATTACH", ignore(ascii_case))]
+    ATTACH,
     #[token("BEFORE", ignore(ascii_case))]
     BEFORE,
     #[token("BETWEEN", ignore(ascii_case))]
@@ -333,6 +389,18 @@ pub enum TokenKind {
     BIGINT,
     #[token("BINARY", ignore(ascii_case))]
     BINARY,
+    #[token("BREAK", ignore(ascii_case))]
+    BREAK,
+    #[token("LONGBLOB", ignore(ascii_case))]
+    LONGBLOB,
+    #[token("MEDIUMBLOB", ignore(ascii_case))]
+    MEDIUMBLOB,
+    #[token("TINYBLOB", ignore(ascii_case))]
+    TINYBLOB,
+    #[token("BLOB", ignore(ascii_case))]
+    BLOB,
+    #[token("BINARY_FORMAT", ignore(ascii_case))]
+    BINARY_FORMAT,
     #[token("BITMAP", ignore(ascii_case))]
     BITMAP,
     #[token("BLOCKED_IP_LIST", ignore(ascii_case))]
@@ -349,10 +417,14 @@ pub enum TokenKind {
     BROTLI,
     #[token("BZ2", ignore(ascii_case))]
     BZ2,
+    #[token("BLOCK", ignore(ascii_case))]
+    BLOCK,
     #[token("CALL", ignore(ascii_case))]
     CALL,
     #[token("CASE", ignore(ascii_case))]
     CASE,
+    #[token("CASE_SENSITIVE", ignore(ascii_case))]
+    CASE_SENSITIVE,
     #[token("CAST", ignore(ascii_case))]
     CAST,
     #[token("CATALOG", ignore(ascii_case))]
@@ -361,6 +433,8 @@ pub enum TokenKind {
     CATALOGS,
     #[token("CENTURY", ignore(ascii_case))]
     CENTURY,
+    #[token("CHANGES", ignore(ascii_case))]
+    CHANGES,
     #[token("CLUSTER", ignore(ascii_case))]
     CLUSTER,
     #[token("COMMENT", ignore(ascii_case))]
@@ -371,12 +445,20 @@ pub enum TokenKind {
     COMPACT,
     #[token("CONNECTION", ignore(ascii_case))]
     CONNECTION,
+    #[token("CONNECTIONS", ignore(ascii_case))]
+    CONNECTIONS,
+    #[token("CONSUME", ignore(ascii_case))]
+    CONSUME,
     #[token("CONTENT_TYPE", ignore(ascii_case))]
     CONTENT_TYPE,
+    #[token("CONTINUE", ignore(ascii_case))]
+    CONTINUE,
     #[token("CHAR", ignore(ascii_case))]
     CHAR,
     #[token("COLUMN", ignore(ascii_case))]
     COLUMN,
+    #[token("COLUMN_MATCH_MODE", ignore(ascii_case))]
+    COLUMN_MATCH_MODE,
     #[token("COLUMNS", ignore(ascii_case))]
     COLUMNS,
     #[token("CHARACTER", ignore(ascii_case))]
@@ -391,12 +473,10 @@ pub enum TokenKind {
     COPY,
     #[token("COUNT", ignore(ascii_case))]
     COUNT,
+    #[token("CREDENTIAL", ignore(ascii_case))]
+    CREDENTIAL,
     #[token("CREATE", ignore(ascii_case))]
     CREATE,
-    #[token("ATTACH", ignore(ascii_case))]
-    ATTACH,
-    #[token("CREDENTIALS", ignore(ascii_case))]
-    CREDENTIALS,
     #[token("CROSS", ignore(ascii_case))]
     CROSS,
     #[token("CSV", ignore(ascii_case))]
@@ -415,6 +495,10 @@ pub enum TokenKind {
     DATE,
     #[token("DATE_ADD", ignore(ascii_case))]
     DATE_ADD,
+    #[token("DATE_DIFF", ignore(ascii_case))]
+    DATE_DIFF,
+    #[token("DATE_PART", ignore(ascii_case))]
+    DATE_PART,
     #[token("DATE_SUB", ignore(ascii_case))]
     DATE_SUB,
     #[token("DATE_TRUNC", ignore(ascii_case))]
@@ -427,6 +511,8 @@ pub enum TokenKind {
     DECADE,
     #[token("DECIMAL", ignore(ascii_case))]
     DECIMAL,
+    #[token("DECLARE", ignore(ascii_case))]
+    DECLARE,
     #[token("DEFAULT", ignore(ascii_case))]
     DEFAULT,
     #[token("DEFLATE", ignore(ascii_case))]
@@ -435,34 +521,56 @@ pub enum TokenKind {
     DELETE,
     #[token("DESC", ignore(ascii_case))]
     DESC,
+    #[token("DETAILED_OUTPUT", ignore(ascii_case))]
+    DETAILED_OUTPUT,
     #[token("DESCRIBE", ignore(ascii_case))]
     DESCRIBE,
+    #[token("DISABLE", ignore(ascii_case))]
+    DISABLE,
     #[token("DISABLE_VARIANT_CHECK", ignore(ascii_case))]
     DISABLE_VARIANT_CHECK,
     #[token("DISTINCT", ignore(ascii_case))]
     DISTINCT,
+    #[token("RESPECT", ignore(ascii_case))]
+    RESPECT,
+    #[token("IGNORE", ignore(ascii_case))]
+    IGNORE,
     #[token("DIV", ignore(ascii_case))]
     DIV,
     #[token("DOUBLE_SHA1_PASSWORD", ignore(ascii_case))]
     DOUBLE_SHA1_PASSWORD,
+    #[token("DO", ignore(ascii_case))]
+    DO,
     #[token("DOUBLE", ignore(ascii_case))]
     DOUBLE,
     #[token("DOW", ignore(ascii_case))]
     DOW,
+    #[token("WEEK", ignore(ascii_case))]
+    WEEK,
+    #[token("DELTA", ignore(ascii_case))]
+    DELTA,
     #[token("DOY", ignore(ascii_case))]
     DOY,
     #[token("DOWNLOAD", ignore(ascii_case))]
     DOWNLOAD,
+    #[token("DOWNSTREAM", ignore(ascii_case))]
+    DOWNSTREAM,
     #[token("DROP", ignore(ascii_case))]
     DROP,
     #[token("DRY", ignore(ascii_case))]
     DRY,
+    #[token("DYNAMIC", ignore(ascii_case))]
+    DYNAMIC,
     #[token("EXCEPT", ignore(ascii_case))]
     EXCEPT,
     #[token("EXCLUDE", ignore(ascii_case))]
     EXCLUDE,
     #[token("ELSE", ignore(ascii_case))]
     ELSE,
+    #[token("EMPTY_FIELD_AS", ignore(ascii_case))]
+    EMPTY_FIELD_AS,
+    #[token("ENABLE", ignore(ascii_case))]
+    ENABLE,
     #[token("ENABLE_VIRTUAL_HOST_STYLE", ignore(ascii_case))]
     ENABLE_VIRTUAL_HOST_STYLE,
     #[token("END", ignore(ascii_case))]
@@ -475,8 +583,12 @@ pub enum TokenKind {
     ENGINES,
     #[token("EPOCH", ignore(ascii_case))]
     EPOCH,
+    #[token("ERROR_ON_COLUMN_COUNT_MISMATCH", ignore(ascii_case))]
+    ERROR_ON_COLUMN_COUNT_MISMATCH,
     #[token("ESCAPE", ignore(ascii_case))]
     ESCAPE,
+    #[token("EXCEPTION_BACKTRACE", ignore(ascii_case))]
+    EXCEPTION_BACKTRACE,
     #[token("EXISTS", ignore(ascii_case))]
     EXISTS,
     #[token("EXPLAIN", ignore(ascii_case))]
@@ -485,6 +597,8 @@ pub enum TokenKind {
     EXPIRE,
     #[token("EXTRACT", ignore(ascii_case))]
     EXTRACT,
+    #[token("ELSEIF", ignore(ascii_case))]
+    ELSEIF,
     #[token("FALSE", ignore(ascii_case))]
     FALSE,
     #[token("FIELDS", ignore(ascii_case))]
@@ -493,6 +607,10 @@ pub enum TokenKind {
     FIELD_DELIMITER,
     #[token("NAN_DISPLAY", ignore(ascii_case))]
     NAN_DISPLAY,
+    #[token("NULL_DISPLAY", ignore(ascii_case))]
+    NULL_DISPLAY,
+    #[token("NULL_IF", ignore(ascii_case))]
+    NULL_IF,
     #[token("FILE_FORMAT", ignore(ascii_case))]
     FILE_FORMAT,
     #[token("FILE", ignore(ascii_case))]
@@ -523,6 +641,8 @@ pub enum TokenKind {
     FORMATS,
     #[token("FRAGMENTS", ignore(ascii_case))]
     FRAGMENTS,
+    #[token("FRIDAY", ignore(ascii_case))]
+    FRIDAY,
     #[token("FROM", ignore(ascii_case))]
     FROM,
     #[token("FULL", ignore(ascii_case))]
@@ -537,10 +657,14 @@ pub enum TokenKind {
     SET_VAR,
     #[token("FUSE", ignore(ascii_case))]
     FUSE,
-    #[token("GENERATE", ignore(ascii_case))]
-    GENERATE,
+    #[token("GET", ignore(ascii_case))]
+    GET,
     #[token("GENERATED", ignore(ascii_case))]
     GENERATED,
+    #[token("GEOMETRY", ignore(ascii_case))]
+    GEOMETRY,
+    #[token("GEOGRAPHY", ignore(ascii_case))]
+    GEOGRAPHY,
     #[token("GLOBAL", ignore(ascii_case))]
     GLOBAL,
     #[token("GRAPH", ignore(ascii_case))]
@@ -551,6 +675,10 @@ pub enum TokenKind {
     GZIP,
     #[token("HAVING", ignore(ascii_case))]
     HAVING,
+    #[token("HIGH", ignore(ascii_case))]
+    HIGH,
+    #[token("HILBERT", ignore(ascii_case))]
+    HILBERT,
     #[token("HISTORY", ignore(ascii_case))]
     HISTORY,
     #[token("HIVE", ignore(ascii_case))]
@@ -565,12 +693,22 @@ pub enum TokenKind {
     INTERSECT,
     #[token("IDENTIFIED", ignore(ascii_case))]
     IDENTIFIED,
+    #[token("IDENTIFIER", ignore(ascii_case))]
+    IDENTIFIER,
     #[token("IF", ignore(ascii_case))]
     IF,
     #[token("IN", ignore(ascii_case))]
     IN,
+    #[token("INCLUDE_QUERY_ID", ignore(ascii_case))]
+    INCLUDE_QUERY_ID,
+    #[token("INCREMENTAL", ignore(ascii_case))]
+    INCREMENTAL,
     #[token("INDEX", ignore(ascii_case))]
     INDEX,
+    #[token("INFORMATION", ignore(ascii_case))]
+    INFORMATION,
+    #[token("INITIALIZE", ignore(ascii_case))]
+    INITIALIZE,
     #[token("INNER", ignore(ascii_case))]
     INNER,
     #[token("INSERT", ignore(ascii_case))]
@@ -591,6 +729,16 @@ pub enum TokenKind {
     INTERVAL,
     #[token("INTO", ignore(ascii_case))]
     INTO,
+    #[token("INVERTED", ignore(ascii_case))]
+    INVERTED,
+    #[token("PREVIOUS_DAY", ignore(ascii_case))]
+    PREVIOUS_DAY,
+    #[token("PROCEDURE", ignore(ascii_case))]
+    PROCEDURE,
+    #[token("PROCEDURES", ignore(ascii_case))]
+    PROCEDURES,
+    #[token("IMMEDIATE", ignore(ascii_case))]
+    IMMEDIATE,
     #[token("IS", ignore(ascii_case))]
     IS,
     #[token("ISODOW", ignore(ascii_case))]
@@ -609,8 +757,22 @@ pub enum TokenKind {
     KEY,
     #[token("KILL", ignore(ascii_case))]
     KILL,
+    #[token("LAST_DAY", ignore(ascii_case))]
+    LAST_DAY,
+    #[token("LATERAL", ignore(ascii_case))]
+    LATERAL,
+    #[token("LINEAR", ignore(ascii_case))]
+    LINEAR,
     #[token("LOCATION_PREFIX", ignore(ascii_case))]
     LOCATION_PREFIX,
+    #[token("LOCKS", ignore(ascii_case))]
+    LOCKS,
+    #[token("LOGICAL", ignore(ascii_case))]
+    LOGICAL,
+    #[token("LOOP", ignore(ascii_case))]
+    LOOP,
+    #[token("SECONDARY", ignore(ascii_case))]
+    SECONDARY,
     #[token("ROLES", ignore(ascii_case))]
     ROLES,
     /// L2DISTANCE op, from https://github.com/pgvector/pgvector
@@ -620,12 +782,16 @@ pub enum TokenKind {
     LEADING,
     #[token("LEFT", ignore(ascii_case))]
     LEFT,
+    #[token("LET", ignore(ascii_case))]
+    LET,
     #[token("LIKE", ignore(ascii_case))]
     LIKE,
     #[token("LIMIT", ignore(ascii_case))]
     LIMIT,
     #[token("LIST", ignore(ascii_case))]
     LIST,
+    #[token("LOW", ignore(ascii_case))]
+    LOW,
     #[token("LZO", ignore(ascii_case))]
     LZO,
     #[token("MASKING", ignore(ascii_case))]
@@ -636,6 +802,8 @@ pub enum TokenKind {
     MAX_FILE_SIZE,
     #[token("MASTER_KEY", ignore(ascii_case))]
     MASTER_KEY,
+    #[token("MEDIUM", ignore(ascii_case))]
+    MEDIUM,
     #[token("MEMO", ignore(ascii_case))]
     MEMO,
     #[token("MEMORY", ignore(ascii_case))]
@@ -656,12 +824,18 @@ pub enum TokenKind {
     MODIFY,
     #[token("MATERIALIZED", ignore(ascii_case))]
     MATERIALIZED,
+    #[token("MUST_CHANGE_PASSWORD", ignore(ascii_case))]
+    MUST_CHANGE_PASSWORD,
+    #[token("NEXT_DAY", ignore(ascii_case))]
+    NEXT_DAY,
     #[token("NON_DISPLAY", ignore(ascii_case))]
     NON_DISPLAY,
     #[token("NATURAL", ignore(ascii_case))]
     NATURAL,
     #[token("NETWORK", ignore(ascii_case))]
     NETWORK,
+    #[token("DISABLED", ignore(ascii_case))]
+    DISABLED,
     #[token("NDJSON", ignore(ascii_case))]
     NDJSON,
     #[token("NO_PASSWORD", ignore(ascii_case))]
@@ -672,6 +846,8 @@ pub enum TokenKind {
     NOT,
     #[token("NOTENANTSETTING", ignore(ascii_case))]
     NOTENANTSETTING,
+    #[token("DEFAULT_ROLE", ignore(ascii_case))]
+    DEFAULT_ROLE,
     #[token("NULL", ignore(ascii_case))]
     NULL,
     #[token("NULLABLE", ignore(ascii_case))]
@@ -684,14 +860,22 @@ pub enum TokenKind {
     OFFSET,
     #[token("ON", ignore(ascii_case))]
     ON,
+    #[token("ON_CREATE", ignore(ascii_case))]
+    ON_CREATE,
+    #[token("ON_SCHEDULE", ignore(ascii_case))]
+    ON_SCHEDULE,
     #[token("OPTIMIZE", ignore(ascii_case))]
     OPTIMIZE,
     #[token("OPTIONS", ignore(ascii_case))]
     OPTIONS,
     #[token("OR", ignore(ascii_case))]
     OR,
+    #[token("ORC", ignore(ascii_case))]
+    ORC,
     #[token("ORDER", ignore(ascii_case))]
     ORDER,
+    #[token("OUTPUT_HEADER", ignore(ascii_case))]
+    OUTPUT_HEADER,
     #[token("OUTER", ignore(ascii_case))]
     OUTER,
     #[token("ON_ERROR", ignore(ascii_case))]
@@ -704,6 +888,30 @@ pub enum TokenKind {
     PARTITION,
     #[token("PARQUET", ignore(ascii_case))]
     PARQUET,
+    #[token("PASSWORD", ignore(ascii_case))]
+    PASSWORD,
+    #[token("PASSWORD_MIN_LENGTH", ignore(ascii_case))]
+    PASSWORD_MIN_LENGTH,
+    #[token("PASSWORD_MAX_LENGTH", ignore(ascii_case))]
+    PASSWORD_MAX_LENGTH,
+    #[token("PASSWORD_MIN_UPPER_CASE_CHARS", ignore(ascii_case))]
+    PASSWORD_MIN_UPPER_CASE_CHARS,
+    #[token("PASSWORD_MIN_LOWER_CASE_CHARS", ignore(ascii_case))]
+    PASSWORD_MIN_LOWER_CASE_CHARS,
+    #[token("PASSWORD_MIN_NUMERIC_CHARS", ignore(ascii_case))]
+    PASSWORD_MIN_NUMERIC_CHARS,
+    #[token("PASSWORD_MIN_SPECIAL_CHARS", ignore(ascii_case))]
+    PASSWORD_MIN_SPECIAL_CHARS,
+    #[token("PASSWORD_MIN_AGE_DAYS", ignore(ascii_case))]
+    PASSWORD_MIN_AGE_DAYS,
+    #[token("PASSWORD_MAX_AGE_DAYS", ignore(ascii_case))]
+    PASSWORD_MAX_AGE_DAYS,
+    #[token("PASSWORD_MAX_RETRIES", ignore(ascii_case))]
+    PASSWORD_MAX_RETRIES,
+    #[token("PASSWORD_LOCKOUT_TIME_MINS", ignore(ascii_case))]
+    PASSWORD_LOCKOUT_TIME_MINS,
+    #[token("PASSWORD_HISTORY", ignore(ascii_case))]
+    PASSWORD_HISTORY,
     #[token("PATTERN", ignore(ascii_case))]
     PATTERN,
     #[token("PIPELINE", ignore(ascii_case))]
@@ -718,8 +926,14 @@ pub enum TokenKind {
     POSITION,
     #[token("PROCESSLIST", ignore(ascii_case))]
     PROCESSLIST,
+    #[token("PRIORITY", ignore(ascii_case))]
+    PRIORITY,
     #[token("PURGE", ignore(ascii_case))]
     PURGE,
+    #[token("PUT", ignore(ascii_case))]
+    PUT,
+    #[token("PARTIAL", ignore(ascii_case))]
+    PARTIAL,
     #[token("QUARTER", ignore(ascii_case))]
     QUARTER,
     #[token("QUERY", ignore(ascii_case))]
@@ -730,6 +944,8 @@ pub enum TokenKind {
     RANGE,
     #[token("RAWDEFLATE", ignore(ascii_case))]
     RAWDEFLATE,
+    #[token("READ_ONLY", ignore(ascii_case))]
+    READ_ONLY,
     #[token("RECLUSTER", ignore(ascii_case))]
     RECLUSTER,
     #[token("RECORD_DELIMITER", ignore(ascii_case))]
@@ -744,6 +960,22 @@ pub enum TokenKind {
     RENAME,
     #[token("REPLACE", ignore(ascii_case))]
     REPLACE,
+    #[token("RETURN_FAILED_ONLY", ignore(ascii_case))]
+    RETURN_FAILED_ONLY,
+    #[token("REVERSE", ignore(ascii_case))]
+    REVERSE,
+    #[token("SAMPLE", ignore(ascii_case))]
+    SAMPLE,
+    #[token("MERGE", ignore(ascii_case))]
+    MERGE,
+    #[token("MATCHED", ignore(ascii_case))]
+    MATCHED,
+    #[token("MISSING_FIELD_AS", ignore(ascii_case))]
+    MISSING_FIELD_AS,
+    #[token("NULL_FIELD_AS", ignore(ascii_case))]
+    NULL_FIELD_AS,
+    #[token("UNMATCHED", ignore(ascii_case))]
+    UNMATCHED,
     #[token("ROW", ignore(ascii_case))]
     ROW,
     #[token("ROWS", ignore(ascii_case))]
@@ -752,6 +984,8 @@ pub enum TokenKind {
     ROW_TAG,
     #[token("GRANT", ignore(ascii_case))]
     GRANT,
+    #[token("REPEAT", ignore(ascii_case))]
+    REPEAT,
     #[token("ROLE", ignore(ascii_case))]
     ROLE,
     #[token("PRECEDING", ignore(ascii_case))]
@@ -762,6 +996,8 @@ pub enum TokenKind {
     PRESIGN,
     #[token("PRIVILEGES", ignore(ascii_case))]
     PRIVILEGES,
+    #[token("QUALIFY", ignore(ascii_case))]
+    QUALIFY,
     #[token("REMOVE", ignore(ascii_case))]
     REMOVE,
     #[token("RETAIN", ignore(ascii_case))]
@@ -772,22 +1008,36 @@ pub enum TokenKind {
     RECURSIVE,
     #[token("RETURN", ignore(ascii_case))]
     RETURN,
+    #[token("RETURNS", ignore(ascii_case))]
+    RETURNS,
+    #[token("RESULTSET", ignore(ascii_case))]
+    RESULTSET,
     #[token("RUN", ignore(ascii_case))]
     RUN,
     #[token("GRANTS", ignore(ascii_case))]
     GRANTS,
+    #[token("REFRESH_MODE", ignore(ascii_case))]
+    REFRESH_MODE,
     #[token("RIGHT", ignore(ascii_case))]
     RIGHT,
     #[token("RLIKE", ignore(ascii_case))]
     RLIKE,
     #[token("RAW", ignore(ascii_case))]
     RAW,
+    #[token("OPTIMIZED", ignore(ascii_case))]
+    OPTIMIZED,
+    #[token("DECORRELATED", ignore(ascii_case))]
+    DECORRELATED,
+    #[token("SATURDAY", ignore(ascii_case))]
+    SATURDAY,
     #[token("SCHEMA", ignore(ascii_case))]
     SCHEMA,
     #[token("SCHEMAS", ignore(ascii_case))]
     SCHEMAS,
     #[token("SECOND", ignore(ascii_case))]
     SECOND,
+    #[token("MILLISECOND", ignore(ascii_case))]
+    MILLISECOND,
     #[token("SELECT", ignore(ascii_case))]
     SELECT,
     #[token("PIVOT", ignore(ascii_case))]
@@ -800,16 +1050,24 @@ pub enum TokenKind {
     SET,
     #[token("UNSET", ignore(ascii_case))]
     UNSET,
+    #[token("SESSION", ignore(ascii_case))]
+    SESSION,
     #[token("SETTINGS", ignore(ascii_case))]
     SETTINGS,
+    #[token("VARIABLES", ignore(ascii_case))]
+    VARIABLES,
     #[token("STAGES", ignore(ascii_case))]
     STAGES,
     #[token("STATISTIC", ignore(ascii_case))]
     STATISTIC,
+    #[token("SUMMARY", ignore(ascii_case))]
+    SUMMARY,
     #[token("SHA256_PASSWORD", ignore(ascii_case))]
     SHA256_PASSWORD,
     #[token("SHOW", ignore(ascii_case))]
     SHOW,
+    #[token("SINCE", ignore(ascii_case))]
+    SINCE,
     #[token("SIGNED", ignore(ascii_case))]
     SIGNED,
     #[token("SINGLE", ignore(ascii_case))]
@@ -818,6 +1076,8 @@ pub enum TokenKind {
     SIZE_LIMIT,
     #[token("MAX_FILES", ignore(ascii_case))]
     MAX_FILES,
+    #[token("MONDAY", ignore(ascii_case))]
+    MONDAY,
     #[token("SKIP_HEADER", ignore(ascii_case))]
     SKIP_HEADER,
     #[token("SMALLINT", ignore(ascii_case))]
@@ -834,10 +1094,14 @@ pub enum TokenKind {
     SYNTAX,
     #[token("USAGE", ignore(ascii_case))]
     USAGE,
+    #[token("USE_RAW_PATH", ignore(ascii_case))]
+    USE_RAW_PATH,
     #[token("UPDATE", ignore(ascii_case))]
     UPDATE,
     #[token("UPLOAD", ignore(ascii_case))]
     UPLOAD,
+    #[token("SEQUENCE", ignore(ascii_case))]
+    SEQUENCE,
     #[token("SHARE", ignore(ascii_case))]
     SHARE,
     #[token("SHARES", ignore(ascii_case))]
@@ -848,6 +1112,10 @@ pub enum TokenKind {
     STATUS,
     #[token("STORED", ignore(ascii_case))]
     STORED,
+    #[token("STREAM", ignore(ascii_case))]
+    STREAM,
+    #[token("STREAMS", ignore(ascii_case))]
+    STREAMS,
     #[token("STRING", ignore(ascii_case))]
     STRING,
     #[token("SUBSTRING", ignore(ascii_case))]
@@ -858,12 +1126,26 @@ pub enum TokenKind {
     SEMI,
     #[token("SOUNDS", ignore(ascii_case))]
     SOUNDS,
+    #[token("SYNC", ignore(ascii_case))]
+    SYNC,
+    #[token("SYSTEM", ignore(ascii_case))]
+    SYSTEM,
+    #[token("STORAGE_TYPE", ignore(ascii_case))]
+    STORAGE_TYPE,
     #[token("TABLE", ignore(ascii_case))]
     TABLE,
     #[token("TABLES", ignore(ascii_case))]
     TABLES,
+    #[token("TARGET_LAG", ignore(ascii_case))]
+    TARGET_LAG,
     #[token("TEXT", ignore(ascii_case))]
     TEXT,
+    #[token("LONGTEXT", ignore(ascii_case))]
+    LONGTEXT,
+    #[token("MEDIUMTEXT", ignore(ascii_case))]
+    MEDIUMTEXT,
+    #[token("TINYTEXT", ignore(ascii_case))]
+    TINYTEXT,
     #[token("TENANTSETTING", ignore(ascii_case))]
     TENANTSETTING,
     #[token("TENANTS", ignore(ascii_case))]
@@ -872,6 +1154,8 @@ pub enum TokenKind {
     TENANT,
     #[token("THEN", ignore(ascii_case))]
     THEN,
+    #[token("THURSDAY", ignore(ascii_case))]
+    THURSDAY,
     #[token("TIMESTAMP", ignore(ascii_case))]
     TIMESTAMP,
     #[token("TIMEZONE_HOUR", ignore(ascii_case))]
@@ -900,6 +1184,8 @@ pub enum TokenKind {
     TRY_CAST,
     #[token("TSV", ignore(ascii_case))]
     TSV,
+    #[token("TUESDAY", ignore(ascii_case))]
+    TUESDAY,
     #[token("TUPLE", ignore(ascii_case))]
     TUPLE,
     #[token("TYPE", ignore(ascii_case))]
@@ -922,6 +1208,10 @@ pub enum TokenKind {
     UNSIGNED,
     #[token("URL", ignore(ascii_case))]
     URL,
+    #[token("METHOD", ignore(ascii_case))]
+    METHOD,
+    #[token("AUTHORIZATION_HEADER", ignore(ascii_case))]
+    AUTHORIZATION_HEADER,
     #[token("USE", ignore(ascii_case))]
     USE,
     #[token("USER", ignore(ascii_case))]
@@ -934,24 +1224,30 @@ pub enum TokenKind {
     VACUUM,
     #[token("VALUES", ignore(ascii_case))]
     VALUES,
-    #[token("VALIDATION_MODE", ignore(ascii_case))]
-    VALIDATION_MODE,
     #[token("VARBINARY", ignore(ascii_case))]
     VARBINARY,
     #[token("VARCHAR", ignore(ascii_case))]
     VARCHAR,
     #[token("VARIANT", ignore(ascii_case))]
     VARIANT,
+    #[token("VARIABLE", ignore(ascii_case))]
+    VARIABLE,
+    #[token("VERBOSE", ignore(ascii_case))]
+    VERBOSE,
+    #[token("GRAPHICAL", ignore(ascii_case))]
+    GRAPHICAL,
     #[token("VIEW", ignore(ascii_case))]
     VIEW,
+    #[token("VIEWS", ignore(ascii_case))]
+    VIEWS,
     #[token("VIRTUAL", ignore(ascii_case))]
     VIRTUAL,
-    #[token("WEEK", ignore(ascii_case))]
-    WEEK,
     #[token("WHEN", ignore(ascii_case))]
     WHEN,
     #[token("WHERE", ignore(ascii_case))]
     WHERE,
+    #[token("WHILE", ignore(ascii_case))]
+    WHILE,
     #[token("WINDOW", ignore(ascii_case))]
     WINDOW,
     #[token("WITH", ignore(ascii_case))]
@@ -992,15 +1288,130 @@ pub enum TokenKind {
     ROLLUP,
     #[token("INDEXES", ignore(ascii_case))]
     INDEXES,
+    #[token("ADDRESS", ignore(ascii_case))]
+    ADDRESS,
+    #[token("OWNERSHIP", ignore(ascii_case))]
+    OWNERSHIP,
+    #[token("READ", ignore(ascii_case))]
+    READ,
+    #[token("WRITE", ignore(ascii_case))]
+    WRITE,
+    #[token("UDF", ignore(ascii_case))]
+    UDF,
+    #[token("HANDLER", ignore(ascii_case))]
+    HANDLER,
+    #[token("LANGUAGE", ignore(ascii_case))]
+    LANGUAGE,
+    #[token("STATE", ignore(ascii_case))]
+    STATE,
+    #[token("TASK", ignore(ascii_case))]
+    TASK,
+    #[token("TASKS", ignore(ascii_case))]
+    TASKS,
+    #[token("TOP", ignore(ascii_case))]
+    TOP,
+    #[token("WAREHOUSE", ignore(ascii_case))]
+    WAREHOUSE,
+    #[token("SCHEDULE", ignore(ascii_case))]
+    SCHEDULE,
+    #[token("SUSPEND_TASK_AFTER_NUM_FAILURES", ignore(ascii_case))]
+    SUSPEND_TASK_AFTER_NUM_FAILURES,
+    #[token("CRON", ignore(ascii_case))]
+    CRON,
+    #[token("EXECUTE", ignore(ascii_case))]
+    EXECUTE,
+    #[token("SUSPEND", ignore(ascii_case))]
+    SUSPEND,
+    #[token("RESUME", ignore(ascii_case))]
+    RESUME,
+    #[token("PIPE", ignore(ascii_case))]
+    PIPE,
+    #[token("NOTIFICATION", ignore(ascii_case))]
+    NOTIFICATION,
+    #[token("INTEGRATION", ignore(ascii_case))]
+    INTEGRATION,
+    #[token("ENABLED", ignore(ascii_case))]
+    ENABLED,
+    #[token("WEBHOOK", ignore(ascii_case))]
+    WEBHOOK,
+    #[token("WEDNESDAY", ignore(ascii_case))]
+    WEDNESDAY,
+    #[token("ERROR_INTEGRATION", ignore(ascii_case))]
+    ERROR_INTEGRATION,
+    #[token("AUTO_INGEST", ignore(ascii_case))]
+    AUTO_INGEST,
+    #[token("PIPE_EXECUTION_PAUSED", ignore(ascii_case))]
+    PIPE_EXECUTION_PAUSED,
+    #[token("PREFIX", ignore(ascii_case))]
+    PREFIX,
+    #[token("MODIFIED_AFTER", ignore(ascii_case))]
+    MODIFIED_AFTER,
+    #[token("UNTIL", ignore(ascii_case))]
+    UNTIL,
+    #[token("BEGIN", ignore(ascii_case))]
+    BEGIN,
+    #[token("TRANSACTION", ignore(ascii_case))]
+    TRANSACTION,
+    #[token("COMMIT", ignore(ascii_case))]
+    COMMIT,
+    #[token("ABORT", ignore(ascii_case))]
+    ABORT,
+    #[token("ROLLBACK", ignore(ascii_case))]
+    ROLLBACK,
+    #[token("TEMPORARY", ignore(ascii_case))]
+    TEMPORARY,
+    #[token("TEMP", ignore(ascii_case))]
+    TEMP,
+    #[token("SECONDS", ignore(ascii_case))]
+    SECONDS,
+    #[token("DAYS", ignore(ascii_case))]
+    DAYS,
+    #[token("DICTIONARY", ignore(ascii_case))]
+    DICTIONARY,
+    #[token("DICTIONARIES", ignore(ascii_case))]
+    DICTIONARIES,
+    #[token("PRIMARY", ignore(ascii_case))]
+    PRIMARY,
+    #[token("SOURCE", ignore(ascii_case))]
+    SOURCE,
+    #[token("SQL", ignore(ascii_case))]
+    SQL,
+    #[token("SUNDAY", ignore(ascii_case))]
+    SUNDAY,
+    #[token("WAREHOUSES", ignore(ascii_case))]
+    WAREHOUSES,
+    #[token("INSPECT", ignore(ascii_case))]
+    INSPECT,
+    #[token("ASSIGN", ignore(ascii_case))]
+    ASSIGN,
+    #[token("NODES", ignore(ascii_case))]
+    NODES,
+    #[token("UNASSIGN", ignore(ascii_case))]
+    UNASSIGN,
+    #[token("ONLINE", ignore(ascii_case))]
+    ONLINE,
 }
 
 // Reference: https://www.postgresql.org/docs/current/sql-keywords-appendix.html
 impl TokenKind {
+    pub fn is_literal(&self) -> bool {
+        matches!(
+            self,
+            LiteralInteger
+                | LiteralFloat
+                | LiteralString
+                | LiteralCodeString
+                | PGLiteralHex
+                | MySQLLiteralHex
+        )
+    }
+
     pub fn is_keyword(&self) -> bool {
         !matches!(
             self,
             Ident
-                | QuotedString
+                | LiteralString
+                | LiteralCodeString
                 | PGLiteralHex
                 | MySQLLiteralHex
                 | LiteralInteger
@@ -1025,9 +1436,10 @@ impl TokenKind {
                 | LParen
                 | RParen
                 | Comma
-                | Period
+                | Dot
                 | Colon
                 | DoubleColon
+                | ColonEqual
                 | SemiColon
                 | Backslash
                 | LBracket
@@ -1038,7 +1450,11 @@ impl TokenKind {
                 | Factorial
                 | LBrace
                 | RBrace
+                | Dollar
                 | RArrow
+                | LongRArrow
+                | HashRArrow
+                | HashLongRArrow
                 | FatRArrow
                 | BitWiseXor
                 | BitWiseNot
@@ -1053,6 +1469,13 @@ impl TokenKind {
                 | CubeRoot
                 | L2DISTANCE
                 | Placeholder
+                | QuestionOr
+                | QuestionAnd
+                | ArrowAt
+                | AtArrow
+                | AtQuestion
+                | AtAt
+                | HashMinus
                 | EOI
         )
     }
@@ -1083,7 +1506,7 @@ impl TokenKind {
             // | TokenKind::CURRENT_DATE
             // | TokenKind::CURRENT_ROLE
             // | TokenKind::CURRENT_TIME
-            | TokenKind::CURRENT_TIMESTAMP
+            // | TokenKind::CURRENT_TIMESTAMP
             // | TokenKind::CURRENT_USER
             // | TokenKind::DEC
             // | TokenKind::DECIMAL
@@ -1091,11 +1514,12 @@ impl TokenKind {
             // | TokenKind::DEFERRABLE
             | TokenKind::DESC
             | TokenKind::DISTINCT
-            // | TokenKind::DO
+            | TokenKind::DO
             | TokenKind::ELSE
             | TokenKind::END
             | TokenKind::EXISTS
             | TokenKind::EXTRACT
+            | TokenKind::DATE_PART
             | TokenKind::FALSE
             | TokenKind::FLOAT
             // | TokenKind::FOREIGN
@@ -1105,12 +1529,13 @@ impl TokenKind {
             | TokenKind::ROLLUP
             // | TokenKind::IFNULL
             | TokenKind::IN
+            | TokenKind::IDENTIFIER
             // | TokenKind::INITIALLY
             // | TokenKind::INOUT
             | TokenKind::INT
             | TokenKind::INTEGER
             | TokenKind::INTERVAL
-            // | TokenKind::LATERAL
+            | TokenKind::LATERAL
             | TokenKind::LEADING
             // | TokenKind::LEAST
             // | TokenKind::LOCALTIME
@@ -1170,7 +1595,7 @@ impl TokenKind {
             // | TokenKind::XMLSERIALIZE
             // | TokenKind::XMLTABLE
             | TokenKind::WHEN
-            | TokenKind::ARRAY
+            // | TokenKind::ARRAY
             | TokenKind::AS
             // | TokenKind::CHAR
             | TokenKind::CHARACTER
@@ -1191,6 +1616,7 @@ impl TokenKind {
             | TokenKind::OF
             | TokenKind::ORDER
             | TokenKind::OVER
+            | TokenKind::QUALIFY
             | TokenKind::ROWS
             // | TokenKind::PRECISION
             // | TokenKind::RETURNING
@@ -1200,8 +1626,12 @@ impl TokenKind {
             // | TokenKind::WINDOW
             | TokenKind::WITH
             | TokenKind::DATE_ADD
+            | TokenKind::DATE_DIFF
             | TokenKind::DATE_SUB
             | TokenKind::DATE_TRUNC
+            | TokenKind::LAST_DAY
+            | TokenKind::PREVIOUS_DAY
+            | TokenKind::NEXT_DAY
             | TokenKind::IGNORE_RESULT
         )
     }
@@ -1213,12 +1643,15 @@ impl TokenKind {
             | TokenKind::ANALYZE
             | TokenKind::AND
             | TokenKind::ANY
+            | TokenKind::FUNCTION
+            | TokenKind::PROCEDURE
             | TokenKind::ASC
             | TokenKind::ANTI
             // | TokenKind::ASYMMETRIC
             // | TokenKind::AUTHORIZATION
             // | TokenKind::BINARY
             | TokenKind::BOTH
+            | TokenKind::BLOCK
             | TokenKind::CASE
             | TokenKind::CAST
             // | TokenKind::CHECK
@@ -1227,6 +1660,7 @@ impl TokenKind {
             // | TokenKind::COLUMN
             // | TokenKind::CONCURRENTLY
             // | TokenKind::CONSTRAINT
+            | TokenKind::CONNECTION
             | TokenKind::CROSS
             // | TokenKind::CURRENT_CATALOG
             // | TokenKind::CURRENT_DATE
@@ -1238,20 +1672,22 @@ impl TokenKind {
             // | TokenKind::DEFERRABLE
             | TokenKind::DESC
             | TokenKind::DISTINCT
-            // | TokenKind::DO
+            | TokenKind::DO
             | TokenKind::ELSE
             | TokenKind::END
             | TokenKind::FALSE
             // | TokenKind::FOREIGN
             // | TokenKind::FREEZE
+            | TokenKind::FOR
             | TokenKind::FULL
             // | TokenKind::ILIKE
             | TokenKind::IN
+            | TokenKind::IDENTIFIER
             // | TokenKind::INITIALLY
             | TokenKind::INNER
             | TokenKind::IS
             | TokenKind::JOIN
-            // | TokenKind::LATERAL
+            | TokenKind::LATERAL
             | TokenKind::LEADING
             | TokenKind::LEFT
             | TokenKind::LIKE
@@ -1262,7 +1698,6 @@ impl TokenKind {
             | TokenKind::NULL
             // | TokenKind::ONLY
             | TokenKind::OR
-            | TokenKind::OUTER
             // | TokenKind::PLACING
             // | TokenKind::PRIMARY
             // | TokenKind::REFERENCES
@@ -1274,8 +1709,8 @@ impl TokenKind {
             // | TokenKind::SIMILAR
             | TokenKind::SOME
             | TokenKind::SEMI
+            | TokenKind::SAMPLE
             // | TokenKind::SYMMETRIC
-            // | TokenKind::TABLE
             // | TokenKind::TABLESAMPLE
             | TokenKind::THEN
             | TokenKind::TRAILING
@@ -1293,9 +1728,8 @@ impl TokenKind {
             | TokenKind::ATTACH
             | TokenKind::EXCEPT
             // | TokenKind::FETCH
-            | TokenKind::FOR
             | TokenKind::FROM
-            // | TokenKind::GRANT
+            | TokenKind::GRANT
             | TokenKind::GROUP
             | TokenKind::HAVING
             | TokenKind::INTERSECT
@@ -1310,11 +1744,13 @@ impl TokenKind {
             | TokenKind::ORDER
             | TokenKind::OVER
             | TokenKind::PARTITION
+            | TokenKind::QUALIFY
             | TokenKind::ROWS
             | TokenKind::RANGE
             // | TokenKind::OVERLAPS
             // | TokenKind::RETURNING
             | TokenKind::STAGE
+            | TokenKind::UDF
             | TokenKind::SHARE
             | TokenKind::SHARES
             | TokenKind::TO
@@ -1325,6 +1761,10 @@ impl TokenKind {
             | TokenKind::IGNORE_RESULT
             | TokenKind::MASKING
             | TokenKind::POLICY
+            | TokenKind::TASK
+            | TokenKind::PIPE
+            | TokenKind::STREAM
+            | TokenKind::NOTIFICATION
             if !after_as => true,
             _ => false
         }

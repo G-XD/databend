@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::collections::BTreeMap;
 use std::env;
 use std::fs::File;
 use std::io;
@@ -21,13 +22,17 @@ use std::io::Read;
 use std::io::Write;
 
 use clap::Parser;
-use common_config::Config;
-use common_config::InnerConfig;
-use common_config::DATABEND_COMMIT_VERSION;
-use common_exception::Result;
-use common_storage::init_operator;
-use common_storage::StorageConfig;
+use databend_common_config::Config;
+use databend_common_config::InnerConfig;
+use databend_common_config::DATABEND_COMMIT_VERSION;
+use databend_common_exception::Result;
+use databend_common_storage::init_operator;
+use databend_common_storage::StorageConfig;
+use databend_common_tracing::init_logging;
+use databend_common_tracing::Config as LogConfig;
 use databend_query::GlobalServices;
+use databend_storages_common_table_meta::meta::SegmentInfo;
+use databend_storages_common_table_meta::meta::TableSnapshot;
 use log::info;
 use opendal::services::Fs;
 use opendal::Operator;
@@ -35,9 +40,6 @@ use serde::Deserialize;
 use serde::Serialize;
 use serfig::collectors::from_file;
 use serfig::parsers::Toml;
-use storages_common_table_meta::meta::SegmentInfo;
-use storages_common_table_meta::meta::TableSnapshot;
-use tokio::io::AsyncReadExt;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Parser)]
 #[clap(about, version = &**DATABEND_COMMIT_VERSION, author)]
@@ -78,7 +80,6 @@ fn parse_output(config: &InspectorConfig) -> Result<Box<dyn Write>> {
 }
 
 async fn parse_input_data(config: &InspectorConfig) -> Result<Vec<u8>> {
-    let mut buffer: Vec<u8> = vec![];
     match &config.input {
         Some(input) => {
             let op = match &config.config {
@@ -87,26 +88,27 @@ async fn parse_input_data(config: &InspectorConfig) -> Result<Vec<u8>> {
                     builder = builder.collect(from_file(Toml, config_file));
                     let read_config = builder.build()?;
                     let inner_config: InnerConfig = read_config.clone().try_into()?;
-                    GlobalServices::init(inner_config).await?;
+                    GlobalServices::init(&inner_config, false).await?;
                     let storage_config: StorageConfig = read_config.storage.try_into()?;
                     init_operator(&storage_config.params)?
                 }
                 None => {
                     let current_dir = env::current_dir()?;
-                    let mut builder = Fs::default();
-                    builder.root(current_dir.to_str().ok_or("Invalid path")?);
+                    let builder = Fs::default().root(current_dir.to_str().ok_or("Invalid path")?);
                     Operator::new(builder)?.finish()
                 }
             };
-            op.reader(input).await?.read_to_end(&mut buffer).await?;
+            let buf = op.read(input).await?.to_vec();
+            Ok(buf)
         }
         None => {
+            let mut buffer: Vec<u8> = vec![];
             let stdin = io::stdin();
             let handle = stdin.lock();
             io::BufReader::new(handle).read_to_end(&mut buffer)?;
+            Ok(buffer)
         }
-    };
-    Ok(buffer)
+    }
 }
 
 async fn run(config: &InspectorConfig) -> Result<()> {
@@ -122,6 +124,10 @@ async fn run(config: &InspectorConfig) -> Result<()> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let mut log_config = LogConfig::default();
+    log_config.stderr.on = true;
+    let _guards = init_logging("table_meta_inspector", &log_config, BTreeMap::new());
+
     let config = InspectorConfig::parse();
 
     if let Err(err) = run(&config).await {

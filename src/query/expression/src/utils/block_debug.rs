@@ -17,7 +17,7 @@ use std::collections::HashSet;
 use comfy_table::Cell;
 use comfy_table::CellAlignment;
 use comfy_table::Table;
-use common_exception::Result;
+use databend_common_exception::Result;
 use terminal_size::terminal_size;
 use terminal_size::Width;
 use unicode_segmentation::UnicodeSegmentation;
@@ -27,7 +27,7 @@ use crate::DataSchemaRef;
 
 /// ! Create a visual representation of record batches
 pub fn pretty_format_blocks(results: &[DataBlock]) -> Result<String> {
-    let block: DataBlock = DataBlock::concat(results)?;
+    let block = DataBlock::concat(results)?;
     Ok(block.to_string())
 }
 
@@ -52,6 +52,27 @@ pub fn assert_blocks_sorted_eq(expect: Vec<&str>, blocks: &[DataBlock]) {
     assert_blocks_sorted_eq_with_name("", expect, blocks)
 }
 
+pub fn assert_block_value_eq(a: &DataBlock, b: &DataBlock) {
+    assert!(a.num_columns() == b.num_columns());
+    assert!(a.num_rows() == b.num_rows());
+    for i in 0..a.num_columns() {
+        assert!(a.columns()[i].eq(&b.columns()[i]));
+    }
+}
+
+pub fn assert_block_value_sort_eq(a: &DataBlock, b: &DataBlock) {
+    assert!(a.num_columns() == b.num_columns());
+    assert!(a.num_rows() == b.num_rows());
+
+    let a = pretty_format_blocks(&[a.clone()]).unwrap();
+    let b = pretty_format_blocks(&[b.clone()]).unwrap();
+
+    let a: Vec<&str> = get_lines(&a);
+    let b: Vec<&str> = get_lines(&b);
+
+    assert_eq!(a, b);
+}
+
 /// Assert with order insensitive.
 /// ['a', 'b'] equals ['b', 'a']
 pub fn assert_blocks_sorted_eq_with_name(test_name: &str, expect: Vec<&str>, blocks: &[DataBlock]) {
@@ -64,6 +85,16 @@ pub fn assert_blocks_sorted_eq_with_name(test_name: &str, expect: Vec<&str>, blo
     }
 
     let formatted = pretty_format_blocks(blocks).unwrap();
+    let actual_lines: Vec<&str> = get_lines(&formatted);
+
+    assert_eq!(
+        expected_lines, actual_lines,
+        "{:#?}\n\nexpected:\n\n{:#?}\nactual:\n\n{:#?}\n\n",
+        test_name, expected_lines, actual_lines
+    );
+}
+
+fn get_lines(formatted: &str) -> Vec<&str> {
     let mut actual_lines: Vec<&str> = formatted.trim().lines().collect();
 
     // sort except for header + footer
@@ -71,12 +102,7 @@ pub fn assert_blocks_sorted_eq_with_name(test_name: &str, expect: Vec<&str>, blo
     if num_lines > 3 {
         actual_lines.as_mut_slice()[2..num_lines - 1].sort_unstable()
     }
-
-    assert_eq!(
-        expected_lines, actual_lines,
-        "{:#?}\n\nexpected:\n\n{:#?}\nactual:\n\n{:#?}\n\n",
-        test_name, expected_lines, actual_lines
-    );
+    actual_lines
 }
 
 /// Assert with order insensitive.
@@ -117,8 +143,16 @@ pub fn box_render(
     max_rows: usize,
     max_width: usize,
     max_col_width: usize,
+    replace_newline: bool,
 ) -> Result<String> {
-    let table = create_box_table(schema, blocks, max_rows, max_width, max_col_width);
+    let table = create_box_table(
+        schema,
+        blocks,
+        max_rows,
+        max_width,
+        max_col_width,
+        replace_newline,
+    );
     Ok(table.to_string())
 }
 
@@ -131,6 +165,7 @@ fn create_box_table(
     max_rows: usize,
     mut max_width: usize,
     max_col_width: usize,
+    replace_newline: bool,
 ) -> Table {
     let mut table = Table::new();
     table.load_preset("││──├─┼┤│    ──┌┐└┘");
@@ -151,7 +186,7 @@ fn create_box_table(
     let row_count: usize = results.iter().map(|block| block.num_rows()).sum();
     let mut rows_to_render = row_count.min(max_rows);
 
-    if row_count <= max_rows + 3 {
+    if row_count <= max_rows.saturating_add(3) {
         // hiding rows adds 3 extra rows
         // so hiding rows makes no sense if we are only slightly over the limit
         // if we are 1 row over the limit hiding rows will actually increase the number of lines we display!
@@ -168,37 +203,23 @@ fn create_box_table(
     };
 
     let mut res_vec: Vec<Vec<String>> = vec![];
-    let top_collection = results.first().unwrap();
-    let top_rows = top_collection.num_rows().min(top_rows);
-    if bottom_rows == 0 {
-        for block in results {
-            for row in 0..block.num_rows() {
-                let mut v = vec![];
-                for block_entry in block.columns() {
-                    v.push(block_entry.value.index(row).unwrap().to_string());
-                }
-                res_vec.push(v);
-            }
-        }
-    } else {
-        let bottom_collection = results.last().unwrap();
-        for row in 0..top_rows {
-            let mut v = vec![];
-            for block_entry in top_collection.columns() {
-                v.push(block_entry.value.index(row).unwrap().to_string());
-            }
-            res_vec.push(v);
-        }
-        let take_num = if bottom_collection.num_rows() > bottom_rows {
-            bottom_collection.num_rows() - bottom_rows
-        } else {
-            0
-        };
 
-        for row in take_num..bottom_collection.num_rows() {
+    let mut rows = 0;
+    for block in results {
+        for row in 0..block.num_rows() {
+            rows += 1;
+            if rows > top_rows && rows <= row_count - bottom_rows {
+                continue;
+            }
+
             let mut v = vec![];
-            for block_entry in top_collection.columns() {
-                v.push(block_entry.value.index(row).unwrap().to_string());
+            for block_entry in block.columns() {
+                let value = block_entry.value.index(row).unwrap().to_string();
+                if replace_newline {
+                    v.push(value.to_string().replace('\n', "\\n"));
+                } else {
+                    v.push(value.to_string());
+                }
             }
             res_vec.push(v);
         }
@@ -207,7 +228,7 @@ fn create_box_table(
     // "..." take up three lengths
     if max_width > 0 {
         (widths, column_map) =
-            compute_render_widths(schema, max_width, max_col_width + 3, &res_vec);
+            compute_render_widths(schema, max_width, max_col_width.saturating_add(3), &res_vec);
     }
 
     let mut header = Vec::with_capacity(schema.fields().len());
@@ -334,7 +355,7 @@ fn compute_render_widths(
     for field in schema.fields() {
         // head_name = field_name + "\n" + field_data_type
         let col_length = field.name().len().max(field.data_type().to_string().len());
-        widths.push(col_length + 3);
+        widths.push(col_length.saturating_add(3));
     }
 
     for values in results {
@@ -411,7 +432,7 @@ fn compute_render_widths(
 fn render_head(
     schema: &DataSchemaRef,
     widths: &mut [usize],
-    column_map: &mut Vec<i32>,
+    column_map: &mut [i32],
     header: &mut Vec<Cell>,
     aligns: &mut Vec<CellAlignment>,
 ) {
@@ -422,7 +443,7 @@ fn render_head(
 
             header.push(cell);
 
-            if field.data_type().is_numeric() {
+            if field.data_type().is_number() {
                 aligns.push(CellAlignment::Right);
             } else {
                 aligns.push(CellAlignment::Left);
@@ -472,7 +493,7 @@ fn render_head(
 
                 header.push(cell);
 
-                if field.data_type().is_numeric() {
+                if field.data_type().is_number() {
                     aligns.push(CellAlignment::Right);
                 } else {
                     aligns.push(CellAlignment::Left);

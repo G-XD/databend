@@ -12,9 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use common_expression::block_debug::box_render;
-use common_expression::DataBlock;
-use common_expression::DataSchemaRef;
+use databend_common_expression::block_debug::box_render;
+use databend_common_expression::DataBlock;
+use databend_common_expression::DataSchemaRef;
 use pyo3::prelude::*;
 
 use crate::dataframe::PyBoxSize;
@@ -37,6 +37,7 @@ impl PyDataBlock {
             self.display_width.bs_max_display_rows,
             self.display_width.bs_max_width,
             self.display_width.bs_max_col_width,
+            false,
         )
         .unwrap();
         Ok(s)
@@ -65,7 +66,15 @@ pub struct PyDataBlocks {
 impl PyDataBlocks {
     pub fn box_render(&self, max_rows: usize, max_width: usize, max_col_width: usize) -> String {
         let blocks: Vec<DataBlock> = self.blocks.iter().take(10).cloned().collect();
-        box_render(&self.schema, &blocks, max_rows, max_width, max_col_width).unwrap()
+        box_render(
+            &self.schema,
+            &blocks,
+            max_rows,
+            max_width,
+            max_col_width,
+            false,
+        )
+        .unwrap()
     }
 }
 

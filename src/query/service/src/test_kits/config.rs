@@ -12,11 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::HashMap;
-
-use common_config::InnerConfig;
-use common_meta_app::principal::AuthInfo;
-use common_users::idm_config::IDMConfig;
+use databend_common_base::base::GlobalUniqName;
+use databend_common_config::BuiltInConfig;
+use databend_common_config::InnerConfig;
+use databend_common_config::UDFConfig;
+use databend_common_config::UserAuthConfig;
+use databend_common_config::UserConfig;
+use databend_common_meta_app::storage::StorageFsConfig;
+use databend_common_meta_app::storage::StorageParams;
+use databend_common_meta_app::tenant::Tenant;
+use tempfile::TempDir;
 
 pub struct ConfigBuilder {
     conf: InnerConfig,
@@ -25,12 +30,39 @@ pub struct ConfigBuilder {
 impl ConfigBuilder {
     pub fn create() -> ConfigBuilder {
         let mut conf = InnerConfig::default();
-        conf.query.tenant_id = "test".to_string();
-        conf.log = common_tracing::Config::new_testing();
-        // add idm users for test
-        let mut users = HashMap::new();
-        users.insert("root".to_string(), AuthInfo::None);
-        conf.query.idm = IDMConfig { users };
+        conf.query.tenant_id = Tenant::new_literal("test");
+        conf.log = databend_common_tracing::Config::new_testing();
+        conf.query.cluster_id = String::from("test_cluster");
+
+        // add builtin users for test
+        let users = vec![UserConfig {
+            name: "root".to_string(),
+            auth: UserAuthConfig {
+                auth_type: "no_password".to_string(),
+                auth_string: None,
+            },
+        }];
+
+        // add builtin udfs for test
+        let udfs = vec![UDFConfig {
+            name: "test_builtin_ping".to_string(),
+            definition: "CREATE OR REPLACE FUNCTION test_builtin_ping (STRING)
+    RETURNS STRING
+    LANGUAGE python
+HANDLER = 'ping'
+ADDRESS = 'https://databend.com';"
+                .to_string(),
+        }];
+        conf.query.builtin = BuiltInConfig { users, udfs };
+
+        // set node_id to a unique value
+        conf.query.node_id = GlobalUniqName::unique();
+
+        // set storage to fs
+        let tmp_dir = TempDir::new().expect("create tmp dir failed");
+        let root = tmp_dir.path().to_str().unwrap().to_string();
+        conf.storage.params = StorageParams::Fs(StorageFsConfig { root });
+        conf.storage.allow_insecure = true;
 
         ConfigBuilder { conf }
     }
@@ -76,10 +108,12 @@ impl ConfigBuilder {
         self
     }
 
-    pub fn add_user(mut self, user_name: &str, auth_info: AuthInfo) -> ConfigBuilder {
-        let mut users = HashMap::new();
-        users.insert(user_name.to_string(), auth_info);
-        self.conf.query.idm = IDMConfig { users };
+    pub fn add_user(mut self, _user_name: &str, user: UserConfig) -> ConfigBuilder {
+        let users = vec![user];
+        self.conf.query.builtin = BuiltInConfig {
+            users,
+            udfs: vec![],
+        };
         self
     }
 

@@ -1,0 +1,96 @@
+statement ok
+DROP DATABASE IF EXISTS db_09_0005
+
+statement ok
+CREATE DATABASE db_09_0005
+
+statement ok
+USE db_09_0005
+
+statement ok
+create table n1(a uint64)
+
+statement ok
+insert into n1 select number from numbers(10)
+
+statement ok
+insert into n1 select number from numbers(10)
+
+query I
+select count(*) from n1
+----
+20
+
+statement ok
+DROP TABLE n1
+
+statement ok
+CREATE TABLE t ( `id` BIGINT UNSIGNED NULL, `business_id` BIGINT UNSIGNED NULL, `col3` BIGINT UNSIGNED NULL  )
+
+statement ok
+insert into t(id) select * from numbers(112)
+
+statement ok
+insert into t(id) select * from numbers(113)
+
+statement ok
+insert into t(id) select * from numbers(20000)
+
+query B
+select count(*) = (112 + 113 + 20000) from t
+----
+1
+
+
+
+query I
+select sum(id) from t
+----
+200002544
+
+query I
+select count(*) from t where IS_NOT_NULL(business_id)
+----
+0
+
+query I
+select sum(col3) from t
+----
+NULL
+
+query I
+select count(*) from t where IS_NOT_NULL(col3)
+----
+0
+
+query I
+select sum(business_id) from t
+----
+NULL
+
+statement ok
+create table t1(a string) block_size_threshold=1024;
+
+statement ok
+create table t2 like t1 engine = Random;
+
+statement ok
+insert into t1 select repeat(a, 500) from t2 limit 10;
+
+query I
+select count() > 1 from fuse_block('db_09_0005', 't1');
+----
+1
+
+statement ok
+DROP TABLE t1 ALL
+
+statement ok
+DROP TABLE t2
+
+statement ok
+DROP TABLE t
+
+statement ok
+DROP DATABASE db_09_0005
+

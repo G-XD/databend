@@ -15,91 +15,58 @@
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::default::Default;
-use std::str::FromStr;
 use std::sync::Arc;
 
-use async_recursion::async_recursion;
 use chrono::TimeZone;
 use chrono::Utc;
-use common_ast::ast::Expr as AExpr;
-use common_ast::ast::Indirection;
-use common_ast::ast::Join;
-use common_ast::ast::SelectStmt;
-use common_ast::ast::SelectTarget;
-use common_ast::ast::Statement;
-use common_ast::ast::TableAlias;
-use common_ast::ast::TableReference;
-use common_ast::ast::TimeTravelPoint;
-use common_ast::parser::parse_sql;
-use common_ast::parser::tokenize_sql;
-use common_ast::Dialect;
-use common_catalog::catalog_kind::CATALOG_DEFAULT;
-use common_catalog::plan::ParquetReadOptions;
-use common_catalog::plan::StageTableInfo;
-use common_catalog::table::ColumnStatistics;
-use common_catalog::table::NavigationPoint;
-use common_catalog::table::Table;
-use common_catalog::table_args::TableArgs;
-use common_catalog::table_context::TableContext;
-use common_catalog::table_function::TableFunction;
-use common_exception::ErrorCode;
-use common_exception::Result;
-use common_exception::Span;
-use common_expression::type_check::common_super_type;
-use common_expression::types::DataType;
-use common_expression::ColumnBuilder;
-use common_expression::ColumnId;
-use common_expression::ConstantFolder;
-use common_expression::DataBlock;
-use common_expression::DataField;
-use common_expression::DataSchema;
-use common_expression::DataSchemaRefExt;
-use common_expression::Evaluator;
-use common_expression::FunctionKind;
-use common_expression::Scalar;
-use common_expression::TableDataType;
-use common_expression::TableField;
-use common_expression::TableSchema;
-use common_functions::BUILTIN_FUNCTIONS;
-use common_license::license::Feature::AggregateIndex;
-use common_license::license_manager::get_license_manager;
-use common_meta_app::principal::FileFormatParams;
-use common_meta_app::principal::StageFileFormatType;
-use common_meta_app::principal::StageInfo;
-use common_meta_app::schema::IndexMeta;
-use common_meta_app::schema::ListIndexesReq;
-use common_meta_types::MetaId;
-use common_storage::DataOperator;
-use common_storage::StageFileInfo;
-use common_storage::StageFilesInfo;
-use common_storages_parquet::Parquet2Table;
-use common_storages_parquet::ParquetTable;
-use common_storages_result_cache::ResultCacheMetaManager;
-use common_storages_result_cache::ResultCacheReader;
-use common_storages_result_cache::ResultScan;
-use common_storages_stage::StageTable;
-use common_storages_view::view_table::QUERY;
-use common_users::UserApiProvider;
 use dashmap::DashMap;
-use indexmap::IndexMap;
-use parking_lot::RwLock;
+use databend_common_ast::ast::Identifier;
+use databend_common_ast::ast::Indirection;
+use databend_common_ast::ast::SampleConfig;
+use databend_common_ast::ast::SelectTarget;
+use databend_common_ast::ast::SetExpr;
+use databend_common_ast::ast::SetOperator;
+use databend_common_ast::ast::TableAlias;
+use databend_common_ast::ast::TemporalClause;
+use databend_common_ast::ast::TimeTravelPoint;
+use databend_common_ast::Span;
+use databend_common_catalog::catalog_kind::CATALOG_DEFAULT;
+use databend_common_catalog::table::NavigationPoint;
+use databend_common_catalog::table::Table;
+use databend_common_catalog::table::TimeNavigation;
+use databend_common_catalog::table_context::AbortChecker;
+use databend_common_catalog::table_context::TableContext;
+use databend_common_exception::ErrorCode;
+use databend_common_exception::Result;
+use databend_common_expression::is_stream_column;
+use databend_common_expression::type_check::check_number;
+use databend_common_expression::types::DataType;
+use databend_common_expression::types::NumberDataType;
+use databend_common_expression::ConstantFolder;
+use databend_common_expression::DataField;
+use databend_common_expression::FunctionContext;
+use databend_common_functions::BUILTIN_FUNCTIONS;
+use databend_common_meta_app::principal::StageInfo;
+use databend_common_meta_app::schema::IndexMeta;
+use databend_common_meta_app::schema::ListIndexesReq;
+use databend_common_meta_app::tenant::Tenant;
+use databend_common_meta_types::MetaId;
+use databend_common_storage::StageFileInfo;
+use databend_common_storage::StageFilesInfo;
+use databend_storages_common_table_meta::table::ChangeType;
+use log::info;
 
-use crate::binder::copy::parse_file_location;
-use crate::binder::scalar::ScalarBinder;
-use crate::binder::table_args::bind_table_args;
-use crate::binder::wrap_cast_scalar;
 use crate::binder::Binder;
 use crate::binder::ColumnBindingBuilder;
 use crate::binder::CteInfo;
 use crate::binder::ExprContext;
 use crate::binder::Visibility;
-use crate::optimizer::ColumnSet;
-use crate::optimizer::RelExpr;
 use crate::optimizer::SExpr;
 use crate::planner::semantic::normalize_identifier;
 use crate::planner::semantic::TypeChecker;
-use crate::plans::ConstantTableScan;
-use crate::plans::CteScan;
+use crate::plans::DummyTableScan;
+use crate::plans::RecursiveCteScan;
+use crate::plans::RelOperator;
 use crate::plans::Scan;
 use crate::plans::Statistics;
 use crate::BaseTableColumn;
@@ -108,653 +75,32 @@ use crate::ColumnEntry;
 use crate::IndexType;
 
 impl Binder {
-    #[async_backtrace::framed]
-    pub async fn bind_one_table(
+    pub fn bind_dummy_table(
         &mut self,
         bind_context: &BindContext,
         select_list: &Vec<SelectTarget>,
     ) -> Result<(SExpr, BindContext)> {
         for select_target in select_list {
-            if let SelectTarget::QualifiedName {
+            if let SelectTarget::StarColumns {
                 qualified: names, ..
             } = select_target
             {
                 for indirect in names {
                     if let Indirection::Star(span) = indirect {
                         return Err(ErrorCode::SemanticError(
-                            "SELECT * with no tables specified is not valid".to_string(),
+                            "'SELECT *' is used without specifying any tables in the FROM clause."
+                                .to_string(),
                         )
                         .set_span(*span));
                     }
                 }
             }
         }
-        let catalog = CATALOG_DEFAULT;
-        let database = "system";
-        let tenant = self.ctx.get_tenant();
-        let table_meta: Arc<dyn Table> = self
-            .resolve_data_source(tenant.as_str(), catalog, database, "one", &None)
-            .await?;
-        let table_index = self.metadata.write().add_table(
-            CATALOG_DEFAULT.to_owned(),
-            database.to_string(),
-            table_meta,
-            None,
-            false,
-            false,
-        );
-
-        self.bind_base_table(bind_context, database, table_index)
-            .await
-    }
-
-    fn check_view_dep(bind_context: &BindContext, database: &str, view_name: &str) -> Result<()> {
-        match &bind_context.parent {
-            Some(parent) => match &parent.view_info {
-                Some((db, v)) => {
-                    if db == database && v == view_name {
-                        Err(ErrorCode::Internal(format!(
-                            "View dependency loop detected (view: {}.{})",
-                            database, view_name
-                        )))
-                    } else {
-                        Self::check_view_dep(parent, database, view_name)
-                    }
-                }
-                _ => Ok(()),
-            },
-            _ => Ok(()),
-        }
-    }
-
-    #[async_recursion]
-    #[async_backtrace::framed]
-    pub(crate) async fn bind_single_table(
-        &mut self,
-        bind_context: &mut BindContext,
-        table_ref: &TableReference,
-    ) -> Result<(SExpr, BindContext)> {
-        match table_ref {
-            TableReference::Table {
-                span,
-                catalog,
-                database,
-                table,
-                alias,
-                travel_point,
-                pivot: _,
-                unpivot: _,
-            } => {
-                let (catalog, database, table_name) =
-                    self.normalize_object_identifier_triple(catalog, database, table);
-                let table_alias_name = if let Some(table_alias) = alias {
-                    Some(normalize_identifier(&table_alias.name, &self.name_resolution_ctx).name)
-                } else {
-                    None
-                };
-                let mut bind_cte = true;
-                if let Some(cte_name) = &bind_context.cte_name {
-                    // If table name equals to cte name, then skip bind cte and find table from catalog
-                    // Or will dead loop and stack overflow
-                    if cte_name == &table_name {
-                        bind_cte = false;
-                    }
-                }
-                // Check and bind common table expression
-                let ctes_map = self.ctes_map.clone();
-                if let Some(cte_info) = ctes_map.get(&table_name) {
-                    if bind_cte {
-                        return if !cte_info.materialized {
-                            self.bind_cte(*span, bind_context, &table_name, alias, cte_info)
-                                .await
-                        } else {
-                            self.bind_m_cte(bind_context, cte_info, &table_name, alias, span)
-                                .await
-                        };
-                    }
-                }
-
-                let tenant = self.ctx.get_tenant();
-
-                let navigation_point = match travel_point {
-                    Some(tp) => Some(self.resolve_data_travel_point(bind_context, tp).await?),
-                    None => None,
-                };
-
-                // Resolve table with catalog
-                let table_meta = match self
-                    .resolve_data_source(
-                        tenant.as_str(),
-                        catalog.as_str(),
-                        database.as_str(),
-                        table_name.as_str(),
-                        &navigation_point,
-                    )
-                    .await
-                {
-                    Ok(table) => table,
-                    Err(_) => {
-                        let mut parent = bind_context.parent.as_mut();
-                        loop {
-                            if parent.is_none() {
-                                break;
-                            }
-                            let bind_context = parent.unwrap().as_mut();
-                            let ctes_map = self.ctes_map.clone();
-                            if let Some(cte_info) = ctes_map.get(&table_name) {
-                                return if !cte_info.materialized {
-                                    self.bind_cte(*span, bind_context, &table_name, alias, cte_info)
-                                        .await
-                                } else {
-                                    self.bind_m_cte(
-                                        bind_context,
-                                        cte_info,
-                                        &table_name,
-                                        alias,
-                                        span,
-                                    )
-                                    .await
-                                };
-                            }
-                            parent = bind_context.parent.as_mut();
-                        }
-                        return Err(ErrorCode::UnknownTable(format!(
-                            "Unknown table '{table_name}'"
-                        ))
-                        .set_span(*span));
-                    }
-                };
-
-                // Avoid death loop
-                let mut agg_indexes = vec![];
-                if self.ctx.get_can_scan_from_agg_index()
-                    && self
-                        .ctx
-                        .get_settings()
-                        .get_enable_aggregating_index_scan()?
-                    && !bind_context.planning_agg_index
-                    && table_meta.support_index()
-                    && table_meta.engine() != "VIEW"
-                {
-                    let license_manager = get_license_manager();
-                    if license_manager
-                        .manager
-                        .check_enterprise_enabled(
-                            &self.ctx.get_settings(),
-                            self.ctx.get_tenant(),
-                            AggregateIndex,
-                        )
-                        .is_ok()
-                    {
-                        let indexes = self
-                            .resolve_table_indexes(
-                                tenant.as_str(),
-                                catalog.as_str(),
-                                table_meta.get_id(),
-                            )
-                            .await?;
-
-                        let mut s_exprs = Vec::with_capacity(indexes.len());
-                        for (index_id, _, index_meta) in indexes {
-                            let tokens = tokenize_sql(&index_meta.query)?;
-                            let (stmt, _) = parse_sql(&tokens, Dialect::PostgreSQL)?;
-                            let mut new_bind_context =
-                                BindContext::with_parent(Box::new(bind_context.clone()));
-                            new_bind_context.planning_agg_index = true;
-                            if let Statement::Query(query) = &stmt {
-                                let (s_expr, _) =
-                                    self.bind_query(&mut new_bind_context, query).await?;
-                                s_exprs.push((index_id, index_meta.query.clone(), s_expr));
-                            }
-                        }
-                        agg_indexes.extend(s_exprs);
-                    }
-                }
-
-                match table_meta.engine() {
-                    "VIEW" => {
-                        Self::check_view_dep(bind_context, &database, &table_name)?;
-                        let query = table_meta
-                            .options()
-                            .get(QUERY)
-                            .ok_or_else(|| ErrorCode::Internal("Invalid VIEW object"))?;
-                        let tokens = tokenize_sql(query.as_str())?;
-                        let (stmt, _) = parse_sql(&tokens, Dialect::PostgreSQL)?;
-                        // For view, we need use a new context to bind it.
-                        let mut new_bind_context =
-                            BindContext::with_parent(Box::new(bind_context.clone()));
-                        new_bind_context.view_info =
-                            Some((database.clone(), table_name.to_string()));
-                        if let Statement::Query(query) = &stmt {
-                            self.metadata.write().add_table(
-                                catalog,
-                                database.clone(),
-                                table_meta,
-                                table_alias_name,
-                                false,
-                                false,
-                            );
-                            let (s_expr, mut new_bind_context) =
-                                self.bind_query(&mut new_bind_context, query).await?;
-                            if let Some(alias) = alias {
-                                // view maybe has alias, e.g. select v1.col1 from v as v1;
-                                new_bind_context
-                                    .apply_table_alias(alias, &self.name_resolution_ctx)?;
-                            } else {
-                                // e.g. select v0.c0 from v0;
-                                for column in new_bind_context.columns.iter_mut() {
-                                    column.database_name = None;
-                                    column.table_name = Some(
-                                        normalize_identifier(table, &self.name_resolution_ctx).name,
-                                    );
-                                }
-                            }
-                            Ok((s_expr, new_bind_context))
-                        } else {
-                            Err(ErrorCode::Internal(format!(
-                                "Invalid VIEW object: {}",
-                                table_meta.name()
-                            ))
-                            .set_span(*span))
-                        }
-                    }
-                    _ => {
-                        let table_name = table_meta.name();
-                        let full_table_name = format!("{catalog}.{database}.{table_name}");
-                        let table_index = self.metadata.write().add_table(
-                            catalog,
-                            database.clone(),
-                            table_meta,
-                            table_alias_name,
-                            bind_context.view_info.is_some(),
-                            bind_context.planning_agg_index,
-                        );
-
-                        if !agg_indexes.is_empty() {
-                            // Should use bound table id.
-                            self.metadata
-                                .write()
-                                .add_agg_indexes(full_table_name, agg_indexes);
-                        }
-
-                        let (s_expr, mut bind_context) = self
-                            .bind_base_table(bind_context, database.as_str(), table_index)
-                            .await?;
-                        if let Some(alias) = alias {
-                            bind_context.apply_table_alias(alias, &self.name_resolution_ctx)?;
-                        }
-                        Ok((s_expr, bind_context))
-                    }
-                }
-            }
-            TableReference::TableFunction {
-                span,
-                name,
-                params,
-                named_params,
-                alias,
-            } => {
-                let mut scalar_binder = ScalarBinder::new(
-                    bind_context,
-                    self.ctx.clone(),
-                    &self.name_resolution_ctx,
-                    self.metadata.clone(),
-                    &[],
-                    self.m_cte_bound_ctx.clone(),
-                    self.ctes_map.clone(),
-                );
-                let table_args = bind_table_args(&mut scalar_binder, params, named_params).await?;
-
-                let func_name = normalize_identifier(name, &self.name_resolution_ctx);
-
-                if func_name.name.eq_ignore_ascii_case("result_scan") {
-                    let query_id = parse_result_scan_args(&table_args)?;
-                    if query_id.is_empty() {
-                        return Err(ErrorCode::InvalidArgument(
-                            "query_id must be specified when using `RESULT_SCAN`",
-                        )
-                        .set_span(*span));
-                    }
-                    let kv_store = UserApiProvider::instance().get_meta_store_client();
-                    let meta_key = self.ctx.get_result_cache_key(&query_id);
-                    if meta_key.is_none() {
-                        return Err(ErrorCode::EmptyData(format!(
-                            "`RESULT_SCAN` could not find related cache key in current session for this query id: {query_id}"
-                        )).set_span(*span));
-                    }
-                    let result_cache_mgr = ResultCacheMetaManager::create(kv_store, 0);
-                    let meta_key = meta_key.unwrap();
-                    let (table_schema, block_raw_data) = match result_cache_mgr
-                        .get(meta_key.clone())
-                        .await?
-                    {
-                        Some(value) => {
-                            let op = DataOperator::instance().operator();
-                            ResultCacheReader::read_table_schema_and_data(op, &value.location)
-                                .await?
-                        }
-                        None => {
-                            return Err(ErrorCode::EmptyData(format!(
-                                "`RESULT_SCAN` could not fetch cache value, maybe the data has touched ttl and was cleaned up.\n\
-                            query id: {query_id}, cache key: {meta_key}"
-                            )).set_span(*span));
-                        }
-                    };
-                    let table = ResultScan::try_create(table_schema, query_id, block_raw_data)?;
-
-                    let table_alias_name = if let Some(table_alias) = alias {
-                        Some(
-                            normalize_identifier(&table_alias.name, &self.name_resolution_ctx).name,
-                        )
-                    } else {
-                        None
-                    };
-
-                    let table_index = self.metadata.write().add_table(
-                        CATALOG_DEFAULT.to_string(),
-                        "system".to_string(),
-                        table.clone(),
-                        table_alias_name,
-                        false,
-                        false,
-                    );
-
-                    let (s_expr, mut bind_context) = self
-                        .bind_base_table(bind_context, "system", table_index)
-                        .await?;
-                    if let Some(alias) = alias {
-                        bind_context.apply_table_alias(alias, &self.name_resolution_ctx)?;
-                    }
-                    return Ok((s_expr, bind_context));
-                }
-
-                if BUILTIN_FUNCTIONS
-                    .get_property(&func_name.name)
-                    .map(|p| p.kind == FunctionKind::SRF)
-                    .unwrap_or(false)
-                {
-                    // If it is a set-returning function, we bind it as a subquery.
-                    let mut bind_context = BindContext::with_parent(Box::new(bind_context.clone()));
-                    let stmt = SelectStmt {
-                        span: *span,
-                        hints: None,
-                        distinct: false,
-                        select_list: vec![SelectTarget::AliasedExpr {
-                            expr: Box::new(common_ast::ast::Expr::FunctionCall {
-                                span: *span,
-                                distinct: false,
-                                name: common_ast::ast::Identifier {
-                                    span: *span,
-                                    name: func_name.name.clone(),
-                                    quote: None,
-                                },
-                                params: vec![],
-                                args: params.clone(),
-                                window: None,
-                                lambda: None,
-                            }),
-                            alias: None,
-                        }],
-                        from: vec![],
-                        selection: None,
-                        group_by: None,
-                        having: None,
-                        window_list: None,
-                    };
-                    self.bind_select_stmt(&mut bind_context, &stmt, &[], 0)
-                        .await
-                } else {
-                    // Other table functions always reside is default catalog
-                    let table_meta: Arc<dyn TableFunction> =
-                        self.catalogs
-                            .get_default_catalog()?
-                            .get_table_function(&func_name.name, table_args)?;
-                    let table = table_meta.as_table();
-                    let table_alias_name = if let Some(table_alias) = alias {
-                        Some(
-                            normalize_identifier(&table_alias.name, &self.name_resolution_ctx).name,
-                        )
-                    } else {
-                        None
-                    };
-                    let table_index = self.metadata.write().add_table(
-                        CATALOG_DEFAULT.to_string(),
-                        "system".to_string(),
-                        table.clone(),
-                        table_alias_name,
-                        false,
-                        false,
-                    );
-
-                    let (s_expr, mut bind_context) = self
-                        .bind_base_table(bind_context, "system", table_index)
-                        .await?;
-                    if let Some(alias) = alias {
-                        bind_context.apply_table_alias(alias, &self.name_resolution_ctx)?;
-                    }
-                    Ok((s_expr, bind_context))
-                }
-            }
-            TableReference::Subquery {
-                span: _,
-                subquery,
-                alias,
-            } => {
-                // For subquery, we need use a new context to bind it.
-                let mut new_bind_context = BindContext::with_parent(Box::new(bind_context.clone()));
-                let (s_expr, mut res_bind_context) =
-                    self.bind_query(&mut new_bind_context, subquery).await?;
-                if let Some(alias) = alias {
-                    res_bind_context.apply_table_alias(alias, &self.name_resolution_ctx)?;
-                }
-                Ok((s_expr, res_bind_context))
-            }
-            TableReference::Stage {
-                span: _,
-                location,
-                options,
-                alias,
-            } => {
-                let (mut stage_info, path) =
-                    parse_file_location(&self.ctx, location, options.connection.clone()).await?;
-                if let Some(f) = &options.file_format {
-                    stage_info.file_format_params = match StageFileFormatType::from_str(f) {
-                        Ok(t) => FileFormatParams::default_by_type(t)?,
-                        _ => self.ctx.get_file_format(f).await?,
-                    }
-                }
-                let files_info = StageFilesInfo {
-                    path,
-                    pattern: options.pattern.clone(),
-                    files: options.files.clone(),
-                };
-                let table_ctx = self.ctx.clone();
-                self.bind_stage_table(table_ctx, bind_context, stage_info, files_info, alias, None)
-                    .await
-            }
-            TableReference::Join { .. } => unreachable!(),
-            TableReference::Values {
-                span,
-                values,
-                alias,
-            } => self.bind_values(bind_context, *span, values, alias).await,
-        }
-    }
-
-    #[async_backtrace::framed]
-    pub(crate) async fn bind_values(
-        &mut self,
-        bind_context: &mut BindContext,
-        span: Span,
-        values: &Vec<Vec<AExpr>>,
-        alias: &Option<TableAlias>,
-    ) -> Result<(SExpr, BindContext)> {
-        if values.is_empty() {
-            return Err(ErrorCode::SemanticError(
-                "Values lists must have at least one row".to_string(),
-            )
-            .set_span(span));
-        }
-        let same_length = values.windows(2).all(|v| v[0].len() == v[1].len());
-        if !same_length {
-            return Err(ErrorCode::SemanticError(
-                "Values lists must all be the same length".to_string(),
-            )
-            .set_span(span));
-        }
-
-        let num_rows = values.len();
-        let num_cols = values[0].len();
-
-        let mut names = match alias {
-            Some(alias) => {
-                if alias.columns.len() > num_cols {
-                    return Err(ErrorCode::SemanticError(format!(
-                        "table {} has {} columns available but {} columns specified",
-                        alias.name,
-                        num_cols,
-                        alias.columns.len()
-                    ))
-                    .set_span(span));
-                }
-                alias
-                    .columns
-                    .iter()
-                    .map(|c| c.to_string())
-                    .collect::<Vec<_>>()
-            }
-            None => vec![],
-        };
-        // For columns whose names are not specified, assigns default column names col0, col2, etc.
-        for i in names.len()..num_cols {
-            names.push(format!("col{}", i));
-        }
-
-        let mut scalar_binder = ScalarBinder::new(
+        let bind_context = BindContext::with_parent(Box::new(bind_context.clone()));
+        Ok((
+            SExpr::create_leaf(Arc::new(DummyTableScan.into())),
             bind_context,
-            self.ctx.clone(),
-            &self.name_resolution_ctx,
-            self.metadata.clone(),
-            &[],
-            HashMap::new(),
-            Box::new(IndexMap::new()),
-        );
-
-        let mut col_scalars = vec![Vec::with_capacity(values.len()); num_cols];
-        let mut common_types: Vec<Option<DataType>> = vec![None; num_cols];
-
-        for row_values in values.iter() {
-            for (i, value) in row_values.iter().enumerate() {
-                let (scalar, data_type) = scalar_binder.bind(value).await?;
-                col_scalars[i].push((scalar, data_type.clone()));
-
-                // Get the common data type for each columns.
-                match &common_types[i] {
-                    Some(common_type) => {
-                        if common_type != &data_type {
-                            let new_common_type = common_super_type(
-                                common_type.clone(),
-                                data_type.clone(),
-                                &BUILTIN_FUNCTIONS.default_cast_rules,
-                            );
-                            if new_common_type.is_none() {
-                                return Err(ErrorCode::SemanticError(format!(
-                                    "{} and {} don't have common data type",
-                                    common_type, data_type
-                                ))
-                                .set_span(span));
-                            }
-                            common_types[i] = new_common_type;
-                        }
-                    }
-                    None => {
-                        common_types[i] = Some(data_type);
-                    }
-                }
-            }
-        }
-
-        let mut value_fields = Vec::with_capacity(names.len());
-        for (name, common_type) in names.into_iter().zip(common_types.into_iter()) {
-            let value_field = DataField::new(&name, common_type.unwrap());
-            value_fields.push(value_field);
-        }
-        let value_schema = DataSchema::new(value_fields);
-
-        let input = DataBlock::empty();
-        let func_ctx = self.ctx.get_function_context()?;
-        let evaluator = Evaluator::new(&input, &func_ctx, &BUILTIN_FUNCTIONS);
-
-        // use values to build columns
-        let mut value_columns = Vec::with_capacity(col_scalars.len());
-        for (scalars, value_field) in col_scalars.iter().zip(value_schema.fields().iter()) {
-            let mut builder =
-                ColumnBuilder::with_capacity(value_field.data_type(), col_scalars.len());
-            for (scalar, value_type) in scalars {
-                let scalar = if value_type != value_field.data_type() {
-                    wrap_cast_scalar(scalar, value_type, value_field.data_type())?
-                } else {
-                    scalar.clone()
-                };
-                let expr = scalar.as_expr()?.project_column_ref(|col| {
-                    value_schema.index_of(&col.index.to_string()).unwrap()
-                });
-                let result = evaluator.run(&expr)?;
-
-                match result.as_scalar() {
-                    Some(val) => {
-                        builder.push(val.as_ref());
-                    }
-                    None => {
-                        return Err(ErrorCode::SemanticError(format!(
-                            "Value must be a scalar, but get {}",
-                            result
-                        ))
-                        .set_span(span));
-                    }
-                }
-            }
-            value_columns.push(builder.build());
-        }
-
-        // add column bindings
-        let mut columns = ColumnSet::new();
-        let mut fields = Vec::with_capacity(values.len());
-        for value_field in value_schema.fields() {
-            let index = self
-                .metadata
-                .write()
-                .add_derived_column(value_field.name().clone(), value_field.data_type().clone());
-            columns.insert(index);
-
-            let column_binding = ColumnBindingBuilder::new(
-                value_field.name().clone(),
-                index,
-                Box::new(value_field.data_type().clone()),
-                Visibility::Visible,
-            )
-            .build();
-            bind_context.add_column_binding(column_binding);
-
-            let field = DataField::new(&index.to_string(), value_field.data_type().clone());
-            fields.push(field);
-        }
-        let schema = DataSchemaRefExt::create(fields);
-
-        let s_expr = SExpr::create_leaf(Arc::new(
-            ConstantTableScan {
-                values: value_columns,
-                num_rows,
-                schema,
-                columns,
-            }
-            .into(),
-        ));
-        if let Some(alias) = alias {
-            bind_context.apply_table_alias(alias, &self.name_resolution_ctx)?;
-        }
-
-        Ok((s_expr, bind_context.clone()))
+        ))
     }
 
     #[async_backtrace::framed]
@@ -766,72 +112,19 @@ impl Binder {
         files_info: StageFilesInfo,
         alias: &Option<TableAlias>,
         files_to_copy: Option<Vec<StageFileInfo>>,
+        case_sensitive: bool,
     ) -> Result<(SExpr, BindContext)> {
-        let table = match stage_info.file_format_params {
-            FileFormatParams::Parquet(..) => {
-                let use_parquet2 = table_ctx.get_settings().get_use_parquet2()?;
-                let read_options = ParquetReadOptions::default();
-                if use_parquet2 {
-                    Parquet2Table::create(
-                        stage_info.clone(),
-                        files_info,
-                        read_options,
-                        files_to_copy,
-                    )
-                    .await?
-                } else {
-                    ParquetTable::create(
-                        stage_info.clone(),
-                        files_info,
-                        read_options,
-                        files_to_copy,
-                    )
-                    .await?
-                }
-            }
-            FileFormatParams::NdJson(..) => {
-                let schema = Arc::new(TableSchema::new(vec![TableField::new(
-                    "_$1", // TODO: this name should be in visible
-                    TableDataType::Variant,
-                )]));
-                let info = StageTableInfo {
-                    schema,
-                    stage_info,
-                    files_info,
-                    files_to_copy: None,
-                    is_select: true,
-                };
-                StageTable::try_create(info)?
-            }
-            FileFormatParams::Csv(..) | FileFormatParams::Tsv(..) => {
-                let max_column_position = self.metadata.read().get_max_column_position();
-                if max_column_position == 0 {
-                    return Err(ErrorCode::SemanticError(
-                        "select columns from csv file must in the form of $<column_position>",
-                    ));
-                }
-
-                let mut fields = vec![];
-                for i in 1..(max_column_position + 1) {
-                    fields.push(TableField::new(&format!("_${}", i), TableDataType::String));
-                }
-
-                let schema = Arc::new(TableSchema::new(fields));
-                let info = StageTableInfo {
-                    schema,
-                    stage_info,
-                    files_info,
-                    files_to_copy: None,
-                    is_select: true,
-                };
-                StageTable::try_create(info)?
-            }
-            _ => {
-                return Err(ErrorCode::Unimplemented(
-                    "query stage files only support parquet/NDJson/CSV/TSV format for now",
-                ));
-            }
-        };
+        let start = std::time::Instant::now();
+        let max_column_position = self.metadata.read().get_max_column_position();
+        let table = table_ctx
+            .create_stage_table(
+                stage_info,
+                files_info,
+                files_to_copy,
+                max_column_position,
+                case_sensitive,
+            )
+            .await?;
 
         let table_alias_name = if let Some(table_alias) = alias {
             Some(normalize_identifier(&table_alias.name, &self.name_resolution_ctx).name)
@@ -846,120 +139,21 @@ impl Binder {
             table_alias_name,
             false,
             false,
+            true,
+            None,
         );
 
-        let (s_expr, mut bind_context) = self
-            .bind_base_table(bind_context, "system", table_index)
-            .await?;
+        let (s_expr, mut bind_context) =
+            self.bind_base_table(bind_context, "system", table_index, None, &None)?;
         if let Some(alias) = alias {
             bind_context.apply_table_alias(alias, &self.name_resolution_ctx)?;
         }
+
+        info!("bind_stage_table cost: {:?}", start.elapsed());
         Ok((s_expr, bind_context))
     }
 
-    #[async_backtrace::framed]
-    pub async fn bind_table_reference(
-        &mut self,
-        bind_context: &mut BindContext,
-        table_ref: &TableReference,
-    ) -> Result<(SExpr, BindContext)> {
-        let mut current_ref = table_ref;
-        let current_ctx = bind_context;
-
-        // Stack to keep track of the joins
-        let mut join_stack: Vec<&Join> = Vec::new();
-
-        // Traverse the table reference hierarchy to get to the innermost table
-        while let TableReference::Join { join, .. } = current_ref {
-            join_stack.push(join);
-
-            // Check whether the right-hand side is a Join or a TableReference
-            match &*join.right {
-                TableReference::Join { .. } => {
-                    // Traverse the right-hand side if the right-hand side is a Join
-                    current_ref = &join.right;
-                }
-                _ => {
-                    // Traverse the left-hand side if the right-hand side is a TableReference
-                    current_ref = &join.left;
-                }
-            }
-        }
-
-        // Bind the innermost table
-        // current_ref must be left table in its join
-        let (mut result_expr, mut result_ctx) =
-            self.bind_single_table(current_ctx, current_ref).await?;
-
-        for join in join_stack.iter().rev() {
-            match &*join.right {
-                TableReference::Join { .. } => {
-                    let (left_expr, left_ctx) =
-                        self.bind_single_table(current_ctx, &join.left).await?;
-                    let (join_expr, ctx) = self
-                        .bind_join(
-                            current_ctx,
-                            left_ctx,
-                            result_ctx,
-                            left_expr,
-                            result_expr,
-                            join,
-                        )
-                        .await?;
-                    result_expr = join_expr;
-                    result_ctx = ctx;
-                }
-                _ => {
-                    let (right_expr, right_ctx) =
-                        self.bind_single_table(current_ctx, &join.right).await?;
-                    let (join_expr, ctx) = self
-                        .bind_join(
-                            current_ctx,
-                            result_ctx,
-                            right_ctx,
-                            result_expr,
-                            right_expr,
-                            join,
-                        )
-                        .await?;
-                    result_expr = join_expr;
-                    result_ctx = ctx;
-                }
-            }
-        }
-
-        Ok((result_expr, result_ctx))
-    }
-
-    fn bind_cte_scan(&mut self, cte_info: &CteInfo) -> Result<SExpr> {
-        let blocks = Arc::new(RwLock::new(vec![]));
-        self.ctx
-            .set_materialized_cte((cte_info.cte_idx, cte_info.used_count), blocks)?;
-        // Get the fields in the cte
-        let mut fields = vec![];
-        let mut offsets = vec![];
-        for (idx, column) in cte_info.columns.iter().enumerate() {
-            fields.push(DataField::new(
-                column.index.to_string().as_str(),
-                *column.data_type.clone(),
-            ));
-            offsets.push(idx);
-        }
-        let cte_scan = SExpr::create_leaf(Arc::new(
-            CteScan {
-                cte_idx: (cte_info.cte_idx, cte_info.used_count),
-                fields,
-                // It is safe to unwrap here because we have checked that the cte is materialized.
-                offsets,
-                stat: cte_info.stat_info.clone().unwrap(),
-            }
-            .into(),
-        ));
-        Ok(cte_scan)
-    }
-
-    #[async_backtrace::framed]
-    pub(crate) async fn bind_cte(
+    pub(crate) fn bind_cte(
         &mut self,
         span: Span,
         bind_context: &mut BindContext,
@@ -967,26 +161,40 @@ impl Binder {
         alias: &Option<TableAlias>,
         cte_info: &CteInfo,
     ) -> Result<(SExpr, BindContext)> {
+        if let Some(cte_name) = &bind_context.cte_context.cte_name {
+            // `cte_name` exists, which means the current cte is a nested cte
+            // If the `cte_name` is the same as the current cte's name, it means the cte is recursive
+            if cte_name == table_name {
+                return Err(ErrorCode::SemanticError(
+                    "The cte is not recursive, but it references itself.".to_string(),
+                )
+                .set_span(span));
+            }
+        }
         let mut new_bind_context = BindContext {
             parent: Some(Box::new(bind_context.clone())),
             bound_internal_columns: BTreeMap::new(),
             columns: vec![],
             aggregate_info: Default::default(),
             windows: Default::default(),
-            lambda_info: Default::default(),
-            cte_name: Some(table_name.to_string()),
-            cte_map_ref: Box::default(),
+            srf_info: Default::default(),
+            cte_context: bind_context.cte_context.clone(),
             in_grouping: false,
             view_info: None,
-            srfs: Default::default(),
+            have_async_func: false,
+            have_udf_script: false,
+            have_udf_server: false,
+            inverted_index_map: Box::default(),
+            virtual_column_context: Default::default(),
             expr_context: ExprContext::default(),
             planning_agg_index: false,
             window_definitions: DashMap::new(),
         };
 
-        let (s_expr, mut res_bind_context) = self
-            .bind_query(&mut new_bind_context, &cte_info.query)
-            .await?;
+        new_bind_context.cte_context.cte_name = Some(table_name.to_string());
+
+        let (s_expr, mut res_bind_context) =
+            self.bind_query(&mut new_bind_context, &cte_info.query)?;
         let mut cols_alias = cte_info.columns_alias.clone();
         if let Some(alias) = alias {
             for (idx, col_alias) in alias.columns.iter().enumerate() {
@@ -1008,11 +216,12 @@ impl Binder {
 
         if cols_alias.len() > res_bind_context.columns.len() {
             return Err(ErrorCode::SemanticError(format!(
-                "table has {} columns available but {} columns specified",
+                "The CTE '{}' has {} columns, but {} aliases were provided. Ensure the number of aliases matches the number of columns in the CTE.",
+                table_name,
                 res_bind_context.columns.len(),
                 cols_alias.len()
             ))
-            .set_span(span));
+                .set_span(span));
         }
         for (index, column_name) in cols_alias.iter().enumerate() {
             res_bind_context.columns[index].column_name = column_name.clone();
@@ -1020,71 +229,141 @@ impl Binder {
         Ok((s_expr, res_bind_context))
     }
 
-    // Bind materialized cte
-    #[async_backtrace::framed]
-    pub(crate) async fn bind_m_cte(
+    pub(crate) fn bind_r_cte_scan(
         &mut self,
         bind_context: &mut BindContext,
         cte_info: &CteInfo,
-        table_name: &String,
+        cte_name: &str,
         alias: &Option<TableAlias>,
-        span: &Span,
     ) -> Result<(SExpr, BindContext)> {
-        let new_bind_context = if cte_info.used_count == 0 {
-            let (cte_s_expr, cte_bind_ctx) = self
-                .bind_cte(*span, bind_context, table_name, alias, cte_info)
-                .await?;
-            let stat_info = RelExpr::with_s_expr(&cte_s_expr).derive_cardinality()?;
-            self.ctes_map
-                .entry(table_name.clone())
-                .and_modify(|cte_info| {
-                    cte_info.stat_info = Some(stat_info);
-                    cte_info.columns = cte_bind_ctx.columns.clone();
-                });
-            self.set_m_cte_bound_ctx(cte_info.cte_idx, cte_bind_ctx.clone());
-            self.set_m_cte_bound_s_expr(cte_info.cte_idx, cte_s_expr);
-            cte_bind_ctx
-        } else {
-            // If the cte has been bound, get the bound context from `Binder`'s `m_cte_bound_ctx`
-            let mut bound_ctx = self.m_cte_bound_ctx.get(&cte_info.cte_idx).unwrap().clone();
-            // Resolve the alias name for the bound cte.
-            let alias_table_name = alias
-                .as_ref()
-                .map(|alias| normalize_identifier(&alias.name, &self.name_resolution_ctx).name)
-                .unwrap_or_else(|| table_name.to_string());
-            for column in bound_ctx.columns.iter_mut() {
-                column.database_name = None;
-                column.table_name = Some(alias_table_name.clone());
-            }
-            // Pass parent to bound_ctx
-            bound_ctx.parent = bind_context.parent.clone();
-            bound_ctx
-        };
-        // `bind_context` is the main BindContext for the whole query
-        // Update the `used_count` which will be used in runtime phase
-        self.ctes_map
-            .entry(table_name.clone())
+        let mut new_bind_ctx = BindContext::with_parent(Box::new(bind_context.clone()));
+        let mut metadata = self.metadata.write();
+        let mut columns = cte_info.columns.clone();
+        for (index, column_name) in cte_info.columns_alias.iter().enumerate() {
+            columns[index].column_name = column_name.clone();
+        }
+        for col in columns.iter() {
+            // Expand a number type to a higher precision to avoid overflow
+            // (Because the output type of recursive cte is the left of the union)
+            let expand_data_type = match *col.data_type {
+                DataType::Number(NumberDataType::UInt8)
+                | DataType::Number(NumberDataType::UInt16)
+                | DataType::Number(NumberDataType::UInt32) => {
+                    Box::new(DataType::Number(NumberDataType::UInt64))
+                }
+                DataType::Number(NumberDataType::Int8)
+                | DataType::Number(NumberDataType::Int16)
+                | DataType::Number(NumberDataType::Int32) => {
+                    Box::new(DataType::Number(NumberDataType::Int64))
+                }
+                _ => col.data_type.clone(),
+            };
+            let idx = metadata.add_derived_column(
+                col.column_name.clone(),
+                *expand_data_type.clone(),
+                None,
+            );
+            new_bind_ctx.columns.push(
+                ColumnBindingBuilder::new(
+                    col.column_name.clone(),
+                    idx,
+                    expand_data_type,
+                    Visibility::Visible,
+                )
+                .table_name(col.table_name.clone())
+                .build(),
+            )
+        }
+        let mut fields = Vec::with_capacity(cte_info.columns.len());
+        for col in new_bind_ctx.columns.iter() {
+            fields.push(DataField::new(
+                col.index.to_string().as_str(),
+                *col.data_type.clone(),
+            ));
+        }
+        // Update the cte_info of the recursive cte
+        bind_context
+            .cte_context
+            .cte_map
+            .entry(cte_name.to_string())
             .and_modify(|cte_info| {
-                cte_info.used_count += 1;
+                cte_info.columns = new_bind_ctx.columns.clone();
             });
-        let cte_info = self.ctes_map.get(table_name).unwrap().clone();
-        let s_expr = self.bind_cte_scan(&cte_info)?;
-        Ok((s_expr, new_bind_context))
+        if let Some(alias) = alias {
+            new_bind_ctx.apply_table_alias(alias, &self.name_resolution_ctx)?;
+        }
+
+        let table_alias_name = alias
+            .as_ref()
+            .map(|table_alias| self.normalize_identifier(&table_alias.name).name);
+        let table_name = if let Some(table_alias_name) = table_alias_name {
+            table_alias_name
+        } else {
+            cte_name.to_string()
+        };
+
+        Ok((
+            SExpr::create_leaf(Arc::new(RelOperator::RecursiveCteScan(RecursiveCteScan {
+                fields,
+                table_name,
+            }))),
+            new_bind_ctx,
+        ))
     }
 
-    #[async_backtrace::framed]
-    pub(crate) async fn bind_base_table(
+    pub(crate) fn bind_r_cte(
+        &mut self,
+        span: Span,
+        bind_context: &mut BindContext,
+        cte_info: &CteInfo,
+        cte_name: &str,
+        alias: &Option<TableAlias>,
+    ) -> Result<(SExpr, BindContext)> {
+        match &cte_info.query.body {
+            SetExpr::SetOperation(set_expr) => {
+                if set_expr.op != SetOperator::Union {
+                    return Err(ErrorCode::SyntaxException(
+                        "Recursive CTE must contain a UNION(ALL) query".to_string(),
+                    ));
+                }
+                self.set_bind_recursive_cte(true);
+                let (union_s_expr, mut new_bind_ctx) = self.bind_set_operator(
+                    bind_context,
+                    &set_expr.left,
+                    &set_expr.right,
+                    &set_expr.op,
+                    &set_expr.all,
+                    Some(cte_name.to_string()),
+                )?;
+                self.set_bind_recursive_cte(false);
+                if let Some(alias) = alias {
+                    new_bind_ctx.apply_table_alias(alias, &self.name_resolution_ctx)?;
+                } else {
+                    for (index, column_name) in cte_info.columns_alias.iter().enumerate() {
+                        new_bind_ctx.columns[index].column_name = column_name.clone();
+                    }
+                }
+                Ok((union_s_expr, new_bind_ctx.clone()))
+            }
+            _ => self.bind_cte(span, bind_context, cte_name, alias, cte_info),
+        }
+    }
+
+    pub(crate) fn bind_base_table(
         &mut self,
         bind_context: &BindContext,
         database_name: &str,
         table_index: IndexType,
+        change_type: Option<ChangeType>,
+        sample: &Option<SampleConfig>,
     ) -> Result<(SExpr, BindContext)> {
         let mut bind_context = BindContext::with_parent(Box::new(bind_context.clone()));
-        let columns = self.metadata.read().columns_by_table_index(table_index);
-        let table = self.metadata.read().table(table_index).clone();
-        let statistics_provider = table.table().column_statistics_provider().await?;
 
-        let mut col_stats: HashMap<IndexType, Option<ColumnStatistics>> = HashMap::new();
+        let table = self.metadata.read().table(table_index).clone();
+        let table_name = table.name();
+        let columns = self.metadata.read().columns_by_table_index(table_index);
+        let scan_id = self.metadata.write().next_scan_id();
+        let mut base_column_scan_id = HashMap::new();
         for column in columns.iter() {
             match column {
                 ColumnEntry::BaseTableColumn(BaseTableColumn {
@@ -1092,7 +371,6 @@ impl Binder {
                     column_index,
                     path_indices,
                     data_type,
-                    leaf_index,
                     table_index,
                     column_position,
                     virtual_computed_expr,
@@ -1102,44 +380,43 @@ impl Binder {
                         column_name.clone(),
                         *column_index,
                         Box::new(DataType::from(data_type)),
-                        if path_indices.is_some() {
+                        if path_indices.is_some() || is_stream_column(column_name) {
                             Visibility::InVisible
                         } else {
                             Visibility::Visible
                         },
                     )
-                    .table_name(Some(table.name().to_string()))
+                    .table_name(Some(table_name.to_string()))
                     .database_name(Some(database_name.to_string()))
                     .table_index(Some(*table_index))
                     .column_position(*column_position)
                     .virtual_computed_expr(virtual_computed_expr.clone())
                     .build();
                     bind_context.add_column_binding(column_binding);
-                    if path_indices.is_none() && virtual_computed_expr.is_none() {
-                        if let Some(col_id) = *leaf_index {
-                            let col_stat =
-                                statistics_provider.column_statistics(col_id as ColumnId);
-                            col_stats.insert(*column_index, col_stat);
-                        }
-                    }
+                    base_column_scan_id.insert(*column_index, scan_id);
                 }
-                _ => {
-                    return Err(ErrorCode::Internal("Invalid column entry"));
+                other => {
+                    return Err(ErrorCode::Internal(format!(
+                        "Invalid column entry '{:?}' encountered while binding the base table '{}'. Ensure that the table definition and column references are correct.",
+                        other.name(),
+                        table_name
+                    )));
                 }
             }
         }
-
-        let stat = table.table().table_statistics()?;
+        self.metadata
+            .write()
+            .add_base_column_scan_id(base_column_scan_id);
 
         Ok((
             SExpr::create_leaf(Arc::new(
                 Scan {
                     table_index,
                     columns: columns.into_iter().map(|col| col.index()).collect(),
-                    statistics: Statistics {
-                        statistics: stat,
-                        col_stats,
-                    },
+                    statistics: Arc::new(Statistics::default()),
+                    change_type,
+                    sample: sample.clone(),
+                    scan_id,
                     ..Default::default()
                 }
                 .into(),
@@ -1148,27 +425,60 @@ impl Binder {
         ))
     }
 
-    #[async_backtrace::framed]
-    pub(crate) async fn resolve_data_source(
+    pub fn resolve_data_source(
         &self,
-        tenant: &str,
         catalog_name: &str,
         database_name: &str,
         table_name: &str,
-        travel_point: &Option<NavigationPoint>,
+        navigation: Option<&TimeNavigation>,
+        max_batch_size: Option<u64>,
+        abort_checker: AbortChecker,
     ) -> Result<Arc<dyn Table>> {
-        // Resolve table with catalog
-        let catalog = self.catalogs.get_catalog(tenant, catalog_name).await?;
-        let mut table_meta = catalog.get_table(tenant, database_name, table_name).await?;
+        databend_common_base::runtime::block_on(async move {
+            // Resolve table with ctx
+            // for example: select * from t1 join (select * from t1 as t2 where a > 1 and a < 13);
+            // we will invoke here twice for t1, so in the past, we use catalog every time to get the
+            // newest snapshot, we can't get consistent snapshot
+            let mut table_meta = self
+                .ctx
+                .get_table_with_batch(catalog_name, database_name, table_name, max_batch_size)
+                .await?;
 
-        if let Some(tp) = travel_point {
-            table_meta = table_meta.navigate_to(tp).await?;
-        }
-        Ok(table_meta)
+            if let Some(desc) = navigation {
+                table_meta = table_meta.navigate_to(desc, abort_checker).await?;
+            }
+            Ok(table_meta)
+        })
     }
 
-    #[async_backtrace::framed]
-    pub(crate) async fn resolve_data_travel_point(
+    pub(crate) fn resolve_temporal_clause(
+        &self,
+        bind_context: &mut BindContext,
+        temporal: &Option<TemporalClause>,
+    ) -> Result<Option<TimeNavigation>> {
+        match temporal {
+            Some(TemporalClause::TimeTravel(point)) => {
+                let point = self.resolve_data_travel_point(bind_context, point)?;
+                Ok(Some(TimeNavigation::TimeTravel(point)))
+            }
+            Some(TemporalClause::Changes(interval)) => {
+                let end = match &interval.end_point {
+                    Some(tp) => Some(self.resolve_data_travel_point(bind_context, tp)?),
+                    None => None,
+                };
+                let at = self.resolve_data_travel_point(bind_context, &interval.at_point)?;
+                Ok(Some(TimeNavigation::Changes {
+                    append_only: interval.append_only,
+                    at,
+                    end,
+                    desc: format!("{interval}"),
+                }))
+            }
+            None => Ok(None),
+        }
+    }
+
+    pub(crate) fn resolve_data_travel_point(
         &self,
         bind_context: &mut BindContext,
         travel_point: &TimeTravelPoint,
@@ -1176,16 +486,15 @@ impl Binder {
         match travel_point {
             TimeTravelPoint::Snapshot(s) => Ok(NavigationPoint::SnapshotID(s.to_owned())),
             TimeTravelPoint::Timestamp(expr) => {
-                let mut type_checker = TypeChecker::new(
+                let mut type_checker = TypeChecker::try_create(
                     bind_context,
                     self.ctx.clone(),
                     &self.name_resolution_ctx,
                     self.metadata.clone(),
                     &[],
                     false,
-                    false,
-                );
-                let box (scalar, _) = type_checker.resolve(expr).await?;
+                )?;
+                let box (scalar, _) = type_checker.resolve(expr)?;
                 let scalar_expr = scalar.as_expr()?;
 
                 let (new_expr, _) = ConstantFolder::fold(
@@ -1195,50 +504,105 @@ impl Binder {
                 );
 
                 match new_expr {
-                    common_expression::Expr::Constant {
-                        scalar, data_type, ..
-                    } if data_type == DataType::Timestamp => {
+                    databend_common_expression::Expr::Constant {
+                        scalar,
+                        data_type: DataType::Timestamp,
+                        ..
+                    } => {
                         let value = scalar.as_timestamp().unwrap();
                         Ok(NavigationPoint::TimePoint(
                             Utc.timestamp_nanos(*value * 1000),
                         ))
                     }
 
-                    _ => Err(ErrorCode::InvalidArgument(
-                        "TimeTravelPoint must be constant timestamp value",
-                    )),
+                    _ => Err(ErrorCode::InvalidArgument(format!(
+                        "TimeTravelPoint for 'Timestamp' must resolve to a constant timestamp value. \
+                        Provided expression '{}' is not a constant timestamp. \
+                        Ensure the expression is a constant and of type timestamp",
+                        expr
+                    ))),
                 }
             }
+            TimeTravelPoint::Offset(expr) => {
+                let mut type_checker = TypeChecker::try_create(
+                    bind_context,
+                    self.ctx.clone(),
+                    &self.name_resolution_ctx,
+                    self.metadata.clone(),
+                    &[],
+                    false,
+                )?;
+                let box (scalar, _) = type_checker.resolve(expr)?;
+                let scalar_expr = scalar.as_expr()?;
+
+                let (new_expr, _) = ConstantFolder::fold(
+                    &scalar_expr,
+                    &self.ctx.get_function_context()?,
+                    &BUILTIN_FUNCTIONS,
+                );
+
+                let v = check_number::<_, i64>(
+                    None,
+                    &FunctionContext::default(),
+                    &new_expr,
+                    &BUILTIN_FUNCTIONS,
+                )?;
+                if v > 0 {
+                    return Err(ErrorCode::InvalidArgument(format!(
+                        "TimeTravelPoint for 'Offset' must resolve to a constant negative integer. \
+                        Provided expression '{}' does not meet this requirement. \
+                        Ensure the expression is a constant and negative integer",
+                        expr
+                    )));
+                }
+                let micros = Utc::now().timestamp_micros() + v * 1_000_000;
+                Ok(NavigationPoint::TimePoint(
+                    Utc.timestamp_nanos(micros * 1000),
+                ))
+            }
+            TimeTravelPoint::Stream {
+                catalog,
+                database,
+                name,
+            } => self.resolve_stream_data_travel_point(catalog, database, name),
         }
+    }
+
+    fn resolve_stream_data_travel_point(
+        &self,
+        catalog: &Option<Identifier>,
+        database: &Option<Identifier>,
+        name: &Identifier,
+    ) -> Result<NavigationPoint> {
+        let (catalog, database, name) =
+            self.normalize_object_identifier_triple(catalog, database, name);
+        databend_common_base::runtime::block_on(async move {
+            let stream = self.ctx.get_table(&catalog, &database, &name).await?;
+            if !stream.is_stream() {
+                return Err(ErrorCode::TableEngineNotSupported(format!(
+                    "{database}.{name} is not STREAM",
+                )));
+            }
+            let info = stream.get_table_info().clone();
+            Ok(NavigationPoint::StreamInfo(info))
+        })
     }
 
     #[async_backtrace::framed]
     pub(crate) async fn resolve_table_indexes(
         &self,
-        tenant: &str,
+        tenant: &Tenant,
         catalog_name: &str,
         table_id: MetaId,
     ) -> Result<Vec<(u64, String, IndexMeta)>> {
-        let catalog = self.catalogs.get_catalog(tenant, catalog_name).await?;
+        let catalog = self
+            .catalogs
+            .get_catalog(tenant.tenant_name(), catalog_name, self.ctx.session_state())
+            .await?;
         let index_metas = catalog
             .list_indexes(ListIndexesReq::new(tenant, Some(table_id)))
             .await?;
 
         Ok(index_metas)
     }
-}
-
-// copy from common-storages-fuse to avoid cyclic dependency.
-fn string_value(value: &Scalar) -> Result<String> {
-    match value {
-        Scalar::String(val) => String::from_utf8(val.clone())
-            .map_err(|e| ErrorCode::BadArguments(format!("invalid string. {}", e))),
-        _ => Err(ErrorCode::BadArguments("invalid string.")),
-    }
-}
-
-#[inline(always)]
-pub fn parse_result_scan_args(table_args: &TableArgs) -> Result<String> {
-    let args = table_args.expect_all_positioned("RESULT_SCAN", Some(1))?;
-    string_value(&args[0])
 }

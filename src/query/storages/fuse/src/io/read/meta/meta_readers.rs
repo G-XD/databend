@@ -14,43 +14,43 @@
 
 use std::io::SeekFrom;
 
-use common_arrow::parquet::metadata::ThriftFileMetaData;
-use common_cache::DefaultHashBuilder;
-use common_exception::ErrorCode;
-use common_exception::Result;
-use common_expression::TableSchemaRef;
-use futures::AsyncRead;
+use arrow_ipc::convert::try_schema_from_ipc_buffer;
+use bytes::Buf;
+use databend_common_exception::ErrorCode;
+use databend_common_exception::Result;
+use databend_common_expression::TableSchemaRef;
+use databend_common_io::constants::DEFAULT_FOOTER_READ_SIZE;
+use databend_storages_common_cache::CacheManager;
+use databend_storages_common_cache::InMemoryItemCacheReader;
+use databend_storages_common_cache::LoadParams;
+use databend_storages_common_cache::Loader;
+use databend_storages_common_index::BloomIndexMeta;
+use databend_storages_common_index::InvertedIndexMeta;
+use databend_storages_common_table_meta::meta::CompactSegmentInfo;
+use databend_storages_common_table_meta::meta::SegmentInfoVersion;
+use databend_storages_common_table_meta::meta::SingleColumnMeta;
+use databend_storages_common_table_meta::meta::SnapshotVersion;
+use databend_storages_common_table_meta::meta::TableSnapshot;
+use databend_storages_common_table_meta::meta::TableSnapshotStatistics;
+use databend_storages_common_table_meta::meta::TableSnapshotStatisticsVersion;
+use databend_storages_common_table_meta::readers::VersionedReader;
 use futures::AsyncSeek;
-use futures_util::AsyncReadExt;
 use futures_util::AsyncSeekExt;
+use opendal::Buffer;
 use opendal::Operator;
-use opendal::Reader;
-use storages_common_cache::InMemoryItemCacheReader;
-use storages_common_cache::LoadParams;
-use storages_common_cache::Loader;
-use storages_common_cache_manager::CacheManager;
-use storages_common_cache_manager::CompactSegmentInfoMeter;
-use storages_common_index::BloomIndexMeta;
-use storages_common_table_meta::meta::CompactSegmentInfo;
-use storages_common_table_meta::meta::SegmentInfoVersion;
-use storages_common_table_meta::meta::SnapshotVersion;
-use storages_common_table_meta::meta::TableSnapshot;
-use storages_common_table_meta::meta::TableSnapshotStatistics;
-use storages_common_table_meta::meta::TableSnapshotStatisticsVersion;
-use storages_common_table_meta::readers::VersionedReader;
+use parquet::format::FileMetaData;
+use parquet::thrift::TSerializable;
 
-use crate::io::read::meta::meta_readers::thrift_file_meta_read::read_thrift_file_metadata;
+use self::thrift_file_meta_read::read_thrift_file_metadata;
 
 pub type TableSnapshotStatisticsReader =
     InMemoryItemCacheReader<TableSnapshotStatistics, LoaderWrapper<Operator>>;
 pub type BloomIndexMetaReader = InMemoryItemCacheReader<BloomIndexMeta, LoaderWrapper<Operator>>;
 pub type TableSnapshotReader = InMemoryItemCacheReader<TableSnapshot, LoaderWrapper<Operator>>;
-pub type CompactSegmentInfoReader = InMemoryItemCacheReader<
-    CompactSegmentInfo,
-    LoaderWrapper<(Operator, TableSchemaRef)>,
-    DefaultHashBuilder,
-    CompactSegmentInfoMeter,
->;
+pub type CompactSegmentInfoReader =
+    InMemoryItemCacheReader<CompactSegmentInfo, LoaderWrapper<(Operator, TableSchemaRef)>>;
+pub type InvertedIndexMetaReader =
+    InMemoryItemCacheReader<InvertedIndexMeta, LoaderWrapper<Operator>>;
 
 pub struct MetaReaders;
 
@@ -62,11 +62,22 @@ impl MetaReaders {
         )
     }
 
+    pub fn segment_info_reader_without_cache(
+        dal: Operator,
+        schema: TableSchemaRef,
+    ) -> CompactSegmentInfoReader {
+        CompactSegmentInfoReader::new(None, LoaderWrapper((dal, schema)))
+    }
+
     pub fn table_snapshot_reader(dal: Operator) -> TableSnapshotReader {
         TableSnapshotReader::new(
             CacheManager::instance().get_table_snapshot_cache(),
             LoaderWrapper(dal),
         )
+    }
+
+    pub fn table_snapshot_reader_without_cache(dal: Operator) -> TableSnapshotReader {
+        TableSnapshotReader::new(None, LoaderWrapper(dal))
     }
 
     pub fn table_snapshot_statistics_reader(dal: Operator) -> TableSnapshotStatisticsReader {
@@ -82,6 +93,13 @@ impl MetaReaders {
             LoaderWrapper(dal),
         )
     }
+
+    pub fn inverted_index_meta_reader(dal: Operator) -> InvertedIndexMetaReader {
+        InvertedIndexMetaReader::new(
+            CacheManager::instance().get_inverted_index_meta_cache(),
+            LoaderWrapper(dal),
+        )
+    }
 }
 
 // workaround for the orphan rules
@@ -94,7 +112,7 @@ impl Loader<TableSnapshot> for LoaderWrapper<Operator> {
     async fn load(&self, params: &LoadParams) -> Result<TableSnapshot> {
         let reader = bytes_reader(&self.0, params.location.as_str(), params.len_hint).await?;
         let version = SnapshotVersion::try_from(params.ver)?;
-        version.read(reader).await
+        version.read(reader.reader())
     }
 }
 
@@ -104,7 +122,7 @@ impl Loader<TableSnapshotStatistics> for LoaderWrapper<Operator> {
     async fn load(&self, params: &LoadParams) -> Result<TableSnapshotStatistics> {
         let version = TableSnapshotStatisticsVersion::try_from(params.ver)?;
         let reader = bytes_reader(&self.0, params.location.as_str(), params.len_hint).await?;
-        version.read(reader).await
+        version.read(reader.reader())
     }
 }
 
@@ -115,7 +133,7 @@ impl Loader<CompactSegmentInfo> for LoaderWrapper<(Operator, TableSchemaRef)> {
         let version = SegmentInfoVersion::try_from(params.ver)?;
         let LoaderWrapper((operator, schema)) = &self;
         let reader = bytes_reader(operator, params.location.as_str(), params.len_hint).await?;
-        (version, schema.clone()).read(reader).await
+        (version, schema.clone()).read(reader.reader())
     }
 }
 
@@ -123,9 +141,8 @@ impl Loader<CompactSegmentInfo> for LoaderWrapper<(Operator, TableSchemaRef)> {
 impl Loader<BloomIndexMeta> for LoaderWrapper<Operator> {
     #[async_backtrace::framed]
     async fn load(&self, params: &LoadParams) -> Result<BloomIndexMeta> {
-        let mut reader = bytes_reader(&self.0, params.location.as_str(), params.len_hint).await?;
         // read the ThriftFileMetaData, omit unnecessary conversions
-        let meta = read_thrift_file_metadata(&mut reader)
+        let meta = read_thrift_file_metadata(self.0.clone(), &params.location, params.len_hint)
             .await
             .map_err(|err| {
                 ErrorCode::StorageOther(format!(
@@ -138,24 +155,119 @@ impl Loader<BloomIndexMeta> for LoaderWrapper<Operator> {
     }
 }
 
-async fn bytes_reader(op: &Operator, path: &str, len_hint: Option<u64>) -> Result<Reader> {
+#[async_trait::async_trait]
+impl Loader<InvertedIndexMeta> for LoaderWrapper<Operator> {
+    #[async_backtrace::framed]
+    async fn load(&self, params: &LoadParams) -> Result<InvertedIndexMeta> {
+        let operator = &self.0;
+        let file_size = if let Some(len) = params.len_hint {
+            len
+        } else {
+            let meta = operator.stat(&params.location).await.map_err(|err| {
+                ErrorCode::StorageOther(format!(
+                    "read inverted index file meta failed, {}, {:?}",
+                    params.location, err
+                ))
+            })?;
+            meta.content_length()
+        };
+
+        // read and cache up to DEFAULT_FOOTER_READ_SIZE bytes from the end and process the footer
+        let end_len = std::cmp::min(DEFAULT_FOOTER_READ_SIZE, file_size) as usize;
+
+        // read the end of the file
+        let buffer = operator
+            .read_with(&params.location)
+            .range(file_size - end_len as u64..file_size)
+            .await
+            .map_err(|err| {
+                ErrorCode::StorageOther(format!(
+                    "read inverted index file meta failed, {}, {:?}",
+                    params.location, err
+                ))
+            })?
+            .to_vec();
+
+        let meta_len =
+            u32::from_le_bytes(buffer[end_len - 4..end_len].try_into().unwrap()) as usize;
+
+        // read legacy index file format
+        if meta_len == 8 {
+            let column_names = vec![
+                "fast".to_string(),
+                "store".to_string(),
+                "fieldnorm".to_string(),
+                "pos".to_string(),
+                "idx".to_string(),
+                "term".to_string(),
+                "meta.json".to_string(),
+                ".managed.json".to_string(),
+            ];
+
+            let mut prev_offset = 0;
+            let mut column_range = end_len - 36;
+            let mut columns = Vec::with_capacity(column_names.len());
+            for name in column_names {
+                let offset =
+                    u32::from_le_bytes(buffer[column_range..column_range + 4].try_into().unwrap())
+                        as u64;
+                column_range += 4;
+
+                let column_meta = SingleColumnMeta {
+                    offset: prev_offset,
+                    len: offset - prev_offset,
+                    num_values: 1,
+                };
+                prev_offset = offset;
+                columns.push((name, column_meta));
+            }
+            return Ok(InvertedIndexMeta { columns });
+        }
+
+        let schema_len =
+            u32::from_le_bytes(buffer[end_len - 8..end_len - 4].try_into().unwrap()) as usize;
+
+        let schema_range_start = end_len - meta_len;
+        let schema_range_end = schema_range_start + schema_len;
+        let index_schema =
+            try_schema_from_ipc_buffer(&buffer[schema_range_start..schema_range_end])?;
+
+        let mut prev_offset = 0;
+        let mut column_range = schema_range_end;
+        let mut columns = Vec::with_capacity(index_schema.fields.len());
+        for field in &index_schema.fields {
+            let offset =
+                u32::from_le_bytes(buffer[column_range..column_range + 4].try_into().unwrap())
+                    as u64;
+            column_range += 4;
+
+            let column_meta = SingleColumnMeta {
+                offset: prev_offset,
+                len: offset - prev_offset,
+                num_values: 1,
+            };
+            prev_offset = offset;
+            columns.push((field.name().clone(), column_meta));
+        }
+
+        Ok(InvertedIndexMeta { columns })
+    }
+}
+
+async fn bytes_reader(op: &Operator, path: &str, len_hint: Option<u64>) -> Result<Buffer> {
     let reader = if let Some(len) = len_hint {
-        op.range_reader(path, 0..len).await?
+        op.read_with(path).range(0..len).await?
     } else {
-        op.reader(path).await?
+        op.read(path).await?
     };
     Ok(reader)
 }
 
 mod thrift_file_meta_read {
-    use common_arrow::parquet::error::Error;
-    use parquet_format_safe::thrift::protocol::TCompactInputProtocol;
+    use parquet::errors::ParquetError;
+    use thrift::protocol::TCompactInputProtocol;
 
     use super::*;
-
-    // the following code is copied from crate `parquet2`, with slight modification:
-    // return a ThriftFileMetaData instead of FileMetaData while reading parquet metadata,
-    // to avoid unnecessary conversions.
 
     const HEADER_SIZE: u64 = PARQUET_MAGIC.len() as u64;
     const FOOTER_SIZE: u64 = 8;
@@ -185,34 +297,42 @@ mod thrift_file_meta_read {
     }
 
     #[async_backtrace::framed]
-    pub async fn read_thrift_file_metadata<R: AsyncRead + AsyncSeek + Send + std::marker::Unpin>(
-        reader: &mut R,
-    ) -> common_arrow::parquet::error::Result<ThriftFileMetaData> {
-        let file_size = stream_len(reader).await?;
+    pub async fn read_thrift_file_metadata(
+        op: Operator,
+        path: &str,
+        len_hint: Option<u64>,
+    ) -> Result<FileMetaData> {
+        let file_size = if let Some(len) = len_hint {
+            len
+        } else {
+            let meta = op
+                .stat(path)
+                .await
+                .map_err(|err| ParquetError::General(err.to_string()))?;
+            meta.content_length()
+        };
 
         if file_size < HEADER_SIZE + FOOTER_SIZE {
-            return Err(Error::OutOfSpec(
-                "A parquet file must contain a header and footer with at least 12 bytes".into(),
+            return Err(ErrorCode::ParquetFileInvalid(
+                "A parquet file must contain a header and footer with at least 12 bytes",
             ));
         }
 
         // read and cache up to DEFAULT_FOOTER_READ_SIZE bytes from the end and process the footer
         let default_end_len = std::cmp::min(DEFAULT_FOOTER_READ_SIZE, file_size) as usize;
-        reader
-            .seek(SeekFrom::End(-(default_end_len as i64)))
-            .await?;
 
-        let mut buffer = vec![];
-        buffer.try_reserve(default_end_len)?;
-        reader
-            .take(default_end_len as u64)
-            .read_to_end(&mut buffer)
-            .await?;
+        // read the end of the file
+        let buffer = op
+            .read_with(path)
+            .range(file_size - default_end_len as u64..file_size)
+            .await
+            .map_err(|err| ParquetError::General(err.to_string()))?
+            .to_vec();
 
         // check this is indeed a parquet file
         if buffer[default_end_len - 4..] != PARQUET_MAGIC {
-            return Err(Error::OutOfSpec(
-                "Invalid Parquet file. Corrupt footer".into(),
+            return Err(ErrorCode::ParquetFileInvalid(
+                "Invalid Parquet file. Corrupt footer",
             ));
         }
 
@@ -221,31 +341,31 @@ mod thrift_file_meta_read {
 
         let footer_len = FOOTER_SIZE + metadata_len;
         if footer_len > file_size {
-            return Err(Error::OutOfSpec(
-                "The footer size must be smaller or equal to the file's size".into(),
+            return Err(ErrorCode::ParquetFileInvalid(
+                "The footer size must be smaller or equal to the file's size",
             ));
         }
 
-        let reader = if (footer_len as usize) < buffer.len() {
+        if (footer_len as usize) < buffer.len() {
             // the whole metadata is in the bytes we already read
             let remaining = buffer.len() - footer_len as usize;
-            &buffer[remaining..]
+
+            let mut prot = TCompactInputProtocol::new(&buffer[remaining..]);
+            let meta = FileMetaData::read_from_in_protocol(&mut prot)
+                .map_err(|err| ErrorCode::ParquetFileInvalid(err.to_string()))?;
+            Ok(meta)
         } else {
             // the end of file read by default is not long enough, read again including the metadata.
-            reader.seek(SeekFrom::End(-(footer_len as i64))).await?;
+            let buffer = op
+                .read_with(path)
+                .range(file_size - footer_len..file_size)
+                .await
+                .map_err(|err| ErrorCode::ParquetFileInvalid(err.to_string()))?;
 
-            buffer.clear();
-            buffer.try_reserve(footer_len as usize)?;
-            reader.take(footer_len).read_to_end(&mut buffer).await?;
-
-            &buffer
-        };
-
-        // a highly nested but sparse struct could result in many allocations
-        let max_size = reader.len() * 2 + 1024;
-
-        let mut prot = TCompactInputProtocol::new(reader, max_size);
-        let meta = ThriftFileMetaData::read_from_in_protocol(&mut prot)?;
-        Ok(meta)
+            let mut prot = TCompactInputProtocol::new(buffer.reader());
+            let meta = FileMetaData::read_from_in_protocol(&mut prot)
+                .map_err(|err| ErrorCode::ParquetFileInvalid(err.to_string()))?;
+            Ok(meta)
+        }
     }
 }

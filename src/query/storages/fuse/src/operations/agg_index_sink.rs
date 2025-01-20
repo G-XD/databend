@@ -17,25 +17,21 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use async_trait::async_trait;
-use async_trait::unboxed_simple;
-use common_exception::Result;
-use common_expression::types::StringType;
-use common_expression::types::ValueType;
-use common_expression::BlockRowIndex;
-use common_expression::DataBlock;
-use common_expression::TableSchemaRef;
-use common_pipeline_core::processors::port::InputPort;
-use common_pipeline_core::processors::processor::ProcessorPtr;
-use common_pipeline_sinks::AsyncSink;
-use common_pipeline_sinks::AsyncSinker;
+use databend_common_exception::Result;
+use databend_common_expression::types::StringType;
+use databend_common_expression::BlockRowIndex;
+use databend_common_expression::DataBlock;
+use databend_common_expression::TableSchemaRef;
+use databend_common_metrics::storage::*;
+use databend_common_pipeline_core::processors::InputPort;
+use databend_common_pipeline_core::processors::ProcessorPtr;
+use databend_common_pipeline_sinks::AsyncSink;
+use databend_common_pipeline_sinks::AsyncSinker;
 use opendal::Operator;
 
 use crate::io;
 use crate::io::TableMetaLocationGenerator;
 use crate::io::WriteSettings;
-use crate::metrics::metrics_inc_agg_index_write_bytes;
-use crate::metrics::metrics_inc_agg_index_write_milliseconds;
-use crate::metrics::metrics_inc_agg_index_write_nums;
 
 pub struct AggIndexSink {
     data_accessor: Operator,
@@ -78,11 +74,7 @@ impl AggIndexSink {
         let block_name_col = col.value.try_downcast::<StringType>().unwrap();
         let block_id = self.blocks.len();
         for i in 0..block.num_rows() {
-            let location = unsafe {
-                String::from_utf8_unchecked(StringType::to_owned_scalar(
-                    block_name_col.index(i).unwrap(),
-                ))
-            };
+            let location = block_name_col.index(i).unwrap().to_string();
 
             self.location_data
                 .entry(location)
@@ -108,10 +100,9 @@ impl AsyncSink for AggIndexSink {
 
     #[async_backtrace::framed]
     async fn on_finish(&mut self) -> Result<()> {
-        let blocks = self.blocks.iter().collect::<Vec<_>>();
         for (loc, indexes) in &self.location_data {
             let start = Instant::now();
-            let block = DataBlock::take_blocks(&blocks, indexes, indexes.len());
+            let block = DataBlock::take_blocks(&self.blocks, indexes, indexes.len());
             let loc = TableMetaLocationGenerator::gen_agg_index_location_from_block_location(
                 loc,
                 self.index_id,
@@ -130,7 +121,6 @@ impl AsyncSink for AggIndexSink {
         Ok(())
     }
 
-    #[unboxed_simple]
     #[async_backtrace::framed]
     async fn consume(&mut self, data_block: DataBlock) -> Result<bool> {
         let mut block = data_block;

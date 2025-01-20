@@ -16,28 +16,24 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_stream::stream;
-use common_base::base::tokio;
-use common_base::base::tokio::sync::mpsc::Sender;
-use common_base::base::tokio::task::JoinHandle;
-use common_base::runtime::TrySpawn;
-use common_compress::CompressAlgorithm;
-use common_exception::ErrorCode;
-use common_exception::Result;
-use common_exception::ToErrorCode;
-use common_expression::infer_table_schema;
-use common_formats::ClickhouseFormatType;
-use common_formats::FileFormatOptionsExt;
-use common_formats::FileFormatTypeExt;
-use common_pipeline_sources::input_formats::InputContext;
-use common_pipeline_sources::input_formats::StreamingReadBatch;
-use common_sql::plans::InsertInputSource;
-use common_sql::plans::Plan;
-use common_sql::Planner;
+use databend_common_base::base::short_sql;
+use databend_common_base::base::tokio::task::JoinHandle;
+use databend_common_base::runtime::TrySpawn;
+use databend_common_exception::ErrorCode;
+use databend_common_exception::Result;
+use databend_common_exception::ToErrorCode;
+use databend_common_expression::infer_table_schema;
+use databend_common_expression::DataSchemaRef;
+use databend_common_formats::ClickhouseFormatType;
+use databend_common_formats::FileFormatOptionsExt;
+use databend_common_formats::FileFormatTypeExt;
+use fastrace::func_path;
+use fastrace::prelude::*;
 use futures::StreamExt;
+use futures::TryStreamExt;
 use http::HeaderMap;
-use log::debug;
+use http::StatusCode;
 use log::info;
-use log::warn;
 use naive_cityhash::cityhash128;
 use poem::error::BadRequest;
 use poem::error::InternalServerError;
@@ -54,11 +50,11 @@ use poem::Route;
 use serde::Deserialize;
 use serde::Serialize;
 
+use crate::interpreters::interpreter_plan_sql;
 use crate::interpreters::InterpreterFactory;
 use crate::interpreters::InterpreterPtr;
 use crate::servers::http::middleware::sanitize_request_headers;
 use crate::servers::http::v1::HttpQueryContext;
-use crate::sessions::short_sql;
 use crate::sessions::QueryContext;
 use crate::sessions::SessionType;
 use crate::sessions::TableContext;
@@ -106,12 +102,12 @@ impl StatementHandlerParams {
 async fn execute(
     ctx: Arc<QueryContext>,
     interpreter: InterpreterPtr,
+    schema: DataSchemaRef,
     format: ClickhouseFormatType,
     params: StatementHandlerParams,
     handle: Option<JoinHandle<()>>,
 ) -> Result<WithContentType<Body>> {
     let format_typ = format.typ.clone();
-    let schema = interpreter.schema();
 
     // the reason of spawning new task to execute the interpreter:
     // (FIXME describe this in a more concise way)
@@ -145,73 +141,82 @@ async fn execute(
     //
     //  P.S. I think it will be better/more reasonable if we could avoid using pthread_join inside an async stack.
 
-    ctx.try_spawn({
-        let ctx = ctx.clone();
-        async move {
-            let mut data_stream = interpreter.execute(ctx.clone()).await?;
-            let table_schema = infer_table_schema(&schema)?;
-            let mut output_format = FileFormatOptionsExt::get_output_format_from_clickhouse_format(
-                format,
-                table_schema,
-                &ctx.get_settings(),
-            )?;
+    ctx.try_spawn(
+        {
+            let ctx = ctx.clone();
+            async move {
+                let mut data_stream = interpreter.execute(ctx.clone()).await?;
+                let table_schema = infer_table_schema(&schema)?;
+                let mut output_format =
+                    FileFormatOptionsExt::get_output_format_from_clickhouse_format(
+                        format,
+                        table_schema,
+                        &ctx.get_settings(),
+                    )?;
 
-            let prefix = Ok(output_format.serialize_prefix()?);
+                let prefix = Ok(output_format.serialize_prefix()?);
 
-            let compress_fn = move |rb: Result<Vec<u8>>| -> Result<Vec<u8>> {
-                if params.compress() {
-                    match rb {
-                        Ok(b) => compress_block(b),
-                        Err(e) => Err(e),
+                let compress_fn = move |rb: Result<Vec<u8>>| -> Result<Vec<u8>> {
+                    if params.compress() {
+                        match rb {
+                            Ok(b) => compress_block(b),
+                            Err(e) => Err(e),
+                        }
+                    } else {
+                        rb
                     }
-                } else {
-                    rb
-                }
-            };
+                };
 
-            // try to catch runtime error before http response, so user can client can get http 500
-            let first_block = match data_stream.next().await {
-                Some(block) => match block {
-                    Ok(block) => Some(compress_fn(output_format.serialize_block(&block))),
-                    Err(err) => return Err(err),
-                },
-                None => None,
-            };
+                // try to catch runtime error before http response, so user can client can get http 500
+                let first_block = match data_stream.next().await {
+                    Some(block) => match block {
+                        Ok(block) => Some(compress_fn(output_format.serialize_block(&block))),
+                        Err(err) => return Err(err),
+                    },
+                    None => None,
+                };
 
-            let session = ctx.get_current_session();
-            let stream = stream! {
-                yield compress_fn(prefix);
-                let mut ok = true;
-                // do not pull data_stream if we already meet a None
-                if let Some(block) = first_block {
-                    yield block;
-                    while let Some(block) = data_stream.next().await {
-                        match block{
-                            Ok(block) => {
-                                yield compress_fn(output_format.serialize_block(&block));
-                            },
-                            Err(err) => {
-                                let message = format!("{}", err);
-                                yield compress_fn(Ok(message.into_bytes()));
-                                ok = false;
-                                break
-                            }
-                        };
+                let session = ctx.get_current_session();
+                let stream = stream! {
+                    yield compress_fn(prefix);
+                    let mut ok = true;
+                    // do not pull data_stream if we already meet a None
+                    if let Some(block) = first_block {
+                        yield block;
+                        while let Some(block) = data_stream.next().await {
+                            match block{
+                                Ok(block) => {
+                                    yield compress_fn(output_format.serialize_block(&block));
+                                },
+                                Err(err) => {
+                                    let message = format!("{}", err);
+                                    yield compress_fn(Ok(message.into_bytes()));
+                                    ok = false;
+                                    break
+                                }
+                            };
+                        }
                     }
+                    if ok {
+                        yield compress_fn(output_format.finalize());
+                    }
+                    // to hold session ref until stream is all consumed
+                    let _ = session.get_id();
+                };
+                if let Some(handle) = handle {
+                    handle.await.expect("must")
                 }
-                if ok {
-                    yield compress_fn(output_format.finalize());
-                }
-                // to hold session ref until stream is all consumed
-                let _ = session.get_id();
-            };
-            if let Some(handle) = handle {
-                handle.await.expect("must")
+
+                let stream =
+                    stream.map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err));
+                Ok(
+                    Body::from_bytes_stream(stream)
+                        .with_content_type(format_typ.get_content_type()),
+                )
             }
-
-            Ok(Body::from_bytes_stream(stream).with_content_type(format_typ.get_content_type()))
-        }
-    })?
+        },
+        None,
+    )?
     .await
     .map_err(|err| {
         ErrorCode::from_string(format!(
@@ -227,39 +232,52 @@ pub async fn clickhouse_handler_get(
     Query(params): Query<StatementHandlerParams>,
     headers: &HeaderMap,
 ) -> PoemResult<WithContentType<Body>> {
-    let session = ctx.get_session(SessionType::ClickHouseHttpHandler);
-    if let Some(db) = &params.database {
-        session.set_current_database(db.clone());
+    let root = Span::root(func_path!(), SpanContext::random());
+    async {
+        let session = ctx.upgrade_session(SessionType::ClickHouseHttpHandler)?;
+        if let Some(db) = &params.database {
+            session.set_current_database(db.clone());
+        }
+        let context = session
+            .create_query_context()
+            .await
+            .map_err(InternalServerError)?;
+
+        let settings = session.get_settings();
+        settings
+            .set_batch_settings(&params.settings, false)
+            .map_err(BadRequest)?;
+
+        if !settings
+            .get_enable_clickhouse_handler()
+            .map_err(InternalServerError)?
+        {
+            return Err(poem::Error::from_string(
+                "default settings: enable_clickhouse_handler is 0".to_string(),
+                StatusCode::METHOD_NOT_ALLOWED,
+            ));
+        }
+
+        let default_format = get_default_format(&params, headers).map_err(BadRequest)?;
+        let sql = params.query();
+        // Use interpreter_plan_sql, we can write the query log if an error occurs.
+        let (plan, extras, _guard) = interpreter_plan_sql(context.clone(), &sql, true)
+            .await
+            .map_err(|err| err.display_with_sql(&sql))
+            .map_err(BadRequest)?;
+
+        let format = get_format_with_default(extras.format, default_format)?;
+        let interpreter = InterpreterFactory::get(context.clone(), &plan)
+            .await
+            .map_err(|err| err.display_with_sql(&sql))
+            .map_err(BadRequest)?;
+        execute(context, interpreter, plan.schema(), format, params, None)
+            .await
+            .map_err(|err| err.display_with_sql(&sql))
+            .map_err(InternalServerError)
     }
-    let context = session
-        .create_query_context()
-        .await
-        .map_err(InternalServerError)?;
-
-    let settings = session.get_settings();
-    settings
-        .set_batch_settings(&params.settings)
-        .map_err(BadRequest)?;
-
-    let default_format = get_default_format(&params, headers).map_err(BadRequest)?;
-    let sql = params.query();
-    let mut planner = Planner::new(context.clone());
-    let (plan, extras) = planner
-        .plan_sql(&sql)
-        .await
-        .map_err(|err| err.display_with_sql(&sql))
-        .map_err(BadRequest)?;
-    let format = get_format_with_default(extras.format, default_format)?;
-
-    context.attach_query_str(plan.to_string(), extras.statement.to_mask_sql());
-    let interpreter = InterpreterFactory::get(context.clone(), &plan)
-        .await
-        .map_err(|err| err.display_with_sql(&sql))
-        .map_err(BadRequest)?;
-    execute(context, interpreter, format, params, None)
-        .await
-        .map_err(|err| err.display_with_sql(&sql))
-        .map_err(InternalServerError)
+    .in_span(root)
+    .await
 }
 
 #[poem::handler]
@@ -270,160 +288,84 @@ pub async fn clickhouse_handler_post(
     Query(params): Query<StatementHandlerParams>,
     headers: &HeaderMap,
 ) -> PoemResult<impl IntoResponse> {
-    info!(
-        "new clickhouse handler request: headers={:?}, params={:?}",
-        sanitize_request_headers(headers),
-        params,
-    );
-    let session = ctx.get_session(SessionType::ClickHouseHttpHandler);
-    if let Some(db) = &params.database {
-        session.set_current_database(db.clone());
-    }
-    let ctx = session
-        .create_query_context()
-        .await
-        .map_err(InternalServerError)?;
+    let root = Span::root(func_path!(), SpanContext::random());
 
-    let settings = session.get_settings();
-    settings
-        .set_batch_settings(&params.settings)
-        .map_err(BadRequest)?;
-
-    let default_format = get_default_format(&params, headers).map_err(BadRequest)?;
-    let mut sql = params.query();
-    if !sql.is_empty() {
-        sql.push(' ');
-    }
-    sql.push_str(body.into_string().await?.as_str());
-    let n = 64;
-    // other parts of the request already logged in middleware
-    let len = sql.len();
-    let msg = if len > n {
-        format!("{}...(omit {} bytes)", short_sql(sql.clone()), len - n)
-    } else {
-        sql.to_string()
-    };
-    info!("receive clickhouse http post, (query + body) = {}", &msg);
-
-    let mut planner = Planner::new(ctx.clone());
-    let (mut plan, extras) = planner
-        .plan_sql(&sql)
-        .await
-        .map_err(|err| err.display_with_sql(&sql))
-        .map_err(BadRequest)?;
-    let schema = plan.schema();
-    ctx.attach_query_str(plan.to_string(), extras.statement.to_mask_sql());
-    let mut handle = None;
-    if let Plan::Insert(insert) = &mut plan {
-        if let InsertInputSource::StreamingWithFormat(format, start, input_context_ref) =
-            &mut insert.source
-        {
-            let (tx, rx) = tokio::sync::mpsc::channel(2);
-            let to_table = ctx
-                .get_table(&insert.catalog, &insert.database, &insert.table)
-                .await
-                .map_err(InternalServerError)?;
-
-            let table_schema = infer_table_schema(&schema)
-                .map_err(|err| err.display_with_sql(&sql))
-                .map_err(InternalServerError)?;
-            let input_context = Arc::new(
-                InputContext::try_create_from_insert_clickhouse(
-                    format.as_str(),
-                    rx,
-                    ctx.get_settings(),
-                    table_schema,
-                    ctx.get_scan_progress(),
-                    to_table.get_block_thresholds(),
-                )
-                .await
-                .map_err(InternalServerError)?,
-            );
-            *input_context_ref = Some(input_context.clone());
-            info!(
-                "clickhouse insert with format {:?}, value {}",
-                input_context, *start
-            );
-            let compression_alg = input_context
-                .get_compression_alg("")
-                .map_err(|err| err.display_with_sql(&sql))
-                .map_err(BadRequest)?;
-            let start = *start;
-            let sql_cloned = sql.clone();
-            handle = Some(ctx.spawn(async move {
-                gen_batches(
-                    sql_cloned,
-                    start,
-                    input_context.read_batch_size,
-                    tx,
-                    compression_alg,
-                )
-                .await
-            }));
-        } else if let InsertInputSource::StreamingWithFileFormat {
-            format,
-            on_error_mode,
-            start,
-            input_context_option,
-        } = &mut insert.source
-        {
-            let (tx, rx) = tokio::sync::mpsc::channel(2);
-            let to_table = ctx
-                .get_table(&insert.catalog, &insert.database, &insert.table)
-                .await
-                .map_err(InternalServerError)?;
-
-            let table_schema = infer_table_schema(&schema)
-                .map_err(|err| err.display_with_sql(&sql))
-                .map_err(InternalServerError)?;
-            let input_context = Arc::new(
-                InputContext::try_create_from_insert_file_format(
-                    rx,
-                    ctx.get_settings(),
-                    format.clone(),
-                    table_schema,
-                    ctx.get_scan_progress(),
-                    false,
-                    to_table.get_block_thresholds(),
-                    on_error_mode.clone(),
-                )
-                .await
-                .map_err(|err| err.display_with_sql(&sql))
-                .map_err(InternalServerError)?,
-            );
-
-            *input_context_option = Some(input_context.clone());
-            info!("clickhouse insert with file_format {:?}", input_context);
-
-            let compression_alg = input_context
-                .get_compression_alg("")
-                .map_err(|err| err.display_with_sql(&sql))
-                .map_err(BadRequest)?;
-            let start = *start;
-            let sql_cloned = sql.clone();
-            handle = Some(ctx.spawn(async move {
-                gen_batches(
-                    sql_cloned,
-                    start,
-                    input_context.read_batch_size,
-                    tx,
-                    compression_alg,
-                )
-                .await
-            }));
+    async {
+        info!(
+            "new clickhouse handler request: headers={:?}, params={:?}",
+            sanitize_request_headers(headers),
+            params,
+        );
+        let session = ctx.upgrade_session(SessionType::ClickHouseHttpHandler)?;
+        if let Some(db) = &params.database {
+            session.set_current_database(db.clone());
         }
-    };
+        let ctx = session
+            .create_query_context()
+            .await
+            .map_err(InternalServerError)?;
 
-    let format = get_format_with_default(extras.format, default_format)?;
-    let interpreter = InterpreterFactory::get(ctx.clone(), &plan)
-        .await
-        .map_err(|err| err.display_with_sql(&sql))
-        .map_err(BadRequest)?;
+        let settings = session.get_settings();
+        settings
+            .set_batch_settings(&params.settings, false)
+            .map_err(BadRequest)?;
 
-    execute(ctx, interpreter, format, params, handle)
-        .await
-        .map_err(|err| err.display_with_sql(&sql))
-        .map_err(InternalServerError)
+        if !settings
+            .get_enable_clickhouse_handler()
+            .map_err(InternalServerError)?
+        {
+            return Err(poem::Error::from_string(
+                "default settings: enable_clickhouse_handler is 0".to_string(),
+                StatusCode::METHOD_NOT_ALLOWED,
+            ));
+        }
+
+        let default_format = get_default_format(&params, headers).map_err(BadRequest)?;
+        let mut sql = params.query();
+        if !sql.is_empty() {
+            sql.push(' ');
+        }
+        sql.push_str(body.into_string().await?.as_str());
+        let n = 64;
+        // other parts of the request already logged in middleware
+        let len = sql.len();
+        let msg = if len > n {
+            format!(
+                "{}...(omit {} bytes)",
+                short_sql(
+                    sql.clone(),
+                    ctx.get_settings()
+                        .get_short_sql_max_length()
+                        .unwrap_or(1000)
+                ),
+                len - n
+            )
+        } else {
+            sql.to_string()
+        };
+        info!("receive clickhouse http post, (query + body) = {}", &msg);
+
+        let (mut plan, extras, _guard) = interpreter_plan_sql(ctx.clone(), &sql, true)
+            .await
+            .map_err(|err| err.display_with_sql(&sql))
+            .map_err(BadRequest)?;
+
+        let mut handle = None;
+        let output_schema = plan.schema();
+
+        let format = get_format_with_default(extras.format, default_format)?;
+        let interpreter = InterpreterFactory::get(ctx.clone(), &plan)
+            .await
+            .map_err(|err| err.display_with_sql(&sql))
+            .map_err(BadRequest)?;
+
+        execute(ctx, interpreter, output_schema, format, params, handle)
+            .await
+            .map_err(|err| err.display_with_sql(&sql))
+            .map_err(InternalServerError)
+    }
+    .in_span(root)
+    .await
 }
 
 #[poem::handler]
@@ -482,10 +424,9 @@ fn get_default_format(
     let name = match &params.default_format {
         None => match headers.get("X-CLICKHOUSE-FORMAT") {
             None => "TSV",
-            Some(v) => v.to_str().map_err_to_code(
-                ErrorCode::BadBytes,
-                || "value of X-CLICKHOUSE-FORMAT is not string",
-            )?,
+            Some(v) => v.to_str().map_err_to_code(ErrorCode::BadBytes, || {
+                "value of X-CLICKHOUSE-FORMAT is not string"
+            })?,
         },
         Some(s) => s,
     };
@@ -499,45 +440,5 @@ fn get_format_with_default(
     match format {
         None => Ok(default_format),
         Some(name) => ClickhouseFormatType::parse_clickhouse_format(&name).map_err(BadRequest),
-    }
-}
-
-async fn gen_batches(
-    data: String,
-    start: usize,
-    batch_size: usize,
-    tx: Sender<Result<StreamingReadBatch>>,
-    compression: Option<CompressAlgorithm>,
-) {
-    let buf = &data.trim_start().as_bytes()[start..];
-    let buf_size = buf.len();
-    let mut is_start = true;
-    let mut start = 0;
-    let path = "clickhouse_insert".to_string();
-    debug!(
-        "begin sending {} bytes, batch_size={}",
-        buf_size, batch_size
-    );
-    while start < buf_size {
-        let data = if buf_size - start >= batch_size {
-            buf[start..start + batch_size].to_vec()
-        } else {
-            buf[start..].to_vec()
-        };
-
-        debug!("sending read {} bytes", data.len());
-        if let Err(e) = tx
-            .send(Ok(StreamingReadBatch {
-                data,
-                path: path.clone(),
-                is_start,
-                compression,
-            }))
-            .await
-        {
-            warn!("clickhouse handler fail to send ReadBatch: {}", e);
-        }
-        is_start = false;
-        start += batch_size;
     }
 }

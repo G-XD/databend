@@ -14,8 +14,9 @@
 
 use std::sync::Arc;
 
-use common_exception::Result;
+use databend_common_exception::Result;
 
+use crate::optimizer::extract::Matcher;
 use crate::optimizer::rule::Rule;
 use crate::optimizer::rule::TransformResult;
 use crate::optimizer::RelExpr;
@@ -23,7 +24,6 @@ use crate::optimizer::RuleID;
 use crate::optimizer::SExpr;
 use crate::plans::Join;
 use crate::plans::JoinType;
-use crate::plans::PatternPlan;
 use crate::plans::RelOp;
 
 /// Rule to apply commutativity of join operator.
@@ -31,7 +31,7 @@ use crate::plans::RelOp;
 /// rule will help us measure which child is the better one.
 pub struct RuleCommuteJoin {
     id: RuleID,
-    patterns: Vec<SExpr>,
+    matchers: Vec<Matcher>,
 }
 
 impl RuleCommuteJoin {
@@ -42,16 +42,10 @@ impl RuleCommuteJoin {
             // LogicalJoin
             // | \
             // *  *
-            patterns: vec![SExpr::create_binary(
-                Arc::new(
-                    PatternPlan {
-                        plan_type: RelOp::Join,
-                    }
-                    .into(),
-                ),
-                Arc::new(SExpr::create_pattern_leaf()),
-                Arc::new(SExpr::create_pattern_leaf()),
-            )],
+            matchers: vec![Matcher::MatchOp {
+                op_type: RelOp::Join,
+                children: vec![Matcher::Leaf, Matcher::Leaf],
+            }],
         }
     }
 }
@@ -63,6 +57,11 @@ impl Rule for RuleCommuteJoin {
 
     fn apply(&self, s_expr: &SExpr, state: &mut TransformResult) -> Result<()> {
         let mut join: Join = s_expr.plan().clone().try_into()?;
+
+        if join.build_side_cache_info.is_some() {
+            return Ok(());
+        }
+
         let left_child = s_expr.child(0)?;
         let right_child = s_expr.child(1)?;
         let left_rel_expr = RelExpr::with_s_expr(left_child);
@@ -84,6 +83,7 @@ impl Rule for RuleCommuteJoin {
                     | JoinType::LeftAnti
                     | JoinType::RightAnti
                     | JoinType::LeftMark
+                    | JoinType::RightMark
             )
         } else if left_card == right_card {
             matches!(
@@ -95,8 +95,10 @@ impl Rule for RuleCommuteJoin {
         };
         if need_commute {
             // Swap the join conditions side
-            (join.left_conditions, join.right_conditions) =
-                (join.right_conditions, join.left_conditions);
+            for condition in join.equi_conditions.iter_mut() {
+                (condition.left, condition.right) =
+                    (condition.right.clone(), condition.left.clone());
+            }
             join.join_type = join.join_type.opposite();
             let mut result = SExpr::create_binary(
                 Arc::new(join.into()),
@@ -109,7 +111,7 @@ impl Rule for RuleCommuteJoin {
         Ok(())
     }
 
-    fn patterns(&self) -> &Vec<SExpr> {
-        &self.patterns
+    fn matchers(&self) -> &[Matcher] {
+        &self.matchers
     }
 }

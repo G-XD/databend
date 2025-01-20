@@ -14,27 +14,20 @@
 
 use std::sync::Arc;
 
-use common_exception::Result;
+use databend_common_exception::Result;
 
 use crate::binder::ColumnBindingBuilder;
+use crate::optimizer::extract::Matcher;
 use crate::optimizer::rule::Rule;
 use crate::optimizer::rule::TransformResult;
 use crate::optimizer::RuleID;
 use crate::optimizer::SExpr;
-use crate::plans::AggregateFunction;
 use crate::plans::BoundColumnRef;
-use crate::plans::CastExpr;
 use crate::plans::Filter;
-use crate::plans::FunctionCall;
-use crate::plans::LagLeadFunction;
-use crate::plans::LambdaFunc;
-use crate::plans::NthValueFunction;
-use crate::plans::PatternPlan;
 use crate::plans::RelOp;
 use crate::plans::Scan;
-use crate::plans::WindowFunc;
-use crate::plans::WindowFuncType;
-use crate::plans::WindowOrderBy;
+use crate::plans::SubqueryExpr;
+use crate::plans::VisitorMut;
 use crate::ColumnEntry;
 use crate::MetadataRef;
 use crate::ScalarExpr;
@@ -42,7 +35,7 @@ use crate::TableEntry;
 
 pub struct RulePushDownFilterScan {
     id: RuleID,
-    patterns: Vec<SExpr>,
+    matchers: Vec<Matcher>,
     metadata: MetadataRef,
 }
 
@@ -52,36 +45,38 @@ impl RulePushDownFilterScan {
             id: RuleID::PushDownFilterScan,
             // Filter
             //  \
-            //   LogicalGet
-            patterns: vec![SExpr::create_unary(
-                Arc::new(
-                    PatternPlan {
-                        plan_type: RelOp::Filter,
-                    }
-                    .into(),
-                ),
-                Arc::new(SExpr::create_leaf(Arc::new(
-                    PatternPlan {
-                        plan_type: RelOp::Scan,
-                    }
-                    .into(),
-                ))),
-            )],
+            //   Scan
+            matchers: vec![Matcher::MatchOp {
+                op_type: RelOp::Filter,
+                children: vec![Matcher::MatchOp {
+                    op_type: RelOp::Scan,
+                    children: vec![],
+                }],
+            }],
             metadata,
         }
     }
 
-    // Using the columns of the source table to replace the columns in the view,
-    // this allows us to perform push-down filtering operations at the storage layer.
-    fn replace_view_column(
+    // Replace columns in a predicate.
+    // If replace_view is true, we will use the columns of the source table to replace the columns in
+    // the view, this allows us to perform push-down filtering operations at the storage layer.
+    // If replace_view is false, we will replace column alias name with original column name.
+    fn replace_predicate_column(
         predicate: &ScalarExpr,
         table_entries: &[TableEntry],
-        column_entries: &[ColumnEntry],
+        column_entries: &[&ColumnEntry],
+        replace_view: bool,
     ) -> Result<ScalarExpr> {
-        match predicate {
-            ScalarExpr::BoundColumnRef(column) => {
+        struct ReplacePredicateColumnVisitor<'a> {
+            table_entries: &'a [TableEntry],
+            column_entries: &'a [&'a ColumnEntry],
+            replace_view: bool,
+        }
+
+        impl<'a> VisitorMut<'a> for ReplacePredicateColumnVisitor<'a> {
+            fn visit_bound_column_ref(&mut self, column: &mut BoundColumnRef) -> Result<()> {
                 if let Some(base_column) =
-                    column_entries
+                    self.column_entries
                         .iter()
                         .find_map(|column_entry| match column_entry {
                             ColumnEntry::BaseTableColumn(base_column)
@@ -92,11 +87,12 @@ impl RulePushDownFilterScan {
                             _ => None,
                         })
                 {
-                    if let Some(table_entry) = table_entries
+                    if let Some(table_entry) = self
+                        .table_entries
                         .iter()
                         .find(|table_entry| table_entry.index() == base_column.table_index)
                     {
-                        let column_binding = ColumnBindingBuilder::new(
+                        let mut column_binding_builder = ColumnBindingBuilder::new(
                             base_column.column_name.clone(),
                             base_column.column_index,
                             column.column.data_type.clone(),
@@ -104,160 +100,46 @@ impl RulePushDownFilterScan {
                         )
                         .table_name(Some(table_entry.name().to_string()))
                         .database_name(Some(table_entry.database().to_string()))
-                        .table_index(Some(table_entry.index()))
-                        .virtual_computed_expr(column.column.virtual_computed_expr.clone())
-                        .build();
-                        let bound_column_ref = BoundColumnRef {
-                            span: column.span,
-                            column: column_binding,
-                        };
-                        return Ok(ScalarExpr::BoundColumnRef(bound_column_ref));
+                        .table_index(Some(table_entry.index()));
+
+                        if self.replace_view {
+                            column_binding_builder = column_binding_builder
+                                .virtual_computed_expr(column.column.virtual_computed_expr.clone());
+                        }
+
+                        column.column = column_binding_builder.build();
                     }
                 }
-                Ok(predicate.clone())
+                Ok(())
             }
-            ScalarExpr::WindowFunction(window) => {
-                let func = match &window.func {
-                    WindowFuncType::Aggregate(agg) => {
-                        let args = agg
-                            .args
-                            .iter()
-                            .map(|arg| {
-                                Self::replace_view_column(arg, table_entries, column_entries)
-                            })
-                            .collect::<Result<Vec<ScalarExpr>>>()?;
 
-                        WindowFuncType::Aggregate(AggregateFunction {
-                            func_name: agg.func_name.clone(),
-                            distinct: agg.distinct,
-                            params: agg.params.clone(),
-                            args,
-                            return_type: agg.return_type.clone(),
-                            display_name: agg.display_name.clone(),
-                        })
-                    }
-                    WindowFuncType::LagLead(ll) => {
-                        let new_arg =
-                            Self::replace_view_column(&ll.arg, table_entries, column_entries)?;
-                        let new_default =
-                            match ll.default.clone().map(|d| {
-                                Self::replace_view_column(&d, table_entries, column_entries)
-                            }) {
-                                None => None,
-                                Some(d) => Some(Box::new(d?)),
-                            };
-                        WindowFuncType::LagLead(LagLeadFunction {
-                            is_lag: ll.is_lag,
-                            arg: Box::new(new_arg),
-                            offset: ll.offset,
-                            default: new_default,
-                            return_type: ll.return_type.clone(),
-                        })
-                    }
-                    WindowFuncType::NthValue(func) => {
-                        let new_arg =
-                            Self::replace_view_column(&func.arg, table_entries, column_entries)?;
-                        WindowFuncType::NthValue(NthValueFunction {
-                            n: func.n,
-                            arg: Box::new(new_arg),
-                            return_type: func.return_type.clone(),
-                        })
-                    }
-                    func => func.clone(),
-                };
-
-                let partition_by = window
-                    .partition_by
-                    .iter()
-                    .map(|arg| Self::replace_view_column(arg, table_entries, column_entries))
-                    .collect::<Result<Vec<ScalarExpr>>>()?;
-
-                let order_by = window
-                    .order_by
-                    .iter()
-                    .map(|item| {
-                        let replaced_scalar =
-                            Self::replace_view_column(&item.expr, table_entries, column_entries)?;
-                        Ok(WindowOrderBy {
-                            expr: replaced_scalar,
-                            asc: item.asc,
-                            nulls_first: item.nulls_first,
-                        })
-                    })
-                    .collect::<Result<Vec<WindowOrderBy>>>()?;
-
-                Ok(ScalarExpr::WindowFunction(WindowFunc {
-                    span: window.span,
-                    display_name: window.display_name.clone(),
-                    func,
-                    partition_by,
-                    order_by,
-                    frame: window.frame.clone(),
-                }))
+            fn visit_subquery_expr(&mut self, _subquery: &'a mut SubqueryExpr) -> Result<()> {
+                Ok(())
             }
-            ScalarExpr::AggregateFunction(agg_func) => {
-                let args = agg_func
-                    .args
-                    .iter()
-                    .map(|arg| Self::replace_view_column(arg, table_entries, column_entries))
-                    .collect::<Result<Vec<ScalarExpr>>>()?;
-
-                Ok(ScalarExpr::AggregateFunction(AggregateFunction {
-                    func_name: agg_func.func_name.clone(),
-                    distinct: agg_func.distinct,
-                    params: agg_func.params.clone(),
-                    args,
-                    return_type: agg_func.return_type.clone(),
-                    display_name: agg_func.display_name.clone(),
-                }))
-            }
-            ScalarExpr::LambdaFunction(lambda_func) => {
-                let args = lambda_func
-                    .args
-                    .iter()
-                    .map(|arg| Self::replace_view_column(arg, table_entries, column_entries))
-                    .collect::<Result<Vec<ScalarExpr>>>()?;
-
-                Ok(ScalarExpr::LambdaFunction(LambdaFunc {
-                    span: lambda_func.span,
-                    func_name: lambda_func.func_name.clone(),
-                    display_name: lambda_func.display_name.clone(),
-                    args,
-                    params: lambda_func.params.clone(),
-                    lambda_expr: lambda_func.lambda_expr.clone(),
-                    return_type: lambda_func.return_type.clone(),
-                }))
-            }
-            ScalarExpr::FunctionCall(func) => {
-                let arguments = func
-                    .arguments
-                    .iter()
-                    .map(|arg| Self::replace_view_column(arg, table_entries, column_entries))
-                    .collect::<Result<Vec<ScalarExpr>>>()?;
-
-                Ok(ScalarExpr::FunctionCall(FunctionCall {
-                    span: func.span,
-                    params: func.params.clone(),
-                    arguments,
-                    func_name: func.func_name.clone(),
-                }))
-            }
-            ScalarExpr::CastExpr(cast) => {
-                let arg = Self::replace_view_column(&cast.argument, table_entries, column_entries)?;
-                Ok(ScalarExpr::CastExpr(CastExpr {
-                    span: cast.span,
-                    is_try: cast.is_try,
-                    argument: Box::new(arg),
-                    target_type: cast.target_type.clone(),
-                }))
-            }
-            _ => Ok(predicate.clone()),
         }
+
+        let mut visitor = ReplacePredicateColumnVisitor {
+            table_entries,
+            column_entries,
+            replace_view,
+        };
+        let mut predicate = predicate.clone();
+        visitor.visit(&mut predicate)?;
+
+        Ok(predicate.clone())
     }
 
-    fn find_push_down_predicates(&self, predicates: &[ScalarExpr]) -> Result<Vec<ScalarExpr>> {
+    fn find_push_down_predicates(
+        &self,
+        predicates: &[ScalarExpr],
+        scan: &Scan,
+    ) -> Result<Vec<ScalarExpr>> {
         let metadata = self.metadata.read();
-        let column_entries = metadata.columns();
+        let column_entries = scan
+            .columns
+            .iter()
+            .map(|index| metadata.column(*index))
+            .collect::<Vec<_>>();
         let table_entries = metadata.tables();
         let is_source_of_view = table_entries.iter().any(|t| t.is_source_of_view());
 
@@ -265,29 +147,24 @@ impl RulePushDownFilterScan {
         for predicate in predicates {
             let used_columns = predicate.used_columns();
             let mut contain_derived_column = false;
-            for column_entry in column_entries {
-                match column_entry {
-                    ColumnEntry::BaseTableColumn(_) => {}
-                    ColumnEntry::InternalColumn(_) => {}
-                    ColumnEntry::DerivedColumn(column) => {
-                        // Don't push down predicate that contains derived column
-                        // Because storage can't know such columns.
-                        if used_columns.contains(&column.column_index) {
-                            contain_derived_column = true;
-                            break;
-                        }
+            for column_entry in column_entries.iter() {
+                if let ColumnEntry::DerivedColumn(column) = column_entry {
+                    // Don't push down predicate that contains derived column
+                    // Because storage can't know such columns.
+                    if used_columns.contains(&column.column_index) {
+                        contain_derived_column = true;
+                        break;
                     }
-                    ColumnEntry::VirtualColumn(_) => {}
                 }
             }
             if !contain_derived_column {
-                if is_source_of_view {
-                    let new_predicate =
-                        Self::replace_view_column(predicate, table_entries, column_entries)?;
-                    filtered_predicates.push(new_predicate);
-                } else {
-                    filtered_predicates.push(predicate.clone());
-                }
+                let predicate = Self::replace_predicate_column(
+                    predicate,
+                    table_entries,
+                    &column_entries,
+                    is_source_of_view,
+                )?;
+                filtered_predicates.push(predicate);
             }
         }
 
@@ -302,25 +179,32 @@ impl Rule for RulePushDownFilterScan {
 
     fn apply(&self, s_expr: &SExpr, state: &mut TransformResult) -> Result<()> {
         let filter: Filter = s_expr.plan().clone().try_into()?;
-        let mut get: Scan = s_expr.child(0)?.plan().clone().try_into()?;
+        let mut scan: Scan = s_expr.child(0)?.plan().clone().try_into()?;
 
-        let add_filters = self.find_push_down_predicates(&filter.predicates)?;
-
-        match get.push_down_predicates.as_mut() {
-            Some(vs) => vs.extend(add_filters),
-            None => get.push_down_predicates = Some(add_filters),
+        let add_filters = self.find_push_down_predicates(&filter.predicates, &scan)?;
+        match scan.push_down_predicates.as_mut() {
+            Some(vs) => {
+                // Add `add_filters` to vs if there's not already there.
+                // Keep the order of `vs` to ensure the tests are stable.
+                for filter in add_filters {
+                    if !vs.contains(&filter) {
+                        vs.push(filter);
+                    }
+                }
+            }
+            None => scan.push_down_predicates = Some(add_filters),
         }
 
         let mut result = SExpr::create_unary(
             Arc::new(filter.into()),
-            Arc::new(SExpr::create_leaf(Arc::new(get.into()))),
+            Arc::new(SExpr::create_leaf(Arc::new(scan.into()))),
         );
         result.set_applied_rule(&self.id);
         state.add_result(result);
         Ok(())
     }
 
-    fn patterns(&self) -> &Vec<SExpr> {
-        &self.patterns
+    fn matchers(&self) -> &[Matcher] {
+        &self.matchers
     }
 }

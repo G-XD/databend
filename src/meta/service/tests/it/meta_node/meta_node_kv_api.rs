@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 
 use async_trait::async_trait;
-use common_meta_kvapi::kvapi;
+use databend_common_meta_kvapi::kvapi;
 use databend_meta::meta_service::MetaNode;
 use maplit::btreeset;
 use test_harness::test;
@@ -69,7 +69,7 @@ impl kvapi::ApiBuilder<Arc<MetaNode>> for MetaNodeUnitTestBuilder {
 }
 
 #[test(harness = meta_service_test_harness)]
-#[minitrace::trace]
+#[fastrace::trace]
 async fn test_meta_node_kv_api() -> anyhow::Result<()> {
     let builder = MetaNodeUnitTestBuilder {
         test_contexts: Arc::new(Mutex::new(vec![])),

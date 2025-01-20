@@ -18,28 +18,29 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::Hash;
 use std::hash::Hasher;
 
-use common_expression::types::decimal::DecimalType;
-use common_expression::types::number::NumberScalar;
-use common_expression::types::number::F32;
-use common_expression::types::number::F64;
-use common_expression::types::ArgType;
-use common_expression::types::BooleanType;
-use common_expression::types::DateType;
-use common_expression::types::NumberClass;
-use common_expression::types::NumberDataType;
-use common_expression::types::NumberType;
-use common_expression::types::StringType;
-use common_expression::types::TimestampType;
-use common_expression::types::VariantType;
-use common_expression::types::ALL_INTEGER_TYPES;
-use common_expression::types::ALL_NUMBER_CLASSES;
-use common_expression::vectorize_with_builder_1_arg;
-use common_expression::vectorize_with_builder_2_arg;
-use common_expression::with_integer_mapped_type;
-use common_expression::with_number_mapped_type;
-use common_expression::FunctionDomain;
-use common_expression::FunctionRegistry;
-use common_expression::Scalar;
+use databend_common_expression::types::decimal::DecimalType;
+use databend_common_expression::types::number::NumberScalar;
+use databend_common_expression::types::number::F32;
+use databend_common_expression::types::number::F64;
+use databend_common_expression::types::ArgType;
+use databend_common_expression::types::BitmapType;
+use databend_common_expression::types::BooleanType;
+use databend_common_expression::types::DateType;
+use databend_common_expression::types::NumberClass;
+use databend_common_expression::types::NumberDataType;
+use databend_common_expression::types::NumberType;
+use databend_common_expression::types::StringType;
+use databend_common_expression::types::TimestampType;
+use databend_common_expression::types::VariantType;
+use databend_common_expression::types::ALL_INTEGER_TYPES;
+use databend_common_expression::types::ALL_NUMBER_CLASSES;
+use databend_common_expression::vectorize_with_builder_1_arg;
+use databend_common_expression::vectorize_with_builder_2_arg;
+use databend_common_expression::with_integer_mapped_type;
+use databend_common_expression::with_number_mapped_type;
+use databend_common_expression::FunctionDomain;
+use databend_common_expression::FunctionRegistry;
+use databend_common_expression::Scalar;
 use ethnum::i256;
 use md5::Digest;
 use md5::Md5 as Md5Hasher;
@@ -47,8 +48,6 @@ use naive_cityhash::cityhash64_with_seed;
 use num_traits::AsPrimitive;
 use twox_hash::XxHash32;
 use twox_hash::XxHash64;
-
-use crate::scalars::string::vectorize_string_to_string;
 
 pub fn register(registry: &mut FunctionRegistry) {
     registry.register_aliases("siphash64", &["siphash"]);
@@ -59,6 +58,7 @@ pub fn register(registry: &mut FunctionRegistry) {
     register_simple_domain_type_hash::<DateType>(registry);
     register_simple_domain_type_hash::<TimestampType>(registry);
     register_simple_domain_type_hash::<BooleanType>(registry);
+    register_simple_domain_type_hash::<BitmapType>(registry);
 
     for ty in ALL_NUMBER_CLASSES {
         with_number_mapped_type!(|NUM_TYPE| match ty {
@@ -77,61 +77,48 @@ pub fn register(registry: &mut FunctionRegistry) {
     registry.register_passthrough_nullable_1_arg::<StringType, StringType, _, _>(
         "md5",
         |_, _| FunctionDomain::MayThrow,
-        vectorize_string_to_string(
-            |col| col.data().len() * 32,
-            |val, output, ctx| {
-                // TODO md5 lib doesn't allow encode into buffer...
-                let old_len = output.data.len();
-                output.data.resize(old_len + 32, 0);
-                if let Err(err) = hex::encode_to_slice(
-                    Md5Hasher::digest(val).as_slice(),
-                    &mut output.data[old_len..],
-                ) {
-                    ctx.set_error(output.len(), err.to_string());
-                }
-                output.commit_row();
-            },
-        ),
+        vectorize_with_builder_1_arg::<StringType, StringType>(|val, output, ctx| {
+            // TODO md5 lib doesn't allow encode into buffer...
+            output.row_buffer.resize(32, 0);
+            if let Err(err) =
+                hex::encode_to_slice(Md5Hasher::digest(val).as_slice(), &mut output.row_buffer)
+            {
+                ctx.set_error(output.len(), err.to_string());
+            }
+            output.commit_row();
+        }),
     );
 
     registry.register_passthrough_nullable_1_arg::<StringType, StringType, _, _>(
         "sha",
         |_, _| FunctionDomain::MayThrow,
-        vectorize_string_to_string(
-            |col| col.data().len() * 40,
-            |val, output, ctx| {
-                let old_len = output.data.len();
-                output.data.resize(old_len + 40, 0);
-                // TODO sha1 lib doesn't allow encode into buffer...
-                let mut m = ::sha1::Sha1::new();
-                sha1::digest::Update::update(&mut m, val);
+        vectorize_with_builder_1_arg::<StringType, StringType>(|val, output, ctx| {
+            output.row_buffer.resize(40, 0);
+            // TODO sha1 lib doesn't allow encode into buffer...
+            let mut m = ::sha1::Sha1::new();
+            sha1::digest::Update::update(&mut m, val.as_bytes());
 
-                if let Err(err) =
-                    hex::encode_to_slice(m.finalize().as_slice(), &mut output.data[old_len..])
-                {
-                    ctx.set_error(output.len(), err.to_string());
-                }
-                output.commit_row();
-            },
-        ),
+            if let Err(err) = hex::encode_to_slice(m.finalize().as_slice(), &mut output.row_buffer)
+            {
+                ctx.set_error(output.len(), err.to_string());
+            }
+            output.commit_row();
+        }),
     );
 
     registry.register_passthrough_nullable_1_arg::<StringType, StringType, _, _>(
         "blake3",
         |_, _| FunctionDomain::MayThrow,
-        vectorize_string_to_string(
-            |col| col.data().len() * 64,
-            |val, output, ctx| {
-                let old_len = output.data.len();
-                output.data.resize(old_len + 64, 0);
-                if let Err(err) =
-                    hex::encode_to_slice(blake3::hash(val).as_bytes(), &mut output.data[old_len..])
-                {
-                    ctx.set_error(output.len(), err.to_string());
-                }
-                output.commit_row();
-            },
-        ),
+        vectorize_with_builder_1_arg::<StringType, StringType>(|val, output, ctx| {
+            output.row_buffer.resize(64, 0);
+            if let Err(err) = hex::encode_to_slice(
+                blake3::hash(val.as_bytes()).as_bytes(),
+                &mut output.row_buffer,
+            ) {
+                ctx.set_error(output.len(), err.to_string());
+            }
+            output.commit_row();
+        }),
     );
 
     registry.register_passthrough_nullable_2_arg::<StringType, NumberType<u64>, StringType, _, _>(
@@ -143,22 +130,22 @@ pub fn register(registry: &mut FunctionRegistry) {
                 let res = match l {
                     224 => {
                         let mut h = sha2::Sha224::new();
-                        sha2::digest::Update::update(&mut h, val);
+                        sha2::digest::Update::update(&mut h, val.as_bytes());
                         format!("{:x}", h.finalize())
                     }
                     256 | 0 => {
                         let mut h = sha2::Sha256::new();
-                        sha2::digest::Update::update(&mut h, val);
+                        sha2::digest::Update::update(&mut h, val.as_bytes());
                         format!("{:x}", h.finalize())
                     }
                     384 => {
                         let mut h = sha2::Sha384::new();
-                        sha2::digest::Update::update(&mut h, val);
+                        sha2::digest::Update::update(&mut h, val.as_bytes());
                         format!("{:x}", h.finalize())
                     }
                     512 => {
                         let mut h = sha2::Sha512::new();
-                        sha2::digest::Update::update(&mut h, val);
+                        sha2::digest::Update::update(&mut h, val.as_bytes());
                         format!("{:x}", h.finalize())
                     }
                     v => {
@@ -172,8 +159,7 @@ pub fn register(registry: &mut FunctionRegistry) {
                         String::new()
                     },
                 };
-                output.put_slice(res.as_bytes());
-                output.commit_row();
+                output.put_and_commit(res);
             },
         ),
     );
@@ -333,10 +319,31 @@ impl DFHash for F64 {
     }
 }
 
-impl<'a> DFHash for &'a [u8] {
+impl DFHash for &[u8] {
     #[inline]
     fn hash<H: Hasher>(&self, state: &mut H) {
         Hash::hash_slice(self, state);
+    }
+}
+
+impl DFHash for &str {
+    #[inline]
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        Hash::hash_slice(self.as_bytes(), state);
+    }
+}
+
+impl DFHash for [u8] {
+    #[inline]
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        Hash::hash_slice(self, state);
+    }
+}
+
+impl DFHash for str {
+    #[inline]
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        Hash::hash_slice(self.as_bytes(), state);
     }
 }
 
@@ -357,10 +364,11 @@ impl DFHash for Scalar {
                     DFHash::hash(v, state);
                 }
             }),
-            Scalar::String(vals) | Scalar::Variant(vals) => {
-                for v in vals {
-                    DFHash::hash(v, state);
-                }
+            Scalar::Binary(vals) | Scalar::Variant(vals) => {
+                DFHash::hash(vals.as_slice(), state);
+            }
+            Scalar::String(vals) => {
+                DFHash::hash(vals.as_str(), state);
             }
             _ => {}
         }

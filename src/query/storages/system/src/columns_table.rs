@@ -12,34 +12,32 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::HashSet;
 use std::sync::Arc;
 
-use common_catalog::catalog_kind::CATALOG_DEFAULT;
-use common_catalog::plan::PushDownInfo;
-use common_catalog::table::Table;
-use common_catalog::table_context::TableContext;
-use common_exception::ErrorCode;
-use common_exception::Result;
-use common_expression::infer_table_schema;
-use common_expression::types::StringType;
-use common_expression::utils::FromData;
-use common_expression::DataBlock;
-use common_expression::Scalar;
-use common_expression::TableDataType;
-use common_expression::TableField;
-use common_expression::TableSchemaRefExt;
-use common_functions::BUILTIN_FUNCTIONS;
-use common_meta_app::principal::GrantObject;
-use common_meta_app::principal::RoleInfo;
-use common_meta_app::principal::UserGrantSet;
-use common_meta_app::principal::UserInfo;
-use common_meta_app::schema::TableIdent;
-use common_meta_app::schema::TableInfo;
-use common_meta_app::schema::TableMeta;
-use common_sql::Planner;
-use common_storages_view::view_table::QUERY;
-use common_storages_view::view_table::VIEW_ENGINE;
+use databend_common_catalog::catalog_kind::CATALOG_DEFAULT;
+use databend_common_catalog::plan::PushDownInfo;
+use databend_common_catalog::table::Table;
+use databend_common_catalog::table_context::TableContext;
+use databend_common_exception::Result;
+use databend_common_expression::infer_table_schema;
+use databend_common_expression::types::StringType;
+use databend_common_expression::utils::FromData;
+use databend_common_expression::DataBlock;
+use databend_common_expression::Scalar;
+use databend_common_expression::TableDataType;
+use databend_common_expression::TableField;
+use databend_common_expression::TableSchemaRefExt;
+use databend_common_functions::BUILTIN_FUNCTIONS;
+use databend_common_meta_app::schema::database_name_ident::DatabaseNameIdent;
+use databend_common_meta_app::schema::TableIdent;
+use databend_common_meta_app::schema::TableInfo;
+use databend_common_meta_app::schema::TableMeta;
+use databend_common_sql::Planner;
+use databend_common_storages_stream::stream_table::StreamTable;
+use databend_common_storages_stream::stream_table::STREAM_ENGINE;
+use databend_common_storages_view::view_table::QUERY;
+use databend_common_storages_view::view_table::VIEW_ENGINE;
+use log::warn;
 
 use crate::table::AsyncOneBlockSystemTable;
 use crate::table::AsyncSystemTable;
@@ -64,22 +62,22 @@ impl AsyncSystemTable for ColumnsTable {
         push_downs: Option<PushDownInfo>,
     ) -> Result<DataBlock> {
         let rows = self.dump_table_columns(ctx, push_downs).await?;
-        let mut names: Vec<Vec<u8>> = Vec::with_capacity(rows.len());
-        let mut tables: Vec<Vec<u8>> = Vec::with_capacity(rows.len());
-        let mut databases: Vec<Vec<u8>> = Vec::with_capacity(rows.len());
-        let mut types: Vec<Vec<u8>> = Vec::with_capacity(rows.len());
-        let mut data_types: Vec<Vec<u8>> = Vec::with_capacity(rows.len());
-        let mut default_kinds: Vec<Vec<u8>> = Vec::with_capacity(rows.len());
-        let mut default_exprs: Vec<Vec<u8>> = Vec::with_capacity(rows.len());
-        let mut is_nullables: Vec<Vec<u8>> = Vec::with_capacity(rows.len());
-        let mut comments: Vec<Vec<u8>> = Vec::with_capacity(rows.len());
-        for (database_name, table_name, field) in rows.into_iter() {
-            names.push(field.name().clone().into_bytes());
-            tables.push(table_name.into_bytes());
-            databases.push(database_name.into_bytes());
-            types.push(field.data_type().wrapped_display().into_bytes());
+        let mut names: Vec<String> = Vec::with_capacity(rows.len());
+        let mut tables: Vec<String> = Vec::with_capacity(rows.len());
+        let mut databases: Vec<String> = Vec::with_capacity(rows.len());
+        let mut types: Vec<String> = Vec::with_capacity(rows.len());
+        let mut data_types: Vec<String> = Vec::with_capacity(rows.len());
+        let mut default_kinds: Vec<String> = Vec::with_capacity(rows.len());
+        let mut default_exprs: Vec<String> = Vec::with_capacity(rows.len());
+        let mut is_nullables: Vec<String> = Vec::with_capacity(rows.len());
+        let mut comments: Vec<String> = Vec::with_capacity(rows.len());
+        for (database_name, table_name, comment, field) in rows.into_iter() {
+            names.push(field.name().clone());
+            tables.push(table_name);
+            databases.push(database_name);
+            types.push(field.data_type().wrapped_display());
             let data_type = field.data_type().remove_recursive_nullable().sql_name();
-            data_types.push(data_type.into_bytes());
+            data_types.push(data_type);
 
             let mut default_kind = "".to_string();
             let mut default_expr = "".to_string();
@@ -87,15 +85,15 @@ impl AsyncSystemTable for ColumnsTable {
                 default_kind = "DEFAULT".to_string();
                 default_expr = expr.to_string();
             }
-            default_kinds.push(default_kind.into_bytes());
-            default_exprs.push(default_expr.into_bytes());
+            default_kinds.push(default_kind);
+            default_exprs.push(default_expr);
             if field.is_nullable() {
-                is_nullables.push("YES".to_string().into_bytes());
+                is_nullables.push("YES".to_string());
             } else {
-                is_nullables.push("NO".to_string().into_bytes());
+                is_nullables.push("NO".to_string());
             }
 
-            comments.push("".to_string().into_bytes());
+            comments.push(comment);
         }
 
         Ok(DataBlock::new_from_columns(vec![
@@ -148,79 +146,85 @@ impl ColumnsTable {
         &self,
         ctx: Arc<dyn TableContext>,
         push_downs: Option<PushDownInfo>,
-    ) -> Result<Vec<(String, String, TableField)>> {
-        let tenant = ctx.get_tenant();
-        let catalog = ctx.get_catalog(CATALOG_DEFAULT).await?;
+    ) -> Result<Vec<(String, String, String, TableField)>> {
+        let database_and_tables = dump_tables(&ctx, push_downs).await?;
 
-        let mut tables = Vec::new();
-        let mut databases = Vec::new();
-
-        if let Some(push_downs) = push_downs {
-            if let Some(filter) = push_downs.filter {
-                let expr = filter.as_expr(&BUILTIN_FUNCTIONS);
-                find_eq_filter(&expr, &mut |col_name, scalar| {
-                    if col_name == "database" {
-                        if let Scalar::String(s) = scalar {
-                            if let Ok(database) = String::from_utf8(s.clone()) {
-                                databases.push(database);
-                            }
-                        }
-                    } else if col_name == "table" {
-                        if let Scalar::String(s) = scalar {
-                            if let Ok(table) = String::from_utf8(s.clone()) {
-                                tables.push(table);
-                            }
-                        }
-                    }
-                });
-            }
-        }
-
-        if databases.is_empty() {
-            let all_databases = catalog.list_databases(tenant.as_str()).await?;
-            for db in all_databases {
-                databases.push(db.name().to_string());
-            }
-        }
-
-        let tenant = ctx.get_tenant();
-        let user = ctx.get_current_user()?;
-        let roles = ctx.get_current_available_roles().await?;
-        let visibility_checker = GrantObjectVisibilityChecker::new(&user, &roles);
-
-        let final_dbs: Vec<String> = databases
-            .iter()
-            .filter(|db| visibility_checker.check_database_visibility(CATALOG_DEFAULT, db))
-            .cloned()
-            .collect();
-
-        let mut rows: Vec<(String, String, TableField)> = vec![];
-        for database in final_dbs {
-            let tables = if tables.is_empty() {
-                if let Ok(table) = catalog.list_tables(tenant.as_str(), &database).await {
-                    table
-                } else {
-                    vec![]
-                }
-            } else {
-                let mut res = Vec::new();
-                for table in &tables {
-                    if let Ok(table) = catalog.get_table(tenant.as_str(), &database, table).await {
-                        res.push(table);
-                    }
-                }
-                res
-            };
-
+        let mut rows: Vec<(String, String, String, TableField)> = vec![];
+        for (database, tables) in database_and_tables {
             for table in tables {
-                if visibility_checker.check_table_visibility(
-                    CATALOG_DEFAULT,
-                    &database,
-                    table.name(),
-                ) {
-                    let fields = generate_fields(&ctx, &table).await?;
-                    for field in fields {
-                        rows.push((database.clone(), table.name().into(), field.clone()))
+                match table.engine() {
+                    VIEW_ENGINE => {
+                        let fields = if let Some(query) = table.options().get(QUERY) {
+                            let mut planner = Planner::new(ctx.clone());
+                            match planner.plan_sql(query).await {
+                                Ok((plan, _)) => {
+                                    infer_table_schema(&plan.schema())?.fields().clone()
+                                }
+                                Err(e) => {
+                                    // If VIEW SELECT QUERY plan err, should return empty. not destroy the query.
+                                    warn!(
+                                        "failed to get columns for {}: {}",
+                                        table.get_table_info().desc,
+                                        e
+                                    );
+                                    vec![]
+                                }
+                            }
+                        } else {
+                            vec![]
+                        };
+                        for field in fields {
+                            rows.push((
+                                database.clone(),
+                                table.name().into(),
+                                "".to_string(),
+                                field.clone(),
+                            ))
+                        }
+                    }
+                    STREAM_ENGINE => {
+                        let stream = StreamTable::try_from_table(table.as_ref())?;
+                        match stream.source_table(ctx.clone()).await {
+                            Ok(source_table) => {
+                                for field in source_table.schema().fields() {
+                                    rows.push((
+                                        database.clone(),
+                                        table.name().into(),
+                                        "".to_string(),
+                                        field.clone(),
+                                    ))
+                                }
+                            }
+                            Err(e) => {
+                                warn!(
+                                    "failed to get columns for {}: {}",
+                                    table.get_table_info().desc,
+                                    e
+                                );
+                            }
+                        }
+                    }
+                    _ => {
+                        let schema = table.schema();
+                        let field_comments = table.field_comments();
+                        let n_fields = schema.fields().len();
+                        for (idx, field) in schema.fields().iter().enumerate() {
+                            // compatibility: creating table in the old planner will not have `fields_comments`
+                            let comment = if field_comments.len() == n_fields
+                                && !field_comments[idx].is_empty()
+                            {
+                                // can not use debug print, will add double quote
+                                format!("{}", &field_comments[idx].as_str().replace('\'', "\\'"))
+                            } else {
+                                "".to_string()
+                            };
+                            rows.push((
+                                database.clone(),
+                                table.name().into(),
+                                comment,
+                                field.clone(),
+                            ))
+                        }
                     }
                 }
             }
@@ -230,123 +234,139 @@ impl ColumnsTable {
     }
 }
 
-async fn generate_fields(
+pub(crate) async fn dump_tables(
     ctx: &Arc<dyn TableContext>,
-    table: &Arc<dyn Table>,
-) -> Result<Vec<TableField>> {
-    let fields = if table.engine() == VIEW_ENGINE {
-        if let Some(query) = table.options().get(QUERY) {
-            let mut planner = Planner::new(ctx.clone());
-            let (plan, _) = planner.plan_sql(query).await?;
-            let schema = infer_table_schema(&plan.schema())?;
-            schema.fields().clone()
-        } else {
-            return Err(ErrorCode::Internal(
-                "Logical error, View Table must have a SelectQuery inside.",
-            ));
+    push_downs: Option<PushDownInfo>,
+) -> Result<Vec<(String, Vec<Arc<dyn Table>>)>> {
+    let tenant = ctx.get_tenant();
+
+    // For performance considerations, we do not require the most up-to-date table information here:
+    // - for regular tables, the data is certainly fresh
+    // - for read-only attached tables, the data may be outdated
+
+    let catalog = ctx
+        .get_catalog(CATALOG_DEFAULT)
+        .await?
+        .disable_table_info_refresh()?;
+
+    let mut tables: Vec<String> = Vec::new();
+    let mut databases: Vec<String> = Vec::new();
+
+    if let Some(push_downs) = push_downs {
+        if let Some(filter) = push_downs.filters.as_ref().map(|f| &f.filter) {
+            let expr = filter.as_expr(&BUILTIN_FUNCTIONS);
+            find_eq_filter(&expr, &mut |col_name, scalar| {
+                if col_name == "database" {
+                    if let Scalar::String(database) = scalar {
+                        if !databases.contains(database) {
+                            databases.push(database.clone());
+                        }
+                    }
+                } else if col_name == "table" {
+                    if let Scalar::String(table) = scalar {
+                        if !tables.contains(table) {
+                            tables.push(table.clone());
+                        }
+                    }
+                }
+                Ok(())
+            });
+        }
+    }
+
+    let visibility_checker = ctx.get_visibility_checker(false).await?;
+
+    let mut final_dbs: Vec<(String, u64)> = Vec::new();
+
+    if !databases.is_empty() {
+        for db in databases {
+            let db_id = catalog
+                .get_database(&tenant, &db)
+                .await?
+                .get_db_info()
+                .database_id
+                .db_id;
+            if visibility_checker.check_database_visibility(CATALOG_DEFAULT, &db, db_id) {
+                final_dbs.push((db.to_string(), db_id));
+            }
         }
     } else {
-        table.schema().fields().clone()
-    };
-    Ok(fields)
-}
-
-/// GrantObjectVisibilityChecker is used to check whether a user has the privilege to access a
-/// database or table.
-/// It is used in `SHOW DATABASES` and `SHOW TABLES` statements.
-pub struct GrantObjectVisibilityChecker {
-    granted_global: bool,
-    granted_databases: HashSet<(String, String)>,
-    granted_tables: HashSet<(String, String, String)>,
-    extra_databases: HashSet<(String, String)>,
-}
-
-impl GrantObjectVisibilityChecker {
-    pub fn new(user: &UserInfo, available_roles: &Vec<RoleInfo>) -> Self {
-        let mut granted_global = false;
-        let mut granted_databases = HashSet::new();
-        let mut granted_tables = HashSet::new();
-        let mut extra_databases = HashSet::new();
-
-        let mut grant_sets: Vec<&UserGrantSet> = vec![&user.grants];
-        for role in available_roles {
-            grant_sets.push(&role.grants);
-        }
-
-        for grant_set in grant_sets {
-            for ent in grant_set.entries() {
-                match ent.object() {
-                    GrantObject::Global => {
-                        granted_global = true;
+        let catalog_dbs = visibility_checker.get_visibility_database();
+        // None means has global level privileges
+        if let Some(catalog_dbs) = catalog_dbs {
+            for (catalog_name, dbs) in catalog_dbs {
+                if catalog_name == CATALOG_DEFAULT {
+                    let mut catalog_db_ids = vec![];
+                    let mut catalog_db_names = vec![];
+                    catalog_db_names.extend(
+                        dbs.iter()
+                            .filter_map(|(db_name, _)| *db_name)
+                            .map(|db_name| db_name.to_string()),
+                    );
+                    catalog_db_ids.extend(dbs.iter().filter_map(|(_, db_id)| *db_id));
+                    if let Ok(databases) = catalog
+                        .mget_database_names_by_ids(&tenant, &catalog_db_ids)
+                        .await
+                    {
+                        catalog_db_names.extend(databases.into_iter().flatten());
+                    } else {
+                        let msg = format!("Failed to get database name by id: {}", catalog.name());
+                        warn!("{}", msg);
                     }
-                    GrantObject::Database(catalog, db) => {
-                        granted_databases.insert((catalog.to_string(), db.to_string()));
-                    }
-                    GrantObject::Table(catalog, db, table) => {
-                        granted_tables.insert((
-                            catalog.to_string(),
-                            db.to_string(),
-                            table.to_string(),
-                        ));
-                        // if table is visible, the table's database is also treated as visible
-                        extra_databases.insert((catalog.to_string(), db.to_string()));
-                    }
+                    let db_idents = catalog_db_names
+                        .iter()
+                        .map(|name| DatabaseNameIdent::new(&tenant, name))
+                        .collect::<Vec<DatabaseNameIdent>>();
+                    let dbs: Vec<(String, u64)> = catalog
+                        .mget_databases(&tenant, &db_idents)
+                        .await?
+                        .iter()
+                        .map(|db| (db.name().to_string(), db.get_db_info().database_id.db_id))
+                        .collect();
+                    final_dbs.extend(dbs);
+                }
+            }
+        } else {
+            let all_databases = catalog.list_databases(&tenant).await?;
+            for db in all_databases {
+                let db_id = db.get_db_info().database_id.db_id;
+                let db_name = db.name();
+                if visibility_checker.check_database_visibility(CATALOG_DEFAULT, db_name, db_id) {
+                    final_dbs.push((db_name.to_string(), db_id));
                 }
             }
         }
-
-        Self {
-            granted_global,
-            granted_databases,
-            granted_tables,
-            extra_databases,
-        }
     }
 
-    pub fn check_database_visibility(&self, catalog: &str, db: &str) -> bool {
-        if self.granted_global {
-            return true;
+    let mut final_tables: Vec<(String, Vec<Arc<dyn Table>>)> = Vec::with_capacity(final_dbs.len());
+    for (database, db_id) in final_dbs {
+        let tables = if tables.is_empty() {
+            catalog
+                .list_tables(&tenant, &database)
+                .await
+                .unwrap_or_default()
+        } else {
+            let mut res = Vec::new();
+            for table in &tables {
+                if let Ok(table) = catalog.get_table(&tenant, &database, table).await {
+                    res.push(table);
+                }
+            }
+            res
+        };
+        let mut filtered_tables = Vec::with_capacity(tables.len());
+        for table in tables {
+            if visibility_checker.check_table_visibility(
+                CATALOG_DEFAULT,
+                &database,
+                table.name(),
+                db_id,
+                table.get_id(),
+            ) {
+                filtered_tables.push(table);
+            }
         }
-
-        if self
-            .granted_databases
-            .contains(&(catalog.to_string(), db.to_string()))
-        {
-            return true;
-        }
-
-        // if one of the tables in the database is granted, the database is also visible
-        if self
-            .extra_databases
-            .contains(&(catalog.to_string(), db.to_string()))
-        {
-            return true;
-        }
-
-        false
+        final_tables.push((database, filtered_tables));
     }
-
-    pub fn check_table_visibility(&self, catalog: &str, database: &str, table: &str) -> bool {
-        if self.granted_global {
-            return true;
-        }
-
-        // if database is granted, all the tables in it are visible
-        if self
-            .granted_databases
-            .contains(&(catalog.to_string(), database.to_string()))
-        {
-            return true;
-        }
-
-        if self.granted_tables.contains(&(
-            catalog.to_string(),
-            database.to_string(),
-            table.to_string(),
-        )) {
-            return true;
-        }
-
-        false
-    }
+    Ok(final_tables)
 }

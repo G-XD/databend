@@ -21,10 +21,12 @@ use std::sync::Arc;
 
 use chrono::DateTime;
 use chrono::Utc;
-use common_expression as ex;
-use common_meta_app::schema as mt;
-use common_meta_app::storage::StorageParams;
-use common_protos::pb;
+use databend_common_expression as ex;
+use databend_common_meta_app::schema as mt;
+use databend_common_meta_app::storage::StorageParams;
+use databend_common_meta_app::tenant::Tenant;
+use databend_common_meta_types::NonEmptyString;
+use databend_common_protos::pb;
 
 use crate::reader_check_msg;
 use crate::FromToProto;
@@ -95,8 +97,13 @@ impl FromToProto for mt::TableNameIdent {
     fn from_pb(p: pb::TableNameIdent) -> Result<Self, Incompatible> {
         reader_check_msg(p.ver, p.min_reader_ver)?;
 
+        let non_empty = NonEmptyString::new(p.tenant.clone())
+            .map_err(|_e| Incompatible::new("tenant is empty"))?;
+
+        let tenant = Tenant::new_nonempty(non_empty);
+
         let v = Self {
-            tenant: p.tenant,
+            tenant,
             db_name: p.db_name,
             table_name: p.table_name,
         };
@@ -107,7 +114,7 @@ impl FromToProto for mt::TableNameIdent {
         let p = pb::TableNameIdent {
             ver: VER,
             min_reader_ver: MIN_READER_VER,
-            tenant: self.tenant.clone(),
+            tenant: self.tenant.tenant_name().to_string(),
             db_name: self.db_name.clone(),
             table_name: self.table_name.clone(),
         };
@@ -176,19 +183,25 @@ impl FromToProto for mt::TableMeta {
     fn from_pb(p: pb::TableMeta) -> Result<Self, Incompatible> {
         reader_check_msg(p.ver, p.min_reader_ver)?;
 
-        let schema = p.schema.ok_or(Incompatible {
-            reason: "TableMeta.schema can not be None".to_string(),
-        })?;
+        let schema = p
+            .schema
+            .ok_or_else(|| Incompatible::new("TableMeta.schema can not be None".to_string()))?;
 
-        let catalog = if p.catalog.is_empty() {
-            "default".to_string()
+        let mut indexes = BTreeMap::new();
+        for (name, index) in p.indexes {
+            indexes.insert(name, mt::TableIndex::from_pb(index)?);
+        }
+
+        let cluster_key_seq = if let Some(seq) = p.cluster_key_seq {
+            seq
+        } else if p.cluster_keys.is_empty() {
+            0
         } else {
-            p.catalog
+            p.cluster_keys.len() as u32 - 1
         };
 
         let v = Self {
             schema: Arc::new(ex::TableSchema::from_pb(schema)?),
-            catalog,
             engine: p.engine,
             engine_options: p.engine_options,
             storage_params: match p.storage_params {
@@ -197,9 +210,8 @@ impl FromToProto for mt::TableMeta {
             },
             part_prefix: p.part_prefix.unwrap_or("".to_string()),
             options: p.options,
-            default_cluster_key: p.default_cluster_key,
-            cluster_keys: p.cluster_keys,
-            default_cluster_key_id: p.default_cluster_key_id,
+            cluster_key: p.cluster_key,
+            cluster_key_seq,
             created_on: DateTime::<Utc>::from_pb(p.created_on)?,
             updated_on: DateTime::<Utc>::from_pb(p.updated_on)?,
             drop_on: match p.drop_on {
@@ -213,21 +225,25 @@ impl FromToProto for mt::TableMeta {
                 .map(mt::TableStatistics::from_pb)
                 .transpose()?
                 .unwrap_or_default(),
-            shared_by: BTreeSet::from_iter(p.shared_by.into_iter()),
+            shared_by: BTreeSet::from_iter(p.shared_by),
             column_mask_policy: if p.column_mask_policy.is_empty() {
                 None
             } else {
                 Some(p.column_mask_policy)
             },
+            indexes,
         };
         Ok(v)
     }
 
     fn to_pb(&self) -> Result<pb::TableMeta, Incompatible> {
+        let mut indexes = BTreeMap::new();
+        for (name, index) in &self.indexes {
+            indexes.insert(name.clone(), index.to_pb()?);
+        }
         let p = pb::TableMeta {
             ver: VER,
             min_reader_ver: MIN_READER_VER,
-            catalog: self.catalog.clone(),
             schema: Some(self.schema.to_pb()?),
             engine: self.engine.clone(),
             engine_options: self.engine_options.clone(),
@@ -241,9 +257,10 @@ impl FromToProto for mt::TableMeta {
                 Some(self.part_prefix.clone())
             },
             options: self.options.clone(),
-            default_cluster_key: self.default_cluster_key.clone(),
-            cluster_keys: self.cluster_keys.clone(),
-            default_cluster_key_id: self.default_cluster_key_id,
+            cluster_key: self.cluster_key.clone(),
+            // cluster_keys is deprecated.
+            cluster_keys: vec![],
+            cluster_key_seq: Some(self.cluster_key_seq),
             created_on: self.created_on.to_pb()?,
             updated_on: self.updated_on.to_pb()?,
             drop_on: match self.drop_on {
@@ -253,8 +270,9 @@ impl FromToProto for mt::TableMeta {
             comment: self.comment.clone(),
             field_comments: self.field_comments.clone(),
             statistics: Some(self.statistics.to_pb()?),
-            shared_by: Vec::from_iter(self.shared_by.clone().into_iter()),
-            column_mask_policy: self.column_mask_policy.clone().unwrap_or(BTreeMap::new()),
+            shared_by: Vec::from_iter(self.shared_by.clone()),
+            column_mask_policy: self.column_mask_policy.clone().unwrap_or_default(),
+            indexes,
         };
         Ok(p)
     }
@@ -312,6 +330,38 @@ impl FromToProto for mt::TableIdList {
             ver: VER,
             min_reader_ver: MIN_READER_VER,
             ids: self.id_list.clone(),
+        };
+        Ok(p)
+    }
+}
+
+impl FromToProto for mt::TableIndex {
+    type PB = pb::TableIndex;
+    fn get_pb_ver(p: &Self::PB) -> u64 {
+        p.ver
+    }
+    fn from_pb(p: pb::TableIndex) -> Result<Self, Incompatible> {
+        reader_check_msg(p.ver, p.min_reader_ver)?;
+
+        let v = Self {
+            name: p.name,
+            column_ids: p.column_ids,
+            sync_creation: p.sync_creation,
+            version: p.version.clone(),
+            options: p.options.clone(),
+        };
+        Ok(v)
+    }
+
+    fn to_pb(&self) -> Result<pb::TableIndex, Incompatible> {
+        let p = pb::TableIndex {
+            ver: VER,
+            min_reader_ver: MIN_READER_VER,
+            name: self.name.clone(),
+            column_ids: self.column_ids.clone(),
+            sync_creation: self.sync_creation,
+            version: self.version.clone(),
+            options: self.options.clone(),
         };
         Ok(p)
     }

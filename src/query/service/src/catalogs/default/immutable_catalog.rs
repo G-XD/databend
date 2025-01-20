@@ -17,67 +17,89 @@ use std::fmt::Debug;
 use std::fmt::Formatter;
 use std::sync::Arc;
 
-use common_catalog::catalog::Catalog;
-use common_config::InnerConfig;
-use common_exception::ErrorCode;
-use common_exception::Result;
-use common_meta_app::schema::CatalogInfo;
-use common_meta_app::schema::CountTablesReply;
-use common_meta_app::schema::CountTablesReq;
-use common_meta_app::schema::CreateDatabaseReply;
-use common_meta_app::schema::CreateDatabaseReq;
-use common_meta_app::schema::CreateIndexReply;
-use common_meta_app::schema::CreateIndexReq;
-use common_meta_app::schema::CreateTableLockRevReply;
-use common_meta_app::schema::CreateTableReply;
-use common_meta_app::schema::CreateTableReq;
-use common_meta_app::schema::CreateVirtualColumnReply;
-use common_meta_app::schema::CreateVirtualColumnReq;
-use common_meta_app::schema::DropDatabaseReply;
-use common_meta_app::schema::DropDatabaseReq;
-use common_meta_app::schema::DropIndexReply;
-use common_meta_app::schema::DropIndexReq;
-use common_meta_app::schema::DropTableByIdReq;
-use common_meta_app::schema::DropTableReply;
-use common_meta_app::schema::DropVirtualColumnReply;
-use common_meta_app::schema::DropVirtualColumnReq;
-use common_meta_app::schema::GetIndexReply;
-use common_meta_app::schema::GetIndexReq;
-use common_meta_app::schema::GetTableCopiedFileReply;
-use common_meta_app::schema::GetTableCopiedFileReq;
-use common_meta_app::schema::IndexMeta;
-use common_meta_app::schema::ListIndexesByIdReq;
-use common_meta_app::schema::ListIndexesReq;
-use common_meta_app::schema::ListVirtualColumnsReq;
-use common_meta_app::schema::RenameDatabaseReply;
-use common_meta_app::schema::RenameDatabaseReq;
-use common_meta_app::schema::RenameTableReply;
-use common_meta_app::schema::RenameTableReq;
-use common_meta_app::schema::SetTableColumnMaskPolicyReply;
-use common_meta_app::schema::SetTableColumnMaskPolicyReq;
-use common_meta_app::schema::TableIdent;
-use common_meta_app::schema::TableInfo;
-use common_meta_app::schema::TableMeta;
-use common_meta_app::schema::TruncateTableReply;
-use common_meta_app::schema::TruncateTableReq;
-use common_meta_app::schema::UndropDatabaseReply;
-use common_meta_app::schema::UndropDatabaseReq;
-use common_meta_app::schema::UndropTableReply;
-use common_meta_app::schema::UndropTableReq;
-use common_meta_app::schema::UpdateIndexReply;
-use common_meta_app::schema::UpdateIndexReq;
-use common_meta_app::schema::UpdateTableMetaReply;
-use common_meta_app::schema::UpdateTableMetaReq;
-use common_meta_app::schema::UpdateVirtualColumnReply;
-use common_meta_app::schema::UpdateVirtualColumnReq;
-use common_meta_app::schema::UpsertTableOptionReply;
-use common_meta_app::schema::UpsertTableOptionReq;
-use common_meta_app::schema::VirtualColumnMeta;
-use common_meta_types::MetaId;
+use databend_common_catalog::catalog::Catalog;
+use databend_common_config::InnerConfig;
+use databend_common_exception::ErrorCode;
+use databend_common_exception::Result;
+use databend_common_meta_app::schema::database_name_ident::DatabaseNameIdent;
+use databend_common_meta_app::schema::dictionary_name_ident::DictionaryNameIdent;
+use databend_common_meta_app::schema::CatalogInfo;
+use databend_common_meta_app::schema::CommitTableMetaReply;
+use databend_common_meta_app::schema::CommitTableMetaReq;
+use databend_common_meta_app::schema::CreateDatabaseReply;
+use databend_common_meta_app::schema::CreateDatabaseReq;
+use databend_common_meta_app::schema::CreateDictionaryReply;
+use databend_common_meta_app::schema::CreateDictionaryReq;
+use databend_common_meta_app::schema::CreateIndexReply;
+use databend_common_meta_app::schema::CreateIndexReq;
+use databend_common_meta_app::schema::CreateLockRevReply;
+use databend_common_meta_app::schema::CreateLockRevReq;
+use databend_common_meta_app::schema::CreateSequenceReply;
+use databend_common_meta_app::schema::CreateSequenceReq;
+use databend_common_meta_app::schema::CreateTableIndexReq;
+use databend_common_meta_app::schema::CreateTableReply;
+use databend_common_meta_app::schema::CreateTableReq;
+use databend_common_meta_app::schema::CreateVirtualColumnReq;
+use databend_common_meta_app::schema::DeleteLockRevReq;
+use databend_common_meta_app::schema::DictionaryMeta;
+use databend_common_meta_app::schema::DropDatabaseReply;
+use databend_common_meta_app::schema::DropDatabaseReq;
+use databend_common_meta_app::schema::DropIndexReq;
+use databend_common_meta_app::schema::DropSequenceReply;
+use databend_common_meta_app::schema::DropSequenceReq;
+use databend_common_meta_app::schema::DropTableByIdReq;
+use databend_common_meta_app::schema::DropTableIndexReq;
+use databend_common_meta_app::schema::DropTableReply;
+use databend_common_meta_app::schema::DropVirtualColumnReq;
+use databend_common_meta_app::schema::ExtendLockRevReq;
+use databend_common_meta_app::schema::GetDictionaryReply;
+use databend_common_meta_app::schema::GetIndexReply;
+use databend_common_meta_app::schema::GetIndexReq;
+use databend_common_meta_app::schema::GetSequenceNextValueReply;
+use databend_common_meta_app::schema::GetSequenceNextValueReq;
+use databend_common_meta_app::schema::GetSequenceReply;
+use databend_common_meta_app::schema::GetSequenceReq;
+use databend_common_meta_app::schema::GetTableCopiedFileReply;
+use databend_common_meta_app::schema::GetTableCopiedFileReq;
+use databend_common_meta_app::schema::IndexMeta;
+use databend_common_meta_app::schema::ListDictionaryReq;
+use databend_common_meta_app::schema::ListIndexesByIdReq;
+use databend_common_meta_app::schema::ListIndexesReq;
+use databend_common_meta_app::schema::ListLockRevReq;
+use databend_common_meta_app::schema::ListLocksReq;
+use databend_common_meta_app::schema::ListVirtualColumnsReq;
+use databend_common_meta_app::schema::LockInfo;
+use databend_common_meta_app::schema::LockMeta;
+use databend_common_meta_app::schema::RenameDatabaseReply;
+use databend_common_meta_app::schema::RenameDatabaseReq;
+use databend_common_meta_app::schema::RenameDictionaryReq;
+use databend_common_meta_app::schema::RenameTableReply;
+use databend_common_meta_app::schema::RenameTableReq;
+use databend_common_meta_app::schema::SetTableColumnMaskPolicyReply;
+use databend_common_meta_app::schema::SetTableColumnMaskPolicyReq;
+use databend_common_meta_app::schema::TableInfo;
+use databend_common_meta_app::schema::TableMeta;
+use databend_common_meta_app::schema::TruncateTableReply;
+use databend_common_meta_app::schema::TruncateTableReq;
+use databend_common_meta_app::schema::UndropDatabaseReply;
+use databend_common_meta_app::schema::UndropDatabaseReq;
+use databend_common_meta_app::schema::UndropTableByIdReq;
+use databend_common_meta_app::schema::UndropTableReq;
+use databend_common_meta_app::schema::UpdateDictionaryReply;
+use databend_common_meta_app::schema::UpdateDictionaryReq;
+use databend_common_meta_app::schema::UpdateIndexReply;
+use databend_common_meta_app::schema::UpdateIndexReq;
+use databend_common_meta_app::schema::UpdateVirtualColumnReq;
+use databend_common_meta_app::schema::UpsertTableOptionReply;
+use databend_common_meta_app::schema::UpsertTableOptionReq;
+use databend_common_meta_app::schema::VirtualColumnMeta;
+use databend_common_meta_app::tenant::Tenant;
+use databend_common_meta_types::MetaId;
+use databend_common_meta_types::SeqV;
+use databend_storages_common_table_meta::table_id_ranges::SYS_DB_ID_BEGIN;
+use databend_storages_common_table_meta::table_id_ranges::SYS_TBL_ID_BEGIN;
 
 use crate::catalogs::InMemoryMetas;
-use crate::catalogs::SYS_DB_ID_BEGIN;
-use crate::catalogs::SYS_TBL_ID_BEGIN;
 use crate::databases::Database;
 use crate::databases::InformationSchemaDatabase;
 use crate::databases::SystemDatabase;
@@ -86,14 +108,14 @@ use crate::storages::Table;
 /// System Catalog contains ... all the system databases (no surprise :)
 #[derive(Clone)]
 pub struct ImmutableCatalog {
-    // it's case sensitive, so we will need two same database only with the name's case
+    // IT'S CASE SENSITIVE, SO WE WILL NEED TWO SAME DATABASE ONLY WITH THE NAME'S CASE
     info_schema_db: Arc<InformationSchemaDatabase>,
     sys_db: Arc<SystemDatabase>,
     sys_db_meta: Arc<InMemoryMetas>,
 }
 
 impl Debug for ImmutableCatalog {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
         f.debug_struct("ImmutableCatalog").finish_non_exhaustive()
     }
 }
@@ -127,12 +149,17 @@ impl Catalog for ImmutableCatalog {
         "default".to_string()
     }
 
-    fn info(&self) -> CatalogInfo {
-        CatalogInfo::new_default()
+    fn info(&self) -> Arc<CatalogInfo> {
+        CatalogInfo::default().into()
+    }
+
+    fn disable_table_info_refresh(self: Arc<Self>) -> Result<Arc<dyn Catalog>> {
+        let me = self.as_ref().clone();
+        Ok(Arc::new(me))
     }
 
     #[async_backtrace::framed]
-    async fn get_database(&self, _tenant: &str, db_name: &str) -> Result<Arc<dyn Database>> {
+    async fn get_database(&self, _tenant: &Tenant, db_name: &str) -> Result<Arc<dyn Database>> {
         match db_name {
             "system" => Ok(self.sys_db.clone()),
             "information_schema" => Ok(self.info_schema_db.clone()),
@@ -143,8 +170,12 @@ impl Catalog for ImmutableCatalog {
         }
     }
 
+    async fn list_databases_history(&self, _tenant: &Tenant) -> Result<Vec<Arc<dyn Database>>> {
+        Ok(vec![self.sys_db.clone(), self.info_schema_db.clone()])
+    }
+
     #[async_backtrace::framed]
-    async fn list_databases(&self, _tenant: &str) -> Result<Vec<Arc<dyn Database>>> {
+    async fn list_databases(&self, _tenant: &Tenant) -> Result<Vec<Arc<dyn Database>>> {
         Ok(vec![self.sys_db.clone(), self.info_schema_db.clone()])
     }
 
@@ -174,19 +205,93 @@ impl Catalog for ImmutableCatalog {
     }
 
     #[async_backtrace::framed]
-    async fn get_table_meta_by_id(&self, table_id: MetaId) -> Result<(TableIdent, Arc<TableMeta>)> {
+    async fn get_table_meta_by_id(&self, table_id: MetaId) -> Result<Option<SeqV<TableMeta>>> {
         let table = self
             .sys_db_meta
             .get_by_id(&table_id)
             .ok_or_else(|| ErrorCode::UnknownTable(format!("Unknown table id: '{}'", table_id)))?;
         let ti = table.get_table_info();
-        Ok((ti.ident, Arc::new(ti.meta.clone())))
+        let seq_table_meta = SeqV::new(ti.ident.seq, ti.meta.clone());
+        Ok(Some(seq_table_meta))
+    }
+
+    async fn mget_table_names_by_ids(
+        &self,
+        _tenant: &Tenant,
+        table_ids: &[MetaId],
+        _get_dropped_table: bool,
+    ) -> Result<Vec<Option<String>>> {
+        let mut table_name = Vec::with_capacity(table_ids.len());
+        for id in table_ids {
+            if let Some(table) = self.sys_db_meta.get_by_id(id) {
+                table_name.push(Some(table.name().to_string()));
+            } else {
+                table_name.push(None);
+            }
+        }
+        Ok(table_name)
+    }
+
+    async fn get_db_name_by_id(&self, db_id: MetaId) -> Result<String> {
+        if self.sys_db.get_db_info().database_id.db_id == db_id {
+            Ok("system".to_string())
+        } else if self.info_schema_db.get_db_info().database_id.db_id == db_id {
+            Ok("information_schema".to_string())
+        } else {
+            Err(ErrorCode::UnknownDatabaseId(format!(
+                "Unknown database id {}",
+                db_id
+            )))
+        }
+    }
+
+    async fn mget_databases(
+        &self,
+        _tenant: &Tenant,
+        db_names: &[DatabaseNameIdent],
+    ) -> Result<Vec<Arc<dyn Database>>> {
+        let mut res: Vec<Arc<dyn Database>> = vec![];
+        for db_name in db_names {
+            let db_name = db_name.database_name();
+            if db_name == "system" {
+                res.push(self.sys_db.clone());
+            } else if db_name == "information_schema" {
+                res.push(self.info_schema_db.clone());
+            }
+        }
+        Ok(res)
+    }
+
+    async fn mget_database_names_by_ids(
+        &self,
+        _tenant: &Tenant,
+        db_ids: &[MetaId],
+    ) -> Result<Vec<Option<String>>> {
+        let mut res = Vec::new();
+        for id in db_ids {
+            if self.sys_db.get_db_info().database_id.db_id == *id {
+                res.push(Some("system".to_string()));
+            } else if self.info_schema_db.get_db_info().database_id.db_id == *id {
+                res.push(Some("information_schema".to_string()));
+            } else {
+                res.push(None);
+            }
+        }
+        Ok(res)
+    }
+
+    async fn get_table_name_by_id(&self, table_id: MetaId) -> Result<Option<String>> {
+        let table_name = self
+            .sys_db_meta
+            .get_by_id(&table_id)
+            .map(|v| v.name().to_string());
+        Ok(table_name)
     }
 
     #[async_backtrace::framed]
     async fn get_table(
         &self,
-        tenant: &str,
+        tenant: &Tenant,
         db_name: &str,
         table_name: &str,
     ) -> Result<Arc<dyn Table>> {
@@ -196,14 +301,24 @@ impl Catalog for ImmutableCatalog {
     }
 
     #[async_backtrace::framed]
-    async fn list_tables(&self, _tenant: &str, db_name: &str) -> Result<Vec<Arc<dyn Table>>> {
+    async fn get_table_history(
+        &self,
+        tenant: &Tenant,
+        db_name: &str,
+        table_name: &str,
+    ) -> Result<Vec<Arc<dyn Table>>> {
+        Ok(vec![self.get_table(tenant, db_name, table_name).await?])
+    }
+
+    #[async_backtrace::framed]
+    async fn list_tables(&self, _tenant: &Tenant, db_name: &str) -> Result<Vec<Arc<dyn Table>>> {
         self.sys_db_meta.get_all_tables(db_name)
     }
 
     #[async_backtrace::framed]
     async fn list_tables_history(
         &self,
-        tenant: &str,
+        tenant: &Tenant,
         db_name: &str,
     ) -> Result<Vec<Arc<dyn Table>>> {
         self.list_tables(tenant, db_name).await
@@ -224,9 +339,15 @@ impl Catalog for ImmutableCatalog {
     }
 
     #[async_backtrace::framed]
-    async fn undrop_table(&self, _req: UndropTableReq) -> Result<UndropTableReply> {
+    async fn undrop_table(&self, _req: UndropTableReq) -> Result<()> {
         Err(ErrorCode::Unimplemented(
             "Cannot undrop table in system database",
+        ))
+    }
+
+    async fn undrop_table_by_id(&self, _req: UndropTableByIdReq) -> Result<()> {
+        Err(ErrorCode::Unimplemented(
+            "Cannot undrop table by id in system database",
         ))
     }
 
@@ -244,17 +365,24 @@ impl Catalog for ImmutableCatalog {
         ))
     }
 
-    #[async_backtrace::framed]
-    async fn count_tables(&self, _req: CountTablesReq) -> Result<CountTablesReply> {
+    async fn commit_table_meta(&self, _req: CommitTableMetaReq) -> Result<CommitTableMetaReply> {
         Err(ErrorCode::Unimplemented(
-            "Cannot count tables in system database",
+            "cannot commit_table_meta in system database",
         ))
+    }
+
+    async fn create_table_index(&self, _req: CreateTableIndexReq) -> Result<()> {
+        unimplemented!()
+    }
+
+    async fn drop_table_index(&self, _req: DropTableIndexReq) -> Result<()> {
+        unimplemented!()
     }
 
     #[async_backtrace::framed]
     async fn get_table_copied_file_info(
         &self,
-        _tenant: &str,
+        _tenant: &Tenant,
         _db_name: &str,
         req: GetTableCopiedFileReq,
     ) -> Result<GetTableCopiedFileReply> {
@@ -279,24 +407,12 @@ impl Catalog for ImmutableCatalog {
     #[async_backtrace::framed]
     async fn upsert_table_option(
         &self,
-        _tenant: &str,
+        _tenant: &Tenant,
         _db_name: &str,
         req: UpsertTableOptionReq,
     ) -> Result<UpsertTableOptionReply> {
         Err(ErrorCode::Unimplemented(format!(
             "upsert table option not allowed for system database {:?}",
-            req
-        )))
-    }
-
-    #[async_backtrace::framed]
-    async fn update_table_meta(
-        &self,
-        _table_info: &TableInfo,
-        req: UpdateTableMetaReq,
-    ) -> Result<UpdateTableMetaReply> {
-        Err(ErrorCode::Unimplemented(format!(
-            "update table meta not allowed for system database {:?}",
             req
         )))
     }
@@ -313,39 +429,37 @@ impl Catalog for ImmutableCatalog {
     }
 
     #[async_backtrace::framed]
-    async fn list_table_lock_revs(&self, _table_id: u64) -> Result<Vec<u64>> {
+    async fn list_lock_revisions(&self, _req: ListLockRevReq) -> Result<Vec<(u64, LockMeta)>> {
         Err(ErrorCode::Unimplemented(
-            "list_table_lock_revs not allowed for system database",
+            "list_lock_revisions not allowed for system database",
         ))
     }
 
     #[async_backtrace::framed]
-    async fn create_table_lock_rev(
-        &self,
-        _expire_sec: u64,
-        _table_info: &TableInfo,
-    ) -> Result<CreateTableLockRevReply> {
+    async fn create_lock_revision(&self, _req: CreateLockRevReq) -> Result<CreateLockRevReply> {
         Err(ErrorCode::Unimplemented(
-            "create_table_lock_rev not allowed for system database",
+            "create_lock_revision not allowed for system database",
         ))
     }
 
     #[async_backtrace::framed]
-    async fn extend_table_lock_rev(
-        &self,
-        _expire_sec: u64,
-        _table_info: &TableInfo,
-        _revision: u64,
-    ) -> Result<()> {
+    async fn extend_lock_revision(&self, _req: ExtendLockRevReq) -> Result<()> {
         Err(ErrorCode::Unimplemented(
-            "extend_table_lock_rev not allowed for system database",
+            "extend_lock_revision not allowed for system database",
         ))
     }
 
     #[async_backtrace::framed]
-    async fn delete_table_lock_rev(&self, _table_info: &TableInfo, _revision: u64) -> Result<()> {
+    async fn delete_lock_revision(&self, _req: DeleteLockRevReq) -> Result<()> {
         Err(ErrorCode::Unimplemented(
-            "delete_table_lock_rev not allowed for system database",
+            "delete_lock_revision not allowed for system database",
+        ))
+    }
+
+    #[async_backtrace::framed]
+    async fn list_locks(&self, _req: ListLocksReq) -> Result<Vec<LockInfo>> {
+        Err(ErrorCode::Unimplemented(
+            "list_locks not allowed for system database",
         ))
     }
 
@@ -357,7 +471,7 @@ impl Catalog for ImmutableCatalog {
     }
 
     #[async_backtrace::framed]
-    async fn drop_index(&self, _req: DropIndexReq) -> Result<DropIndexReply> {
+    async fn drop_index(&self, _req: DropIndexReq) -> Result<()> {
         unimplemented!()
     }
 
@@ -377,33 +491,32 @@ impl Catalog for ImmutableCatalog {
     }
 
     #[async_backtrace::framed]
-    async fn list_indexes_by_table_id(&self, _req: ListIndexesByIdReq) -> Result<Vec<u64>> {
+    async fn list_index_ids_by_table_id(&self, _req: ListIndexesByIdReq) -> Result<Vec<u64>> {
+        unimplemented!()
+    }
+
+    #[async_backtrace::framed]
+    async fn list_indexes_by_table_id(
+        &self,
+        _req: ListIndexesByIdReq,
+    ) -> Result<Vec<(u64, String, IndexMeta)>> {
         unimplemented!()
     }
 
     // Virtual column
 
     #[async_backtrace::framed]
-    async fn create_virtual_column(
-        &self,
-        _req: CreateVirtualColumnReq,
-    ) -> Result<CreateVirtualColumnReply> {
+    async fn create_virtual_column(&self, _req: CreateVirtualColumnReq) -> Result<()> {
         unimplemented!()
     }
 
     #[async_backtrace::framed]
-    async fn update_virtual_column(
-        &self,
-        _req: UpdateVirtualColumnReq,
-    ) -> Result<UpdateVirtualColumnReply> {
+    async fn update_virtual_column(&self, _req: UpdateVirtualColumnReq) -> Result<()> {
         unimplemented!()
     }
 
     #[async_backtrace::framed]
-    async fn drop_virtual_column(
-        &self,
-        _req: DropVirtualColumnReq,
-    ) -> Result<DropVirtualColumnReply> {
+    async fn drop_virtual_column(&self, _req: DropVirtualColumnReq) -> Result<()> {
         unimplemented!()
     }
 
@@ -412,6 +525,64 @@ impl Catalog for ImmutableCatalog {
         &self,
         _req: ListVirtualColumnsReq,
     ) -> Result<Vec<VirtualColumnMeta>> {
+        unimplemented!()
+    }
+
+    async fn create_sequence(&self, _req: CreateSequenceReq) -> Result<CreateSequenceReply> {
+        unimplemented!()
+    }
+
+    async fn get_sequence(&self, _req: GetSequenceReq) -> Result<GetSequenceReply> {
+        unimplemented!()
+    }
+
+    async fn get_sequence_next_value(
+        &self,
+        _req: GetSequenceNextValueReq,
+    ) -> Result<GetSequenceNextValueReply> {
+        unimplemented!()
+    }
+
+    async fn drop_sequence(&self, _req: DropSequenceReq) -> Result<DropSequenceReply> {
+        unimplemented!()
+    }
+
+    /// Dictionary
+    #[async_backtrace::framed]
+    async fn create_dictionary(&self, _req: CreateDictionaryReq) -> Result<CreateDictionaryReply> {
+        unimplemented!()
+    }
+
+    #[async_backtrace::framed]
+    async fn update_dictionary(&self, _req: UpdateDictionaryReq) -> Result<UpdateDictionaryReply> {
+        unimplemented!()
+    }
+
+    #[async_backtrace::framed]
+    async fn drop_dictionary(
+        &self,
+        _dict_ident: DictionaryNameIdent,
+    ) -> Result<Option<SeqV<DictionaryMeta>>> {
+        unimplemented!()
+    }
+
+    #[async_backtrace::framed]
+    async fn get_dictionary(
+        &self,
+        _req: DictionaryNameIdent,
+    ) -> Result<Option<GetDictionaryReply>> {
+        unimplemented!()
+    }
+
+    #[async_backtrace::framed]
+    async fn list_dictionaries(
+        &self,
+        _req: ListDictionaryReq,
+    ) -> Result<Vec<(String, DictionaryMeta)>> {
+        unimplemented!()
+    }
+
+    async fn rename_dictionary(&self, _req: RenameDictionaryReq) -> Result<()> {
         unimplemented!()
     }
 }
